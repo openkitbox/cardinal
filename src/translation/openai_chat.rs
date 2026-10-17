@@ -238,8 +238,10 @@ pub fn from_ir(
     request: &IrRequest,
     model: &str,
 ) -> Result<(Value, Vec<&'static str>), ProtocolError> {
-    // Chat clients put thinking back as `reasoning_content` only for vendors
-    // that read it; the safe default drops it.
+    // DeepSeek requires the thinking of a tool-calling assistant turn to be
+    // replayed as `reasoning_content` (an unsigned-thinking upstream answers a
+    // missing one with HTTP 400 — misread as a pairing bug). So Thinking is
+    // always kept here; vendors that ignore the field do no harm with it.
     let mut dropped: Vec<&'static str> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
     // Tool results must follow their call's assistant turn; images a tool

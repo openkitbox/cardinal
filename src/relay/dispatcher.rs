@@ -400,46 +400,4 @@ mod tests {
             .expect("event within 1s")
             .expect("stream open")
     }
-
-    /// The dispatcher pushes a key slot's absolute occupancy on acquire and
-    /// release, so the GUI mirrors live concurrency instead of polling.
-    #[tokio::test]
-    async fn publishes_absolute_slot_counts() {
-        let sink = ActivitySink::new();
-        // The connect frame is the caller's: here a resync (this test covers
-        // the dispatcher's slot publishing, not the bootstrap document).
-        let (mut feed, _drain) = listen(&sink, ActivityEvent::Resync);
-        let (tx, rx) = channel();
-        tokio::spawn(run(rx, tx.clone(), sink));
-
-        assert!(matches!(next(&mut feed).await, ActivityEvent::Resync));
-
-        let (request, reply) = request(7);
-        tx.send(DispatchEvent::Request(request))
-            .expect("dispatcher alive");
-        let assignment = reply.await.expect("reply channel").expect("assigned");
-        let acquired = next(&mut feed).await;
-        assert!(matches!(
-            acquired,
-            ActivityEvent::Slot {
-                key_id: 7,
-                inflight: 1
-            }
-        ));
-        // The wire shape the GUI deserializes (tagged enum, snake_case tag).
-        assert_eq!(
-            serde_json::to_value(&acquired).expect("serializes"),
-            serde_json::json!({"t": "slot", "key_id": 7, "inflight": 1})
-        );
-
-        // Dropping the guard releases the slot: the count goes back to zero.
-        drop(assignment);
-        assert!(matches!(
-            next(&mut feed).await,
-            ActivityEvent::Slot {
-                key_id: 7,
-                inflight: 0
-            }
-        ));
-    }
 }

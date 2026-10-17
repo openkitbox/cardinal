@@ -55,8 +55,8 @@ fn next_request_id() -> u64 {
 }
 
 use dialects::{
-    ChatFixups, conversation_seed, is_deepseek_model, is_glm_upstream, is_opencode_upstream,
-    join_split_tool_call_turns, opencode_headers, strip_image_data_uris,
+    ChatFixups, conversation_seed, fill_missing_reasoning, is_deepseek_model, is_glm_upstream,
+    is_opencode_upstream, join_split_tool_call_turns, opencode_headers, strip_image_data_uris,
     vendor_thinking_off_fields,
 };
 use streaming::{
@@ -339,6 +339,15 @@ async fn send_attempt(
                     {
                         body = fixed;
                     }
+                    // Thinking-mode consistency: after the turn-join above, level
+                    // `reasoning_content` across all assistant turns so a mixed
+                    // history (some turns carry it, some don't) cannot trip
+                    // DeepSeek's all-or-nothing check.
+                    if fixups.deepseek_dialect
+                        && let std::borrow::Cow::Owned(fixed) = fill_missing_reasoning(&body)
+                    {
+                        body = fixed;
+                    }
                     body
                 }),
                 false => &request.body,
@@ -538,6 +547,14 @@ fn prepare_translated(
     // straight away by its tool results.
     if fixups.deepseek_dialect
         && let std::borrow::Cow::Owned(fixed) = join_split_tool_call_turns(&upstream_value)
+    {
+        upstream_value = fixed;
+    }
+    // Same all-or-nothing levelling as the passthrough path: the emitter only
+    // writes `reasoning_content` for turns whose IR carried thinking, so a
+    // partially-reasoning history still needs the gaps backfilled.
+    if fixups.deepseek_dialect
+        && let std::borrow::Cow::Owned(fixed) = fill_missing_reasoning(&upstream_value)
     {
         upstream_value = fixed;
     }
@@ -1127,7 +1144,9 @@ pub async fn dispatch_at(
         .into_iter()
         .partition(|candidate| !is_resting(candidate));
     for candidate in &resting {
-        tracing::info!(
+        // Per-request bookkeeping for every rested candidate: steady noise on
+        // a resting provider (one line per request per rested key) — DEBUG.
+        tracing::debug!(
             provider = candidate.provider.name.as_str(),
             key = candidate.key.label.as_str(),
             "candidate resting, deferred behind ready keys"

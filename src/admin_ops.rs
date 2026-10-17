@@ -333,7 +333,8 @@ impl Admin {
     }
 
     /// Every concurrency-limited key with its live occupancy (for the health page).
-    pub async fn concurrency_usage(&self) -> anyhow::Result<Vec<ConcurrencyView>> {        let rows = self.route_cache.all_limited_keys();
+    pub async fn concurrency_usage(&self) -> anyhow::Result<Vec<ConcurrencyView>> {
+        let rows = self.route_cache.all_limited_keys();
         let live = self.live_inflight().await;
         Ok(rows
             .iter()

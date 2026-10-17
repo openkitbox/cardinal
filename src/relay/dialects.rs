@@ -357,6 +357,68 @@ pub(super) fn join_split_tool_call_turns(body: &Value) -> std::borrow::Cow<'_, V
     }
 }
 
+/// DeepSeek thinking mode is all-or-nothing: once ANY assistant turn in the
+/// history carries `reasoning_content`, EVERY assistant turn must carry it, and
+/// a single gap fails the whole request with
+/// `The reasoning_content in the thinking mode must be passed back to the API.`
+/// (DeepSeek's own rule, not a gateway invention — see opencode issue #25000.)
+///
+/// A client that does not know the upstream is a DeepSeek thinking model (an
+/// alias like `k4-1m` hides it) only replays reasoning when it feels like it,
+/// producing exactly that mixed history. This levels the field: when at least
+/// one assistant turn already carries a non-empty `reasoning_content`, every
+/// other assistant turn that lacks the field gets an empty one, so the wire is
+/// uniformly populated. A turn that already has the field — empty or not — is
+/// left untouched, so no real reasoning text is ever overwritten; only the
+/// missing structure is backfilled. When NO turn carries reasoning at all the
+/// history is consistent already (thinking never engaged), and the body is
+/// returned borrowed with no copy.
+pub(super) fn fill_missing_reasoning(body: &Value) -> std::borrow::Cow<'_, Value> {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return std::borrow::Cow::Borrowed(body);
+    };
+    let is_assistant = |m: &Value| m.get("role").and_then(Value::as_str) == Some("assistant");
+    // The all-or-nothing trigger only fires once reasoning has actually
+    // appeared: a present-but-empty field is a placeholder, not engaged
+    // thinking, so the backfill keys off a non-empty `reasoning_content`.
+    let thinking_engaged = messages.iter().any(|m| {
+        is_assistant(m)
+            && m.get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+    });
+    // Only copy when there is real work: thinking must be engaged AND at least
+    // one assistant turn must be missing the field. A history where every
+    // assistant already carries `reasoning_content` (the common thinking
+    // replay) passes both gates yet needs no edit — checking the gap up front
+    // keeps that case borrowed, with no `to_vec` copy.
+    let any_gap = messages
+        .iter()
+        .any(|m| is_assistant(m) && m.get("reasoning_content").is_none());
+    if !thinking_engaged || !any_gap {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut joined = messages.to_vec();
+    for message in &mut joined {
+        if !is_assistant(message) {
+            continue;
+        }
+        // Backfill only a turn with no `reasoning_content` key at all; an
+        // existing key — even an empty string — is the client's own statement
+        // and is preserved verbatim.
+        if message.get("reasoning_content").is_none()
+            && let Some(object) = message.as_object_mut()
+        {
+            object.insert("reasoning_content".to_owned(), Value::String(String::new()));
+        }
+    }
+    // `any_gap` guaranteed at least one backfill, so the body is always rebuilt
+    // here — no unchanged-borrow fallback is reachable past this point.
+    let mut object = body.as_object().cloned().unwrap_or_default();
+    object.insert("messages".to_owned(), Value::Array(joined));
+    std::borrow::Cow::Owned(Value::Object(object))
+}
+
 /// The Chat-body adaptations one candidate's request needs, decided once in the
 /// candidate loop and honored by both prepare paths (same-protocol passthrough
 /// and cross-protocol translation). Both are vendor dialects of the outgoing

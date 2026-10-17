@@ -603,7 +603,7 @@ pub fn router(
     admin_remote: Arc<crate::admin::AdminRemote>,
 ) -> Router {
     Router::new()
-        .hoop(salvo::logging::Logger::new())
+        .hoop(crate::access_log::AccessLog)
         .push(Router::with_path("health").get(health))
         .push(
             Router::with_path("v1")

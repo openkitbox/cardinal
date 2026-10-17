@@ -14,6 +14,7 @@
 //! logging, loads config, and waits for signals. Test hosts embedding the
 //! crate call `gateway::gateway::Gateway::start` directly.
 
+pub mod access_log;
 pub mod activity;
 pub mod admin;
 pub mod admin_ops;

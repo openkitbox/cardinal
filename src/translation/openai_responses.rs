@@ -209,7 +209,10 @@ fn input_item(
     item: &Value,
     system: &mut Vec<String>,
     messages: &mut Vec<IrMessage>,
-    dropped: &mut Vec<&'static str>,
+    // Reasoning items are now kept (replayed as Thinking), so nothing here
+    // drops audibly any more; the parameter stays for the call-site symmetry
+    // with the other dialect adapters.
+    _dropped: &mut [&'static str],
 ) -> Result<(), ProtocolError> {
     let kind = match item.get("type").and_then(Value::as_str) {
         Some(kind) => kind,
@@ -288,9 +291,30 @@ fn input_item(
                 }],
             });
         }
-        // A reasoning item cannot be replayed upstream: its signature never
-        // survives a translated hop. Dropped audibly rather than blocking the turn.
-        "reasoning" => dropped.push("reasoning_item"),
+        // A reasoning item carries the thinking a client must replay on the
+        // next turn (DeepSeek rejects a tool-calling assistant turn without
+        // it). Accumulate its text into the following assistant message; the
+        // signature never survives a translated hop, so only the text is kept.
+        "reasoning" => {
+            let mut text = String::new();
+            // Responses reasoning items carry their thinking in `summary` (an
+            // array of summary_text parts) or, on some clients, `content`.
+            for field in ["summary", "content"] {
+                if let Some(parts) = item.get(field).and_then(Value::as_array) {
+                    for part in parts {
+                        if let Some(t) = part.get("text").and_then(Value::as_str) {
+                            text.push_str(t);
+                        }
+                    }
+                }
+            }
+            if !text.is_empty() {
+                messages.push(IrMessage {
+                    role: IrRole::Assistant,
+                    parts: vec![IrPart::Thinking { text }],
+                });
+            }
+        }
         // Hard fail over silent content loss (unknown item kinds included).
         _ => return Err(ProtocolError::InvalidRequest),
     }
@@ -368,14 +392,24 @@ fn tool_output_text(output: &Value) -> Result<String, ProtocolError> {
 pub fn emit_response_json(response: &IrResponse) -> Vec<u8> {
     let mut output: Vec<Value> = Vec::new();
     let mut pending = String::new();
+    let mut thinking = String::new();
     let mut messages = 0u64;
     let mut calls = 0u64;
+    let mut reasonings = 0u64;
     for part in &response.content {
         match part {
-            IrPart::Text(text) => pending.push_str(text),
+            // Thinking rides its own reasoning item so the client can replay it
+            // next turn (DeepSeek requires it back); the text accumulates until a
+            // non-thinking part flushes it as one reasoning item.
+            IrPart::Thinking { text } => thinking.push_str(text),
+            IrPart::Text(text) => {
+                flush_reasoning(&mut output, &mut thinking, &mut reasonings);
+                pending.push_str(text);
+            }
             IrPart::ToolCall { id, name, args } => {
-                // Adjacent text merges into one message item; a tool call flushes the
-                // pending text ahead of it so item order mirrors the IR.
+                // A tool call flushes any pending reasoning and text ahead of it
+                // so item order mirrors the IR.
+                flush_reasoning(&mut output, &mut thinking, &mut reasonings);
                 if !pending.is_empty() {
                     messages += 1;
                     output.push(message_item(messages, std::mem::take(&mut pending)));
@@ -393,12 +427,12 @@ pub fn emit_response_json(response: &IrResponse) -> Vec<u8> {
                   "arguments": args.to_string(),
                 }));
             }
-            // Unsigned thinking cannot be replayed to a Responses client either:
-            // the Chat upstream's reasoning has no signature by construction.
-            IrPart::Thinking { .. } => {}
+            // The Thinking arm above accumulates into `thinking`; nothing else
+            // to do here.
             _ => {}
         }
     }
+    flush_reasoning(&mut output, &mut thinking, &mut reasonings);
     if !pending.is_empty() {
         messages += 1;
         output.push(message_item(messages, pending));
@@ -449,6 +483,22 @@ fn message_item(seq: u64, text: String) -> Value {
       "role": "assistant",
       "content": [{"type": "output_text", "text": text}],
     })
+}
+
+/// Push the accumulated thinking as one reasoning item, if any. The client's
+/// next turn replays this item; `to_ir` reads its `summary` text back into a
+/// Thinking part so a thinking-mode upstream (DeepSeek) gets its reasoning.
+fn flush_reasoning(output: &mut Vec<Value>, thinking: &mut String, seq: &mut u64) {
+    if thinking.is_empty() {
+        return;
+    }
+    *seq += 1;
+    let text = std::mem::take(thinking);
+    output.push(serde_json::json!({
+      "id": format!("rs_{seq:016x}"),
+      "type": "reasoning",
+      "summary": [{"type": "summary_text", "text": text}],
+    }));
 }
 
 /// Responses is never the translation *target* (`OPENED` carries only the
