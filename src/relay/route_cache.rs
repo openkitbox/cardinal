@@ -1,0 +1,229 @@
+//! In-memory cache of providers, keys, and routes — the data `resolve()` needs.
+//! Seeded from PG at startup, refreshed after any admin write.
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use crate::store::{
+    EnabledKeyModels, KeyModels, LimitedKeyRow, ProviderKeyRow, ProviderRow, RouteRow,
+};
+
+#[derive(Clone)]
+pub struct RouteCache {
+    inner: Arc<RwLock<RouteCacheInner>>,
+}
+
+struct RouteCacheInner {
+    providers_by_name: HashMap<String, ProviderRow>,
+    providers_by_id: HashMap<i64, ProviderRow>,
+    keys_by_id: HashMap<i64, ProviderKeyRow>,
+    keys_by_provider: HashMap<i64, Vec<ProviderKeyRow>>, // provider_id → keys
+    routes_by_alias: HashMap<String, RouteRow>,
+    all_routes: Vec<RouteRow>,
+}
+
+impl RouteCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(RouteCacheInner {
+                providers_by_name: HashMap::new(),
+                providers_by_id: HashMap::new(),
+                keys_by_id: HashMap::new(),
+                keys_by_provider: HashMap::new(),
+                routes_by_alias: HashMap::new(),
+                all_routes: Vec::new(),
+            })),
+        }
+    }
+
+    /// One-shot load from PG at startup.
+    pub async fn load(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        self.refresh(pool).await
+    }
+
+    /// Full reload after admin mutations (create/update/delete provider/key/route).
+    pub async fn refresh(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        let providers = crate::store::list_providers(pool).await?;
+        let keys = crate::store::list_all_keys(pool).await?;
+        let routes = crate::store::list_routes(pool).await?;
+
+        let mut providers_by_name = HashMap::new();
+        let mut providers_by_id = HashMap::new();
+        for p in providers {
+            providers_by_name.insert(p.name.clone(), p.clone());
+            providers_by_id.insert(p.id, p);
+        }
+
+        let mut keys_by_id = HashMap::new();
+        let mut keys_by_provider: HashMap<i64, Vec<ProviderKeyRow>> = HashMap::new();
+        for k in keys {
+            keys_by_provider
+                .entry(k.provider_id)
+                .or_default()
+                .push(k.clone());
+            keys_by_id.insert(k.id, k);
+        }
+
+        let mut routes_by_alias = HashMap::new();
+        for r in &routes {
+            routes_by_alias.insert(r.alias.clone(), r.clone());
+        }
+
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|e| anyhow::anyhow!("route cache lock poisoned: {e}"))?;
+        inner.providers_by_name = providers_by_name;
+        inner.providers_by_id = providers_by_id;
+        inner.keys_by_id = keys_by_id;
+        inner.keys_by_provider = keys_by_provider;
+        inner.routes_by_alias = routes_by_alias;
+        inner.all_routes = routes;
+        Ok(())
+    }
+
+    // Sync read methods used by resolve():
+    pub fn provider_by_name(&self, name: &str) -> Option<ProviderRow> {
+        self.inner.read().ok()?.providers_by_name.get(name).cloned()
+    }
+
+    pub fn keys_for_provider(&self, provider_id: i64) -> Vec<ProviderKeyRow> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|inner| inner.keys_by_provider.get(&provider_id).cloned())
+            .unwrap_or_default()
+    }
+
+    pub fn route_by_alias(&self, alias: &str) -> Option<RouteRow> {
+        self.inner.read().ok()?.routes_by_alias.get(alias).cloned()
+    }
+
+    pub fn keys_by_ids(&self, ids: &[i64]) -> Vec<ProviderKeyRow> {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        let mut rows: Vec<ProviderKeyRow> = ids
+            .iter()
+            .filter_map(|id| inner.keys_by_id.get(id).cloned())
+            .collect();
+        rows.sort_by_key(|k| (k.position, k.id));
+        rows
+    }
+
+    pub fn providers_by_ids(&self, ids: &[i64]) -> Vec<ProviderRow> {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        ids.iter()
+            .filter_map(|id| inner.providers_by_id.get(id).cloned())
+            .collect()
+    }
+
+    // Used by api.rs / admin_ops.rs:
+    pub fn all_routes(&self) -> Vec<RouteRow> {
+        self.inner
+            .read()
+            .map(|inner| inner.all_routes.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn all_enabled_key_models(&self) -> Vec<EnabledKeyModels> {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        // Replicates: SELECT p.name AS provider, k.models, k.allowed_models
+        //   FROM gateway_provider_keys k JOIN gateway_providers p ON p.id = k.provider_id
+        //   WHERE p.enabled AND k.enabled ORDER BY p.name, k.position, k.id
+        let mut rows: Vec<EnabledKeyModels> = Vec::new();
+        let mut providers: Vec<&ProviderRow> = inner
+            .providers_by_id
+            .values()
+            .filter(|p| p.enabled)
+            .collect();
+        providers.sort_by(|a, b| a.name.cmp(&b.name));
+        for provider in providers {
+            let mut keys: Vec<&ProviderKeyRow> = inner
+                .keys_by_provider
+                .get(&provider.id)
+                .map(|keys| keys.iter().filter(|k| k.enabled).collect())
+                .unwrap_or_default();
+            keys.sort_by_key(|k| (k.position, k.id));
+            for key in keys {
+                rows.push(EnabledKeyModels {
+                    provider: provider.name.clone(),
+                    models: key.models.clone(),
+                    allowed_models: key.allowed_models.clone(),
+                });
+            }
+        }
+        rows
+    }
+
+    pub fn all_limited_keys(&self) -> Vec<LimitedKeyRow> {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        // Replicates: SELECT k.id AS key_id, k.provider_id, p.name AS provider_name, k.label AS key_label, k.max_concurrency
+        //   FROM gateway_provider_keys k JOIN gateway_providers p ON p.id = k.provider_id
+        //   WHERE k.max_concurrency IS NOT NULL ORDER BY p.name, k.label, k.id
+        let mut rows: Vec<LimitedKeyRow> = Vec::new();
+        for key in inner.keys_by_id.values() {
+            if let (Some(max_concurrency), Some(provider)) = (
+                key.max_concurrency,
+                inner.providers_by_id.get(&key.provider_id),
+            ) {
+                rows.push(LimitedKeyRow {
+                    key_id: key.id,
+                    provider_id: key.provider_id,
+                    provider_name: provider.name.clone(),
+                    key_label: key.label.clone(),
+                    max_concurrency,
+                });
+            }
+        }
+        rows.sort_by(|a, b| {
+            a.provider_name
+                .cmp(&b.provider_name)
+                .then(a.key_label.cmp(&b.key_label))
+                .then(a.key_id.cmp(&b.key_id))
+        });
+        rows
+    }
+
+    pub fn all_key_models(&self) -> Vec<KeyModels> {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        // Replicates: SELECT id, models, allowed_models FROM gateway_provider_keys ORDER BY id
+        let mut rows: Vec<KeyModels> = inner
+            .keys_by_id
+            .values()
+            .map(|k| KeyModels {
+                id: k.id,
+                models: k.models.clone(),
+                allowed_models: k.allowed_models.clone(),
+            })
+            .collect();
+        rows.sort_by_key(|k| k.id);
+        rows
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .read()
+            .map(|inner| inner.providers_by_id.is_empty() && inner.keys_by_id.is_empty())
+            .unwrap_or(true)
+    }
+}
+
+impl Default for RouteCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}

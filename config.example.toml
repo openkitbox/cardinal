@@ -1,0 +1,80 @@
+# cardinal-gateway 示例配置
+#
+# 默认加载路径 ~/.ox/config.toml 的 [gateway] / [log] 段；
+# `--config /path/to/config.toml` 可改用任意路径。
+# 本文件只是示例——拷贝为 config.toml 并按需修改。
+# 所有字段都有默认值：整个文件缺失时 gateway 以
+# 127.0.0.1:8787 + 本地 PostgreSQL 默认值直接可用。
+
+[gateway]
+# 监听地址（明文 HTTP）。默认 "127.0.0.1:8787"。
+listen = "127.0.0.1:8787"
+
+# TLS 终止（可选）。注释掉 = 明文。
+# [gateway.ssl]
+# cert_path = "/path/to/cert.pem"
+# key_path = "/path/to/key.pem"
+
+# PostgreSQL 连接串。默认 "postgres://beaver:beaver@127.0.0.1:5432/ox"。
+# sql_dsn = "postgres://user:pass@localhost:5432/cardinal"
+
+# 非本机客户端访问网关时携带的 Authorization bearer 值。默认 "cardinal"。
+# gateway_key = "cardinal"
+
+# 允许非 loopback 访问管理 API（/api/*）。默认 false（仅本机）。
+# 部署在远端、GUI 从另一台机器连接时设为 true。
+# admin_remote = false
+
+# 开发模式：允许明文 loopback 上游和非常规端口（本地 mock 上游用）。默认 false。
+# allow_insecure_upstream = false
+
+# 把请求/响应 body 镜像到日志（target `gateway::payload`，截断 64 KiB）。
+# 默认 false——body 含用户对话内容。
+# payloads = false
+
+# 某个 key 满载时，调度在队列里等多久（秒）再故障转移到下一个候选。默认 30。
+# queue_timeout_secs = 30
+
+# ── Provider 种子 ─────────────────────────────────────────────
+# 启动时幂等写入 DB（name 为主键，config 是 source of truth）。
+# 凭证（keys）和路由不在这里配——运行时通过管理 API / GUI 管理。
+#
+# [[gateway.providers]]
+# name = "kimi"                       # 唯一名；也是直连寻址前缀（"kimi/<model>"）
+# protocol = "anthropic_messages"     # 协议：anthropic_messages / openai_compat / gemini ...
+# base_url = "https://api.moonshot.cn/anthropic"
+# # auth_scheme 省略时按协议推断（anthropic_messages → x_api_key，其余 → bearer）
+# # auth_scheme = "x_api_key"
+# enabled = true                      # 默认 true
+
+# [[gateway.providers]]
+# name = "deepseek"
+# protocol = "openai_compat"
+# base_url = "https://api.deepseek.com"
+
+# ── 模型价格表 ────────────────────────────────────────────────
+# USD / 百万 token；config 是 source of truth。未列价格的模型不计费。
+#
+# [[gateway.prices]]
+# model = "kimi-k2.5"                 # 上游模型 id（与写入账本的 served model 匹配）
+# # provider = "kimi"                 # 可选：把价格限定到某个种子 provider（中转加价行）；省略 = 全局行
+# input_usd = 0.60
+# output_usd = 3.00
+# cache_read_usd = 0.10
+# cache_write_usd = 1.00
+# # cache_write_1h_usd = 2.00         # 1 小时 cache-write 价（Anthropic）；省略按 5 分钟价计费，
+#                                     # Claude 模型默认 2× input
+#
+# # 量级阶梯（按 above 升序）：prompt 总量超过某档后整单按该档价格计费。
+# # [[gateway.prices.tiers]]
+# # above = 200000
+# # input_usd = 1.20
+# # output_usd = 6.00
+# # cache_read_usd = 0.20
+# # cache_write_usd = 2.00
+# # cache_write_1h_usd = 4.00
+
+# ── 日志（cardinal-gateway 二进制的 [log] 段）─────────────────
+# [log]
+# level = "info"                      # EnvFilter 指令；RUST_LOG 环境变量优先
+# file = "/tmp/cardinal/gateway.log"  # 可选：按小时轮转的日志文件；省略 = 仅 stderr

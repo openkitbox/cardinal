@@ -1,0 +1,50 @@
+[package]
+name = "cardinal"
+version = "0.1.0"
+edition = "2024"
+description = "Headless LLM gateway"
+license = "GPL-3.0-only"
+
+[lib]
+name = "cardinal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cardinal"
+path = "src/bin/main.rs"
+
+# test-support exposes the admin-API test server scaffolding (testing module)
+# to external test builds driving the real admin router over HTTP.
+[features]
+test-support = []
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+dirs = "7"
+futures = "0.3"
+hex = "0.4"
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "https-ring", "webpki-roots"] }
+nanoid = "0.5"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "query"] }
+salvo = { version = "1.0.1", features = ["server", "http1", "http2", "server-handle", "rustls", "affix-state", "sse", "logging"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+serde_yaml = "0.9.34"
+sha2 = "0.11"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "json", "uuid", "migrate", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "1.1"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "time", "local-time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
