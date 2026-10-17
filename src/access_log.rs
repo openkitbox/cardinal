@@ -51,6 +51,10 @@ impl Handler for AccessLog {
                 ResBody::Error(e) => e.code,
                 _ => StatusCode::OK,
             });
+            // The Response event: INFO for relay, DEBUG for admin. The
+            // trailing unit field keeps relay/admin structurally identical so
+            // a single field-keyed span filter (see span_level!) can re-key
+            // the level without missing-field noise.
             if let ResBody::Error(error) = &res.body {
                 if relay {
                     tracing::info!(%status, ?duration, ?error, "Response");

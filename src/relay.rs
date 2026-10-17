@@ -325,32 +325,48 @@ async fn send_attempt(
     //   re-encodes (translated) arrive as data URIs, which GLM rejects.
     //   DeepSeek: a calling assistant turn must be followed by its tool results.
     let adapts = fixups.strip_glm_images || fixups.deepseek_dialect;
-    let mut adapted_body: Option<Value> = None;
+    // The adapted body is a Cow so a request whose dialect fixups all come back
+    // unchanged borrows the client's tree outright — no clone of the whole body
+    // is paid unless some fixup actually rewrites it.
+    let mut adapted_body: Option<std::borrow::Cow<'_, Value>> = None;
     let mut prepare = |fields: &[&str]| {
         if request.protocol == protocol {
-            let body = match adapts {
-                true => adapted_body.get_or_insert_with(|| {
-                    let mut body = match fixups.strip_glm_images {
-                        true => strip_image_data_uris(&request.body).into_owned(),
-                        false => request.body.clone(),
-                    };
-                    if fixups.deepseek_dialect
-                        && let std::borrow::Cow::Owned(fixed) = join_split_tool_call_turns(&body)
-                    {
-                        body = fixed;
-                    }
-                    // Thinking-mode consistency: after the turn-join above, level
-                    // `reasoning_content` across all assistant turns so a mixed
-                    // history (some turns carry it, some don't) cannot trip
-                    // DeepSeek's all-or-nothing check.
-                    if fixups.deepseek_dialect
-                        && let std::borrow::Cow::Owned(fixed) = fill_missing_reasoning(&body)
-                    {
-                        body = fixed;
-                    }
-                    body
-                }),
-                false => &request.body,
+            // Fill the adapted body at most once, then hand out a shared borrow.
+            // `let` binds the &Cow so the `.as_ref()` borrow outlives the match.
+            let adapted: Option<&std::borrow::Cow<'_, Value>> = match adapts {
+                true => {
+                    let cow = adapted_body.get_or_insert_with(|| {
+                        // Each fixup takes &Value and either borrows (no edit) or
+                        // hands back an owned rewrite the next fixup reads. A no-op
+                        // chain ends borrowed, so the client's tree is never cloned
+                        // unless some fixup actually rewrites it.
+                        let seed: std::borrow::Cow<'_, Value> = match fixups.strip_glm_images {
+                            true => strip_image_data_uris(&request.body),
+                            false => std::borrow::Cow::Borrowed(&request.body),
+                        };
+                        if !fixups.deepseek_dialect {
+                            return seed;
+                        }
+                        let body = match join_split_tool_call_turns(seed.as_ref()) {
+                            std::borrow::Cow::Owned(fixed) => std::borrow::Cow::Owned(fixed),
+                            std::borrow::Cow::Borrowed(_) => seed,
+                        };
+                        // Thinking-mode consistency: after the turn-join, level
+                        // `reasoning_content` across all assistant turns so a mixed
+                        // history (some carry it, some don't) cannot trip DeepSeek's
+                        // all-or-nothing check.
+                        match fill_missing_reasoning(body.as_ref()) {
+                            std::borrow::Cow::Owned(fixed) => std::borrow::Cow::Owned(fixed),
+                            std::borrow::Cow::Borrowed(_) => body,
+                        }
+                    });
+                    Some(&*cow)
+                }
+                false => None,
+            };
+            let body: &Value = match adapted {
+                Some(cow) => cow.as_ref(),
+                None => &request.body,
             };
             protocol::prepare(protocol, body, &target, stream, fields)
         } else {

@@ -296,8 +296,28 @@ pub(super) fn join_split_tool_call_turns(body: &Value) -> std::borrow::Cow<'_, V
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return std::borrow::Cow::Borrowed(body);
     };
+    // Dry run: a join happens exactly when some assistant turn immediately
+    // follows a call-bearing assistant turn. The join swallows the follower
+    // into the message before it, so the last-joined entry stays the
+    // call-bearing one and every later run of consecutive assistants follows a
+    // call too — one adjacent pair is therefore enough to prove work exists.
+    // Scanning for that pair first keeps the common no-join body borrowed,
+    // with no `joined` clone built only to be thrown away.
+    let has_join = messages.windows(2).any(|pair| {
+        let [previous, current] = pair else {
+            return false;
+        };
+        current.get("role").and_then(Value::as_str) == Some("assistant")
+            && previous.get("role").and_then(Value::as_str) == Some("assistant")
+            && previous
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty())
+    });
+    if !has_join {
+        return std::borrow::Cow::Borrowed(body);
+    }
     let mut joined: Vec<Value> = Vec::with_capacity(messages.len());
-    let mut changed = false;
     for message in messages {
         let follows_call = message.get("role").and_then(Value::as_str) == Some("assistant")
             && joined.last().is_some_and(|previous| {
@@ -311,7 +331,6 @@ pub(super) fn join_split_tool_call_turns(body: &Value) -> std::borrow::Cow<'_, V
             joined.push(message.clone());
             continue;
         }
-        changed = true;
         let previous = joined
             .last_mut()
             .expect("follows_call checked the last message");
@@ -347,14 +366,11 @@ pub(super) fn join_split_tool_call_turns(body: &Value) -> std::borrow::Cow<'_, V
             }
         }
     }
-    match changed {
-        true => {
-            let mut object = body.as_object().cloned().unwrap_or_default();
-            object.insert("messages".to_owned(), Value::Array(joined));
-            std::borrow::Cow::Owned(Value::Object(object))
-        }
-        false => std::borrow::Cow::Borrowed(body),
-    }
+    // `has_join` guaranteed at least one follower was swallowed, so the body is
+    // always rebuilt — no unchanged-borrow fallback is reachable here.
+    let mut object = body.as_object().cloned().unwrap_or_default();
+    object.insert("messages".to_owned(), Value::Array(joined));
+    std::borrow::Cow::Owned(Value::Object(object))
 }
 
 /// DeepSeek thinking mode is all-or-nothing: once ANY assistant turn in the
@@ -434,4 +450,138 @@ pub(super) struct ChatFixups {
     /// interrupted turn is joined back together (see
     /// [`join_split_tool_call_turns`]).
     pub(super) deepseek_dialect: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fill_missing_reasoning, join_split_tool_call_turns};
+    use serde_json::{Value, json};
+
+    // ---- fill_missing_reasoning ----------------------------------------------
+
+    /// Three-turn history: one assistant turn carries real reasoning, the
+    /// tool-calling turn that follows does not.
+    fn mixed_body() -> Value {
+        json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "let me check", "reasoning_content": "thinking..."},
+                {"role": "user", "content": "run ls"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "file-a"},
+            ]
+        })
+    }
+
+    #[test]
+    fn backfills_only_turns_missing_the_field() {
+        let filled = fill_missing_reasoning(&mixed_body()).into_owned();
+        let messages = filled["messages"].as_array().unwrap();
+        // The reasoning turn keeps its original text verbatim.
+        assert_eq!(messages[1]["reasoning_content"], "thinking...");
+        // The tool-calling turn gained an empty placeholder.
+        assert_eq!(messages[3]["reasoning_content"], "");
+        // Non-assistant turns are untouched.
+        assert!(messages[0].get("reasoning_content").is_none());
+        assert!(messages[2].get("reasoning_content").is_none());
+        assert!(messages[4].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn no_reasoning_anywhere_borrows_without_copy() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ]
+        });
+        assert!(matches!(
+            fill_missing_reasoning(&body),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn all_turns_already_reasoning_borrows_without_copy() {
+        // Thinking is engaged but every assistant turn already carries the
+        // field — nothing to backfill, so the body stays borrowed (no copy).
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": "a", "reasoning_content": "thinking"},
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "b", "reasoning_content": ""},
+            ]
+        });
+        assert!(matches!(
+            fill_missing_reasoning(&body),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn present_but_empty_reasoning_does_not_trigger_backfill() {
+        // A placeholder-empty field is not engaged thinking, so nothing is
+        // backfilled and no other turn is touched.
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": null, "reasoning_content": "", "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ]},
+                {"role": "assistant", "content": "done"},
+            ]
+        });
+        let filled = fill_missing_reasoning(&body).into_owned();
+        assert!(filled["messages"][1].get("reasoning_content").is_none());
+    }
+
+    // ---- join_split_tool_call_turns ------------------------------------------
+
+    #[test]
+    fn no_join_needed_borrows_without_copy() {
+        // No assistant turn follows a call-bearing one → the body is returned
+        // borrowed, never cloned.
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "more"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ]
+        });
+        assert!(matches!(
+            join_split_tool_call_turns(&body),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn follower_is_joined_into_the_call_bearing_turn() {
+        // A text-only assistant turn right after a call-bearing one is merged
+        // into it: content concatenates, the follower disappears.
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ]},
+                {"role": "assistant", "content": "thinking out loud"},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ]
+        });
+        let joined = join_split_tool_call_turns(&body).into_owned();
+        let messages = joined["messages"].as_array().unwrap();
+        // Two messages left: the merged assistant and the tool result.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "thinking out loud");
+        assert!(messages[0]["tool_calls"].as_array().unwrap().len() == 1);
+        assert_eq!(messages[1]["role"], "tool");
+    }
 }
