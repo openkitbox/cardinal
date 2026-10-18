@@ -1327,14 +1327,15 @@ pub async fn dispatch_at(
         // match relays natively at the capability's endpoint; otherwise the
         // capability table's preferred translation target (a candidate that can
         // do neither is skipped — translation makes a candidate usable, never
-        // reorders them).
+        // reorders them). Anthropic rows carrying `claude_only` (aggregator
+        // vendors) additionally gate on Claude model ids.
         let caps = capabilities::capabilities(
             &provider.name,
             &provider.protocol,
             &provider.base_url,
             &provider.auth_scheme,
         );
-        let Some(capability) = capabilities::select(&caps, protocol) else {
+        let Some(capability) = capabilities::select(&caps, protocol, target_model) else {
             if caps.is_empty() {
                 tracing::warn!(
                     "provider {} has an invalid protocol or credential scheme; skipping candidate",
