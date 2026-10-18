@@ -582,6 +582,10 @@ pub struct RouteRow {
     /// Dispatch strategy; rows and clients predating 0020 default to `ordered`.
     #[serde(default)]
     pub strategy: RouteStrategy,
+    /// Admin-facing display note (备注); `None` = unset. Never read by the
+    /// relay resolution path — it exists for the GUI's route header only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// One concurrency-limited key, joined with its provider name so UIs can read it directly.

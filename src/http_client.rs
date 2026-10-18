@@ -600,16 +600,18 @@ impl GatewayHttpClient {
     }
 
     /// Create or replace a route (alias → key/model entries) with its dispatch
-    /// `strategy`. The field is always sent; the server defaults an absent one
-    /// to `ordered` for old clients.
+    /// `strategy` and optional display `note`. Strategy and note are always
+    /// sent; the server defaults an absent strategy to `ordered` and treats an
+    /// absent note as unset, for old clients.
     pub async fn put_route(
         &self,
         alias: &str,
         entries: &[RouteEntry],
         context_window: Option<i64>,
         strategy: RouteStrategy,
+        note: Option<&str>,
     ) -> Result<(), ClientError> {
-        let body = serde_json::json!({ "entries": entries, "context_window": context_window, "strategy": strategy });
+        let body = serde_json::json!({ "entries": entries, "context_window": context_window, "strategy": strategy, "note": note });
         ok(self.put(&format!("/api/routes/{alias}")).json(&body)).await
     }
 

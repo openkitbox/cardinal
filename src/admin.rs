@@ -322,6 +322,9 @@ struct RouteBody {
     /// GUI learns the field).
     #[serde(default)]
     strategy: RouteStrategy,
+    /// Admin-facing display note; absent/empty on old clients clears it.
+    #[serde(default)]
+    note: Option<String>,
 }
 
 /// The 400 body for a malformed `PUT /api/routes/{alias}`. An unknown
@@ -368,6 +371,7 @@ async fn put_route(request: &mut Request, depot: &mut Depot, response: &mut Resp
         &body.entries,
         body.context_window,
         body.strategy,
+        body.note,
     )
     .await
     {

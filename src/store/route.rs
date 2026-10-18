@@ -2,28 +2,37 @@ use sqlx::PgPool;
 
 use super::key::{RouteEntry, RouteRow, RouteStrategy};
 
+/// One raw `gateway_routes` row straight off SQL, before entries/strategy parsing.
+type RawRouteRow = (
+    String,
+    serde_json::Value,
+    Option<i64>,
+    String,
+    Option<String>,
+);
+
 pub async fn list_routes(pool: &PgPool) -> anyhow::Result<Vec<RouteRow>> {
-    let rows: Vec<(String, serde_json::Value, Option<i64>, String)> = sqlx::query_as(
-        "SELECT alias, entries, context_window, strategy FROM gateway_routes ORDER BY alias",
+    let rows: Vec<RawRouteRow> = sqlx::query_as(
+        "SELECT alias, entries, context_window, strategy, note FROM gateway_routes ORDER BY alias",
     )
     .fetch_all(pool)
     .await?;
     rows.into_iter()
-        .map(|(alias, entries, context_window, strategy)| {
-            parse_route(alias, entries, context_window, &strategy)
+        .map(|(alias, entries, context_window, strategy, note)| {
+            parse_route(alias, entries, context_window, &strategy, note)
         })
         .collect()
 }
 
 pub async fn get_route(pool: &PgPool, alias: &str) -> anyhow::Result<Option<RouteRow>> {
-    let row: Option<(String, serde_json::Value, Option<i64>, String)> = sqlx::query_as(
-        "SELECT alias, entries, context_window, strategy FROM gateway_routes WHERE alias = $1",
-    )
+    let row: Option<RawRouteRow> = sqlx::query_as(
+            "SELECT alias, entries, context_window, strategy, note FROM gateway_routes WHERE alias = $1",
+        )
     .bind(alias)
     .fetch_optional(pool)
     .await?;
-    row.map(|(alias, entries, context_window, strategy)| {
-        parse_route(alias, entries, context_window, &strategy)
+    row.map(|(alias, entries, context_window, strategy, note)| {
+        parse_route(alias, entries, context_window, &strategy, note)
     })
     .transpose()
 }
@@ -38,12 +47,22 @@ pub async fn put_route(
     entries: &[RouteEntry],
     context_window: Option<i64>,
     strategy: RouteStrategy,
+    note: Option<String>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!alias.is_empty(), "route alias must not be empty");
     anyhow::ensure!(!entries.is_empty(), "route entries must not be empty");
     anyhow::ensure!(
         context_window.is_none_or(|window| window > 0),
         "route {alias} context window must be positive"
+    );
+    // Empty trims to unset so the DB never stores `""` — `note IS NULL` stays
+    // the single "no note" representation.
+    let note = note
+        .map(|note| note.trim().to_string())
+        .filter(|note| !note.is_empty());
+    anyhow::ensure!(
+        note.as_ref().is_none_or(|note| note.chars().count() <= 200),
+        "route {alias} note exceeds 200 characters"
     );
     let mut tx = pool.begin().await?;
     for entry in entries {
@@ -81,13 +100,14 @@ pub async fn put_route(
     }
     let json = serde_json::to_value(entries)?;
     sqlx::query(
-    "INSERT INTO gateway_routes (alias, entries, context_window, strategy) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (alias) DO UPDATE SET entries = EXCLUDED.entries, context_window = EXCLUDED.context_window, strategy = EXCLUDED.strategy",
+    "INSERT INTO gateway_routes (alias, entries, context_window, strategy, note) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (alias) DO UPDATE SET entries = EXCLUDED.entries, context_window = EXCLUDED.context_window, strategy = EXCLUDED.strategy, note = EXCLUDED.note",
   )
   .bind(alias)
   .bind(json)
   .bind(context_window)
   .bind(strategy.as_str())
+  .bind(note)
   .execute(&mut *tx)
   .await?;
     tx.commit().await?;
@@ -107,6 +127,7 @@ fn parse_route(
     entries: serde_json::Value,
     context_window: Option<i64>,
     strategy: &str,
+    note: Option<String>,
 ) -> anyhow::Result<RouteRow> {
     // Empty entries are a legitimate state: deleting a key cascades it out of
     // every route, and the emptied route keeps its alias so it can be
@@ -120,5 +141,6 @@ fn parse_route(
         entries,
         context_window,
         strategy,
+        note,
     })
 }

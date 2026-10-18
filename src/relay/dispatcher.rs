@@ -371,33 +371,3 @@ fn publish_slot(sink: &ActivitySink, slots: &HashMap<SlotKey, SlotState>, key: S
         sink.slot(id as i64, state.inflight);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::activity::{ActivityEvent, ActivityReceiver, listen};
-    use std::time::Duration;
-
-    fn request(key_id: u64) -> (DispatchRequest, oneshot::Receiver<Option<Assignment>>) {
-        let (reply, rx) = oneshot::channel();
-        let req = DispatchRequest {
-            id: 1,
-            slot_keys: vec![(SlotKey::Key(key_id), None)],
-            order: vec![0],
-            caps: vec![CandidateCaps {
-                key_cap: Some(1),
-                entry_cap: None,
-                rested: false,
-            }],
-            reply,
-        };
-        (req, rx)
-    }
-
-    async fn next(feed: &mut ActivityReceiver) -> ActivityEvent {
-        tokio::time::timeout(Duration::from_secs(1), feed.recv())
-            .await
-            .expect("event within 1s")
-            .expect("stream open")
-    }
-}
