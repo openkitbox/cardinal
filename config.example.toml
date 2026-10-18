@@ -78,3 +78,5 @@ listen = "127.0.0.1:8787"
 # [log]
 # level = "info"                      # EnvFilter 指令；RUST_LOG 环境变量优先
 # file = "/tmp/cardinal/gateway.log"  # 可选：按小时轮转的日志文件；省略 = 仅 stderr
+# console = true                      # stderr 是否同时输出；systemd 部署设 false，只留文件
+# retain_hours = 72                   # 可选：删除超过 N 小时的轮转文件；省略 = 全部保留
