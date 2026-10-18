@@ -28,6 +28,13 @@ pub struct Limits {
     pub idle: Duration,
     pub total: Duration,
     pub max_json_bytes: usize,
+    /// Inbound request-body read deadline: how long the gateway waits for the
+    /// client to finish sending the body before it gives up with 408. Distinct
+    /// from `max_json_bytes` (a size cap) — this is a TIME cap on the read, so a
+    /// slow or stalled client (e.g. a request trickling through a CDN/tunnel)
+    /// cannot hold the connection open indefinitely while the relay sits
+    /// "connecting" without ever dispatching.
+    pub body_read: Duration,
     /// Test-only affordance: permits plaintext loopback URLs. Production policy
     /// requires HTTPS to a validated global destination (B §3.3).
     pub allow_plaintext_loopback: bool,
@@ -53,6 +60,10 @@ impl Default for Limits {
             // stream is cut by idle long before this ever fires.
             total: Duration::from_secs(3600),
             max_json_bytes: 32 * 1024 * 1024,
+            // Inbound body read deadline (2 minutes): a normal chat body lands in
+            // well under a second; 120s absorbs a slow client/CDN hop without ever
+            // being the path that stalls an ordinary request.
+            body_read: Duration::from_secs(120),
             allow_plaintext_loopback: false,
             allowed_ports: Vec::new(),
             allow_private_destinations: false,

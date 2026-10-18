@@ -1,6 +1,7 @@
 //! HTTP surface: /health, /v1/messages, /v1/chat/completions, /v1/responses (M4 adds /api/*).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use salvo::affix_state;
 use salvo::http::{ParseError, StatusCode, header};
@@ -83,6 +84,41 @@ fn stream_of(body: &Value) -> bool {
 ///
 /// `endpoint_protocol` is determined by the route: /v1/messages = Anthropic, /v1/chat/completions = Chat,
 /// /v1/responses = Responses. The handler only does HTTP parsing and rendering; all orchestration lives in
+/// The outcome of a bounded request-body read, split so each endpoint can map
+/// it onto its own wire dialect (relay uses bare statuses, Gemini a JSON error).
+enum BodyRead {
+    Ok(Value),
+    TooLarge,
+    Invalid,
+    /// The client did not finish sending the body within `Limits::body_read`.
+    Timeout,
+}
+
+/// Read the inbound JSON body under two bounds: `max_json_bytes` (size, via
+/// salvo's secure max) and `Limits::body_read` (time, via a timeout). The time
+/// bound is the guard against a slow or stalled client holding the connection
+/// open forever while the request never dispatches — observed on prod behind a
+/// tunnel as a request sitting "connecting" for minutes with zero dispatch.
+async fn read_json_body(request: &mut Request, state: &AppState) -> BodyRead {
+    let limits = state.transport.limits();
+    request.set_secure_max_size(limits.max_json_bytes);
+    let start = Instant::now();
+    match tokio::time::timeout(limits.body_read, request.parse_json::<Value>()).await {
+        Ok(Ok(value)) => BodyRead::Ok(value),
+        Ok(Err(ParseError::PayloadTooLarge)) => BodyRead::TooLarge,
+        Ok(Err(_)) => BodyRead::Invalid,
+        Err(_elapsed) => {
+            tracing::warn!(
+                remote = %request.remote_addr(),
+                path = request.uri().path(),
+                waited_ms = start.elapsed().as_millis() as u64,
+                "request body read timed out; client never finished sending it"
+            );
+            BodyRead::Timeout
+        }
+    }
+}
+
 /// [`relay::dispatch`].
 async fn relay_endpoint(
     request: &mut Request,
@@ -91,18 +127,21 @@ async fn relay_endpoint(
     protocol: ProtocolId,
 ) {
     let state = depot.get_typed::<Arc<AppState>>().expect("state");
-    // Bounded read: the inbound ceiling shares the outbound JSON limit.
-    request.set_secure_max_size(state.transport.limits().max_json_bytes);
-    let body: Value = match request.parse_json().await {
-        Ok(value) => value,
-        Err(ParseError::PayloadTooLarge) => {
+    let body: Value = match read_json_body(request, state.as_ref()).await {
+        BodyRead::Ok(value) => value,
+        BodyRead::TooLarge => {
             response.status_code(StatusCode::PAYLOAD_TOO_LARGE);
             let _ = response.body("request body too large");
             return;
         }
-        Err(_) => {
+        BodyRead::Invalid => {
             response.status_code(StatusCode::BAD_REQUEST);
             let _ = response.body("invalid JSON body");
+            return;
+        }
+        BodyRead::Timeout => {
+            response.status_code(StatusCode::REQUEST_TIMEOUT);
+            let _ = response.body("request body not received in time");
             return;
         }
     };
@@ -291,10 +330,9 @@ async fn gemini_generate(request: &mut Request, response: &mut Response, depot: 
         );
     }
     let state = depot.get_typed::<Arc<AppState>>().expect("state");
-    request.set_secure_max_size(state.transport.limits().max_json_bytes);
-    let mut body: Value = match request.parse_json().await {
-        Ok(value) => value,
-        Err(ParseError::PayloadTooLarge) => {
+    let mut body: Value = match read_json_body(request, state.as_ref()).await {
+        BodyRead::Ok(value) => value,
+        BodyRead::TooLarge => {
             return gemini_error(
                 response,
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -302,12 +340,20 @@ async fn gemini_generate(request: &mut Request, response: &mut Response, depot: 
                 "request body too large",
             );
         }
-        Err(_) => {
+        BodyRead::Invalid => {
             return gemini_error(
                 response,
                 StatusCode::BAD_REQUEST,
                 "INVALID_ARGUMENT",
                 "invalid JSON body",
+            );
+        }
+        BodyRead::Timeout => {
+            return gemini_error(
+                response,
+                StatusCode::REQUEST_TIMEOUT,
+                "DEADLINE_EXCEEDED",
+                "request body not received in time",
             );
         }
     };

@@ -28,25 +28,46 @@ impl SmartCache {
 
     /// Replace all snapshots wholesale. Called once per probe round — NOT
     /// on the request path.
+    ///
+    /// Lock poisoning degrades instead of panicking (consistent with the
+    /// other caches): a poisoned write keeps the previous snapshots and logs,
+    /// since stale-but-present quota data beats crashing the process.
     pub fn refresh(&self, snapshots: HashMap<i64, KeyQuota>) {
-        *self.inner.write().expect("smart cache lock poisoned") = snapshots;
+        match self.inner.write() {
+            Ok(mut guard) => *guard = snapshots,
+            Err(_) => {
+                tracing::warn!("smart cache lock poisoned on refresh; keeping previous snapshots");
+            }
+        }
     }
 
     /// Clone the current snapshot map for a dispatch's ordering pass.
     /// One lock acquisition regardless of candidate count.
+    ///
+    /// A poisoned lock degrades to an empty map, which the caller treats like
+    /// "no snapshots yet" — smart ordering falls back to stored route order.
     pub fn snapshots(&self) -> HashMap<i64, KeyQuota> {
-        self.inner
-            .read()
-            .expect("smart cache lock poisoned")
-            .clone()
+        match self.inner.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                tracing::warn!("smart cache lock poisoned on read; dispatching without quota data");
+                HashMap::new()
+            }
+        }
     }
 
     /// Whether any snapshot has been loaded (drives the degradation path
     /// without a PG round-trip).
+    ///
+    /// A poisoned lock reports empty, routing the dispatch down the same
+    /// "no snapshots" fallback as an unloaded cache.
     pub fn is_empty(&self) -> bool {
-        self.inner
-            .read()
-            .expect("smart cache lock poisoned")
-            .is_empty()
+        match self.inner.read() {
+            Ok(guard) => guard.is_empty(),
+            Err(_) => {
+                tracing::warn!("smart cache lock poisoned on is_empty; treating as empty");
+                true
+            }
+        }
     }
 }
