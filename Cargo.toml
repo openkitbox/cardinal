@@ -32,6 +32,12 @@ hickory-resolver = { version = "0.26.3", default-features = false, features = ["
 nanoid = "0.5"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "query"] }
+# mimalloc as the global allocator: frees pages back to the OS ~1s after a
+# burst (glibc retains them for the process lifetime). `no_thp` makes it
+# prctl(PR_SET_THP_DISABLE) itself — under a THP=[always] kernel (Debian 13)
+# the default would back every touched arena with 2MiB huge pages, showing
+# ~50MB RSS at startup for a few MB of real use.
+rustfs-mimalloc = { version = "0.7", features = ["no_thp"] }
 salvo = { version = "1.0.1", features = ["server", "http1", "http2", "server-handle", "rustls", "affix-state", "sse", "logging"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }

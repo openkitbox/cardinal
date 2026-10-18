@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
+// Global allocator: mimalloc (see Cargo.toml for why `no_thp`).
+#[global_allocator]
+static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 #[derive(Parser)]
 #[command(
     name = "cardinal-gateway",
