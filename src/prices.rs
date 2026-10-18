@@ -263,8 +263,10 @@ fn is_priced(cost: &CostEntry) -> bool {
 }
 
 /// The id without its path head ("deepseek/deepseek-v4.1-flash" →
-/// "deepseek-v4.1-flash").
-fn bare(key: &str) -> &str {
+/// "deepseek-v4.1-flash"). Shared by the catalog import and the request-path
+/// price lookup (aggregator-served ids keep the vendor prefix the price
+/// table doesn't).
+pub(crate) fn bare(key: &str) -> &str {
     key.rsplit('/').next().unwrap_or(key)
 }
 

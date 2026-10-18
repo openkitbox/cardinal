@@ -102,11 +102,16 @@ impl PriceCache {
     pub fn get(&self, provider_id: i64, model: &str) -> Option<ModelPrice> {
         let inner = self.inner.read().ok()?;
         // Provider-scoped row first, then the global fallback (provider_id = 0).
+        // Aggregator routes serve vendor-prefixed ids (`deepseek/deepseek-v4.1-flash`)
+        // the price table doesn't carry; a global miss retries the bare id —
+        // the same one-path-head strip the catalog import normalizes with
+        // (`crate::prices::bare`).
         inner
             .scoped
             .get(&provider_id)
             .and_then(|m| m.get(model))
             .or_else(|| inner.global.get(model))
+            .or_else(|| inner.global.get(crate::prices::bare(model)))
             .cloned()
     }
 
@@ -139,5 +144,36 @@ impl PriceCache {
 impl Default for PriceCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The request path serves aggregator-prefixed ids the price table
+    /// doesn't carry (`deepseek/deepseek-v4.1-flash`); the global bare-id
+    /// fallback must still price them. Provider-scoped rows keep precedence
+    /// and are never bare-fallback.
+    #[test]
+    fn global_bare_id_fallback_prices_prefixed_served_models() {
+        let cache = PriceCache::new();
+        cache.inner.write().unwrap().global.insert(
+            "deepseek-v4.1-flash".into(),
+            ModelPrice {
+                input_usd: 0.15,
+                output_usd: 0.6,
+                cache_read_usd: 0.0,
+                cache_write_usd: 0.0,
+                cache_write_1h_usd: None,
+                tiers: Vec::new(),
+            },
+        );
+
+        assert!(
+            cache.get(12, "deepseek/deepseek-v4.1-flash").is_some(),
+            "prefixed id falls back to the bare global row"
+        );
+        assert!(cache.get(12, "unknown-model").is_none());
     }
 }
