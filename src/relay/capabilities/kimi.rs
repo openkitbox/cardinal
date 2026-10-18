@@ -1,11 +1,14 @@
-//! Kimi (Moonshot): the Anthropic-compatible endpoint IS the connection.
+//! Kimi (Moonshot): all three protocols are native, every client passes
+//! through.
 //!
-//! The Anthropic Messages wire is the most complete surface Kimi offers
-//! (native thinking fields, cache_control; Kimi Code itself speaks Anthropic
-//! to the managed endpoint) — so kimi rows connect at the anthropic leaf only,
-//! one Bearer credential. Chat and Responses clients reach kimi through the
-//! translation layer. The leaf serves KIMI's OWN models, so its rows are not
-//! `claude_only`: Anthropic clients targeting kimi models passthrough.
+//! Coding Plan (`…/coding/v1`): probe evidence (2026-10-18, invalid-key
+//! requests return 401 — routed past auth) on /messages, /chat/completions
+//! and /responses: the plan serves anthropic, chat and responses natively.
+//! Platform (site root, api.moonshot.cn): probe evidence 2026-10-18 —
+//! invalid-key 401 on /v1/chat/completions, /v1/responses and
+//! /anthropic/v1/messages (the /v1/messages control correctly 404s), matching
+//! the official endpoint table (platform.kimi.com docs, API overview). The
+//! leaves serve KIMI's OWN models, so no row is `claude_only`.
 
 use crate::protocol::ProtocolId;
 
@@ -14,16 +17,24 @@ use super::{Capability, bearer};
 pub(super) fn capabilities(base: &str, code: bool) -> Vec<Capability> {
     if code {
         // Coding Plan: the base IS the version root (`…/coding/v1`).
-        vec![bearer(
-            ProtocolId::AnthropicMessages,
-            format!("{base}/messages"),
-        )]
+        vec![
+            bearer(ProtocolId::OpenAiChat, format!("{base}/chat/completions")),
+            bearer(ProtocolId::AnthropicMessages, format!("{base}/messages")),
+            bearer(ProtocolId::OpenAiResponses, format!("{base}/responses")),
+        ]
     } else {
         // Platform: the base is the site root.
-        vec![bearer(
-            ProtocolId::AnthropicMessages,
-            format!("{base}/anthropic/v1/messages"),
-        )]
+        vec![
+            bearer(
+                ProtocolId::OpenAiChat,
+                format!("{base}/v1/chat/completions"),
+            ),
+            bearer(
+                ProtocolId::AnthropicMessages,
+                format!("{base}/anthropic/v1/messages"),
+            ),
+            bearer(ProtocolId::OpenAiResponses, format!("{base}/v1/responses")),
+        ]
     }
 }
 
@@ -36,7 +47,7 @@ pub(super) fn validate_base_url(path: String, code: bool) -> anyhow::Result<()> 
     } else {
         anyhow::ensure!(
             path.is_empty() || path == "/",
-            "kimi base_url 应为站点根（如 https://api.moonshot.cn）——anthropic 端点 /anthropic/v1/messages 由网关拼接"
+            "kimi base_url 应为站点根（如 https://api.moonshot.cn）——协议端点由网关拼接"
         );
     }
     Ok(())

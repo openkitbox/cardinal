@@ -1,7 +1,9 @@
-//! GLM Coding Plan: chat + responses under the version root with Bearer, plus
-//! an anthropic endpoint on the ORIGIN (`{origin}/api/anthropic/v1/messages`)
-//! with the Anthropic-style `x-api-key` credential. The anthropic leaf serves
-//! GLM's OWN models — not `claude_only`.
+//! GLM: chat + responses under the version root with Bearer, plus an
+//! anthropic endpoint on the ORIGIN (`{origin}/api/anthropic/v1/messages`)
+//! with the Anthropic-style `x-api-key` credential. Both plan variants share
+//! this row shape — Coding Plan base `…/api/coding/paas/v4`, general-API base
+//! `…/api/paas/v4` (both probed 2026-10-18: invalid-key 401 on all three
+//! leaves). The anthropic leaf serves GLM's OWN models — not `claude_only`.
 
 use crate::protocol::ProtocolId;
 use crate::providers::AuthScheme;
@@ -36,10 +38,17 @@ pub(super) fn capabilities(base: &str) -> Vec<Capability> {
     caps
 }
 
-pub(super) fn validate_base_url(path: String) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        path == "/api/coding/paas/v4",
-        "glm code base_url 应为编码版版本根（如 https://open.bigmodel.cn/api/coding/paas/v4）——协议路径由网关拼接"
-    );
+pub(super) fn validate_base_url(path: String, code: bool) -> anyhow::Result<()> {
+    if code {
+        anyhow::ensure!(
+            path == "/api/coding/paas/v4",
+            "glm code base_url 应为编码版版本根（如 https://open.bigmodel.cn/api/coding/paas/v4）——协议路径由网关拼接"
+        );
+    } else {
+        anyhow::ensure!(
+            path == "/api/paas/v4",
+            "glm base_url 应为通用版版本根（如 https://open.bigmodel.cn/api/paas/v4）——协议路径由网关拼接"
+        );
+    }
     Ok(())
 }

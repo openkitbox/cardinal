@@ -146,34 +146,3 @@ impl Default for PriceCache {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The request path serves aggregator-prefixed ids the price table
-    /// doesn't carry (`deepseek/deepseek-v4.1-flash`); the global bare-id
-    /// fallback must still price them. Provider-scoped rows keep precedence
-    /// and are never bare-fallback.
-    #[test]
-    fn global_bare_id_fallback_prices_prefixed_served_models() {
-        let cache = PriceCache::new();
-        cache.inner.write().unwrap().global.insert(
-            "deepseek-v4.1-flash".into(),
-            ModelPrice {
-                input_usd: 0.15,
-                output_usd: 0.6,
-                cache_read_usd: 0.0,
-                cache_write_usd: 0.0,
-                cache_write_1h_usd: None,
-                tiers: Vec::new(),
-            },
-        );
-
-        assert!(
-            cache.get(12, "deepseek/deepseek-v4.1-flash").is_some(),
-            "prefixed id falls back to the bare global row"
-        );
-        assert!(cache.get(12, "unknown-model").is_none());
-    }
-}

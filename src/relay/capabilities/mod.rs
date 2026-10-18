@@ -14,12 +14,13 @@
 //! their base_url contract and their per-row facts; this file owns only the
 //! generic contract ([`Capability`], [`select`], [`resolve_for_model`]) and
 //! the single-protocol fallback. Vendor modules: [`kimi`], [`glm`],
-//! [`gemini`], [`opencode`], [`commandcode`].
+//! [`gemini`], [`opencode`], [`commandcode`], [`deepseek`].
 //!
 //! Endpoints are FULL request URLs: the protocol kernels use
 //! `TargetView.endpoint` verbatim.
 
 mod commandcode;
+mod deepseek;
 mod gemini;
 mod glm;
 mod kimi;
@@ -114,7 +115,8 @@ pub fn validate_base_url(provider_name: &str, base_url: &str) -> anyhow::Result<
     }
     match provider_kind(provider_name) {
         ("kimi", code) => kimi::validate_base_url(path, code),
-        ("glm", true) => glm::validate_base_url(path),
+        ("glm", code) => glm::validate_base_url(path, code),
+        ("deepseek", _) => deepseek::validate_base_url(path),
         ("opencode", _) => opencode::validate_base_url(path),
         ("commandcode", _) => commandcode::validate_base_url(path),
         _ => Ok(()),
@@ -136,10 +138,11 @@ pub fn capabilities(
     let base = row_base_url.trim_end_matches('/');
     match provider_kind(provider_name) {
         ("kimi", code) => kimi::capabilities(base, code),
-        ("glm", true) => glm::capabilities(base),
+        ("glm", _) => glm::capabilities(base),
         ("gemini", _) => gemini::capabilities(base),
         ("opencode", _) => opencode::capabilities(base),
         ("commandcode", _) => commandcode::capabilities(base),
+        ("deepseek", _) => deepseek::capabilities(base),
         _ => single_protocol(row_protocol, row_auth_scheme, base),
     }
 }
