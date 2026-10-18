@@ -48,6 +48,7 @@ pub fn prepare(
     target: &TargetView<'_>,
     stream: bool,
     skip: &[&str],
+    strip_images: bool,
 ) -> Result<Prepared, ProtocolError> {
     validate_request(client_body)?;
     let object = client_body
@@ -70,7 +71,7 @@ pub fn prepare(
         if field == "model" {
             super::write_json(&mut out, target.upstream_model)?;
         } else {
-            super::write_json(&mut out, value)?;
+            super::write_json_value(&mut out, value, strip_images)?;
         }
     }
     out.push(b'}');

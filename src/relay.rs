@@ -55,9 +55,9 @@ fn next_request_id() -> u64 {
 }
 
 use dialects::{
-    ChatFixups, conversation_seed, fill_missing_reasoning, is_deepseek_model, is_glm_upstream,
-    is_opencode_upstream, join_split_tool_call_turns, opencode_headers, strip_image_data_uris,
-    vendor_thinking_off_fields,
+    ChatFixups, conversation_seed, fill_missing_reasoning, fill_missing_reasoning_pending,
+    is_deepseek_model, is_glm_upstream, is_opencode_upstream, join_split_tool_call_turns,
+    join_split_tool_call_turns_pending, opencode_headers, vendor_thinking_off_fields,
 };
 use streaming::{
     AttemptSuccess, HoldSignal, PumpSide, RelayOutcome, StreamPump, spawn_stream_pump,
@@ -163,7 +163,69 @@ pub fn extract_effort(protocol: ProtocolId, body: &Value) -> Option<String> {
 const PAYLOAD_TARGET: &str = "gateway::payload";
 
 /// Char-boundary-safe truncation (slicing a multibyte char would panic).
-fn truncate_payload(text: &str) -> String {
+/// Payload-log rendering cap: one small slack above body_log's capture limit,
+/// so the capture's own boundary-accurate cut still sees the same bytes an
+/// unbounded render would have given it.
+const PAYLOAD_RENDER_LIMIT: usize = crate::body_log::CALL_BODY_LIMIT + 4;
+
+/// A bounded rendering of a JSON body for payload logging: `text` stops at
+/// [`PAYLOAD_RENDER_LIMIT`] bytes while `total_bytes` keeps the true size for
+/// the log line. A long-context body costs the capped buffer plus a counter —
+/// never a second full copy of itself.
+struct RenderedPayload {
+    text: String,
+    total_bytes: usize,
+}
+
+/// A `Vec<u8>` sink that retains only the first `cap` bytes yet counts every
+/// byte written, so the caller learns the full size without holding it.
+struct BoundedWriter {
+    buf: Vec<u8>,
+    cap: usize,
+    total: usize,
+}
+
+impl BoundedWriter {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            cap,
+            total: 0,
+        }
+    }
+}
+
+impl std::io::Write for BoundedWriter {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        self.total = self.total.saturating_add(chunk.len());
+        let room = self.cap.saturating_sub(self.buf.len());
+        self.buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        Ok(chunk.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Render a JSON body for payload logging, bounded (see [`RenderedPayload`]).
+/// Serializing a `Value` into this always-OK writer cannot fail, so the
+/// discarded `Result` is unreachable.
+fn render_payload_bounded(body: &Value) -> RenderedPayload {
+    let mut writer = BoundedWriter::new(PAYLOAD_RENDER_LIMIT);
+    let _ = serde_json::to_writer(&mut writer, body);
+    // A cut can land inside a UTF-8 character; lossy decoding repairs the tail
+    // (a stray U+FFFD in a diagnostic capture, never anything on the wire).
+    let text = String::from_utf8_lossy(&writer.buf).into_owned();
+    RenderedPayload {
+        text,
+        total_bytes: writer.total,
+    }
+}
+
+/// Cut a rendered payload down to the log-line cap. `total_bytes` is the FULL
+/// body size — the caller may have rendered a bounded prefix (see
+/// [`render_payload_bounded`]) while still owing the log the true total.
+fn truncate_payload(text: &str, total_bytes: usize) -> String {
     if text.len() <= MAX_PAYLOAD_LOG_BYTES {
         return text.to_string();
     }
@@ -171,7 +233,7 @@ fn truncate_payload(text: &str) -> String {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}… [truncated, {} bytes total]", &text[..end], text.len())
+    format!("{}… [truncated, {} bytes total]", &text[..end], total_bytes)
 }
 
 /// Diagnostic body capture of one in-flight request: the
@@ -318,57 +380,40 @@ async fn send_attempt(
     // strip-after-prepare did.
     let mut skip: Vec<&'static str> = vendor_skip.to_vec();
     skip.extend(unfit.refused_fields(provider_id, protocol));
-    // Per-candidate Chat-body adaptations, built lazily and cached (the common
-    // request — neither flag set — keeps borrowing the client's own tree, and the
-    // strip-round rebuilds below reuse the built one):
+    // Per-candidate Chat-body adaptations:
     //   GLM: the client's inline images (passthrough) or the ones the emitter
-    //   re-encodes (translated) arrive as data URIs, which GLM rejects.
-    //   DeepSeek: a calling assistant turn must be followed by its tool results.
-    let adapts = fixups.strip_glm_images || fixups.deepseek_dialect;
-    // The adapted body is a Cow so a request whose dialect fixups all come back
-    // unchanged borrows the client's tree outright — no clone of the whole body
-    // is paid unless some fixup actually rewrites it.
+    //   re-encodes (translated) arrive as data URIs, which GLM rejects. That
+    //   strip is a pure string rewrite, so it rides the wire render
+    //   (protocol::prepare's strip_images) and never copies the tree.
+    //   DeepSeek: a calling assistant turn must be followed by its tool
+    //   results, and a mixed reasoning history must be levelled. Both edits
+    //   are structural, so they are detected read-only first and materialized
+    //   as ONE owned copy only when either has real work; the edits then land
+    //   in place.
     let mut adapted_body: Option<std::borrow::Cow<'_, Value>> = None;
-    let mut prepare = |fields: &[&str]| {
+    if fixups.deepseek_dialect
+        && (join_split_tool_call_turns_pending(&request.body)
+            || fill_missing_reasoning_pending(&request.body))
+    {
+        let body = adapted_body
+            .get_or_insert(std::borrow::Cow::Borrowed(&request.body))
+            .to_mut();
+        join_split_tool_call_turns(body);
+        fill_missing_reasoning(body);
+    }
+    let passthrough_body: &Value = adapted_body
+        .as_ref()
+        .map_or(&request.body, std::borrow::Cow::as_ref);
+    let prepare = |fields: &[&str]| {
         if request.protocol == protocol {
-            // Fill the adapted body at most once, then hand out a shared borrow.
-            // `let` binds the &Cow so the `.as_ref()` borrow outlives the match.
-            let adapted: Option<&std::borrow::Cow<'_, Value>> = match adapts {
-                true => {
-                    let cow = adapted_body.get_or_insert_with(|| {
-                        // Each fixup takes &Value and either borrows (no edit) or
-                        // hands back an owned rewrite the next fixup reads. A no-op
-                        // chain ends borrowed, so the client's tree is never cloned
-                        // unless some fixup actually rewrites it.
-                        let seed: std::borrow::Cow<'_, Value> = match fixups.strip_glm_images {
-                            true => strip_image_data_uris(&request.body),
-                            false => std::borrow::Cow::Borrowed(&request.body),
-                        };
-                        if !fixups.deepseek_dialect {
-                            return seed;
-                        }
-                        let body = match join_split_tool_call_turns(seed.as_ref()) {
-                            std::borrow::Cow::Owned(fixed) => std::borrow::Cow::Owned(fixed),
-                            std::borrow::Cow::Borrowed(_) => seed,
-                        };
-                        // Thinking-mode consistency: after the turn-join, level
-                        // `reasoning_content` across all assistant turns so a mixed
-                        // history (some carry it, some don't) cannot trip DeepSeek's
-                        // all-or-nothing check.
-                        match fill_missing_reasoning(body.as_ref()) {
-                            std::borrow::Cow::Owned(fixed) => std::borrow::Cow::Owned(fixed),
-                            std::borrow::Cow::Borrowed(_) => body,
-                        }
-                    });
-                    Some(&*cow)
-                }
-                false => None,
-            };
-            let body: &Value = match adapted {
-                Some(cow) => cow.as_ref(),
-                None => &request.body,
-            };
-            protocol::prepare(protocol, body, &target, stream, fields)
+            protocol::prepare(
+                protocol,
+                passthrough_body,
+                &target,
+                stream,
+                fields,
+                fixups.strip_glm_images,
+            )
         } else {
             prepare_translated(
                 &request.body,
@@ -513,7 +558,7 @@ async fn attempt_json(
             (upstream_dialect.response_to_ir)(&body).map_err(failover::AttemptError::Protocol)?;
         let bytes = (source_dialect.emit_response_json)(&ir);
         if request.payload_log {
-            tracing::debug!(target: PAYLOAD_TARGET, direction = "upstream_response", translated = true, body = %truncate_payload(&String::from_utf8_lossy(&bytes)));
+            tracing::debug!(target: PAYLOAD_TARGET, direction = "upstream_response", translated = true, body = %truncate_payload(&String::from_utf8_lossy(&bytes), bytes.len()));
         }
         let terminal = match ir.stop {
             translation::ir::IrStop::Length => protocol::Terminal::Incomplete,
@@ -530,7 +575,7 @@ async fn attempt_json(
         });
     };
     if request.payload_log {
-        tracing::debug!(target: PAYLOAD_TARGET, direction = "upstream_response", translated = false, body = %truncate_payload(&String::from_utf8_lossy(&body)));
+        tracing::debug!(target: PAYLOAD_TARGET, direction = "upstream_response", translated = false, body = %truncate_payload(&String::from_utf8_lossy(&body), body.len()));
     }
     Ok(RelayOutcome::Json {
         status,
@@ -555,24 +600,15 @@ fn prepare_translated(
     let upstream_dialect = translation::dialect(upstream)?;
     let (ir, _) = (source_dialect.to_ir)(source_body, translation::ir::NO_DECLARED_LIMIT)?;
     let (mut upstream_value, _) = (upstream_dialect.from_ir)(&ir, target.upstream_model)?;
-    if fixups.strip_glm_images {
-        upstream_value = strip_image_data_uris(&upstream_value).into_owned();
-    }
-    // A client of another protocol reaching a DeepSeek model obeys the same
-    // dialect as a Chat client does: a calling assistant turn must be followed
-    // straight away by its tool results.
-    if fixups.deepseek_dialect
-        && let std::borrow::Cow::Owned(fixed) = join_split_tool_call_turns(&upstream_value)
-    {
-        upstream_value = fixed;
-    }
-    // Same all-or-nothing levelling as the passthrough path: the emitter only
-    // writes `reasoning_content` for turns whose IR carried thinking, so a
-    // partially-reasoning history still needs the gaps backfilled.
-    if fixups.deepseek_dialect
-        && let std::borrow::Cow::Owned(fixed) = fill_missing_reasoning(&upstream_value)
-    {
-        upstream_value = fixed;
+    // The rebuilt tree is already owned, so the DeepSeek dialect edits land in
+    // place: a calling assistant turn must be followed straight away by its
+    // tool results, and a partially-reasoning history still needs the gaps
+    // backfilled (the emitter only writes `reasoning_content` for turns whose
+    // IR carried thinking). The GLM image strip needs nothing here — it rides
+    // the wire render below.
+    if fixups.deepseek_dialect {
+        join_split_tool_call_turns(&mut upstream_value);
+        fill_missing_reasoning(&mut upstream_value);
     }
     if stream {
         // The IR has no stream concept, so `from_ir` never emits it; the client
@@ -580,7 +616,14 @@ fn prepare_translated(
         // here or the upstream answers with one non-streaming JSON blob.
         upstream_value["stream"] = Value::Bool(true);
     }
-    protocol::prepare(upstream, &upstream_value, target, stream, skip)
+    protocol::prepare(
+        upstream,
+        &upstream_value,
+        target,
+        stream,
+        skip,
+        fixups.strip_glm_images,
+    )
 }
 
 /// Model resolution: the client-supplied model string picks the candidate set.
@@ -1039,8 +1082,11 @@ pub async fn dispatch_at(
     let effort = extract_effort(request.protocol, &request.body);
     let agent = request.agent.as_deref();
     // Serialize the body at most once (payloads on): the tracing line and the
-    // capture snapshot share the same rendering.
-    let rendered = request.payload_log.then(|| request.body.to_string());
+    // capture snapshot share the same bounded rendering, so a long-context
+    // body costs the capped buffer plus a byte count, never a full copy.
+    let rendered = request
+        .payload_log
+        .then(|| render_payload_bounded(&request.body));
     if let Some(rendered) = &rendered {
         tracing::debug!(
           target: PAYLOAD_TARGET,
@@ -1048,15 +1094,17 @@ pub async fn dispatch_at(
           protocol = protocol.as_str(),
           model = model.as_str(),
           caller = caller_key.unwrap_or(""),
-          body = %truncate_payload(rendered),
+          body = %truncate_payload(&rendered.text, rendered.total_bytes),
         );
     }
 
     // Diagnostic body capture, gated by the same payloads
     // flag: the client body is snapshotted now; the response side lands when
     // the final attempt settles, correlated by the dispatch's request id.
-    let capture = rendered.map(|rendered| {
-        let (request_text, request_truncated) = crate::body_log::capture_text(&rendered);
+    let capture = rendered.as_ref().map(|rendered| {
+        let (request_text, request_truncated) = crate::body_log::capture_text(&rendered.text);
+        // The render itself may have been the cut — report truncation either way.
+        let request_truncated = request_truncated || rendered.total_bytes > rendered.text.len();
         RequestCapture {
             request_text,
             request_truncated,

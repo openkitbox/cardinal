@@ -23,6 +23,7 @@ pub mod usage;
 
 use self::usage::UsageCounts;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// The closed protocol identifiers (B §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -244,6 +245,61 @@ fn write_json<T: serde::Serialize + ?Sized>(
     serde_json::to_writer(out, value).map_err(|_| ProtocolError::InvalidRequest)
 }
 
+/// The bare base64 payload of an image data URI, `None` for any other string
+/// (`https://` URLs, `data:` URIs of other media, plain text — all untouched).
+fn data_uri_payload(text: &str) -> Option<&str> {
+    text.strip_prefix("data:image/")?
+        .split_once(";base64,")
+        .map(|(_, payload)| payload)
+}
+
+/// A JSON tree that serializes with image data URIs reduced to their bare
+/// base64 payloads (GLM's chat dialect: its endpoints reject inline images as
+/// data URIs — `400 图片输入格式/解析错误` — while bare base64 and remote
+/// `https://` URLs both work; verified live by CodexPlusPlus #2031, fixed
+/// upstream in v1.6.0, and mirrored by the official zai-sdk's
+/// `drop_prefix_image_data`). Applied at wire-render time: the rewrite rides
+/// the serializer's own walk, so the client's parsed tree is never cloned for
+/// it and every variant delegates to serde — byte-identical output except for
+/// the intercepted strings.
+struct StripDataUris<'a>(&'a Value);
+
+impl serde::Serialize for StripDataUris<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Value::String(text) => match data_uri_payload(text) {
+                Some(payload) => serializer.serialize_str(payload),
+                None => serializer.serialize_str(text),
+            },
+            Value::Array(items) => serializer.collect_seq(items.iter().map(StripDataUris)),
+            Value::Object(object) => serializer.collect_map(
+                object
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), StripDataUris(value))),
+            ),
+            Value::Null => serializer.serialize_unit(),
+            Value::Bool(flag) => serializer.serialize_bool(*flag),
+            Value::Number(number) => number.serialize(serializer),
+        }
+    }
+}
+
+/// Write one client value to the wire, optionally stripping image data URIs
+/// on the way out (see [`StripDataUris`]) — the render-time form of the old
+/// rewrite-the-tree fixup.
+fn write_json_value(
+    out: &mut Vec<u8>,
+    value: &Value,
+    strip_images: bool,
+) -> Result<(), ProtocolError> {
+    if strip_images {
+        serde_json::to_writer(&mut *out, &StripDataUris(value))
+            .map_err(|_| ProtocolError::InvalidRequest)
+    } else {
+        write_json(out, value)
+    }
+}
+
 /// Borrowed, zero-copy view of one observed JSON field (`serde_json`
 /// `raw_value` feature): a reference into the response bytes, never a copy.
 /// Non-streaming responses can be tens of megabytes while observation reads a
@@ -289,19 +345,27 @@ pub(super) fn raw_value(raw: &RawValue) -> Option<serde_json::Value> {
 /// `skip` names top-level fields the wire must not carry (learned upstream
 /// refusals, vendor fixups): the kernels omit them while building the body,
 /// so a strip never costs a parse/re-serialize round-trip of the wire.
+/// `strip_images` rides the same render pass: GLM's data-URI rewrite happens
+/// while serializing (see [`StripDataUris`]), never as a tree copy. Gemini
+/// takes no flag — no Gemini-wire upstream declares the dialect.
 pub fn prepare(
     protocol: ProtocolId,
     client_body: &serde_json::Value,
     target: &TargetView<'_>,
     stream: bool,
     skip: &[&str],
+    strip_images: bool,
 ) -> Result<Prepared, ProtocolError> {
     debug_assert_eq!(protocol, target.protocol);
     match protocol {
-        ProtocolId::OpenAiChat => openai_chat::prepare(client_body, target, stream, skip),
-        ProtocolId::OpenAiResponses => openai_responses::prepare(client_body, target, stream, skip),
+        ProtocolId::OpenAiChat => {
+            openai_chat::prepare(client_body, target, stream, skip, strip_images)
+        }
+        ProtocolId::OpenAiResponses => {
+            openai_responses::prepare(client_body, target, stream, skip, strip_images)
+        }
         ProtocolId::AnthropicMessages => {
-            anthropic_messages::prepare(client_body, target, stream, skip)
+            anthropic_messages::prepare(client_body, target, stream, skip, strip_images)
         }
         ProtocolId::Gemini => gemini::prepare(client_body, target, stream, skip),
     }

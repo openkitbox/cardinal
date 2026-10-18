@@ -30,6 +30,7 @@ pub fn prepare(
     target: &TargetView<'_>,
     stream: bool,
     skip: &[&str],
+    strip_images: bool,
 ) -> Result<Prepared, ProtocolError> {
     validate_request(client_body)?;
     let object = client_body
@@ -72,7 +73,7 @@ pub fn prepare(
                     if key == "include_usage" {
                         out.extend_from_slice(b"true");
                     } else {
-                        super::write_json(&mut out, item)?;
+                        super::write_json_value(&mut out, item, strip_images)?;
                     }
                 }
                 if !forced {
@@ -83,10 +84,10 @@ pub fn prepare(
                 }
                 out.push(b'}');
             } else {
-                super::write_json(&mut out, value)?;
+                super::write_json_value(&mut out, value, strip_images)?;
             }
         } else {
-            super::write_json(&mut out, value)?;
+            super::write_json_value(&mut out, value, strip_images)?;
         }
     }
     if pin_usage && !object.contains_key("stream_options") {

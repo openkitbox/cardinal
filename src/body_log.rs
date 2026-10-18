@@ -9,7 +9,10 @@
 use std::path::PathBuf;
 
 /// Per-side truncation limit, in bytes.
-const CALL_BODY_LIMIT: usize = 256 << 10;
+/// Shared with relay.rs's bounded payload render, which stops one small slack
+/// above this limit (the render's cut is byte-aligned; the capture re-cuts on
+/// the char boundary).
+pub(crate) const CALL_BODY_LIMIT: usize = 256 << 10;
 
 /// Where the hourly payload files live: `~/.ox/payloads`.
 fn payload_dir() -> PathBuf {

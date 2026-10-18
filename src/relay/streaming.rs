@@ -398,7 +398,7 @@ async fn drive_stream(
                               target: PAYLOAD_TARGET,
                               direction = "upstream_frame",
                               event = frame.event.as_deref().unwrap_or(""),
-                              data = %truncate_payload(&String::from_utf8_lossy(&frame.data)),
+                              data = %truncate_payload(&String::from_utf8_lossy(&frame.data), frame.data.len()),
                             );
                         }
                         // Body capture: the client receives held frames verbatim too
@@ -497,7 +497,7 @@ async fn drive_stream(
                               target: PAYLOAD_TARGET,
                               direction = "upstream_frame",
                               event = frame.event.as_deref().unwrap_or(""),
-                              data = %truncate_payload(&String::from_utf8_lossy(&frame.data)),
+                              data = %truncate_payload(&String::from_utf8_lossy(&frame.data), frame.data.len()),
                             );
                         }
                         // Observe + synthesize events straight from the raw frame bytes:

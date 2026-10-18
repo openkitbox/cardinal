@@ -2,10 +2,14 @@
 //! needs and its siblings must not see.
 //!
 //! Two dialects today, both Chat-wire and both candidate-scoped (the client's
-//! own tree is never touched): GLM wants inline images as bare base64, and a
-//! DeepSeek model requires a calling assistant turn to be followed straight away
-//! by its tool results. [`ChatFixups`] is the once-per-candidate decision the
-//! relay honors on both prepare paths; the undesired-field list
+//! own tree is never touched): GLM wants inline images as bare base64 — a pure
+//! string rewrite the protocol kernels apply at wire-render time
+//! (`StripDataUris` in `crate::protocol`), so no copy of the tree exists
+//! anywhere — and a DeepSeek model requires a calling assistant turn to be
+//! followed straight away by its tool results plus a levelled
+//! `reasoning_content` history, both edited in place on at most one owned
+//! copy. [`ChatFixups`] is the once-per-candidate decision the relay honors on
+//! both prepare paths; the undesired-field list
 //! ([`vendor_thinking_off_fields`]) rides the prepare skip list instead.
 
 use crate::protocol::ProtocolId;
@@ -169,58 +173,13 @@ pub(super) fn vendor_thinking_off_fields(
     }
 }
 
-/// GLM's chat endpoints reject inline images sent as data URIs (`400 图片输入
-/// 格式/解析错误`) while bare base64 and remote `https://` URLs both work —
-/// verified live by CodexPlusPlus #2031 (fixed upstream, v1.6.0) and mirrored
-/// by the official zai-sdk, which runs `drop_prefix_image_data` over every
-/// chat request's messages for exactly this reason. Rewrites `image_url.url`
-/// strings of the shape `data:image/…;base64,…` down to their base64 payload.
-///
-/// Copy-on-write walk: a body without any data URI is returned as borrowed
-/// (zero copies — the common text-only request), one with them is rebuilt
-/// only along the paths that carry one. Every other shape (`https://` URLs,
-/// `data:` URIs of other media, `detail` fields beside the URL) passes
-/// through untouched.
-pub(super) fn strip_image_data_uris(body: &Value) -> std::borrow::Cow<'_, Value> {
-    match body {
-        Value::String(url) => match url
-            .strip_prefix("data:image/")
-            .and_then(|rest| rest.split_once(";base64,"))
-        {
-            Some((_, payload)) => std::borrow::Cow::Owned(Value::String(payload.to_owned())),
-            None => std::borrow::Cow::Borrowed(body),
-        },
-        Value::Array(items) => {
-            let mut owned: Option<Vec<Value>> = None;
-            for (index, item) in items.iter().enumerate() {
-                let stripped = strip_image_data_uris(item);
-                if let std::borrow::Cow::Owned(stripped) = stripped {
-                    owned.get_or_insert_with(|| items.clone())[index] = stripped;
-                }
-            }
-            match owned {
-                Some(items) => std::borrow::Cow::Owned(Value::Array(items)),
-                None => std::borrow::Cow::Borrowed(body),
-            }
-        }
-        Value::Object(map) => {
-            let mut owned: Option<serde_json::Map<String, Value>> = None;
-            for (key, value) in map {
-                let stripped = strip_image_data_uris(value);
-                if let std::borrow::Cow::Owned(stripped) = stripped {
-                    owned
-                        .get_or_insert_with(|| map.clone())
-                        .insert(key.clone(), stripped);
-                }
-            }
-            match owned {
-                Some(map) => std::borrow::Cow::Owned(Value::Object(map)),
-                None => std::borrow::Cow::Borrowed(body),
-            }
-        }
-        _ => std::borrow::Cow::Borrowed(body),
-    }
-}
+// GLM's data-URI strip moved to wire-render time: it is a pure string
+// rewrite, so the protocol kernels apply it while serializing (see
+// `StripDataUris` in `crate::protocol`) and no tree copy ever exists. The
+// reference stays: GLM's chat endpoints reject inline images as data URIs
+// (`400 图片输入/格式解析错误`) while bare base64 and remote `https://` URLs
+// both work — verified live by CodexPlusPlus #2031 (fixed upstream, v1.6.0)
+// and mirrored by the official zai-sdk's `drop_prefix_image_data`.
 
 /// DeepSeek's Chat dialect belongs to the MODEL, not the row that serves it: the
 /// official API, OpenCode Go/Zen and Command Code all carry the same DeepSeek
@@ -272,6 +231,31 @@ fn concat_content(into: Option<&Value>, from: Option<&Value>) -> Value {
     }
 }
 
+/// Read-only dry run for [`join_split_tool_call_turns`]: a join is pending
+/// exactly when some assistant turn immediately follows a call-bearing
+/// assistant turn. The join swallows the follower into the message before it,
+/// so the last-joined entry stays the call-bearing one and every later run of
+/// consecutive assistants follows a call too — one adjacent pair is therefore
+/// enough to prove work exists. Scanning for that pair first lets the
+/// passthrough chain skip its single owned copy entirely when no join is
+/// pending.
+pub(super) fn join_split_tool_call_turns_pending(body: &Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    messages.windows(2).any(|pair| {
+        let [previous, current] = pair else {
+            return false;
+        };
+        current.get("role").and_then(Value::as_str) == Some("assistant")
+            && previous.get("role").and_then(Value::as_str) == Some("assistant")
+            && previous
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty())
+    })
+}
+
 /// Join every assistant message that follows a call-bearing assistant message
 /// into it, so the calls and the tool messages answering them stay adjacent.
 ///
@@ -289,88 +273,112 @@ fn concat_content(into: Option<&Value>, from: Option<&Value>) -> Value {
 /// pairing without reordering or dropping a byte of the turn.
 ///
 /// Only a follower of a CALL-BEARING assistant message is joined, so two plain
-/// assistant messages are left as they are; a body with nothing to join comes
-/// back borrowed — callers gate on [`is_deepseek_model`] first, so a non-DeepSeek
-/// request pays nothing.
-pub(super) fn join_split_tool_call_turns(body: &Value) -> std::borrow::Cow<'_, Value> {
-    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-        return std::borrow::Cow::Borrowed(body);
+/// assistant messages are left as they are. The edit lands in place on the
+/// `messages` array — nothing is rebuilt and no whole-body copy is made; the
+/// caller either checked [`join_split_tool_call_turns_pending`] (the passthrough
+/// chain pays its one owned copy only when work exists) or owns the tree
+/// outright (the translation path).
+pub(super) fn join_split_tool_call_turns(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
     };
-    // Dry run: a join happens exactly when some assistant turn immediately
-    // follows a call-bearing assistant turn. The join swallows the follower
-    // into the message before it, so the last-joined entry stays the
-    // call-bearing one and every later run of consecutive assistants follows a
-    // call too — one adjacent pair is therefore enough to prove work exists.
-    // Scanning for that pair first keeps the common no-join body borrowed,
-    // with no `joined` clone built only to be thrown away.
-    let has_join = messages.windows(2).any(|pair| {
-        let [previous, current] = pair else {
-            return false;
+    // Walk with an index: a merged follower is removed from the array, so the
+    // position is re-examined rather than advanced — the merged message still
+    // carries the call and may precede another assistant turn.
+    let mut index = 1;
+    while index < messages.len() {
+        let follows_call = {
+            let (previous, current) = (&messages[index - 1], &messages[index]);
+            current.get("role").and_then(Value::as_str) == Some("assistant")
+                && previous.get("role").and_then(Value::as_str) == Some("assistant")
+                && previous
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
         };
-        current.get("role").and_then(Value::as_str) == Some("assistant")
-            && previous.get("role").and_then(Value::as_str) == Some("assistant")
-            && previous
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .is_some_and(|calls| !calls.is_empty())
-    });
-    if !has_join {
-        return std::borrow::Cow::Borrowed(body);
-    }
-    let mut joined: Vec<Value> = Vec::with_capacity(messages.len());
-    for message in messages {
-        let follows_call = message.get("role").and_then(Value::as_str) == Some("assistant")
-            && joined.last().is_some_and(|previous| {
-                previous.get("role").and_then(Value::as_str) == Some("assistant")
-                    && previous
-                        .get("tool_calls")
-                        .and_then(Value::as_array)
-                        .is_some_and(|calls| !calls.is_empty())
-            });
         if !follows_call {
-            joined.push(message.clone());
+            index += 1;
             continue;
         }
-        let previous = joined
-            .last_mut()
-            .expect("follows_call checked the last message");
-        let Some(previous) = previous.as_object_mut() else {
-            continue;
-        };
-        let follower = message.as_object().expect("a message is an object");
-        previous.insert(
-            "content".to_owned(),
-            concat_content(previous.get("content"), follower.get("content")),
-        );
-        if let Some(calls) = follower.get("tool_calls").and_then(Value::as_array) {
-            let mut merged = previous
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            merged.extend(calls.iter().cloned());
-            previous.insert("tool_calls".to_owned(), Value::Array(merged));
-        }
-        // The follower's thinking, if the joined-into message has none of its own.
-        let keeps_reasoning = previous
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty());
-        if !keeps_reasoning && let Some(reasoning) = follower.get("reasoning_content") {
-            previous.insert("reasoning_content".to_owned(), reasoning.clone());
-        }
-        // Any other field the follower carried alone (a `name`, say) rides along.
-        for (key, value) in follower {
-            if !previous.contains_key(key) {
-                previous.insert(key.clone(), value.clone());
+        {
+            let (left, right) = messages.split_at_mut(index - 1);
+            // Both slices are populated: `index` starts at 1 and stays below
+            // the array length. A non-object message cannot merge — unreachable
+            // for valid chat JSON; the follower is dropped there, the way the
+            // old rebuild loop dropped it, instead of panicking on it.
+            let previous = match left.last_mut().and_then(Value::as_object_mut) {
+                Some(object) => object,
+                None => {
+                    messages.remove(index);
+                    continue;
+                }
+            };
+            let follower = match right.first().and_then(Value::as_object) {
+                Some(object) => object,
+                None => {
+                    messages.remove(index);
+                    continue;
+                }
+            };
+            previous.insert(
+                "content".to_owned(),
+                concat_content(previous.get("content"), follower.get("content")),
+            );
+            if let Some(calls) = follower.get("tool_calls").and_then(Value::as_array) {
+                let mut merged = previous
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                merged.extend(calls.iter().cloned());
+                previous.insert("tool_calls".to_owned(), Value::Array(merged));
+            }
+            // The follower's thinking, if the joined-into message has none of its own.
+            let keeps_reasoning = previous
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty());
+            if !keeps_reasoning && let Some(reasoning) = follower.get("reasoning_content") {
+                previous.insert("reasoning_content".to_owned(), reasoning.clone());
+            }
+            // Any other field the follower carried alone (a `name`, say) rides along.
+            for (key, value) in follower {
+                if !previous.contains_key(key) {
+                    previous.insert(key.clone(), value.clone());
+                }
             }
         }
+        messages.remove(index);
     }
-    // `has_join` guaranteed at least one follower was swallowed, so the body is
-    // always rebuilt — no unchanged-borrow fallback is reachable here.
-    let mut object = body.as_object().cloned().unwrap_or_default();
-    object.insert("messages".to_owned(), Value::Array(joined));
-    std::borrow::Cow::Owned(Value::Object(object))
+}
+
+/// Whether any assistant turn carries non-empty `reasoning_content` —
+/// DeepSeek thinking-mode's engagement signal (a present-but-empty field is a
+/// placeholder, not engaged thinking). Shared by the fill dry run and the
+/// in-place backfill.
+fn reasoning_engaged(messages: &[Value]) -> bool {
+    messages.iter().any(|m: &Value| {
+        m.get("role").and_then(Value::as_str) == Some("assistant")
+            && m.get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+    })
+}
+
+/// Read-only dry run for [`fill_missing_reasoning`]: the backfill only has
+/// work when thinking has actually appeared AND at least one assistant turn
+/// lacks the field. A fully populated replay needs no edit, and a history
+/// with no reasoning at all is already consistent for DeepSeek's
+/// all-or-nothing check — both skip the passthrough chain's owned copy.
+pub(super) fn fill_missing_reasoning_pending(body: &Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    let any_gap = messages.iter().any(|m: &Value| {
+        m.get("role").and_then(Value::as_str) == Some("assistant")
+            && m.get("reasoning_content").is_none()
+    });
+    reasoning_engaged(messages) && any_gap
 }
 
 /// DeepSeek thinking mode is all-or-nothing: once ANY assistant turn in the
@@ -381,42 +389,27 @@ pub(super) fn join_split_tool_call_turns(body: &Value) -> std::borrow::Cow<'_, V
 ///
 /// A client that does not know the upstream is a DeepSeek thinking model (an
 /// alias like `k4-1m` hides it) only replays reasoning when it feels like it,
-/// producing exactly that mixed history. This levels the field: when at least
-/// one assistant turn already carries a non-empty `reasoning_content`, every
-/// other assistant turn that lacks the field gets an empty one, so the wire is
+/// producing exactly that mixed history. This levels the field: every
+/// assistant turn that lacks the field gets an empty one, so the wire is
 /// uniformly populated. A turn that already has the field — empty or not — is
 /// left untouched, so no real reasoning text is ever overwritten; only the
-/// missing structure is backfilled. When NO turn carries reasoning at all the
-/// history is consistent already (thinking never engaged), and the body is
-/// returned borrowed with no copy.
-pub(super) fn fill_missing_reasoning(body: &Value) -> std::borrow::Cow<'_, Value> {
-    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-        return std::borrow::Cow::Borrowed(body);
+/// missing structure is backfilled.
+///
+/// The edit lands in place on the `messages` array — nothing is rebuilt and
+/// no whole-body copy is made. The engagement gate lives here too, not only
+/// in [`fill_missing_reasoning_pending`], so the translation path can call
+/// this directly on its owned tree: without it, a consistently reasoning-free
+/// history would come out wearing empty placeholders — a wire DeepSeek would
+/// have accepted bare.
+pub(super) fn fill_missing_reasoning(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
     };
-    let is_assistant = |m: &Value| m.get("role").and_then(Value::as_str) == Some("assistant");
-    // The all-or-nothing trigger only fires once reasoning has actually
-    // appeared: a present-but-empty field is a placeholder, not engaged
-    // thinking, so the backfill keys off a non-empty `reasoning_content`.
-    let thinking_engaged = messages.iter().any(|m| {
-        is_assistant(m)
-            && m.get("reasoning_content")
-                .and_then(Value::as_str)
-                .is_some_and(|text| !text.is_empty())
-    });
-    // Only copy when there is real work: thinking must be engaged AND at least
-    // one assistant turn must be missing the field. A history where every
-    // assistant already carries `reasoning_content` (the common thinking
-    // replay) passes both gates yet needs no edit — checking the gap up front
-    // keeps that case borrowed, with no `to_vec` copy.
-    let any_gap = messages
-        .iter()
-        .any(|m| is_assistant(m) && m.get("reasoning_content").is_none());
-    if !thinking_engaged || !any_gap {
-        return std::borrow::Cow::Borrowed(body);
+    if !reasoning_engaged(messages) {
+        return;
     }
-    let mut joined = messages.to_vec();
-    for message in &mut joined {
-        if !is_assistant(message) {
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
         // Backfill only a turn with no `reasoning_content` key at all; an
@@ -428,11 +421,6 @@ pub(super) fn fill_missing_reasoning(body: &Value) -> std::borrow::Cow<'_, Value
             object.insert("reasoning_content".to_owned(), Value::String(String::new()));
         }
     }
-    // `any_gap` guaranteed at least one backfill, so the body is always rebuilt
-    // here — no unchanged-borrow fallback is reachable past this point.
-    let mut object = body.as_object().cloned().unwrap_or_default();
-    object.insert("messages".to_owned(), Value::Array(joined));
-    std::borrow::Cow::Owned(Value::Object(object))
 }
 
 /// The Chat-body adaptations one candidate's request needs, decided once in the
@@ -443,11 +431,11 @@ pub(super) fn fill_missing_reasoning(body: &Value) -> std::borrow::Cow<'_, Value
 #[derive(Clone, Copy, Default)]
 pub(super) struct ChatFixups {
     /// GLM chat upstream: inline images must go out as bare base64, never data
-    /// URIs (see [`strip_image_data_uris`]).
+    /// URIs — applied by the protocol kernels at wire-render time (see
+    /// `StripDataUris` in `crate::protocol`), never by rewriting the tree.
     pub(super) strip_glm_images: bool,
     /// DeepSeek Chat dialect (see [`is_deepseek_model`]): a calling assistant
-    /// turn must be followed straight away by its tool results, so a split or
-    /// interrupted turn is joined back together (see
+    /// turn must be followed straight away by its tool results (see
     /// [`join_split_tool_call_turns`]).
     pub(super) deepseek_dialect: bool,
 }
