@@ -50,11 +50,17 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             connect: Duration::from_secs(10),
-            // Response-header deadline (10 minutes):
-            // a big prompt on a slow upstream (kimi's coding-plan endpoint takes
-            // >30s to first byte on a cache miss, measured p99 total 103s) is slow
-            // to start anywhere, so the relay fails over instead of calling it dead.
-            opening: Duration::from_secs(600),
+            // Response-header deadline (3 minutes): waiting for the first byte is
+            // the one phase no other bound covers (`connect` ends at the socket,
+            // `idle` starts at the first frame). A big prompt on a slow upstream
+            // (kimi's coding-plan endpoint takes >30s to first byte on a cache
+            // miss; measured p99 total 103s, and the slowest legitimate antb
+            // request on prod was 124s) is slow to start anywhere, so the relay
+            // fails over instead of calling it dead — but 600s only matched the
+            // client's own give-up, so a silent upstream hung the caller for ten
+            // minutes with nothing recorded. 180s keeps ~1.5× headroom over the
+            // slowest observed legitimate start.
+            opening: Duration::from_secs(180),
             idle: Duration::from_secs(60),
             // Whole-dispatch cap: must clear opening plus a long stream; a stalled
             // stream is cut by idle long before this ever fires.
@@ -455,19 +461,25 @@ impl Transport {
                     .collect::<Vec<_>>(),
             );
         }
-        match request.send().await {
-            Ok(response) => Ok(response),
-            Err(error) if error.is_timeout() => {
+        // The opening deadline (`opening`, capped by the dispatch budget) is the
+        // only bound on the wait for response headers: `connect_timeout` ends at
+        // the socket and `idle` starts at the first frame, so without it a silent
+        // upstream holds the dispatch — and the client — indefinitely.
+        let wait = self.limits.opening.min(remaining);
+        let sent = tokio::time::timeout(wait, request.send()).await;
+        match sent {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) if error.is_timeout() => {
                 tracing::warn!(host = %destination.host, "upstream send timed out");
                 Err(TransportError::Timeout)
             }
             // Query-carried credentials (e.g. `?key=`) live in the request URL that
             // reqwest's Display renders; the raw error must never reach the log.
-            Err(error) if error.is_connect() => {
+            Ok(Err(error)) if error.is_connect() => {
                 tracing::warn!(host = %destination.host, category = "connect", "upstream connection failed");
                 Err(TransportError::Connect)
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 let category = if error.is_timeout() {
                     "timeout"
                 } else if error.is_body() || error.is_decode() {
@@ -477,6 +489,18 @@ impl Transport {
                 };
                 tracing::warn!(host = %destination.host, category, "upstream send failed");
                 Err(TransportError::InvalidBody)
+            }
+            // The opening deadline elapsed: the connection is up but the upstream
+            // never started answering. Report it as a timeout (transferable, so the
+            // relay fails over) and keep `waited_ms` to tell it apart from a
+            // reqwest-level one.
+            Err(_elapsed) => {
+                tracing::warn!(
+                    host = %destination.host,
+                    waited_ms = wait.as_millis() as u64,
+                    "upstream sent no response headers within the opening deadline"
+                );
+                Err(TransportError::Timeout)
             }
         }
     }

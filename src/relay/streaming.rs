@@ -310,6 +310,9 @@ pub(super) struct PumpSide {
     pub(super) captured: Option<CapturedBody>,
     pub(super) activity: Option<(ActivitySink, u64)>,
     pub(super) started: std::time::Instant,
+    /// Dispatch request id, so a post-commit upstream death can be traced back
+    /// to its ledger row and routing trace.
+    pub(super) request_id: String,
 }
 
 /// Start the streaming relay pump: a background task turns upstream frames
@@ -364,6 +367,7 @@ async fn drive_stream(
         mut captured,
         activity,
         started,
+        request_id,
     } = side;
     let mut activity = activity.map(|(sink, seq)| PumpActivity::new(sink, seq));
     let mut usage: Option<crate::protocol::usage::UsageCounts> = None;
@@ -470,7 +474,11 @@ async fn drive_stream(
                             signal_hold(&mut commit_tx, HoldSignal::Aborted);
                             return (None, ttft_ms, captured);
                         }
-                        tracing::warn!("upstream stream interrupted: {error}");
+                        tracing::warn!(
+                            request_id = %request_id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "upstream stream interrupted: {error}"
+                        );
                         break;
                     }
                 }
@@ -638,7 +646,11 @@ async fn drive_stream(
                             signal_hold(&mut commit_tx, HoldSignal::Aborted);
                             return (None, ttft_ms, captured);
                         }
-                        tracing::warn!("upstream stream interrupted: {error}");
+                        tracing::warn!(
+                            request_id = %request_id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "upstream stream interrupted: {error}"
+                        );
                         if let Ok(frames) =
                             translator.close_after_eof(protocol::Terminal::Incomplete)
                         {

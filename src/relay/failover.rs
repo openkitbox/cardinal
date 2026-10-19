@@ -81,6 +81,19 @@ impl AttemptError {
         }
     }
 
+    /// The status a ledger row records. Same as [`Self::client_status`] except
+    /// for [`TransportError::ClientGone`]: the 502 it maps to ("invalid upstream
+    /// response") would blame the vendor for a request that died because the
+    /// caller left, so the row carries nginx's 499 client-closed verdict.
+    /// Salvo clamps 499 to 500 for the (already disconnected) client, so this
+    /// is a record, not a wire status.
+    pub fn ledger_status(&self) -> u16 {
+        match self {
+            Self::Transport(TransportError::ClientGone) => 499,
+            other => other.client_status(),
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             Self::Transport(error) => as_protocol_error(error).code(),

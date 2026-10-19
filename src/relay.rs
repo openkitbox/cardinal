@@ -831,7 +831,7 @@ impl AttemptLog {
             provider_key_id,
             model: model.to_owned(),
             served_model: None,
-            status: error.client_status(),
+            status: error.ledger_status(),
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
@@ -893,6 +893,77 @@ impl AttemptLog {
             input_tokens: self.input_tokens,
             cached_input_tokens: self.cached_input_tokens,
         }
+    }
+}
+
+/// Records the attempt the client walked away from.
+///
+/// A disconnect makes hyper drop the handler future: no error is produced, no
+/// ledger row is queued, no access-log line is written, and the live-activity
+/// row never ends — the request simply vanishes while the GUI still shows it
+/// "connecting". The guard is armed for exactly the in-flight attempt and
+/// disarmed the moment it resolves; a `Drop` while still armed is that case.
+/// It records the client-closed row (499) and one WARN with the attempt's
+/// identity and elapsed time.
+struct AbandonGuard<'a> {
+    request_id: &'a str,
+    provider: &'a str,
+    key: &'a str,
+    model: &'a str,
+    alias: Option<&'a str>,
+    protocol: ProtocolId,
+    client_protocol: ProtocolId,
+    effort: Option<&'a str>,
+    provider_id: i64,
+    provider_key_id: i64,
+    caller_key: Option<&'a str>,
+    agent: Option<&'a str>,
+    started: std::time::Instant,
+    ledger: &'a LedgerWriter,
+    activity: &'a ActivitySink,
+    seq: u64,
+    armed: bool,
+}
+
+impl AbandonGuard<'_> {
+    /// The attempt settled on its own (any outcome): dropping it now must not
+    /// fabricate a client-closed row.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbandonGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let error = failover::AttemptError::Transport(transport::TransportError::ClientGone);
+        let row = AttemptLog::from_error(
+            self.protocol,
+            self.alias,
+            self.provider_id,
+            self.provider_key_id,
+            self.model,
+            &error,
+            self.started,
+        )
+        .with_caller(self.caller_key)
+        .with_agent(self.agent)
+        .with_client_protocol(self.client_protocol)
+        .with_effort(self.effort)
+        .with_request_id(self.request_id);
+        let metrics = row.end_metrics();
+        tracing::warn!(
+            request_id = self.request_id,
+            provider = self.provider,
+            key = self.key,
+            model = self.model,
+            elapsed_ms = row.total_ms,
+            "client closed before the attempt settled"
+        );
+        self.ledger.push(vec![row]);
+        self.activity.end(self.seq, EndStatus::Error, metrics);
     }
 }
 
@@ -1494,6 +1565,51 @@ pub async fn dispatch_at(
                 key_id: Some(candidate.key.id),
                 stream: request.stream,
             });
+            // The client-closed watchdog covers the in-flight attempt only: once
+            // `attempt` returns, the pump owns client-gone (pre-commit via its own
+            // hold verdict, post-commit via the stream) and the arm below writes
+            // the row. Scoped to this block so the borrows end before `effort` /
+            // `request_id` move into the streaming accounting task.
+            let settled = {
+                let mut watchdog = AbandonGuard {
+                    request_id: &request_id,
+                    provider: provider.name.as_str(),
+                    key: candidate.key.label.as_str(),
+                    model: &model,
+                    alias: alias.as_deref(),
+                    protocol: capability.protocol,
+                    client_protocol: request.protocol,
+                    effort: effort.as_deref(),
+                    provider_id: provider.id,
+                    provider_key_id: key_id,
+                    caller_key,
+                    agent,
+                    started,
+                    ledger,
+                    activity,
+                    seq,
+                    armed: true,
+                };
+                let settled = attempt(
+                    &AttemptContext {
+                        transport,
+                        capability,
+                        credential: &credential,
+                        unfit: failover.unfit(),
+                        provider_id: provider.id,
+                        vendor_skip,
+                        opencode_seed: opencode_seed.as_deref(),
+                        fixups,
+                    },
+                    target_model,
+                    request,
+                    &request_id,
+                    deadline,
+                )
+                .await;
+                watchdog.disarm();
+                settled
+            };
             // Streaming hold: a streaming attempt counts as
             // successful only past the pump's commit point — the 200 headers alone
             // no longer lock the attempt in. Before the commit point, an upstream
@@ -1501,24 +1617,7 @@ pub async fn dispatch_at(
             // byte; the dispatcher slot guards stay here through the failure path (so
             // a last-candidate retry keeps holding them) and move to the pump only
             // on commit.
-            let outcome: Result<AttemptSuccess, failover::AttemptError> = match attempt(
-                &AttemptContext {
-                    transport,
-                    capability,
-                    credential: &credential,
-                    unfit: failover.unfit(),
-                    provider_id: provider.id,
-                    vendor_skip,
-                    opencode_seed: opencode_seed.as_deref(),
-                    fixups,
-                },
-                target_model,
-                request,
-                &request_id,
-                deadline,
-            )
-            .await
-            {
+            let outcome: Result<AttemptSuccess, failover::AttemptError> = match settled {
                 Ok(RelayOutcome::Json {
                     status,
                     body,
@@ -1550,6 +1649,7 @@ pub async fn dispatch_at(
                             captured,
                             activity: Some((activity.clone(), seq)),
                             started,
+                            request_id: request_id.clone(),
                         },
                     );
                     match commit_rx.await {
@@ -1737,8 +1837,6 @@ pub async fn dispatch_at(
                     // The client disappeared: record the row for the ledger and stop —
                     // never classify, cool the key, bump the counter, fail over, or
                     // retry in place (a reconnect replays the whole request anyway).
-                    // Status 499 mirrors nginx's client-closed-request; salvo clamps
-                    // unknown codes to 500 for the (already disconnected) client.
                     if matches!(
                         &error,
                         failover::AttemptError::Transport(transport::TransportError::ClientGone)
@@ -1751,7 +1849,7 @@ pub async fn dispatch_at(
                             push_capture(body_log, &request_id, capture, None);
                         }
                         return DispatchOutcome::Failed {
-                            status: 499,
+                            status: error.ledger_status(),
                             message: error.message(),
                             retry_after_secs: None,
                         };
@@ -1819,8 +1917,11 @@ pub async fn dispatch_at(
                         if pause <= MAX_RETRY_PAUSE && pause <= remaining {
                             retried += 1;
                             tracing::info!(
+                                request_id = %request_id,
                                 provider = provider.name.as_str(),
                                 key = candidate.key.label.as_str(),
+                                model = target_model,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
                                 "last candidate failed ({}), retrying in {}ms ({retried}/{retries_left})",
                                 error.message(),
                                 pause.as_millis()
@@ -1835,8 +1936,11 @@ pub async fn dispatch_at(
                     // failure counter.
                     if matches!(failure, failover::Failure::Blameless) {
                         tracing::warn!(
+                            request_id = %request_id,
                             provider = provider.name.as_str(),
                             key = candidate.key.label.as_str(),
+                            model = target_model,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
                             "attempt failed without blaming the key, failing over: {}",
                             error.message()
                         );
@@ -1863,8 +1967,11 @@ pub async fn dispatch_at(
                         .insert(key_id, rest_model, until, error.code())
                         .await;
                     tracing::warn!(
+                        request_id = %request_id,
                         provider = provider.name.as_str(),
                         key = candidate.key.label.as_str(),
+                        model = target_model,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
                         "attempt failed, failing over: {} (resting until {until})",
                         error.message()
                     );
