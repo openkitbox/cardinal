@@ -60,7 +60,7 @@ impl Default for Limits {
             // client's own give-up, so a silent upstream hung the caller for ten
             // minutes with nothing recorded. 180s keeps ~1.5× headroom over the
             // slowest observed legitimate start.
-            opening: Duration::from_secs(180),
+            opening: Duration::from_secs(60),
             idle: Duration::from_secs(60),
             // Whole-dispatch cap: must clear opening plus a long stream; a stalled
             // stream is cut by idle long before this ever fires.
