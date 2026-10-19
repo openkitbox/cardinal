@@ -207,7 +207,9 @@ impl StreamTranslator {
                     None,
                 ));
             }
-            ProtocolId::Gemini => unreachable!("Gemini is never a translation client"),
+            ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => {
+                unreachable!("only the three chat protocols are translation clients")
+            }
         }
     }
 
@@ -294,7 +296,9 @@ impl StreamTranslator {
                             None,
                         ));
                     }
-                    ProtocolId::Gemini => unreachable!("Gemini is never a translation client"),
+                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => {
+                        unreachable!("only the three chat protocols are translation clients")
+                    }
                 }
             }
             StreamEvent::ReasoningDelta(delta) => {
@@ -376,7 +380,9 @@ impl StreamTranslator {
                             None,
                         ));
                     }
-                    ProtocolId::Gemini => unreachable!("Gemini is never a translation client"),
+                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => {
+                        unreachable!("only the three chat protocols are translation clients")
+                    }
                 }
             }
             StreamEvent::ToolCallDelta {
@@ -511,7 +517,9 @@ impl StreamTranslator {
               None,
             ));
                     }
-                    ProtocolId::Gemini => unreachable!("Gemini is never a translation client"),
+                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => {
+                        unreachable!("only the three chat protocols are translation clients")
+                    }
                 }
             }
             StreamEvent::Usage(usage) => {

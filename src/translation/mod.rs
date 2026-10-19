@@ -82,7 +82,9 @@ pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
         }),
         // Gemini is passthrough-only: it takes part in no IR translation in
         // either direction (the OPENED matrix is untouched by design).
-        ProtocolId::Gemini => None,
+        // Embeddings is likewise passthrough-only, and structurally so: a
+        // retrieval call carries no conversation to put in the IR.
+        ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => None,
     }
 }
 

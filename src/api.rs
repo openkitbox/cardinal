@@ -57,14 +57,18 @@ async fn health() -> &'static str {
 /// keys' model-list snapshots — context window, output cap, input modalities,
 /// reasoning effort levels (see [`crate::models`]). Model pickers in clients
 /// like omp/opencode can pull it directly.
+///
+/// Retrieval routes are listed too (OpenAI's own `/v1/models` lists embedding
+/// models), but bare: no context window, no modalities, no reasoning — a
+/// chat-shaped attribute on an embeddings id is a lie a picker would trust.
 #[handler]
 async fn list_models(depot: &mut Depot, response: &mut Response) {
     let state = depot.get_typed::<Arc<AppState>>().expect("state");
-    let routes = state.route_cache.all_routes();
+    let routes = state.route_cache.routes_with_kind();
     let keys = state.route_cache.all_key_models();
     let data: Vec<Value> = routes
         .iter()
-        .map(|route| crate::models::route_model_object(route, &keys))
+        .map(|(route, chat_capable)| crate::models::route_model_object(route, &keys, *chat_capable))
         .collect();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -266,6 +270,76 @@ async fn responses(request: &mut Request, response: &mut Response, depot: &mut D
     relay_endpoint(request, response, depot, ProtocolId::OpenAiResponses).await;
 }
 
+// ---------- Embeddings surface (`/v1/embeddings`) ----------
+
+/// `POST /v1/embeddings`: OpenAI's retrieval API, passthrough-only.
+///
+/// The relay behind it is the same one chat uses — model resolution (route
+/// alias or `provider/model`), failover, rest, dispatcher slots, ledger and
+/// pricing all key off [`ProtocolId`], so nothing here is retrieval-specific
+/// beyond the protocol's own two facts: it has no streaming wire, and it gets
+/// a shorter call budget than a chat turn (`relay::call_budget`).
+#[handler]
+async fn embeddings(request: &mut Request, response: &mut Response, depot: &mut Depot) {
+    // Cloned out of the depot: `relay_dispatch` below needs the depot mutably,
+    // so no borrow of it may stay alive across the call.
+    let state = depot.get_typed::<Arc<AppState>>().expect("state").clone();
+    let mut body: Value = match read_json_body(request, state.as_ref()).await {
+        BodyRead::Ok(value) => value,
+        BodyRead::TooLarge => {
+            response.status_code(StatusCode::PAYLOAD_TOO_LARGE);
+            let _ = response.body("request body too large");
+            return;
+        }
+        BodyRead::Invalid => {
+            response.status_code(StatusCode::BAD_REQUEST);
+            let _ = response.body("invalid JSON body");
+            return;
+        }
+        BodyRead::Timeout => {
+            response.status_code(StatusCode::REQUEST_TIMEOUT);
+            let _ = response.body("request body not received in time");
+            return;
+        }
+    };
+    // The retrieval API has no SSE wire. A client that asked for one gets a
+    // plain refusal instead of a single JSON body it would fail to frame.
+    if stream_of(&body) {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("streaming is not supported for embeddings");
+        return;
+    }
+    // Dispatch reads the flag off the body; clearing it keeps a stray
+    // `"stream": false` out of the upstream wire, which some vendors validate
+    // strictly. The body is the one parsed tree the relay owns — no clone.
+    if let Some(object) = body.as_object_mut() {
+        object.remove("stream");
+    }
+    // Validate the envelope here as well as in the kernel: the kernel must
+    // refuse a bad body before any send, but its error reaches the caller as a
+    // machine code alone. This entry point is the one place that can say *what*
+    // is wrong, so a caller fixing a script gets a sentence, not a enum name.
+    if let Err(error) = crate::protocol::embeddings::validate_request(&body) {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body(match error {
+            crate::protocol::ProtocolError::InvalidRequest => {
+                "invalid embeddings request: \"model\" must be a non-empty string and \
+                 \"input\" a non-empty string or array"
+            }
+            other => other.code(),
+        });
+        return;
+    }
+    relay_dispatch(
+        response,
+        depot,
+        ProtocolId::OpenAiEmbeddings,
+        body,
+        caller_agent(request),
+    )
+    .await;
+}
+
 // ---------- Google Gemini surface (`/v1beta/*`) ----------
 //
 // Gemini keeps the model and the streaming choice in the URL
@@ -380,10 +454,12 @@ async fn gemini_generate(request: &mut Request, response: &mut Response, depot: 
 /// `GET /v1beta/models`: the route catalog in Google's shape — one entry per
 /// route alias, with the token limits derivable from the member keys' model
 /// snapshots (same derivation as `/v1/models`; omitted when not derivable).
+/// Chat-capable routes only: Gemini's `supportedGenerationMethods` advertises
+/// `generateContent`, which a retrieval route cannot serve.
 #[handler]
 async fn list_gemini_models(depot: &mut Depot, response: &mut Response) {
     let state = depot.get_typed::<Arc<AppState>>().expect("state");
-    let routes = state.route_cache.all_routes();
+    let routes = state.route_cache.chat_routes();
     let keys = state.route_cache.all_key_models();
     let data: Vec<Value> = routes
         .iter()
@@ -657,7 +733,8 @@ pub fn router(
                 .push(Router::with_path("models").get(list_models))
                 .push(Router::with_path("messages").post(messages))
                 .push(Router::with_path("chat/completions").post(chat_completions))
-                .push(Router::with_path("responses").post(responses)),
+                .push(Router::with_path("responses").post(responses))
+                .push(Router::with_path("embeddings").post(embeddings)),
         )
         .push(
             Router::with_path("v1beta")

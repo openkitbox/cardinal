@@ -6,6 +6,7 @@ A headless LLM gateway that routes requests across multiple AI providers with fa
 
 - **Multi-provider routing** — Route requests to multiple providers (Kimi, DeepSeek, GLM, OpenAI-compatible, Anthropic, etc.) with ordered or quota-aware (smart) strategies
 - **Protocol translation** — Accept OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini API requests; translate between protocols automatically
+- **Embeddings passthrough** — Serve OpenAI-style `POST /v1/embeddings` (OpenAI, SiliconFlow, Jina, Voyage, Ollama, …) across the same routes, failover and metering as chat; retrieval calls are forwarded verbatim with only the model id rewritten
 - **Failover & cooldown** — Automatic failover to the next candidate on errors, with per-key cooldown tracking
 - **Quota monitoring** — Periodic probing of provider quota/balance endpoints; quota-aware routing decisions
 - **Usage metering** — Per-request token counting and cost calculation (USD) with provider/model price tables
@@ -59,6 +60,7 @@ curl -H "Authorization: Bearer your-admin-key" http://127.0.0.1:8787/api/info
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/responses` | OpenAI Responses API |
 | `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/embeddings` | OpenAI Embeddings (retrieval, passthrough) |
 | `POST /v1beta/models/{model}:generateContent` | Gemini |
 | `GET /v1/models` | List available models |
 | `GET /api/info` | Gateway status |

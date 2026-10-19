@@ -85,8 +85,15 @@ fn model_list_urls(base_url: &str, protocol: &str) -> anyhow::Result<Vec<String>
         // variants fit this rule unchanged: kimi-code's base IS the version root
         // (`…/coding/v1`), so the probe hits `{base}/models` = `/coding/v1/models`
         // — a route the service answers.
-        "openai_chat" if !versioned(base) => urls.push(format!("{base}/v1/models")),
-        "openai_chat" => {}
+        //
+        // Retrieval providers share the rule exactly: the model list lives
+        // beside the embedding endpoint (`…/v1/models` for `…/v1/embeddings`),
+        // so a bare host gets the same version-segment probe and a versioned
+        // base is asked as written.
+        "openai_chat" | "openai_embeddings" if !versioned(base) => {
+            urls.push(format!("{base}/v1/models"));
+        }
+        "openai_chat" | "openai_embeddings" => {}
         other => anyhow::bail!("协议 {other} 没有模型列表端点"),
     }
     Ok(urls)

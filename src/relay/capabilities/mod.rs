@@ -85,6 +85,10 @@ fn protocol_suffix(protocol: ProtocolId) -> &'static str {
         ProtocolId::OpenAiChat => "chat/completions",
         ProtocolId::AnthropicMessages => "v1/messages",
         ProtocolId::OpenAiResponses => "responses",
+        // Retrieval sits one leaf under the version root, exactly like chat:
+        // OpenAI `…/v1/embeddings`, SiliconFlow/Voyage `…/v1/embeddings`,
+        // Jina `…/v1/embeddings`, Cohere `…/v2/embeddings` (base = `…/v2`).
+        ProtocolId::OpenAiEmbeddings => "embeddings",
         // The gemini row never takes this arm: it is served by the gemini
         // vendor module. A gemini protocol on a non-gemini name yields NO
         // capability (config error).
@@ -107,6 +111,7 @@ pub fn validate_base_url(provider_name: &str, base_url: &str) -> anyhow::Result<
         "/v1/messages",
         "/messages",
         "/responses",
+        "/embeddings",
     ] {
         anyhow::ensure!(
             !path.ends_with(leaf),
@@ -136,6 +141,14 @@ pub fn capabilities(
     row_auth_scheme: &str,
 ) -> Vec<Capability> {
     let base = row_base_url.trim_end_matches('/');
+    // Retrieval rows are served by the generic arm whatever the provider is
+    // called. Vendor modules know a vendor's chat endpoints, never its
+    // retrieval one, and they dispatch on the NAME alone — so a row named
+    // "glm-embed" would otherwise be handed that vendor's three chat
+    // capabilities and silently fail every retrieval call.
+    if row_protocol == ProtocolId::OpenAiEmbeddings.as_str() {
+        return single_protocol(row_protocol, row_auth_scheme, base);
+    }
     match provider_kind(provider_name) {
         ("kimi", code) => kimi::capabilities(base, code),
         ("glm", _) => glm::capabilities(base),

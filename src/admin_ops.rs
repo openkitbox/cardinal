@@ -404,10 +404,13 @@ impl Admin {
     /// unprobed account contributes no direct entries until it is probed.
     /// Aliases are listed even when every entry's key is disabled — the relay
     /// is the source of truth for dispatch-time failure (404).
+    ///
+    /// Retrieval rows and retrieval-only routes are excluded: an embeddings id
+    /// in a chat picker is a model no agent can hold a conversation with.
     pub async fn chat_models(&self) -> anyhow::Result<Vec<String>> {
         let mut models: Vec<String> = self
             .route_cache
-            .all_routes()
+            .chat_routes()
             .into_iter()
             .map(|route| route.alias)
             .collect();

@@ -154,7 +154,9 @@ pub fn extract_effort(protocol: ProtocolId, body: &Value) -> Option<String> {
                 });
             configured.or_else(|| budgeted.map(str::to_string))
         }
-        ProtocolId::Gemini => None,
+        // Neither carries an effort dial: Gemini's effort lives in
+        // `generationConfig`, and a retrieval call generates nothing at all.
+        ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => None,
     }
 }
 
@@ -990,6 +992,27 @@ pub enum DispatchOutcome {
 /// In-place retries of the last candidate never pause longer than this.
 const MAX_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Whole-call budget for a retrieval request. The transport's `total` is an
+/// hour, sized for a long SSE stream; a retrieval call has no stream, a much
+/// shorter natural ceiling (a vendor answers in seconds, a long batch in a
+/// minute or two), and no reason to buy the relay's full retry ladder on a
+/// silent upstream. Thirty seconds short of three minutes leaves the last
+/// retry a usable slice of its opening deadline rather than starting an
+/// attempt the budget would have to cut.
+const EMBEDDINGS_BUDGET: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// The dispatch budget for one client protocol: the shared transport budget,
+/// except for the protocols whose call shape is bounded more tightly. The
+/// relay's retry-pause check reads the same deadline, so the budget also ends
+/// the retry ladder — a stuck retrieval fails as a recorded 504 instead of
+/// spending an hour of attempts.
+fn call_budget(protocol: ProtocolId, limits: &transport::Limits) -> std::time::Duration {
+    match protocol {
+        ProtocolId::OpenAiEmbeddings => EMBEDDINGS_BUDGET.min(limits.total),
+        _ => limits.total,
+    }
+}
+
 /// The observability sidecars every dispatch threads through: the body
 /// capture ring and the live-activity feed. Bundled because they always
 /// travel together; both are fail-open by design.
@@ -1260,7 +1283,7 @@ pub async fn dispatch_at(
         };
     }
 
-    let deadline = std::time::Instant::now() + transport.limits().total;
+    let deadline = std::time::Instant::now() + call_budget(protocol, &transport.limits());
     let mut attempts: Vec<AttemptLog> = Vec::new();
     // The last busy-gate verdict's queue wait (None once any real attempt
     // fails): the Retry-After for the terminal verdict when busy is the end.

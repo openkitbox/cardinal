@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::protocol::ProtocolId;
 use crate::store::{
     EnabledKeyModels, KeyModels, LimitedKeyRow, ProviderKeyRow, ProviderRow, RouteRow,
 };
@@ -130,6 +131,43 @@ impl RouteCache {
             .unwrap_or_default()
     }
 
+    /// Every route with the kind derived from its entries: `true` = chat-capable
+    /// (some entry's provider serves a chat protocol), `false` = retrieval-only.
+    ///
+    /// Derived, never stored: the kind follows whatever the route currently
+    /// points at, so re-pointing an alias changes its kind with no migration.
+    /// A mixed route is chat-capable — its chat half is real.
+    pub fn routes_with_kind(&self) -> Vec<(RouteRow, bool)> {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        inner
+            .all_routes
+            .iter()
+            .map(|route| {
+                let chat_capable = route.entries.iter().any(|entry| {
+                    inner
+                        .keys_by_id
+                        .get(&entry.key_id)
+                        .and_then(|key| inner.providers_by_id.get(&key.provider_id))
+                        .is_some_and(chat_capable)
+                });
+                (route.clone(), chat_capable)
+            })
+            .collect()
+    }
+
+    /// The routes a chat model picker may advertise: every chat-capable route.
+    /// A retrieval route has no `messages` body and no chat attributes, so
+    /// offering it to an agent offers a model that refuses every chat call.
+    pub fn chat_routes(&self) -> Vec<RouteRow> {
+        self.routes_with_kind()
+            .into_iter()
+            .filter_map(|(route, chat_capable)| chat_capable.then_some(route))
+            .collect()
+    }
+
     pub fn all_enabled_key_models(&self) -> Vec<EnabledKeyModels> {
         let inner = match self.inner.read() {
             Ok(inner) => inner,
@@ -138,11 +176,13 @@ impl RouteCache {
         // Replicates: SELECT p.name AS provider, k.models, k.allowed_models
         //   FROM gateway_provider_keys k JOIN gateway_providers p ON p.id = k.provider_id
         //   WHERE p.enabled AND k.enabled ORDER BY p.name, k.position, k.id
+        //   — minus the retrieval-only providers (see [`chat_capable`]): their
+        //   models are embeddings ids, not chat model ids.
         let mut rows: Vec<EnabledKeyModels> = Vec::new();
         let mut providers: Vec<&ProviderRow> = inner
             .providers_by_id
             .values()
-            .filter(|p| p.enabled)
+            .filter(|p| p.enabled && chat_capable(p))
             .collect();
         providers.sort_by(|a, b| a.name.cmp(&b.name));
         for provider in providers {
@@ -220,6 +260,17 @@ impl RouteCache {
             .map(|inner| inner.providers_by_id.is_empty() && inner.keys_by_id.is_empty())
             .unwrap_or(true)
     }
+}
+
+/// Whether a provider row can serve a chat-shaped request — the filter that
+/// keeps retrieval-only rows (and their models) out of chat model pickers.
+///
+/// Deliberately a denylist of ONE closed protocol, not an allowlist of the
+/// chat three: a row whose protocol this build does not know is still offered
+/// (the relay is the source of truth for dispatch failure), while a retrieval
+/// row is known to be the wrong kind for a conversation.
+fn chat_capable(provider: &ProviderRow) -> bool {
+    provider.protocol != ProtocolId::OpenAiEmbeddings.as_str()
 }
 
 impl Default for RouteCache {

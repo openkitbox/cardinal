@@ -15,6 +15,7 @@
 //! roles only share the wire formats, not code.
 
 pub mod anthropic_messages;
+pub mod embeddings;
 pub mod gemini;
 pub mod openai_chat;
 pub mod openai_responses;
@@ -34,14 +35,19 @@ pub enum ProtocolId {
     AnthropicMessages,
     /// Google Gemini `generateContent` / `streamGenerateContent`.
     Gemini,
+    /// OpenAI Embeddings (`/v1/embeddings`): a retrieval API, not a chat.
+    /// Passthrough-only — it takes part in no IR translation and has no
+    /// streaming wire.
+    OpenAiEmbeddings,
 }
 
 impl ProtocolId {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::OpenAiChat,
         Self::OpenAiResponses,
         Self::AnthropicMessages,
         Self::Gemini,
+        Self::OpenAiEmbeddings,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -50,6 +56,7 @@ impl ProtocolId {
             Self::OpenAiResponses => "openai_responses",
             Self::AnthropicMessages => "anthropic_messages",
             Self::Gemini => "gemini",
+            Self::OpenAiEmbeddings => "openai_embeddings",
         }
     }
 
@@ -69,6 +76,7 @@ impl ProtocolId {
             Self::OpenAiChat => &["/v1/chat/completions"],
             Self::OpenAiResponses => &["/v1/responses"],
             Self::AnthropicMessages => &["/v1/messages"],
+            Self::OpenAiEmbeddings => &["/v1/embeddings"],
             // Dynamic routing: the model and method are path segments, matched by
             // the `/v1beta/models/<**call>` handler in `gateway::api`.
             Self::Gemini => &[],
@@ -81,7 +89,9 @@ impl ProtocolId {
     pub const fn streaming_shares_endpoint(self) -> bool {
         match self {
             Self::OpenAiChat | Self::OpenAiResponses | Self::AnthropicMessages => true,
-            Self::Gemini => false,
+            // Neither has an SSE wire: Gemini puts the stream on its own path,
+            // embeddings has none at all (`TargetView::url(true)` refuses).
+            Self::Gemini | Self::OpenAiEmbeddings => false,
         }
     }
 }
@@ -368,6 +378,7 @@ pub fn prepare(
             anthropic_messages::prepare(client_body, target, stream, skip, strip_images)
         }
         ProtocolId::Gemini => gemini::prepare(client_body, target, stream, skip),
+        ProtocolId::OpenAiEmbeddings => embeddings::prepare(client_body, target, stream, skip),
     }
 }
 
@@ -378,6 +389,7 @@ pub fn parse_json(protocol: ProtocolId, body: &[u8]) -> Result<ObservedResponse,
         ProtocolId::OpenAiResponses => openai_responses::parse_json(body),
         ProtocolId::AnthropicMessages => anthropic_messages::parse_json(body),
         ProtocolId::Gemini => gemini::parse_json(body),
+        ProtocolId::OpenAiEmbeddings => embeddings::parse_json(body),
     }
 }
 
@@ -388,6 +400,10 @@ pub enum Decoder {
     Responses(openai_responses::StreamDecoder),
     Messages(anthropic_messages::StreamDecoder),
     Gemini(gemini::StreamDecoder),
+    /// No streaming wire exists for this protocol. Construction is
+    /// unconditional (the relay builds a decoder by protocol alone), so the
+    /// variant exists to refuse every frame instead of panicking later.
+    Unstreamed,
 }
 
 impl Decoder {
@@ -399,6 +415,7 @@ impl Decoder {
                 Self::Messages(anthropic_messages::StreamDecoder::new())
             }
             ProtocolId::Gemini => Self::Gemini(gemini::StreamDecoder::new()),
+            ProtocolId::OpenAiEmbeddings => Self::Unstreamed,
         }
     }
 
@@ -408,6 +425,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.observe(frame),
             Self::Messages(decoder) => decoder.observe(frame),
             Self::Gemini(decoder) => decoder.observe(frame),
+            Self::Unstreamed => Err(ProtocolError::UnsupportedApi),
         }
     }
 
@@ -423,6 +441,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.observe_raw(&frame.data),
             Self::Messages(decoder) => decoder.observe_raw(frame.event.as_deref(), &frame.data),
             Self::Gemini(decoder) => decoder.observe_raw(&frame.data),
+            Self::Unstreamed => Err(ProtocolError::UnsupportedApi),
         }
     }
     /// Validate and observe a relay frame without constructing unused events.
@@ -432,6 +451,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.observe_for_relay(frame),
             Self::Messages(decoder) => decoder.observe(frame).map(|_| ()),
             Self::Gemini(decoder) => decoder.observe(frame).map(|_| ()),
+            Self::Unstreamed => Err(ProtocolError::UnsupportedApi),
         }
     }
     pub fn observe_raw_for_relay(&mut self, frame: &sse::RawFrame) -> Result<(), ProtocolError> {
@@ -440,6 +460,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.observe_raw_frame_for_relay(frame),
             Self::Messages(decoder) => decoder.observe_raw_for_relay(frame),
             Self::Gemini(decoder) => decoder.observe_raw_for_relay(frame),
+            Self::Unstreamed => Err(ProtocolError::UnsupportedApi),
         }
     }
 
@@ -449,6 +470,8 @@ impl Decoder {
             Self::Responses(decoder) => decoder.finish(),
             Self::Messages(decoder) => decoder.finish(),
             Self::Gemini(decoder) => decoder.finish(),
+            // A stream that cannot exist never completed.
+            Self::Unstreamed => Terminal::Failed,
         }
     }
 
@@ -458,6 +481,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.usage(),
             Self::Messages(decoder) => decoder.usage(),
             Self::Gemini(decoder) => decoder.usage(),
+            Self::Unstreamed => None,
         }
     }
     pub fn terminal_seen(&self) -> bool {
@@ -466,6 +490,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.terminal_seen(),
             Self::Messages(decoder) => decoder.terminal_seen(),
             Self::Gemini(decoder) => decoder.terminal_seen(),
+            Self::Unstreamed => false,
         }
     }
 
@@ -478,6 +503,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.content_seen(),
             Self::Messages(decoder) => decoder.content_seen(),
             Self::Gemini(decoder) => decoder.content_seen(),
+            Self::Unstreamed => false,
         }
     }
 }

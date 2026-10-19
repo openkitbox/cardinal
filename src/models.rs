@@ -30,13 +30,25 @@ use crate::store::{KeyModels, RouteRow};
 /// Any entry that fails to resolve (key deleted, snapshot missing, model not
 /// in the snapshot) voids ALL derived fields; a declared context window is
 /// still emitted.
-pub fn route_model_object(route: &RouteRow, keys: &[KeyModels]) -> Value {
+///
+/// `chat_capable` = the route serves a chat protocol. A retrieval route
+/// (`openai_embeddings`) is listed — OpenAI's own catalog lists embedding
+/// models — but bare: it gets no context window, no modalities and no
+/// reasoning, because none of those describe an embeddings id and a picker
+/// would trust them. Its derived attributes are suppressed wholesale rather
+/// than individually, so the enrichment block stays one decision.
+pub fn route_model_object(route: &RouteRow, keys: &[KeyModels], chat_capable: bool) -> Value {
     let mut object = json!({
         "id": route.alias,
         "object": "model",
         "created": 0,
         "owned_by": "cardinal",
     });
+    // A retrieval route is listed bare (see the doc comment): nothing below
+    // describes an embeddings id, a declared context window included.
+    if !chat_capable {
+        return object;
+    }
     if let Some(window) = route.context_window {
         object["context_window"] = window.into();
         object["context_length"] = window.into();

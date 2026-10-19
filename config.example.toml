@@ -41,7 +41,8 @@ listen = "127.0.0.1:8787"
 #
 # [[gateway.providers]]
 # name = "kimi"                       # 唯一名；也是直连寻址前缀（"kimi/<model>"）
-# protocol = "anthropic_messages"     # 协议：anthropic_messages / openai_compat / gemini ...
+# protocol = "anthropic_messages"     # 协议：anthropic_messages / openai_chat /
+#                                     #       openai_responses / gemini / openai_embeddings
 # base_url = "https://api.moonshot.cn/anthropic"
 # # auth_scheme 省略时按协议推断（anthropic_messages → x_api_key，其余 → bearer）
 # # auth_scheme = "x_api_key"
@@ -49,8 +50,18 @@ listen = "127.0.0.1:8787"
 
 # [[gateway.providers]]
 # name = "deepseek"
-# protocol = "openai_compat"
+# protocol = "openai_chat"
 # base_url = "https://api.deepseek.com"
+
+# 向量（embeddings）provider：纯透传，/v1/embeddings 的请求原样转发，
+# 只改写 model 字段；无 IR 翻译、无 SSE。base_url 同样是版本根
+# （网关拼 /embeddings）。$base/embeddings 一般同时提供 $base/models，
+# 所以加 key 时的模型探测（=凭证校验）照常可用。
+#
+# [[gateway.providers]]
+# name = "openai-embed"
+# protocol = "openai_embeddings"
+# base_url = "https://api.openai.com/v1"
 
 # ── 模型价格表 ────────────────────────────────────────────────
 # USD / 百万 token；config 是 source of truth。未列价格的模型不计费。
