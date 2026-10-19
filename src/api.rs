@@ -45,6 +45,8 @@ pub struct AppState {
     pub ledger: relay::LedgerWriter,
     /// `[gateway].payloads`: relay mirrors request/response bodies into the log.
     pub payload_log: bool,
+    /// `[gateway.privacy]`: masking policy for outbound bodies.
+    pub privacy: crate::config::PrivacyConfig,
 }
 
 #[handler]
@@ -186,6 +188,7 @@ async fn relay_dispatch(
         body_log: &state.body_log,
         activity: &state.activity,
     };
+    let privacy = state.privacy.policy();
     let deps = relay::DispatchDeps {
         transport: &state.transport,
         queue_timeout: state.queue_timeout,
@@ -198,6 +201,7 @@ async fn relay_dispatch(
         rest_cache: &state.rest_cache,
         price_cache: &state.price_cache,
         ledger: &state.ledger,
+        privacy: &privacy,
     };
     match relay::dispatch(&deps, &observability, request).await {
         relay::DispatchOutcome::Json { status, body } => {

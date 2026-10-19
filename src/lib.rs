@@ -29,6 +29,7 @@ pub mod http_client;
 pub mod metering;
 pub mod models;
 pub mod prices;
+pub mod privacy;
 pub mod probe;
 pub mod protocol;
 pub mod providers;

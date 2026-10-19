@@ -4,7 +4,10 @@
 //! the wire. This is a diagnostic aid, not an archive: each side is truncated
 //! at 256 KiB ([`CALL_BODY_LIMIT`]) and one NDJSON line is appended per
 //! captured row to `~/.ox/payloads/<YYYY-MM-DD>/<HH>.ndjson` (local time;
-//! missing directories are created on demand).
+//! missing directories are created on demand). Because a capture holds user
+//! conversations, its lifetime is bounded like the log sink's: directories
+//! older than `[gateway].payload_retain_days` (default 7) are swept at startup
+//! and hourly.
 
 use std::path::PathBuf;
 
@@ -146,8 +149,58 @@ impl BodyLog {
             })
         })
     }
-}
 
+    /// Drop capture days older than `days` now and hourly thereafter; `0` keeps
+    /// everything. The capture holds user conversations and is a diagnostic
+    /// aid, not an archive, so its lifetime is bounded like the log sink's.
+    ///
+    /// Only `<YYYY-MM-DD>` directories under the capture root are candidates:
+    /// anything else (a stray file, a foreign directory) is left alone, and the
+    /// current day is never inside the window.
+    pub fn start_retention(&self, days: u64) {
+        if days == 0 {
+            return;
+        }
+        let log = self.clone();
+        tokio::spawn(async move {
+            loop {
+                log.sweep(days);
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
+    /// One sweep: remove every `<YYYY-MM-DD>` directory whose local date is at
+    /// least `days` days before today. `days == 1` therefore keeps today only.
+    fn sweep(&self, days: u64) {
+        let root = self.dir();
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return; // no capture yet (payloads off, or nothing written)
+        };
+        let today = chrono::Local::now().date_naive();
+        let cutoff = i64::try_from(days).unwrap_or(i64::MAX);
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(stamp) = name.to_str() else { continue };
+            let Ok(day) = chrono::NaiveDate::parse_from_str(stamp, "%Y-%m-%d") else {
+                continue;
+            };
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if (today - day).num_days() < cutoff {
+                continue;
+            }
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                tracing::warn!(
+                    target: "gateway::payload",
+                    "cannot remove expired payload dir {}: {error}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+}
 /// Truncate text to [`CALL_BODY_LIMIT`] bytes on a UTF-8 char boundary
 /// (slicing a multibyte char would panic). Returns the text and whether it
 /// was truncated.
@@ -256,4 +309,75 @@ pub(crate) fn mask_secrets(text: &str) -> String {
             format!("\"{}\"{}\"***\"", &captures[1], &captures[2])
         })
         .into_owned()
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn sweep_drops_only_expired_date_dirs() {
+        let root = std::env::temp_dir().join(format!("cardinal-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let today = chrono::Local::now().date_naive();
+        let day = |n: i64| {
+            (today - chrono::Duration::days(n))
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        for (n, name) in [(0, day(0)), (6, day(6)), (7, day(7)), (30, day(30))] {
+            let dir = root.join(&name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("07.ndjson"), "{}").unwrap();
+            assert!(dir.exists(), "setup {n}");
+        }
+        let foreign = root.join("not-a-date");
+        std::fs::create_dir_all(&foreign).unwrap();
+        // A *file* whose name looks like a date must survive: only directories
+        // are candidates.
+        std::fs::write(root.join(day(90)), "x").unwrap();
+
+        let log = BodyLog {
+            dir: Some(root.clone()),
+        };
+        log.sweep(7);
+
+        assert!(root.join(day(0)).exists(), "today kept");
+        assert!(root.join(day(6)).exists(), "day 6 kept");
+        assert!(!root.join(day(7)).exists(), "day 7 dropped");
+        assert!(!root.join(day(30)).exists(), "day 30 dropped");
+        assert!(foreign.exists(), "foreign dir kept");
+        assert!(root.join(day(90)).exists(), "date-named file kept");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn start_retention_sweeps_immediately_on_the_runtime() {
+        let root = std::env::temp_dir().join(format!("cardinal-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let today = chrono::Local::now().date_naive();
+        let old = (today - chrono::Duration::days(9))
+            .format("%Y-%m-%d")
+            .to_string();
+        let fresh = today.format("%Y-%m-%d").to_string();
+        std::fs::create_dir_all(root.join(&old)).unwrap();
+        std::fs::create_dir_all(root.join(&fresh)).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let log = BodyLog {
+                dir: Some(root.clone()),
+            };
+            log.start_retention(7);
+            // The spawn sweeps before its first sleep; yield so it gets to run.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        assert!(!root.join(&old).exists(), "expired dir removed by the task");
+        assert!(root.join(&fresh).exists(), "today kept");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

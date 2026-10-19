@@ -158,13 +158,19 @@ impl Core {
             crate::relay::ledger_writer::DEFAULT_FLUSH_INTERVAL,
             crate::relay::ledger_writer::DEFAULT_BATCH_SIZE,
         );
+        // Payload captures hold user conversations: bound their lifetime the
+        // same way the log sink is bounded (startup + hourly sweep).
+        let body_log = crate::body_log::BodyLog::new();
+        if config.payloads {
+            body_log.start_retention(config.payload_retain_days);
+        }
         Ok(Self {
             pool,
             transport: transport::Transport::new(limits(config))?,
             queue_timeout,
             failover: relay::Failover::new(),
             trace_ring: Arc::new(relay::trace::TraceRing::new()),
-            body_log: crate::body_log::BodyLog::new(),
+            body_log,
             ledger,
             writer_handle,
             activity,

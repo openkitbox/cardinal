@@ -253,50 +253,131 @@ fn data_uri_payload(text: &str) -> Option<&str> {
         .map(|(_, payload)| payload)
 }
 
-/// A JSON tree that serializes with image data URIs reduced to their bare
-/// base64 payloads (GLM's chat dialect: its endpoints reject inline images as
-/// data URIs — `400 图片输入格式/解析错误` — while bare base64 and remote
-/// `https://` URLs both work; verified live by CodexPlusPlus #2031, fixed
-/// upstream in v1.6.0, and mirrored by the official zai-sdk's
-/// `drop_prefix_image_data`). Applied at wire-render time: the rewrite rides
-/// the serializer's own walk, so the client's parsed tree is never cloned for
-/// it and every variant delegates to serde — byte-identical output except for
-/// the intercepted strings.
-struct StripDataUris<'a>(&'a Value);
+/// The render-time transforms a kernel applies while writing the wire: the
+/// fields to omit (`skip`), the GLM image strip, and the privacy policy. They
+/// always travel together, so they are bundled.
+pub struct Render<'a> {
+    /// Top-level fields the wire must not carry (learned refusals, vendor fixups).
+    pub skip: &'a [&'a str],
+    /// Rewrite inline image data URIs to their bare base64 (see [`data_uri_payload`]).
+    pub strip_images: bool,
+    /// Mask sensitive strings; `None` when nothing is masked. Shared as an
+    /// `Arc` so every candidate attempt of one request reuses its context.
+    pub ctx: Option<&'a std::sync::Arc<crate::privacy::MaskCtx>>,
+}
 
-impl serde::Serialize for StripDataUris<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self.0 {
-            Value::String(text) => match data_uri_payload(text) {
-                Some(payload) => serializer.serialize_str(payload),
-                None => serializer.serialize_str(text),
-            },
-            Value::Array(items) => serializer.collect_seq(items.iter().map(StripDataUris)),
-            Value::Object(object) => serializer.collect_map(
-                object
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), StripDataUris(value))),
-            ),
-            Value::Null => serializer.serialize_unit(),
-            Value::Bool(flag) => serializer.serialize_bool(*flag),
-            Value::Number(number) => number.serialize(serializer),
-        }
+impl Render<'_> {
+    /// Whether this render leaves every value untouched (the fast path).
+    fn is_identity(&self) -> bool {
+        !self.strip_images && self.ctx.is_none()
     }
 }
 
-/// Write one client value to the wire, optionally stripping image data URIs
-/// on the way out (see [`StripDataUris`]) — the render-time form of the old
-/// rewrite-the-tree fixup.
+/// Write one client value to the wire, applying `render`'s transforms — the
+/// render-time form of the old rewrite-the-tree fixups, so the client's parsed
+/// tree is never cloned for them. `key` is the field the value sits under: an
+/// identifier or enum field is written verbatim (see [`crate::privacy::structural`]).
 fn write_json_value(
     out: &mut Vec<u8>,
     value: &Value,
-    strip_images: bool,
+    render: &Render<'_>,
+    key: &str,
 ) -> Result<(), ProtocolError> {
-    if strip_images {
-        serde_json::to_writer(&mut *out, &StripDataUris(value))
-            .map_err(|_| ProtocolError::InvalidRequest)
-    } else {
-        write_json(out, value)
+    if render.is_identity() {
+        return write_json(out, value);
+    }
+    write_value(out, value, render, key)
+}
+
+/// Recursive wire writer with masking / image strip. Byte-identical to
+/// [`write_json`] for everything it does not intercept.
+fn write_value(
+    out: &mut Vec<u8>,
+    value: &Value,
+    render: &Render<'_>,
+    key: &str,
+) -> Result<(), ProtocolError> {
+    match value {
+        Value::Object(object) => {
+            // A block that carries a signed / encrypted carrier is emitted
+            // verbatim: masking its plaintext would void the signature and the
+            // upstream would reject the replay (Anthropic thinking, OpenAI
+            // Responses `encrypted_content`, Gemini `thoughtSignature`).
+            if object.keys().any(|key| protected_key(key)) {
+                return write_json(out, value);
+            }
+            out.push(b'{');
+            let mut first = true;
+            for (name, item) in object {
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                write_json(out, name.as_str())?;
+                out.push(b':');
+                write_value(out, item, render, name)?;
+            }
+            out.push(b'}');
+        }
+        Value::Array(items) => {
+            out.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_value(out, item, render, key)?;
+            }
+            out.push(b']');
+        }
+        Value::String(text) => {
+            if render.strip_images
+                && let Some(payload) = data_uri_payload(text)
+            {
+                return write_json(out, payload);
+            }
+            // A data URI is an opaque base64 payload, not prose: masking a
+            // digit run that happens to look like a phone number inside it would
+            // corrupt the payload and the upstream would reject the request. A
+            // structural field is an identifier or enum the vendor matches
+            // against its own — rewriting it breaks routing or validation.
+            if text.starts_with("data:") || crate::privacy::structural(key) {
+                return write_json(out, text);
+            }
+            match render.ctx {
+                Some(ctx) => {
+                    let (masked, _) = crate::privacy::mask(text, ctx);
+                    write_json(out, masked.as_ref())?;
+                }
+                None => write_json(out, text)?,
+            }
+        }
+        scalar => write_json(out, scalar)?,
+    }
+    Ok(())
+}
+
+/// A field whose value is a signature or opaque encrypted payload: neither it
+/// nor the block holding it may be rewritten. The list lives with the masking
+/// layer (`privacy::opaque`) so the request-mask and response-restore sides
+/// cannot drift apart.
+pub(super) fn protected_key(key: &str) -> bool {
+    crate::privacy::opaque(key)
+}
+
+/// Write one scalar, masking a string under `render.ctx` (the gemini
+/// kernel's scalar path, which does not go through [`write_value`]; its
+/// caller has already resolved structural keys).
+pub(super) fn write_scalar(
+    out: &mut Vec<u8>,
+    value: &Value,
+    render: &Render<'_>,
+) -> Result<(), ProtocolError> {
+    match (value, render.ctx) {
+        (Value::String(text), Some(ctx)) if !text.starts_with("data:") => {
+            let (masked, _) = crate::privacy::mask(text, ctx);
+            write_json(out, masked.as_ref())
+        }
+        _ => write_json(out, value),
     }
 }
 
@@ -342,32 +423,30 @@ pub(super) fn raw_value(raw: &RawValue) -> Option<serde_json::Value> {
 /// Exhaustive dispatch. A new protocol must be added here explicitly; there is
 /// no catch-all that would silently downgrade to another protocol (A §5).
 ///
-/// `skip` names top-level fields the wire must not carry (learned upstream
-/// refusals, vendor fixups): the kernels omit them while building the body,
-/// so a strip never costs a parse/re-serialize round-trip of the wire.
-/// `strip_images` rides the same render pass: GLM's data-URI rewrite happens
-/// while serializing (see [`StripDataUris`]), never as a tree copy. Gemini
-/// takes no flag — no Gemini-wire upstream declares the dialect.
+/// `render` carries the wire transforms: `skip` names top-level fields the wire
+/// must not carry (learned upstream refusals, vendor fixups) and the kernels
+/// omit them while building the body, so a strip never costs a
+/// parse/re-serialize round-trip; `strip_images` and `policy` ride the same
+/// render pass (see [`write_value`]), never as a tree copy. Gemini takes no
+/// image strip — no Gemini-wire upstream declares the strip dialect — but does
+/// take `policy`.
 pub fn prepare(
     protocol: ProtocolId,
     client_body: &serde_json::Value,
     target: &TargetView<'_>,
     stream: bool,
-    skip: &[&str],
-    strip_images: bool,
+    render: &Render<'_>,
 ) -> Result<Prepared, ProtocolError> {
     debug_assert_eq!(protocol, target.protocol);
     match protocol {
-        ProtocolId::OpenAiChat => {
-            openai_chat::prepare(client_body, target, stream, skip, strip_images)
-        }
+        ProtocolId::OpenAiChat => openai_chat::prepare(client_body, target, stream, render),
         ProtocolId::OpenAiResponses => {
-            openai_responses::prepare(client_body, target, stream, skip, strip_images)
+            openai_responses::prepare(client_body, target, stream, render)
         }
         ProtocolId::AnthropicMessages => {
-            anthropic_messages::prepare(client_body, target, stream, skip, strip_images)
+            anthropic_messages::prepare(client_body, target, stream, render)
         }
-        ProtocolId::Gemini => gemini::prepare(client_body, target, stream, skip),
+        ProtocolId::Gemini => gemini::prepare(client_body, target, stream, render),
     }
 }
 
@@ -547,4 +626,50 @@ pub struct ObservedResponse {
     pub terminal: Terminal,
     /// Model id echoed by the upstream, kept for evidence only.
     pub upstream_model: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(policy: crate::privacy::Policy) -> std::sync::Arc<crate::privacy::MaskCtx> {
+        std::sync::Arc::new(crate::privacy::MaskCtx::new(policy))
+    }
+
+    /// The wire writer must leave alone everything that is not prose: a
+    /// structural field the vendor matches against its own, an opaque data URI,
+    /// and a block carrying a signed / encrypted carrier.
+    #[test]
+    fn the_wire_writer_leaves_non_prose_alone() {
+        let ctx = render(crate::privacy::Policy {
+            secrets: true,
+            personal: true,
+            words: Vec::new(),
+        });
+        let render = Render {
+            skip: &[],
+            strip_images: false,
+            ctx: Some(&ctx),
+        };
+        let value = serde_json::json!({
+            "model": "zhang.san@corp.cn",
+            "content": "zhang.san@corp.cn",
+            "image_url": "data:image/png;base64,13800138000AAAA",
+            "thinking": { "signature": "zhang.san@corp.cn", "text": "zhang.san@corp.cn" },
+            "tools": [{ "name": "zhang.san@corp.cn" }]
+        });
+        let mut out = Vec::new();
+        write_json_value(&mut out, &value, &render, "").unwrap();
+        let wire: Value = serde_json::from_slice(&out).unwrap();
+
+        // A structural field and a data URI pass through untouched.
+        assert_eq!(wire["model"], "zhang.san@corp.cn");
+        assert_eq!(wire["image_url"], "data:image/png;base64,13800138000AAAA");
+        assert_eq!(wire["tools"][0]["name"], "zhang.san@corp.cn");
+        // Prose is masked...
+        assert!(wire["content"].as_str().unwrap().starts_with("{{EMAIL_"));
+        // ...but a block holding a signature is emitted whole, both fields intact.
+        assert_eq!(wire["thinking"]["signature"], "zhang.san@corp.cn");
+        assert_eq!(wire["thinking"]["text"], "zhang.san@corp.cn");
+    }
 }

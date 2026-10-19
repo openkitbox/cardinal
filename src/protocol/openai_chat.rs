@@ -29,20 +29,19 @@ pub fn prepare(
     client_body: &Value,
     target: &TargetView<'_>,
     stream: bool,
-    skip: &[&str],
-    strip_images: bool,
+    render: &super::Render<'_>,
 ) -> Result<Prepared, ProtocolError> {
     validate_request(client_body)?;
     let object = client_body
         .as_object()
         .ok_or(ProtocolError::InvalidRequest)?;
     let url = target.url(stream)?;
-    let pin_usage = stream && !skip.contains(&"stream_options");
+    let pin_usage = stream && !render.skip.contains(&"stream_options");
     let mut out = Vec::new();
     out.push(b'{');
     let mut first = true;
     for (field, value) in object {
-        if skip.contains(&field.as_str()) {
+        if render.skip.contains(&field.as_str()) {
             continue;
         }
         if !first {
@@ -73,7 +72,7 @@ pub fn prepare(
                     if key == "include_usage" {
                         out.extend_from_slice(b"true");
                     } else {
-                        super::write_json_value(&mut out, item, strip_images)?;
+                        super::write_json_value(&mut out, item, render, key)?;
                     }
                 }
                 if !forced {
@@ -84,10 +83,10 @@ pub fn prepare(
                 }
                 out.push(b'}');
             } else {
-                super::write_json_value(&mut out, value, strip_images)?;
+                super::write_json_value(&mut out, value, render, "stream_options")?;
             }
         } else {
-            super::write_json_value(&mut out, value, strip_images)?;
+            super::write_json_value(&mut out, value, render, field)?;
         }
     }
     if pin_usage && !object.contains_key("stream_options") {

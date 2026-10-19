@@ -48,13 +48,13 @@ pub fn prepare(
     client_body: &Value,
     target: &TargetView<'_>,
     stream: bool,
-    skip: &[&str],
+    render: &super::Render<'_>,
 ) -> Result<Prepared, ProtocolError> {
     if !client_body.is_object() {
         return Err(ProtocolError::InvalidRequest);
     }
     let mut out = Vec::new();
-    write_camelized(&mut out, client_body, &["model", "stream"], skip)?;
+    write_camelized(&mut out, client_body, &["model", "stream"], render)?;
     let mut url = target.url(stream)?.to_owned();
     if stream {
         // `alt=sse` picks the SSE wire over Google's default chunked-JSON.
@@ -86,7 +86,7 @@ fn write_camelized(
     out: &mut Vec<u8>,
     value: &Value,
     strip: &[&str],
-    skip: &[&str],
+    render: &super::Render<'_>,
 ) -> Result<(), ProtocolError> {
     match value {
         Value::Object(object) => {
@@ -99,7 +99,7 @@ fn write_camelized(
             // because each is the emitted key of its write.
             let mut folded_names: Vec<String> = Vec::new();
             for (key, item) in object {
-                if strip.contains(&key.as_str()) || skip.contains(&key.as_str()) {
+                if strip.contains(&key.as_str()) || render.skip.contains(&key.as_str()) {
                     continue;
                 }
                 // A snake_case key folds into its camelCase spelling; when the
@@ -125,10 +125,13 @@ fn write_camelized(
                 first = false;
                 super::write_json(out, name)?;
                 out.push(b':');
-                if CALLER_OWNED_KEYS.contains(&name) {
+                if CALLER_OWNED_KEYS.contains(&name)
+                    || super::protected_key(name)
+                    || crate::privacy::structural(name)
+                {
                     super::write_json(out, item)?;
                 } else {
-                    write_camelized(out, item, &[], &[])?;
+                    write_camelized(out, item, &[], render)?;
                 }
             }
             out.push(b'}');
@@ -139,11 +142,11 @@ fn write_camelized(
                 if index > 0 {
                     out.push(b',');
                 }
-                write_camelized(out, item, &[], &[])?;
+                write_camelized(out, item, &[], render)?;
             }
             out.push(b']');
         }
-        scalar => super::write_json(out, scalar)?,
+        scalar => super::write_scalar(out, scalar, render)?,
     }
     Ok(())
 }

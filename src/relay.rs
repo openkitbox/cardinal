@@ -482,8 +482,15 @@ async fn send_attempt(
                 }
             }
         }
+        // A vendor error body can echo the credential it just rejected; excise it
+        // before the body becomes the attempt's error — that error is what the
+        // caller reads, what the attempt log prints, and what the request row keeps.
+        let body = match credential.redact(&body) {
+            Some(redacted) => bytes::Bytes::from(redacted),
+            None => bytes::Bytes::from(body),
+        };
         return Err(
-            match transport::status_error(status, &response_headers, bytes::Bytes::from(body)) {
+            match transport::status_error(status, &response_headers, body) {
                 Some(error) => failover::AttemptError::Transport(error),
                 // Unreachable (status >= 400 always classifies), kept total without panicking.
                 None => failover::AttemptError::Transport(transport::TransportError::InvalidBody),

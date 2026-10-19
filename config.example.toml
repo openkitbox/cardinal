@@ -28,9 +28,13 @@ listen = "127.0.0.1:8787"
 # 开发模式：允许明文 loopback 上游和非常规端口（本地 mock 上游用）。默认 false。
 # allow_insecure_upstream = false
 
-# 把请求/响应 body 镜像到日志（target `gateway::payload`，截断 64 KiB）。
+# 把请求/响应 body 镜像到日志（target `gateway::payload`，截断 256 KiB）。
 # 默认 false——body 含用户对话内容。
 # payloads = false
+
+# `~/.ox/payloads` 抓包保留天数（默认 7；0 = 永久保留）。抓包是诊断手段不是
+# 归档，且含用户对话，所以和日志一样有保留期（启动时 + 每小时清扫一次）。
+# payload_retain_days = 7
 
 # 某个 key 满载时，调度在队列里等多久（秒）再故障转移到下一个候选。默认 30。
 # queue_timeout_secs = 30

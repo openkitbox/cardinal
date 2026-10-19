@@ -103,4 +103,36 @@ impl<'a> AuthSchemeMaterial<'a> {
             None => vec![("key", self.material.to_owned())],
         }
     }
+
+    /// `body` with this credential excised, or `None` when the body does not
+    /// echo it — the common case, and then the caller keeps the original bytes
+    /// with no copy.
+    ///
+    /// Vendors routinely echo the key they just rejected ("Incorrect API key
+    /// provided: sk-…", "API key not valid"), and that body is forwarded to the
+    /// caller, written to the attempt log, and persisted on the request row.
+    /// Excising it here — at the only party that knows the value — covers all
+    /// three from one point instead of three independent scrub sites.
+    pub fn redact(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let needle = self.material.as_bytes();
+        // Below a credential's shape, replacing would shred the vendor's words
+        // without protecting anything.
+        if needle.len() < 8 {
+            return None;
+        }
+        let mut at = 0;
+        let mut out: Option<Vec<u8>> = None;
+        while let Some(found) = body[at..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+        {
+            let buffer = out.get_or_insert_with(|| Vec::with_capacity(body.len()));
+            buffer.extend_from_slice(&body[at..at + found]);
+            buffer.extend_from_slice(b"[REDACTED]");
+            at += found + needle.len();
+        }
+        let mut out = out?;
+        out.extend_from_slice(&body[at..]);
+        Some(out)
+    }
 }

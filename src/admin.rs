@@ -853,6 +853,22 @@ async fn quota_snapshots(depot: &mut Depot, response: &mut Response) {
     );
 }
 
+/// `GET /api/privacy`: the masking policy currently in effect. Read-only — the
+/// config file is the source of truth; this only reports it.
+#[handler]
+async fn privacy_status(depot: &mut Depot, response: &mut Response) {
+    let privacy = &state(depot).privacy;
+    json_response(
+        response,
+        &json!({
+            "enabled": privacy.enabled,
+            "secrets": privacy.secrets,
+            "personal": privacy.personal,
+            "words": privacy.words,
+        }),
+    );
+}
+
 // ---------- live activity (SSE) ----------
 
 /// The SSE rendering of an activity receiver: one JSON frame per event plus
@@ -1060,6 +1076,7 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
         )
         .push(Router::with_path("chat-models").get(chat_models))
         .push(Router::with_path("concurrency").get(concurrency_usage))
+        .push(Router::with_path("privacy").get(privacy_status))
         .push(Router::with_path("quotas").get(quotas))
         .push(Router::with_path("quota-snapshots").get(quota_snapshots))
         .push(Router::with_path("activity").get(activity_stream))

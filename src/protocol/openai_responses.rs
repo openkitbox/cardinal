@@ -32,20 +32,19 @@ pub fn prepare(
     client_body: &Value,
     target: &TargetView<'_>,
     stream: bool,
-    skip: &[&str],
-    strip_images: bool,
+    render: &super::Render<'_>,
 ) -> Result<Prepared, ProtocolError> {
     validate_request(client_body)?;
     let object = client_body
         .as_object()
         .ok_or(ProtocolError::InvalidRequest)?;
     let url = target.url(stream)?;
-    let pin_store = !skip.contains(&"store");
+    let pin_store = !render.skip.contains(&"store");
     let mut out = Vec::new();
     out.push(b'{');
     let mut first = true;
     for (field, value) in object {
-        if skip.contains(&field.as_str()) {
+        if render.skip.contains(&field.as_str()) {
             continue;
         }
         if !first {
@@ -57,7 +56,7 @@ pub fn prepare(
         if field == "model" {
             super::write_json(&mut out, target.upstream_model)?;
         } else {
-            super::write_json_value(&mut out, value, strip_images)?;
+            super::write_json_value(&mut out, value, render, field)?;
         }
     }
     // Stateless relay: pin store=false when the client omitted it, so upstreams

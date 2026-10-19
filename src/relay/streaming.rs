@@ -192,7 +192,7 @@ async fn flush_hold(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     hold: &mut Option<HoldState>,
     activity: &mut Option<PumpActivity>,
-    wire: &mut bytes::BytesMut,
+    wire: &mut Wire,
 ) -> bool {
     let Some(held) = hold.take() else { return true };
     for frame in &held.buf {
@@ -232,7 +232,7 @@ async fn commit_hold(
     hold: &mut Option<HoldState>,
     commit_tx: &mut Option<tokio::sync::oneshot::Sender<HoldSignal>>,
     activity: &mut Option<PumpActivity>,
-    wire: &mut bytes::BytesMut,
+    wire: &mut Wire,
 ) {
     signal_hold(commit_tx, HoldSignal::Committed);
     if let Some(activity) = activity {
@@ -310,6 +310,9 @@ pub(super) struct PumpSide {
     pub(super) captured: Option<CapturedBody>,
     pub(super) activity: Option<(ActivitySink, u64)>,
     pub(super) started: std::time::Instant,
+    /// This request's masking context, so a masked value split across frames can
+    /// be put back; `None` when nothing is masked.
+    pub(super) mask: Option<std::sync::Arc<crate::privacy::MaskCtx>>,
 }
 
 /// Start the streaming relay pump: a background task turns upstream frames
@@ -364,6 +367,7 @@ async fn drive_stream(
         mut captured,
         activity,
         started,
+        mask,
     } = side;
     let mut activity = activity.map(|(sink, seq)| PumpActivity::new(sink, seq));
     let mut usage: Option<crate::protocol::usage::UsageCounts> = None;
@@ -378,7 +382,7 @@ async fn drive_stream(
     // out of it (`split()`), so the client-held `Bytes` stay independent while
     // the allocation is reused (held frames re-render from their own `RawFrame`
     // clones — `split()` is what makes that safe).
-    let mut wire = bytes::BytesMut::new();
+    let mut wire = Wire::new(mask);
     match pump {
         StreamPump::PassThrough { mut decoder } => {
             loop {
@@ -664,6 +668,7 @@ async fn drive_stream(
             }
         }
     }
+    wire.flush_carry(tx).await;
     let usage = usage.map(|counts| StreamUsage {
         input_tokens: counts.input_tokens as i64,
         output_tokens: counts.output_tokens as i64,
@@ -674,27 +679,74 @@ async fn drive_stream(
     (usage, ttft_ms, captured)
 }
 
+/// The pump's SSE render buffer plus the streaming restore state: a placeholder
+/// the upstream split across two frames is held there and finished on the frame
+/// that completes it.
+struct Wire {
+    buf: bytes::BytesMut,
+    restore: crate::privacy::StreamRestore,
+}
+
+impl Wire {
+    fn new(mask: Option<std::sync::Arc<crate::privacy::MaskCtx>>) -> Self {
+        Self {
+            buf: bytes::BytesMut::new(),
+            restore: crate::privacy::StreamRestore::new(mask),
+        }
+    }
+
+    /// Emit anything still held at end of stream (lossless).
+    async fn flush_carry(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    ) {
+        if let Some(out) = self.restore.finish() {
+            let _ = self.write(tx, out).await;
+        }
+    }
+
+    /// Write one restored frame to the client, reusing the render buffer.
+    async fn write(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+        out: crate::privacy::OutFrame,
+    ) -> Result<(), std::io::Error> {
+        let buf = &mut self.buf;
+        buf.reserve(out.data.len() + 8 + out.event.as_deref().map_or(0, |e| e.len() + 8));
+        if let Some(event) = &out.event {
+            buf.extend_from_slice(b"event: ");
+            buf.extend_from_slice(event.as_bytes());
+            buf.extend_from_slice(b"\n");
+        }
+        buf.extend_from_slice(b"data: ");
+        buf.extend_from_slice(&out.data);
+        buf.extend_from_slice(b"\n\n");
+        tx.send(Ok(buf.split().freeze()))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client gone"))
+    }
+}
+
 /// Render one frame into SSE wire bytes. `wire` is a render buffer reused
 /// across frames: each send reserves into it and freezes its bytes out with
 /// `split()`, so the `Bytes` the client channel holds are independent of the
-/// buffer while the allocation is amortized instead of fresh per frame.
+/// buffer while the allocation is amortized instead of fresh per frame. Masked
+/// values are put back on the way out by [`Wire::restore`], which also finishes
+/// a placeholder the upstream split across two frames.
 async fn send_frame(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     frame: &RawFrame,
-    wire: &mut bytes::BytesMut,
+    wire: &mut Wire,
 ) -> Result<usize, std::io::Error> {
-    wire.reserve(frame.data.len() + 8 + frame.event.as_deref().map_or(0, |event| event.len() + 8));
-    if let Some(event) = &frame.event {
-        wire.extend_from_slice(b"event: ");
-        wire.extend_from_slice(event.as_bytes());
-        wire.extend_from_slice(b"\n");
+    let emit = wire.restore.frame(frame.event.as_deref(), &frame.data);
+    let mut written = 0;
+    if let Some(release) = emit.release {
+        written += release.data.len();
+        wire.write(tx, release).await?;
     }
-    wire.extend_from_slice(b"data: ");
-    wire.extend_from_slice(&frame.data);
-    wire.extend_from_slice(b"\n\n");
-    let len = wire.len();
-    tx.send(Ok(wire.split().freeze()))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client gone"))?;
-    Ok(len)
+    if let Some(out) = emit.emit {
+        written += out.data.len();
+        wire.write(tx, out).await?;
+    }
+    Ok(written)
 }

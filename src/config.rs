@@ -27,11 +27,18 @@ pub struct Config {
     /// Development mode: allow plaintext loopback upstreams and unusual ports (for local mock upstreams).
     pub allow_insecure_upstream: bool,
     /// Mirror request/response payloads into the log (target `gateway::payload`,
-    /// truncated at 64 KiB per body). Off by default: payloads contain user
+    /// truncated at 256 KiB per body). Off by default: payloads contain user
     /// conversations. Silence the target via RUST_LOG (`gateway::payload=off`)
     /// even when on. A relay behavior flag — the logging subscriber itself is
     /// the `cardinal-gateway` binary's `[log]` section.
     pub payloads: bool,
+    /// How many days of `~/.ox/payloads` captures to keep (default 7; `0` keeps
+    /// them all). The capture is a diagnostic aid, not an archive, and it holds
+    /// user conversations: an unbounded one grows into a permanent local
+    /// transcript. Swept at startup and hourly, same as the log sink.
+    /// Ignored when `payloads` is off.
+    #[serde(default = "default_payload_retain_days")]
+    pub payload_retain_days: u64,
     /// Provider declarations idempotently written to the DB at startup (name is the primary key; config is the source of truth).
     /// Keys and routes are NOT seeded — they are managed at runtime via the admin API / GUI.
     pub providers: Vec<ProviderSeed>,
@@ -57,6 +64,7 @@ impl Default for Config {
             admin_remote: false,
             allow_insecure_upstream: false,
             payloads: false,
+            payload_retain_days: default_payload_retain_days(),
             providers: Vec::new(),
             prices: Vec::new(),
             queue_timeout_secs: None,
@@ -126,6 +134,12 @@ pub struct ProviderSeed {
 
 fn default_true() -> bool {
     true
+}
+
+/// A week: long enough to debug last week's traffic, short enough that the
+/// capture does not become a permanent local transcript.
+fn default_payload_retain_days() -> u64 {
+    7
 }
 
 impl Config {
