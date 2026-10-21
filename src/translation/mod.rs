@@ -13,6 +13,7 @@
 //! this pair).
 
 pub mod anthropic_messages;
+pub mod effort_clamp;
 pub mod ir;
 pub mod openai_chat;
 pub mod openai_responses;

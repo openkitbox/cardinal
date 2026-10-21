@@ -396,6 +396,34 @@ async fn send_attempt(
         join_split_tool_call_turns(body);
         fill_missing_reasoning(body);
     }
+    // Passthrough carries the client's own wire shape — no IR to clamp. Plan
+    // read-only first and materialize one owned copy only when a rewrite is due
+    // (same Cow discipline as the fixups above).
+    let mut clamp_note: Option<(String, String)> = None;
+    if request.protocol == protocol
+        && let Some(supported) = supported_efforts
+    {
+        let current: &Value = adapted_body
+            .as_ref()
+            .map_or(&request.body, std::borrow::Cow::as_ref);
+        let rewrites = translation::effort_clamp::plan(protocol, current, supported);
+        if !rewrites.is_empty() {
+            let body = adapted_body
+                .get_or_insert(std::borrow::Cow::Borrowed(&request.body))
+                .to_mut();
+            clamp_note = translation::effort_clamp::apply(body, &rewrites);
+        }
+    }
+    if let Some((from, to)) = &clamp_note {
+        tracing::info!(
+            target: EFFORT_TARGET,
+            model = target_model,
+            provider_id,
+            from,
+            to,
+            "effort clamped to upstream model support"
+        );
+    }
     let passthrough_body: &Value = adapted_body
         .as_ref()
         .map_or(&request.body, std::borrow::Cow::as_ref);
