@@ -43,6 +43,7 @@ use crate::body_log::{BodyLog, CapturedBodies, CapturedBody};
 use crate::protocol::{self, ProtocolError, TargetView};
 use crate::store::{self, AttemptLog};
 use crate::translation;
+use crate::translation::ir::Effort;
 use crate::upstream::transport::{self, Transport};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,28 +91,23 @@ const MAX_PAYLOAD_LOG_BYTES: usize = 64 * 1024;
 /// `output_config.effort` override it.
 /// Levels normalize to low/medium/high/xhigh/max; None = no effort named.
 pub fn extract_effort(protocol: ProtocolId, body: &Value) -> Option<String> {
-    let normalize = |raw: &str| match raw.trim().to_ascii_lowercase().as_str() {
-        "minimal" | "none" => Some("low".to_string()),
-        "ultra" => Some("max".to_string()),
-        "low" | "medium" | "high" | "xhigh" | "max" => Some(raw.trim().to_ascii_lowercase()),
-        _ => None,
-    };
+    let name = |raw: &str| Effort::parse_name(raw).map(|effort| effort.chat_name().to_owned());
     match protocol {
         ProtocolId::OpenAiChat => body
             .get("reasoning_effort")
             .and_then(Value::as_str)
-            .and_then(normalize)
+            .and_then(name)
             .or_else(|| {
                 body.get("thinking")
                     .and_then(|t| t.get("effort"))
                     .and_then(Value::as_str)
-                    .and_then(normalize)
+                    .and_then(name)
             }),
         ProtocolId::OpenAiResponses => body
             .get("reasoning")
             .and_then(|r| r.get("effort"))
             .and_then(Value::as_str)
-            .and_then(normalize),
+            .and_then(name),
         ProtocolId::AnthropicMessages => {
             let thinking = body.get("thinking")?;
             let kind = thinking.get("type").and_then(Value::as_str)?;
@@ -120,25 +116,15 @@ pub fn extract_effort(protocol: ProtocolId, body: &Value) -> Option<String> {
             }
             let budgeted = thinking
                 .get("budget_tokens")
-                .and_then(Value::as_i64)
-                .map(|budget| {
-                    // Claude Code's budget dial rounded to a level.
-                    if budget <= 4096 {
-                        "low"
-                    } else if budget <= 12000 {
-                        "medium"
-                    } else if budget <= 24000 {
-                        "high"
-                    } else {
-                        "xhigh"
-                    }
-                });
+                .and_then(Value::as_u64)
+                .and_then(Effort::from_budget)
+                .map(|effort| effort.chat_name().to_owned());
             // output_config (request-level or per-message) overrides the budget.
             let configured = body
                 .get("output_config")
                 .and_then(|oc| oc.get("effort"))
                 .and_then(Value::as_str)
-                .and_then(normalize)
+                .and_then(name)
                 .or_else(|| {
                     body.get("messages")?
                         .as_array()?
@@ -149,10 +135,10 @@ pub fn extract_effort(protocol: ProtocolId, body: &Value) -> Option<String> {
                                 .get("output_config")?
                                 .get("effort")
                                 .and_then(Value::as_str)
-                                .and_then(normalize)
+                                .and_then(name)
                         })
                 });
-            configured.or_else(|| budgeted.map(str::to_string))
+            configured.or(budgeted)
         }
         // Neither carries an effort dial: Gemini's effort lives in
         // `generationConfig`, and a retrieval call generates nothing at all.
