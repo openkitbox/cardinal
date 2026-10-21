@@ -141,7 +141,8 @@ fn push_name(
 }
 
 fn push_budget(rewrites: &mut Vec<Rewrite>, body: &Value, supported: &[Effort]) {
-    let Some(budget) = value_at(body, &["thinking", "budget_tokens"]).and_then(Value::as_u64) else {
+    let Some(budget) = value_at(body, &["thinking", "budget_tokens"]).and_then(Value::as_u64)
+    else {
         return;
     };
     let Some(level) = Effort::from_budget(budget) else {

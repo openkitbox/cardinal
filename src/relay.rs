@@ -444,9 +444,11 @@ async fn send_attempt(
                 protocol,
                 &target,
                 stream,
-                fields,
-                fixups,
-                supported_efforts,
+                WireTweaks {
+                    skip: fields,
+                    fixups,
+                    supported_efforts,
+                },
             )
         }
     };
@@ -615,6 +617,17 @@ async fn attempt_json(
     })
 }
 
+/// Candidate-specific wire adjustments for the translation path.
+#[derive(Clone, Copy)]
+struct WireTweaks<'a> {
+    /// Optional fields the upstream is known to refuse.
+    skip: &'a [&'a str],
+    /// Vendor Chat-body adaptations.
+    fixups: ChatFixups,
+    /// The target model's supported effort levels; `None` = unconstrained.
+    supported_efforts: Option<&'a [Effort]>,
+}
+
 /// Request preparation for the translation path: source to_ir → target from_ir → target prepare.
 /// `skip` passes through to the target kernel (learned refusals, vendor fixups).
 /// `fixups` are the vendor Chat-body adaptations (see [`ChatFixups`]).
@@ -624,14 +637,12 @@ fn prepare_translated(
     upstream: ProtocolId,
     target: &TargetView<'_>,
     stream: bool,
-    skip: &[&str],
-    fixups: ChatFixups,
-    supported_efforts: Option<&[Effort]>,
+    tweaks: WireTweaks<'_>,
 ) -> Result<protocol::Prepared, ProtocolError> {
     let source_dialect = translation::dialect(source)?;
     let upstream_dialect = translation::dialect(upstream)?;
     let (mut ir, _) = (source_dialect.to_ir)(source_body, translation::ir::NO_DECLARED_LIMIT)?;
-    if let (Some(supported), Some(effort)) = (supported_efforts, ir.effort)
+    if let (Some(supported), Some(effort)) = (tweaks.supported_efforts, ir.effort)
         && !supported.is_empty()
     {
         let clamped = effort.clamp_against(supported);
@@ -653,7 +664,7 @@ fn prepare_translated(
     // backfilled (the emitter only writes `reasoning_content` for turns whose
     // IR carried thinking). The GLM image strip needs nothing here — it rides
     // the wire render below.
-    if fixups.deepseek_dialect {
+    if tweaks.fixups.deepseek_dialect {
         join_split_tool_call_turns(&mut upstream_value);
         fill_missing_reasoning(&mut upstream_value);
     }
@@ -668,8 +679,8 @@ fn prepare_translated(
         &upstream_value,
         target,
         stream,
-        skip,
-        fixups.strip_glm_images,
+        tweaks.skip,
+        tweaks.fixups.strip_glm_images,
     )
 }
 

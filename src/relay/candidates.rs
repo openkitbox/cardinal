@@ -65,7 +65,11 @@ fn serves_model(key: &ProviderKeyRow, upstream_model: &str) -> bool {
 /// model-list snapshot, canonicalized and ascending. `None` when the snapshot
 /// cannot answer — dispatch then leaves the client's dial untouched.
 fn supported_efforts(key: &ProviderKeyRow, model: &str) -> Option<Box<[Effort]>> {
-    let entry = key.models.as_ref()?.iter().find(|entry| entry.id == model)?;
+    let entry = key
+        .models
+        .as_ref()?
+        .iter()
+        .find(|entry| entry.id == model)?;
     let mut levels: Vec<Effort> = entry
         .effort_levels
         .iter()
@@ -234,4 +238,3 @@ fn make_candidate(
         supported_efforts: supported_efforts(key, model),
     }
 }
-
