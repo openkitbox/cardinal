@@ -50,18 +50,24 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             connect: Duration::from_secs(10),
-            // Response-header deadline (3 minutes): waiting for the first byte is
+            // Response-header deadline (1 minute): waiting for the first byte is
             // the one phase no other bound covers (`connect` ends at the socket,
             // `idle` starts at the first frame). A big prompt on a slow upstream
             // (kimi's coding-plan endpoint takes >30s to first byte on a cache
             // miss; measured p99 total 103s, and the slowest legitimate antb
             // request on prod was 124s) is slow to start anywhere, so the relay
             // fails over instead of calling it dead — but 600s only matched the
-            // client's own give-up, so a silent upstream hung the caller for ten
-            // minutes with nothing recorded. 180s keeps ~1.5× headroom over the
-            // slowest observed legitimate start.
+            // client's own give-up. 60s covers the observed p99 start with
+            // headroom.
             opening: Duration::from_secs(60),
-            idle: Duration::from_secs(60),
+            // Inter-frame silence budget (5 minutes): third-party coding-plan
+            // relays stall mid-stream for minutes at a time (glm-code normal
+            // streams run up to 22min; official kimi 343s max with continuous
+            // deltas). 60s cut real thinking-phase silences; 300s aligns with
+            // the client-side consensus (new-api STREAMING_TIMEOUT, Codex
+            // stream_idle_timeout_ms). A truly dead connection is cut by this,
+            // and the pump reports the truncation (see drive_stream).
+            idle: Duration::from_secs(300),
             // Whole-dispatch cap: must clear opening plus a long stream; a stalled
             // stream is cut by idle long before this ever fires.
             total: Duration::from_secs(3600),
