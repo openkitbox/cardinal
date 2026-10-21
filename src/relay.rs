@@ -150,6 +150,9 @@ pub fn extract_effort(protocol: ProtocolId, body: &Value) -> Option<String> {
 /// (`gateway::payload=off` silences bodies without hiding the relay's warns).
 const PAYLOAD_TARGET: &str = "gateway::payload";
 
+/// Tracing target for effort-clamp decisions (one info line per clamped attempt).
+const EFFORT_TARGET: &str = "cardinal::relay::effort";
+
 /// Char-boundary-safe truncation (slicing a multibyte char would panic).
 /// Payload-log rendering cap: one small slack above body_log's capture limit,
 /// so the capture's own boundary-accurate cut still sees the same bytes an
@@ -415,6 +418,7 @@ async fn send_attempt(
                 stream,
                 fields,
                 fixups,
+                supported_efforts,
             )
         }
     };
@@ -594,10 +598,26 @@ fn prepare_translated(
     stream: bool,
     skip: &[&str],
     fixups: ChatFixups,
+    supported_efforts: Option<&[Effort]>,
 ) -> Result<protocol::Prepared, ProtocolError> {
     let source_dialect = translation::dialect(source)?;
     let upstream_dialect = translation::dialect(upstream)?;
-    let (ir, _) = (source_dialect.to_ir)(source_body, translation::ir::NO_DECLARED_LIMIT)?;
+    let (mut ir, _) = (source_dialect.to_ir)(source_body, translation::ir::NO_DECLARED_LIMIT)?;
+    if let (Some(supported), Some(effort)) = (supported_efforts, ir.effort)
+        && !supported.is_empty()
+    {
+        let clamped = effort.clamp_against(supported);
+        if clamped != effort {
+            tracing::info!(
+                target: EFFORT_TARGET,
+                model = target.upstream_model,
+                from = ?effort,
+                to = ?clamped,
+                "effort clamped to upstream model support"
+            );
+            ir.effort = Some(clamped);
+        }
+    }
     let (mut upstream_value, _) = (upstream_dialect.from_ir)(&ir, target.upstream_model)?;
     // The rebuilt tree is already owned, so the DeepSeek dialect edits land in
     // place: a calling assistant turn must be followed straight away by its

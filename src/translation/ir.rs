@@ -111,6 +111,27 @@ impl Effort {
             .unwrap_or(*lowest)
     }
 
+    /// Clamp this effort against a candidate's supported levels (ascending,
+    /// named only, possibly empty). Explicit off passes through; a budget
+    /// folds to its level and keeps the budget shape when no change is due.
+    pub fn clamp_against(self, supported: &[Self]) -> Self {
+        match self {
+            Self::None => self,
+            Self::Budget(budget) => match Self::from_budget(budget) {
+                Some(level) => {
+                    let clamped = level.clamp_to(supported);
+                    if clamped == level {
+                        self
+                    } else {
+                        Self::Budget(clamped.budget())
+                    }
+                }
+                None => self,
+            },
+            named => named.clamp_to(supported),
+        }
+    }
+
     /// The wire name for the Chat-family emitters (Chat `reasoning_effort`,
     /// Responses `reasoning.effort`). Each variant maps back to its canonical
     /// wire name; dispatch clamps the dial against the candidate model's
