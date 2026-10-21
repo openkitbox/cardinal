@@ -246,6 +246,10 @@ pub struct StreamDecoder {
     tool_index: u32,
     saw_payload: bool,
     content_seen: bool,
+    /// Upstream chunk identity, captured for synthesized terminal frames on
+    /// post-commit truncation (cold path only).
+    upstream_id: Option<String>,
+    upstream_model: Option<String>,
 }
 
 impl StreamDecoder {
@@ -281,6 +285,16 @@ impl StreamDecoder {
         self.saw_payload = true;
         if value.get("error").is_some_and(|error| !error.is_null()) {
             return Err(ProtocolError::UpstreamError);
+        }
+        if self.upstream_id.is_none() {
+            if let Some(id) = value.get("id").and_then(Value::as_str) {
+                self.upstream_id = Some(id.to_owned());
+            }
+        }
+        if self.upstream_model.is_none() {
+            if let Some(model) = value.get("model").and_then(Value::as_str) {
+                self.upstream_model = Some(model.to_owned());
+            }
         }
         if let Some(usage) = usage_from(&value) {
             events.push(StreamEvent::Usage(usage.clone()));
@@ -405,6 +419,16 @@ impl StreamDecoder {
         if value.get("error").is_some_and(|error| !error.is_null()) {
             return Err(ProtocolError::UpstreamError);
         }
+        if self.upstream_id.is_none() {
+            if let Some(id) = value.get("id").and_then(Value::as_str) {
+                self.upstream_id = Some(id.to_owned());
+            }
+        }
+        if self.upstream_model.is_none() {
+            if let Some(model) = value.get("model").and_then(Value::as_str) {
+                self.upstream_model = Some(model.to_owned());
+            }
+        }
         if let Some(usage) = usage_from(&value) {
             self.usage = Some(usage);
         }
@@ -472,10 +496,46 @@ impl StreamDecoder {
         self.done && self.finish.is_some()
     }
 
+    /// Upstream chunk `id` captured from the first parsed chunk — the echo
+    /// identity for a synthesized terminal frame on post-commit truncation.
+    pub fn upstream_id(&self) -> Option<&str> {
+        self.upstream_id.as_deref()
+    }
+
+    /// Upstream chunk `model` captured from the first parsed chunk — the echo
+    /// identity for a synthesized terminal frame on post-commit truncation.
+    pub fn upstream_model(&self) -> Option<&str> {
+        self.upstream_model.as_deref()
+    }
+
     /// Whether real content (text / reasoning / tool_calls delta) was observed.
     /// The relay streaming hold's commit signal: once set, the response has
     /// begun reaching the client and must never be replaced by a failover.
     pub fn content_seen(&self) -> bool {
         self.content_seen
     }
+}
+
+/// Synthesized terminal frames for a post-commit upstream truncation
+/// (OpenRouter convention: a chunk carrying `finish_reason:"error"` plus a
+/// top-level `error` object, then the stream terminates — no `[DONE]`).
+pub fn stream_error_frames(
+    id: Option<&str>,
+    model: Option<&str>,
+    message: &str,
+    created: i64,
+) -> Vec<RawFrame> {
+    let chunk = serde_json::json!({
+        "id": id.unwrap_or("cardinal-error"),
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model.unwrap_or("unknown"),
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+        "error": {"message": message, "type": "server_error", "code": 502},
+    });
+    vec![RawFrame {
+        event: None,
+        id: None,
+        data: bytes::Bytes::from(chunk.to_string()),
+    }]
 }
