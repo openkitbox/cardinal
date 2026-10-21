@@ -3,3 +3,4 @@ cardinal-gui
 Taskfile.yml
 config.toml
 reference
+.worktrees/
