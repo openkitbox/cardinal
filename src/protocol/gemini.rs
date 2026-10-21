@@ -489,3 +489,16 @@ impl StreamDecoder {
         self.content_seen
     }
 }
+
+/// Synthesized terminal frames for a post-commit upstream truncation:
+/// an error-shaped SSE data payload, then the stream terminates.
+pub fn stream_error_frames(message: &str) -> Vec<RawFrame> {
+    let payload = serde_json::json!({
+        "error": {"code": 502, "message": message, "status": "UNAVAILABLE"},
+    });
+    vec![RawFrame {
+        event: None,
+        id: None,
+        data: bytes::Bytes::from(payload.to_string()),
+    }]
+}
