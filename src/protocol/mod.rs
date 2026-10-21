@@ -494,6 +494,26 @@ impl Decoder {
         }
     }
 
+    /// Synthesized terminal frames for a post-commit upstream truncation.
+    /// Cold path only: one allocation on the interruption branch, nothing on
+    /// the normal stream.
+    pub fn stream_error_frames(&self, message: &str) -> Vec<sse::RawFrame> {
+        let created = chrono::Utc::now().timestamp();
+        match self {
+            Self::Chat(decoder) => openai_chat::stream_error_frames(
+                decoder.upstream_id(),
+                decoder.upstream_model(),
+                message,
+                created,
+            ),
+            Self::Responses(_) => openai_responses::stream_error_frames(message),
+            Self::Messages(_) => anthropic_messages::stream_error_frames(message),
+            Self::Gemini(_) => gemini::stream_error_frames(message),
+            // A stream that cannot exist never carried content to truncate.
+            Self::Unstreamed => Vec::new(),
+        }
+    }
+
     /// Whether any real content (text / reasoning / tool-call delta) has been
     /// observed on either the event or the relay path. The relay streaming hold
     /// commits (stops buffering, starts forwarding) the moment this flips.
