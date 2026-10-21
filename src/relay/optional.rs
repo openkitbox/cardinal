@@ -13,7 +13,10 @@ use serde_json::Value;
 use std::sync::OnceLock;
 
 /// Request fields a request does without: an upstream that refuses one by
-/// name is asked again without it.
+/// name is asked again without it. `reasoning_effort` rides this list so a
+/// model that refuses the whole field is learned and pre-stripped instead of
+/// re-400ing; value-level rejections (`expected one of …`) are NOT learned
+/// here.
 pub const OPTIONAL_FIELDS: &[&str] = &[
     "store",
     "metadata",
@@ -26,6 +29,7 @@ pub const OPTIONAL_FIELDS: &[&str] = &[
     "verbosity",
     "thinking",
     "enable_thinking",
+    "reasoning_effort",
 ];
 
 /// Upper bound on strip-and-retry rounds for one send. Each round strips at
