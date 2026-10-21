@@ -358,6 +358,23 @@ impl StreamDecoder {
     }
 }
 
+/// Synthesized terminal frames for a post-commit upstream truncation:
+/// the protocol's own `error` stream event (not `response.failed` — that one
+/// needs the full response object), then the stream terminates.
+pub fn stream_error_frames(message: &str) -> Vec<RawFrame> {
+    let payload = serde_json::json!({
+        "type": "error",
+        "code": "server_error",
+        "message": message,
+        "param": serde_json::Value::Null,
+    });
+    vec![RawFrame {
+        event: Some("error".to_owned()),
+        id: None,
+        data: bytes::Bytes::from(payload.to_string()),
+    }]
+}
+
 /// The `type` strings whose presence marks a frame worth a full parse on the
 /// relay fast path.
 const TERMINAL_SNIFF: &[&str] = &[
