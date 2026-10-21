@@ -265,6 +265,9 @@ pub(super) struct StreamOutcome {
     /// None for a stream that died contentless.
     pub(super) ttft_ms: Option<i64>,
     pub(super) captured: Option<CapturedBody>,
+    /// Post-commit upstream truncation note, recorded to the ledger's error
+    /// column; None on a clean stream.
+    pub(super) interrupted: Option<String>,
 }
 
 /// Live-activity reporter for one streaming attempt: counts client-bound
@@ -331,7 +334,7 @@ pub(super) fn spawn_stream_pump(
 ) -> tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
     tokio::spawn(async move {
-        let (usage, ttft_ms, captured) =
+        let (usage, ttft_ms, captured, interrupted) =
             drive_stream(&mut reader, pump, &tx, commit_tx, side).await;
         drop(reader); // release the upstream response
         drop(tx); // close the client stream
@@ -343,6 +346,7 @@ pub(super) fn spawn_stream_pump(
             usage,
             ttft_ms,
             captured,
+            interrupted,
         });
     });
     rx
@@ -361,7 +365,12 @@ async fn drive_stream(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     commit_tx: tokio::sync::oneshot::Sender<HoldSignal>,
     side: PumpSide,
-) -> (Option<StreamUsage>, Option<i64>, Option<CapturedBody>) {
+) -> (
+    Option<StreamUsage>,
+    Option<i64>,
+    Option<CapturedBody>,
+    Option<String>,
+) {
     let PumpSide {
         payload_log,
         mut captured,
@@ -376,6 +385,10 @@ async fn drive_stream(
     // tool-call delta — role-only deltas don't count); the pump just reads the
     // flag after each observe.
     let mut ttft_ms: Option<i64> = None;
+    // Post-commit upstream truncation note (see [`StreamOutcome::interrupted`]):
+    // set only on the paths where the client's stream ends without the
+    // upstream's own terminal frame.
+    let mut interrupted: Option<String> = None;
     let mut hold = Some(HoldState::new());
     let mut commit_tx = Some(commit_tx);
     // One SSE render buffer for the whole pump: every send freezes its bytes
@@ -389,7 +402,7 @@ async fn drive_stream(
                 // A client that left mid-hold never commits: stop, don't fail over.
                 if hold.is_some() && tx.is_closed() {
                     signal_hold(&mut commit_tx, HoldSignal::ClientGone);
-                    return (None, ttft_ms, captured);
+                    return (None, ttft_ms, captured, None);
                 }
                 match read_frame(reader.next_raw_frame(), hold.as_ref()).await {
                     PumpRead::WindowExpired => {
@@ -438,7 +451,7 @@ async fn drive_stream(
                                         activity.frame(bytes);
                                     }
                                 }
-                                Err(_) => return (None, ttft_ms, captured), // client disconnected
+                                Err(_) => return (None, ttft_ms, captured, None), // client disconnected
                             }
                         }
                     }
@@ -461,8 +474,29 @@ async fn drive_stream(
                                     "stream ended before the commit point; aborting for failover"
                                 );
                                 signal_hold(&mut commit_tx, HoldSignal::Aborted);
-                                return (None, ttft_ms, captured);
+                                return (None, ttft_ms, captured, None);
                             }
+                        }
+                        // EOF without any closing signal (no finish_reason
+                        // chunk, no [DONE]) is still a truncation (B §4.2):
+                        // end the client stream with an explicit error frame
+                        // instead of a bare close.
+                        if !decoder.wire_terminal_seen() {
+                            let message = "upstream stream ended without terminal frame";
+                            for frame in decoder.stream_error_frames(message) {
+                                if let Some(captured) = &mut captured {
+                                    captured.push(&frame.data);
+                                }
+                                match send_frame(tx, &frame, &mut wire).await {
+                                    Ok(bytes) => {
+                                        if let Some(activity) = &mut activity {
+                                            activity.frame(bytes);
+                                        }
+                                    }
+                                    Err(_) => return (None, ttft_ms, captured, None),
+                                }
+                            }
+                            interrupted = Some(message.to_owned());
                         }
                         break;
                     }
@@ -472,13 +506,28 @@ async fn drive_stream(
                                 "stream read failed before the commit point ({error}); aborting for failover"
                             );
                             signal_hold(&mut commit_tx, HoldSignal::Aborted);
-                            return (None, ttft_ms, captured);
+                            return (None, ttft_ms, captured, None);
                         }
                         tracing::warn!(
                             request_id = %request_id,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "upstream stream interrupted: {error}"
                         );
+                        let message = format!("upstream stream interrupted: {error}");
+                        for frame in decoder.stream_error_frames(&message) {
+                            if let Some(captured) = &mut captured {
+                                captured.push(&frame.data);
+                            }
+                            match send_frame(tx, &frame, &mut wire).await {
+                                Ok(bytes) => {
+                                    if let Some(activity) = &mut activity {
+                                        activity.frame(bytes);
+                                    }
+                                }
+                                Err(_) => return (None, ttft_ms, captured, None), // client disconnected
+                            }
+                        }
+                        interrupted = Some(message);
                         break;
                     }
                 }
@@ -493,7 +542,7 @@ async fn drive_stream(
             while !done {
                 if hold.is_some() && tx.is_closed() {
                     signal_hold(&mut commit_tx, HoldSignal::ClientGone);
-                    return (None, ttft_ms, captured);
+                    return (None, ttft_ms, captured, None);
                 }
                 match read_frame(reader.next_raw_frame(), hold.as_ref()).await {
                     PumpRead::WindowExpired => {
@@ -572,7 +621,7 @@ async fn drive_stream(
                                             activity.frame(bytes);
                                         }
                                     }
-                                    Err(_) => return (None, ttft_ms, captured), // client disconnected
+                                    Err(_) => return (None, ttft_ms, captured, None), // client disconnected
                                 }
                             }
                         }
@@ -612,14 +661,24 @@ async fn drive_stream(
                                     "translated stream ended before the commit point; aborting for failover"
                                 );
                                 signal_hold(&mut commit_tx, HoldSignal::Aborted);
-                                return (None, ttft_ms, captured);
+                                return (None, ttft_ms, captured, None);
                             }
                             break;
                         }
-                        // Upstream EOF: finish as Completed; a truncated stream counts as Incomplete.
-                        if let Ok(frames) =
-                            translator.close_after_eof(protocol::Terminal::Completed)
+                        // Upstream EOF: the decoder's verdict decides the close
+                        // (B §4.2) — a stream that never saw its terminal event
+                        // is Incomplete, never a "stop".
+                        let verdict = if matches!(upstream.finish(), protocol::Terminal::Completed)
                         {
+                            protocol::Terminal::Completed
+                        } else {
+                            if !upstream.terminal_seen() {
+                                interrupted =
+                                    Some("upstream stream ended without terminal frame".to_owned());
+                            }
+                            protocol::Terminal::Incomplete
+                        };
+                        if let Ok(frames) = translator.close_after_eof(verdict) {
                             if let Some(captured) = &mut captured {
                                 for frame in &frames {
                                     captured.push(&frame.data);
@@ -632,7 +691,7 @@ async fn drive_stream(
                                             activity.frame(bytes);
                                         }
                                     }
-                                    Err(_) => return (None, ttft_ms, captured),
+                                    Err(_) => return (None, ttft_ms, captured, None),
                                 }
                             }
                         }
@@ -644,13 +703,14 @@ async fn drive_stream(
                                 "translated stream read failed before the commit point ({error}); aborting for failover"
                             );
                             signal_hold(&mut commit_tx, HoldSignal::Aborted);
-                            return (None, ttft_ms, captured);
+                            return (None, ttft_ms, captured, None);
                         }
                         tracing::warn!(
                             request_id = %request_id,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "upstream stream interrupted: {error}"
                         );
+                        interrupted = Some(format!("upstream stream interrupted: {error}"));
                         if let Ok(frames) =
                             translator.close_after_eof(protocol::Terminal::Incomplete)
                         {
@@ -666,7 +726,7 @@ async fn drive_stream(
                                             activity.frame(bytes);
                                         }
                                     }
-                                    Err(_) => return (None, ttft_ms, captured),
+                                    Err(_) => return (None, ttft_ms, captured, None),
                                 }
                             }
                         }
@@ -683,7 +743,7 @@ async fn drive_stream(
         cache_creation_input_tokens: counts.cache_creation_input_tokens.map(|v| v as i64),
         cache_creation_1h_input_tokens: counts.cache_creation_1h_input_tokens.map(|v| v as i64),
     });
-    (usage, ttft_ms, captured)
+    (usage, ttft_ms, captured, interrupted)
 }
 
 /// Render one frame into SSE wire bytes. `wire` is a render buffer reused

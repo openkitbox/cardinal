@@ -494,6 +494,18 @@ impl Decoder {
         }
     }
 
+    /// Whether the wire stream carried any closing signal (see the per-kernel
+    /// `wire_terminal_seen`); post-commit synthesis gate.
+    pub fn wire_terminal_seen(&self) -> bool {
+        match self {
+            Self::Chat(decoder) => decoder.wire_terminal_seen(),
+            Self::Responses(decoder) => decoder.terminal_seen(),
+            Self::Messages(decoder) => decoder.terminal_seen(),
+            Self::Gemini(decoder) => decoder.terminal_seen(),
+            Self::Unstreamed => false,
+        }
+    }
+
     /// Synthesized terminal frames for a post-commit upstream truncation.
     /// Cold path only: one allocation on the interruption branch, nothing on
     /// the normal stream.

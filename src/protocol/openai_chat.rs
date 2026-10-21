@@ -496,6 +496,14 @@ impl StreamDecoder {
         self.done && self.finish.is_some()
     }
 
+    /// Whether the wire stream carried any closing signal — a finish_reason
+    /// chunk or the `[DONE]` marker. Post-commit synthesis only fires when
+    /// neither arrived (B §4.2): a delivered finish_reason already closes the
+    /// client stream, so an error chunk on top would contradict it.
+    pub fn wire_terminal_seen(&self) -> bool {
+        self.finish.is_some() || self.done
+    }
+
     /// Upstream chunk `id` captured from the first parsed chunk — the echo
     /// identity for a synthesized terminal frame on post-commit truncation.
     pub fn upstream_id(&self) -> Option<&str> {
