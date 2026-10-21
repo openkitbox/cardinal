@@ -325,6 +325,66 @@ struct RouteBody {
     /// Admin-facing display note; absent/empty on old clients clears it.
     #[serde(default)]
     note: Option<String>,
+    /// 三态:缺席 = 保留库值;`null` = 清除回 legacy 派生;数组 = 设置。
+    #[serde(default, deserialize_with = "de_efforts_field")]
+    efforts: EffortsField,
+}
+
+/// `PUT /api/routes` 的 efforts 字段三态(见 [`store::EffortsUpdate`])。
+#[derive(Default)]
+enum EffortsField {
+    #[default]
+    Absent,
+    Null,
+    Values(Vec<String>),
+}
+
+fn de_efforts_field<'de, D>(deserializer: D) -> Result<EffortsField, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // An untagged `Option<Raw>` cannot express the three states: serde turns a
+    // JSON `null` into `Option::None` before any variant is tried, collapsing
+    // "explicit null" into "absent". A visitor sees `visit_none` for null
+    // (absence never reaches it — `#[serde(default)]` covers that), so the
+    // clear state stays distinguishable from the preserve state.
+    struct TripleState;
+
+    impl<'de> serde::de::Visitor<'de> for TripleState {
+        type Value = EffortsField;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("null or a list of effort level names")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<EffortsField, E> {
+            Ok(EffortsField::Null)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<EffortsField, E> {
+            Ok(EffortsField::Null)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<EffortsField, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<EffortsField, A::Error> {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element::<String>()? {
+                values.push(value);
+            }
+            Ok(EffortsField::Values(values))
+        }
+    }
+
+    deserializer.deserialize_option(TripleState)
 }
 
 /// The 400 body for a malformed `PUT /api/routes/{alias}`. An unknown
@@ -365,6 +425,11 @@ async fn put_route(request: &mut Request, depot: &mut Depot, response: &mut Resp
         let _ = response.body(INVALID_ROUTE_BODY);
         return;
     };
+    let efforts = match body.efforts {
+        EffortsField::Absent => store::EffortsUpdate::Preserve,
+        EffortsField::Null => store::EffortsUpdate::Set(None),
+        EffortsField::Values(names) => store::EffortsUpdate::Set(Some(names)),
+    };
     match store::put_route(
         pool,
         &alias,
@@ -372,6 +437,7 @@ async fn put_route(request: &mut Request, depot: &mut Depot, response: &mut Resp
         body.context_window,
         body.strategy,
         body.note,
+        efforts,
     )
     .await
     {

@@ -602,7 +602,8 @@ impl GatewayHttpClient {
     /// Create or replace a route (alias → key/model entries) with its dispatch
     /// `strategy` and optional display `note`. Strategy and note are always
     /// sent; the server defaults an absent strategy to `ordered` and treats an
-    /// absent note as unset, for old clients.
+    /// absent note as unset, for old clients. `efforts` 缺席时字段不发送,
+    /// 服务端保留库值(三态);传 `Some(&[])` 显式清空变体。
     pub async fn put_route(
         &self,
         alias: &str,
@@ -610,8 +611,12 @@ impl GatewayHttpClient {
         context_window: Option<i64>,
         strategy: RouteStrategy,
         note: Option<&str>,
+        efforts: Option<&[String]>,
     ) -> Result<(), ClientError> {
-        let body = serde_json::json!({ "entries": entries, "context_window": context_window, "strategy": strategy, "note": note });
+        let mut body = serde_json::json!({ "entries": entries, "context_window": context_window, "strategy": strategy, "note": note });
+        if let Some(efforts) = efforts {
+            body["efforts"] = serde_json::json!(efforts);
+        }
         ok(self.put(&format!("/api/routes/{alias}")).json(&body)).await
     }
 
