@@ -23,9 +23,9 @@ pub(crate) const SYSTEM_JOIN: &str = "\n\n";
 ///
 /// [`Effort::None`] is an *explicit* client request to turn reasoning off; an
 /// absent `Option` means the client said nothing. Wire names map as follows:
-/// `minimal` → `Low`, `none` → `None`, `ultra` → `Max`, the remaining names
-/// pass through. The off state is modelled explicitly so emitters can honour
-/// it exactly.
+/// `minimal` → `Low`, `none`/`off` → `None`, `ultra` → `Max`, the remaining
+/// names pass through. The off state is modelled explicitly so emitters can
+/// honour it exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effort {
     None,
@@ -41,10 +41,12 @@ pub enum Effort {
 impl Effort {
     /// Parse a wire effort name (Chat `reasoning_effort`, Anthropic
     /// `output_config.effort`). Unknown names are dropped by the caller.
+    /// Vendors disagree on the explicit-off marker (`none` on DeepSeek,
+    /// `off` on Kimi), so both parse to [`Self::None`].
     pub fn parse_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "minimal" => Some(Self::Low),
-            "none" => Some(Self::None),
+            "none" | "off" => Some(Self::None),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),

@@ -65,6 +65,18 @@ pub(crate) fn provider_kind(name: &str) -> (&str, bool) {
     (vendor, segments.any(|segment| segment == "code"))
 }
 
+/// The wire name a vendor's Chat-family effort dial uses for the explicit-off
+/// state. Vendors disagree (`off` on Kimi, `none` on DeepSeek/OpenAI), so the
+/// relay normalizes the client's `none`/`off` to the target's own marker
+/// instead of forwarding a value the upstream rejects. Unknown vendors keep
+/// the OpenAI spelling.
+pub fn effort_off_name(provider_name: &str) -> &'static str {
+    match provider_kind(provider_name) {
+        ("kimi", _) => "off",
+        _ => "none",
+    }
+}
+
 /// `scheme://host[:port]` of a base_url, when it parses as http(s).
 pub(crate) fn origin_of(base_url: &str) -> Option<String> {
     let url = reqwest::Url::parse(base_url.trim()).ok()?;

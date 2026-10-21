@@ -19,8 +19,8 @@ const ERROR_SNIPPET: usize = 200;
 /// carries. Most vendor endpoints return ids only; the optional fields are
 /// populated when the wire says so. Two attribute namings are read:
 /// OpenRouter-flavoured (`context_length`, `modalities.input`) and
-/// DeepSeek-flavoured (`context_window`, flat `input_modalities`,
-/// `effort.supported_levels`).
+/// DeepSeek/Kimi-flavoured (`context_window`, flat `input_modalities`, and the
+/// effort block in any of its published shapes — see the model-list parser).
 ///
 /// The struct is also the wire shape of a key's persisted model-list snapshot
 /// (`gateway_provider_keys.models`), so it round-trips through serde; the
@@ -40,6 +40,11 @@ pub struct ProbeModel {
     /// Reasoning effort levels the list says the model takes.
     #[serde(default)]
     pub effort_levels: Vec<String>,
+    /// The vendor's default reasoning level, canonical; `None` when the list
+    /// does not name one. Dispatch falls back to it when a client sends a
+    /// level outside the closed vocabulary.
+    #[serde(default)]
+    pub default_effort: Option<String>,
 }
 
 /// Fetch the models a key can list at a provider endpoint.
@@ -239,15 +244,35 @@ fn parse_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
         /// no agent can talk to it.
         #[serde(rename = "supportedGenerationMethods")]
         supported_generation_methods: Option<Vec<String>>,
-        effort: Option<Effort>,
+        /// DeepSeek: `effort.supported_levels` + `default_level`.
+        effort: Option<EffortBlock>,
+        /// Kimi: `think_efforts.valid_efforts` + `default_effort`.
+        think_efforts: Option<EffortBlock>,
+        /// Kimi's alternate spelling: `reasoning.effort.valid` + `default`.
+        reasoning: Option<Reasoning>,
     }
     #[derive(serde::Deserialize)]
     struct Modalities {
         input: Vec<String>,
     }
     #[derive(serde::Deserialize)]
-    struct Effort {
+    struct EffortBlock {
+        #[serde(default)]
         supported_levels: Vec<String>,
+        #[serde(default)]
+        valid_efforts: Vec<String>,
+        #[serde(default)]
+        valid: Vec<String>,
+        #[serde(default)]
+        default_level: Option<String>,
+        #[serde(default)]
+        default_effort: Option<String>,
+        #[serde(default)]
+        default: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Reasoning {
+        effort: Option<EffortBlock>,
     }
     fn token_count(value: serde_json::Value) -> Option<u64> {
         match value {
@@ -304,18 +329,53 @@ fn parse_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
             {
                 input_modalities.push("image".into());
             }
-            let effort_levels = entry
-                .effort
-                .map(|effort| {
-                    crate::translation::ir::Effort::canonical_levels(&effort.supported_levels)
-                })
-                .unwrap_or_default();
+            // Vendors publish the same effort data under different names:
+            // DeepSeek `effort.supported_levels`, Kimi `think_efforts.valid_efforts`
+            // or `reasoning.effort.valid`. Take the first block that actually
+            // lists levels, and its matching default.
+            let effort = [
+                entry.effort,
+                entry.think_efforts,
+                entry.reasoning.and_then(|reasoning| reasoning.effort),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|block| {
+                !block.supported_levels.is_empty()
+                    || !block.valid_efforts.is_empty()
+                    || !block.valid.is_empty()
+            });
+            let (effort_levels, default_effort) = match effort {
+                Some(effort) => {
+                    let levels = if !effort.supported_levels.is_empty() {
+                        effort.supported_levels
+                    } else if !effort.valid_efforts.is_empty() {
+                        effort.valid_efforts
+                    } else {
+                        effort.valid
+                    };
+                    let default = effort
+                        .default_level
+                        .or(effort.default_effort)
+                        .or(effort.default);
+                    let levels = crate::translation::ir::Effort::canonical_levels(&levels);
+                    let default = default
+                        .as_deref()
+                        .and_then(crate::translation::ir::Effort::parse_name)
+                        .filter(|level| !matches!(level, crate::translation::ir::Effort::None))
+                        .map(crate::translation::ir::Effort::chat_name)
+                        .map(str::to_owned);
+                    (levels, default)
+                }
+                None => (Vec::new(), None),
+            };
             Some(ProbeModel {
                 id,
                 context,
                 max_output,
                 input_modalities,
                 effort_levels,
+                default_effort,
             })
         })
         .collect();

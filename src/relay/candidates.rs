@@ -35,8 +35,11 @@ pub struct Candidate {
     pub entry_cap: Option<i32>,
     /// Effort levels the candidate's snapshot says its upstream model accepts,
     /// canonical and ascending. `None` = unconstrained (no snapshot, model
-    /// absent from it, or nothing listed): dispatch passes effort through.
+    /// absent from it, or nothing listed).
     pub supported_efforts: Option<Box<[Effort]>>,
+    /// The vendor-declared default level for this model, canonical; `None`
+    /// when the snapshot does not name one.
+    pub default_effort: Option<Effort>,
 }
 
 impl Candidate {
@@ -61,15 +64,19 @@ fn serves_model(key: &ProviderKeyRow, upstream_model: &str) -> bool {
     })
 }
 
-/// The candidate model's supported effort levels from the key's cached
-/// model-list snapshot, canonicalized and ascending. `None` when the snapshot
-/// cannot answer — dispatch then leaves the client's dial untouched.
-fn supported_efforts(key: &ProviderKeyRow, model: &str) -> Option<Box<[Effort]>> {
-    let entry = key
+/// The candidate model's effort dial from the key's cached model-list
+/// snapshot: canonical levels (ascending) plus the vendor-declared default.
+/// A missing snapshot/model or an empty level list yields `(None, default)`,
+/// meaning dispatch does not clamp (the default may still repair unknown
+/// names).
+fn effort_support(key: &ProviderKeyRow, model: &str) -> (Option<Box<[Effort]>>, Option<Effort>) {
+    let Some(entry) = key
         .models
-        .as_ref()?
-        .iter()
-        .find(|entry| entry.id == model)?;
+        .as_ref()
+        .and_then(|models| models.iter().find(|entry| entry.id == model))
+    else {
+        return (None, None);
+    };
     let mut levels: Vec<Effort> = entry
         .effort_levels
         .iter()
@@ -78,10 +85,15 @@ fn supported_efforts(key: &ProviderKeyRow, model: &str) -> Option<Box<[Effort]>>
         .collect();
     levels.sort_by_key(|level| level.rank().unwrap_or(u8::MAX));
     levels.dedup();
+    let default = entry
+        .default_effort
+        .as_deref()
+        .and_then(Effort::parse_name)
+        .filter(|level| !matches!(level, Effort::None));
     if levels.is_empty() {
-        return None;
+        return (None, default);
     }
-    Some(levels.into_boxed_slice())
+    (Some(levels.into_boxed_slice()), default)
 }
 
 /// Direct path ("<provider>/<model>"): the provider's enabled keys — which must arrive in global
@@ -95,7 +107,7 @@ pub fn expand_direct(
     let mut candidates = Vec::new();
     let mut excluded = Vec::new();
     for (key, secret) in keys {
-        let supported = supported_efforts(&key, upstream_model);
+        let (supported, default) = effort_support(&key, upstream_model);
         if !key.enabled {
             excluded.push((
                 Candidate {
@@ -106,6 +118,7 @@ pub fn expand_direct(
                     route_alias: None,
                     entry_cap: None,
                     supported_efforts: supported.clone(),
+                    default_effort: default,
                 },
                 SkipReason::Disabled,
             ));
@@ -121,6 +134,7 @@ pub fn expand_direct(
                     route_alias: None,
                     entry_cap: None,
                     supported_efforts: supported.clone(),
+                    default_effort: default,
                 },
                 SkipReason::ModelNotAllowed,
             ));
@@ -134,6 +148,7 @@ pub fn expand_direct(
             route_alias: None,
             entry_cap: None,
             supported_efforts: supported,
+            default_effort: default,
         });
     }
     (candidates, excluded)
@@ -222,6 +237,7 @@ fn make_candidate(
     model: &str,
     entry: &RouteEntry,
 ) -> Candidate {
+    let (supported, default) = effort_support(key, model);
     Candidate {
         key: key.clone(),
         // A key serving several entries clones its secret per candidate (each
@@ -235,6 +251,7 @@ fn make_candidate(
         entry_cap: entry
             .max_concurrency
             .and_then(|cap| i32::try_from(cap).ok()),
-        supported_efforts: supported_efforts(key, model),
+        supported_efforts: supported,
+        default_effort: default,
     }
 }

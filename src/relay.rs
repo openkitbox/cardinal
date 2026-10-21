@@ -89,9 +89,15 @@ const MAX_PAYLOAD_LOG_BYTES: usize = 64 * 1024;
 /// `thinking.budget_tokens` to a level (thinking must be enabled/adaptive — a
 /// title request with effort but no thinking stays effortless) and lets
 /// `output_config.effort` override it.
-/// Levels normalize to low/medium/high/xhigh/max; None = no effort named.
+/// Levels normalize to low/medium/high/xhigh/max, explicit off to `off`;
+/// None = no effort named.
 pub fn extract_effort(protocol: ProtocolId, body: &Value) -> Option<String> {
-    let name = |raw: &str| Effort::parse_name(raw).map(|effort| effort.chat_name().to_owned());
+    let name = |raw: &str| {
+        Effort::parse_name(raw).map(|effort| match effort {
+            Effort::None => "off".to_owned(),
+            named => named.chat_name().to_owned(),
+        })
+    };
     match protocol {
         ProtocolId::OpenAiChat => body
             .get("reasoning_effort")
@@ -328,6 +334,11 @@ struct AttemptContext<'a> {
     /// This candidate model's supported effort levels (ascending, named only);
     /// `None` = unconstrained.
     supported_efforts: Option<&'a [Effort]>,
+    /// The vendor-declared default level, used to repair names outside the
+    /// closed vocabulary.
+    default_effort: Option<Effort>,
+    /// The vendor's explicit-off wire marker (`off` on Kimi, `none` elsewhere).
+    effort_off_name: &'static str,
 }
 
 /// Shared send for both attempt flavors: prepare (passthrough or translated),
@@ -355,6 +366,8 @@ async fn send_attempt(
         opencode_seed,
         fixups,
         supported_efforts,
+        default_effort,
+        effort_off_name,
     } = *ctx;
     // The selected capability IS the upstream protocol: passthrough when it
     // matches the client protocol, translation target otherwise.
@@ -396,17 +409,24 @@ async fn send_attempt(
         join_split_tool_call_turns(body);
         fill_missing_reasoning(body);
     }
-    // Passthrough carries the client's own wire shape — no IR to clamp. Plan
-    // read-only first and materialize one owned copy only when a rewrite is due
-    // (same Cow discipline as the fixups above).
+    // Passthrough carries the client's own wire shape — no IR to normalize.
+    // Even without a snapshot, the dial is scrubbed against the closed
+    // vocabulary: aliases become canonical names and unknown/off values are
+    // repaired to the vendor's own markers, so a strict upstream never sees a
+    // name it would 400 on. Plan read-only first and materialize one owned
+    // copy only when a rewrite is due (same Cow discipline as the fixups).
     let mut clamp_note: Option<(String, String)> = None;
-    if request.protocol == protocol
-        && let Some(supported) = supported_efforts
-    {
+    if request.protocol == protocol {
         let current: &Value = adapted_body
             .as_ref()
             .map_or(&request.body, std::borrow::Cow::as_ref);
-        let rewrites = translation::effort_clamp::plan(protocol, current, supported);
+        let rewrites = translation::effort_clamp::plan(
+            protocol,
+            current,
+            supported_efforts.unwrap_or(&[]),
+            default_effort,
+            effort_off_name,
+        );
         if !rewrites.is_empty() {
             let body = adapted_body
                 .get_or_insert(std::borrow::Cow::Borrowed(&request.body))
@@ -421,7 +441,7 @@ async fn send_attempt(
             provider_id,
             from,
             to,
-            "effort clamped to upstream model support"
+            "effort normalized for upstream"
         );
     }
     let passthrough_body: &Value = adapted_body
@@ -1673,6 +1693,8 @@ pub async fn dispatch_at(
                         opencode_seed: opencode_seed.as_deref(),
                         fixups,
                         supported_efforts: candidate.supported_efforts.as_deref(),
+                        default_effort: candidate.default_effort,
+                        effort_off_name: capabilities::effort_off_name(&provider.name),
                     },
                     target_model,
                     request,

@@ -25,7 +25,9 @@ use crate::store::{KeyModels, RouteRow};
 ///   extra input modalities (a modality is advertised only when every member
 ///   lists it);
 /// - `reasoning: true` + `supported_reasoning_levels`: the intersection of
-///   members' effort levels, in the first member's order, only when non-empty.
+///   the members that DECLARE effort levels (a member whose list is silent is
+///   treated as unconstrained, not as a veto), in the first declaring member's
+///   order, only when non-empty.
 ///
 /// Any entry that fails to resolve (key deleted, snapshot missing, model not
 /// in the snapshot) voids ALL derived fields; a declared context window is
@@ -74,11 +76,15 @@ pub fn route_model_object(route: &RouteRow, keys: &[KeyModels], chat_capable: bo
     object["modalities"] = json!({ "input": ["text", "image"] });
     // Snapshots may predate the probe-side normalization: canonicalize on the
     // way in so the advertised levels always match the request-side vocabulary.
-    let normalized: Vec<Vec<String>> = members
+    // A member that declares nothing is not a veto — most vendors' model lists
+    // carry no effort block at all, while dispatch clamps/normalizes per
+    // candidate anyway.
+    let declared: Vec<Vec<String>> = members
         .iter()
         .map(|model| crate::translation::ir::Effort::canonical_levels(&model.effort_levels))
+        .filter(|levels| !levels.is_empty())
         .collect();
-    let efforts = intersection(normalized.iter().map(Vec::as_slice));
+    let efforts = intersection(declared.iter().map(Vec::as_slice));
     if !efforts.is_empty() {
         object["reasoning"] = true.into();
         object["supported_reasoning_levels"] = efforts

@@ -31,6 +31,15 @@ impl Slot {
     }
 }
 
+/// The target model's effort vocabulary: declared levels (empty = unknown),
+/// vendor default, and the vendor's explicit-off wire marker.
+#[derive(Clone, Copy)]
+struct Dial<'a> {
+    supported: &'a [Effort],
+    default: Option<Effort>,
+    off_name: &'a str,
+}
+
 /// One planned rewrite: where it lands, its wire value, and the human-readable
 /// values for the clamp log line.
 #[derive(Clone, Debug)]
@@ -42,13 +51,27 @@ pub struct Rewrite {
 }
 
 /// Plan the effort rewrites a passthrough body needs, without touching it.
-/// Empty when the client's dial is absent, outside the closed vocabulary,
-/// already supported, or the protocol has no effort concept.
-pub fn plan(protocol: ProtocolId, body: &Value, supported: &[Effort]) -> Vec<Rewrite> {
-    if supported.is_empty() {
-        return Vec::new();
-    }
+/// Empty when the client's dial is absent, already in the upstream's wire
+/// vocabulary, or the protocol has no effort concept.
+///
+/// `supported` is the target model's declared level set (empty = unknown) and
+/// `default` its vendor-declared fallback. `off_name` is the vendor's explicit
+/// off marker. Values outside the closed vocabulary are repaired to `default`
+/// (or a neutral medium) rather than forwarded to a strict upstream that would
+/// answer 400.
+pub fn plan(
+    protocol: ProtocolId,
+    body: &Value,
+    supported: &[Effort],
+    default: Option<Effort>,
+    off_name: &str,
+) -> Vec<Rewrite> {
     let mut rewrites = Vec::new();
+    let dial = Dial {
+        supported,
+        default,
+        off_name,
+    };
     match protocol {
         ProtocolId::OpenAiChat => {
             push_name(
@@ -56,14 +79,14 @@ pub fn plan(protocol: ProtocolId, body: &Value, supported: &[Effort]) -> Vec<Rew
                 body,
                 Slot::ReasoningEffort,
                 &["reasoning_effort"],
-                supported,
+                dial,
             );
             push_name(
                 &mut rewrites,
                 body,
                 Slot::ThinkingEffort,
                 &["thinking", "effort"],
-                supported,
+                dial,
             );
         }
         ProtocolId::OpenAiResponses => {
@@ -72,7 +95,7 @@ pub fn plan(protocol: ProtocolId, body: &Value, supported: &[Effort]) -> Vec<Rew
                 body,
                 Slot::ReasoningNestedEffort,
                 &["reasoning", "effort"],
-                supported,
+                dial,
             );
         }
         ProtocolId::AnthropicMessages => {
@@ -81,7 +104,7 @@ pub fn plan(protocol: ProtocolId, body: &Value, supported: &[Effort]) -> Vec<Rew
                 body,
                 Slot::OutputConfigEffort,
                 &["output_config", "effort"],
-                supported,
+                dial,
             );
             push_budget(&mut rewrites, body, supported);
         }
@@ -111,27 +134,27 @@ fn value_at<'a>(body: &'a Value, path: &[&str]) -> Option<&'a Value> {
     Some(current)
 }
 
-fn push_name(
-    rewrites: &mut Vec<Rewrite>,
-    body: &Value,
-    slot: Slot,
-    path: &[&str],
-    supported: &[Effort],
-) {
+fn push_name(rewrites: &mut Vec<Rewrite>, body: &Value, slot: Slot, path: &[&str], dial: Dial<'_>) {
     let Some(raw) = value_at(body, path).and_then(Value::as_str) else {
         return;
     };
-    let Some(level) = Effort::parse_name(raw) else {
-        return;
+    let name = match Effort::parse_name(raw) {
+        // Explicit off: encode it with the target vendor's own marker.
+        Some(Effort::None) => dial.off_name.to_owned(),
+        Some(level) => level.clamp_against(dial.supported).chat_name().to_owned(),
+        // Outside the closed vocabulary: repair to the vendor default instead
+        // of forwarding a name the upstream would reject.
+        None => dial
+            .default
+            .filter(|level| !matches!(*level, Effort::None))
+            .unwrap_or(Effort::Medium)
+            .clamp_against(dial.supported)
+            .chat_name()
+            .to_owned(),
     };
-    if matches!(level, Effort::None) {
+    if raw == name {
         return;
     }
-    let clamped = level.clamp_against(supported);
-    if clamped == level {
-        return;
-    }
-    let name = clamped.chat_name().to_owned();
     rewrites.push(Rewrite {
         slot,
         from: raw.to_owned(),
