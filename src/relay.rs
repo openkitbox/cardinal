@@ -1900,8 +1900,9 @@ pub async fn dispatch_at(
                                 .unwrap_or_default();
                             price.cost_split(input, output, cached, written, written_1h)
                         });
-                        let interrupted =
-                            outcome.as_ref().and_then(|outcome| outcome.interrupted.clone());
+                        let interrupted = outcome
+                            .as_ref()
+                            .and_then(|outcome| outcome.interrupted.clone());
                         let attempt = AttemptLog {
                             protocol: attempt_protocol,
                             client_protocol: Some(client_protocol),
