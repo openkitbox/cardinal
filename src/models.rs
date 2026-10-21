@@ -24,14 +24,16 @@ use crate::store::{KeyModels, RouteRow};
 /// - `modalities.input`: `["text", …]` — the intersection of all members'
 ///   extra input modalities (a modality is advertised only when every member
 ///   lists it);
-/// - `reasoning: true` + `supported_reasoning_levels`: the intersection of
+/// - `reasoning: true` + `supported_reasoning_levels`: the route's DECLARED
+///   efforts list when set (`Some([])` suppresses the block entirely — no
+///   reasoning variants, in fixed order otherwise), else the intersection of
 ///   the members that DECLARE effort levels (a member whose list is silent is
 ///   treated as unconstrained, not as a veto), in the first declaring member's
 ///   order, only when non-empty.
 ///
 /// Any entry that fails to resolve (key deleted, snapshot missing, model not
-/// in the snapshot) voids ALL derived fields; a declared context window is
-/// still emitted.
+/// in the snapshot) voids ALL derived fields; a declared context window and a
+/// declared efforts list are still emitted.
 ///
 /// `chat_capable` = the route serves a chat protocol. A retrieval route
 /// (`openai_embeddings`) is listed — OpenAI's own catalog lists embedding
@@ -56,41 +58,61 @@ pub fn route_model_object(route: &RouteRow, keys: &[KeyModels], chat_capable: bo
         object["context_length"] = window.into();
         object["max_input_tokens"] = window.into();
     }
-    let Some(members) = resolve_members(route, keys) else {
-        return object;
-    };
-    if route.context_window.is_none()
-        && let Some(context) = members.iter().map(|model| model.context).min()
-        && let Some(context) = context
-    {
-        object["context_window"] = context.into();
-        object["context_length"] = context.into();
-        object["max_input_tokens"] = context.into();
+    let members = resolve_members(route, keys);
+    if let Some(members) = &members {
+        if route.context_window.is_none()
+            && let Some(context) = members.iter().map(|model| model.context).min()
+            && let Some(context) = context
+        {
+            object["context_window"] = context.into();
+            object["context_length"] = context.into();
+            object["max_input_tokens"] = context.into();
+        }
+        if let Some(Some(max_output)) = members.iter().map(|model| model.max_output).min() {
+            object["max_output_tokens"] = max_output.into();
+        }
+        // Routes are multimodal at the gateway level: every member model in every
+        // route accepts image input, so the route advertises it unconditionally
+        // regardless of what each provider's /models snapshot reports.
+        object["modalities"] = json!({ "input": ["text", "image"] });
     }
-    if let Some(Some(max_output)) = members.iter().map(|model| model.max_output).min() {
-        object["max_output_tokens"] = max_output.into();
-    }
-    // Routes are multimodal at the gateway level: every member model in every
-    // route accepts image input, so the route advertises it unconditionally
-    // regardless of what each provider's /models snapshot reports.
-    object["modalities"] = json!({ "input": ["text", "image"] });
-    // Snapshots may predate the probe-side normalization: canonicalize on the
-    // way in so the advertised levels always match the request-side vocabulary.
-    // A member that declares nothing is not a veto — most vendors' model lists
-    // carry no effort block at all, while dispatch clamps/normalizes per
-    // candidate anyway.
-    let declared: Vec<Vec<String>> = members
-        .iter()
-        .map(|model| crate::translation::ir::Effort::canonical_levels(&model.effort_levels))
-        .filter(|levels| !levels.is_empty())
-        .collect();
-    let efforts = intersection(declared.iter().map(Vec::as_slice));
-    if !efforts.is_empty() {
-        object["reasoning"] = true.into();
-        object["supported_reasoning_levels"] = efforts
-            .into_iter()
-            .map(|effort| json!({ "effort": effort }))
-            .collect();
+    // 路由层固定档位是对外契约:Some(list) 直接广告(顺序即展示顺序),
+    // Some([]) 显式无变体,None 才走成员快照交集(沉默成员不否决)。
+    // 声明档位的广告不依赖成员快照可得,故空路由/缺快照也能列出变体。
+    match &route.efforts {
+        Some(efforts) => {
+            if !efforts.is_empty() {
+                object["reasoning"] = true.into();
+                object["supported_reasoning_levels"] = efforts
+                    .iter()
+                    .map(|effort| json!({ "effort": effort }))
+                    .collect();
+            }
+        }
+        None => {
+            if let Some(members) = &members {
+                // Snapshots may predate the probe-side normalization: canonicalize on the
+                // way in so the advertised levels always match the request-side vocabulary.
+                // A member that declares nothing is not a veto — most vendors' model lists
+                // carry no effort block at all, while dispatch clamps/normalizes per
+                // candidate anyway.
+                let declared: Vec<Vec<String>> = members
+                    .iter()
+                    .map(|model| {
+                        crate::translation::ir::Effort::canonical_levels(&model.effort_levels)
+                    })
+                    .filter(|levels| !levels.is_empty())
+                    .collect();
+                let efforts = intersection(declared.iter().map(Vec::as_slice));
+                if !efforts.is_empty() {
+                    object["reasoning"] = true.into();
+                    object["supported_reasoning_levels"] = efforts
+                        .into_iter()
+                        .map(|effort| json!({ "effort": effort }))
+                        .collect();
+                }
+            }
+        }
     }
     object
 }
