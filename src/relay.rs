@@ -1900,6 +1900,8 @@ pub async fn dispatch_at(
                                 .unwrap_or_default();
                             price.cost_split(input, output, cached, written, written_1h)
                         });
+                        let interrupted =
+                            outcome.as_ref().and_then(|outcome| outcome.interrupted.clone());
                         let attempt = AttemptLog {
                             protocol: attempt_protocol,
                             client_protocol: Some(client_protocol),
@@ -1919,7 +1921,7 @@ pub async fn dispatch_at(
                             total_ms: started.elapsed().as_millis().min(i32::MAX as u128) as i32,
                             ttft_ms,
                             cost_usd,
-                            error: None,
+                            error: interrupted,
                             caller_key,
                             agent,
                             request_id: Some(stream_request_id),
