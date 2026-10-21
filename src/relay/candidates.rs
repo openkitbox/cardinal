@@ -17,6 +17,7 @@ use secrecy::SecretString;
 
 use super::trace::SkipReason;
 use crate::store::{ProviderKeyRow, ProviderRow, RouteEntry};
+use crate::translation::ir::Effort;
 
 /// One triable candidate: a key, the provider it belongs to, and the upstream model to request.
 #[derive(Clone, Debug)]
@@ -32,6 +33,10 @@ pub struct Candidate {
     /// Per-item concurrency cap of the route entry (None = only the key-level
     /// cap applies).
     pub entry_cap: Option<i32>,
+    /// Effort levels the candidate's snapshot says its upstream model accepts,
+    /// canonical and ascending. `None` = unconstrained (no snapshot, model
+    /// absent from it, or nothing listed): dispatch passes effort through.
+    pub supported_efforts: Option<Box<[Effort]>>,
 }
 
 impl Candidate {
@@ -56,6 +61,25 @@ fn serves_model(key: &ProviderKeyRow, upstream_model: &str) -> bool {
     })
 }
 
+/// The candidate model's supported effort levels from the key's cached
+/// model-list snapshot, canonicalized and ascending. `None` when the snapshot
+/// cannot answer — dispatch then leaves the client's dial untouched.
+fn supported_efforts(key: &ProviderKeyRow, model: &str) -> Option<Box<[Effort]>> {
+    let entry = key.models.as_ref()?.iter().find(|entry| entry.id == model)?;
+    let mut levels: Vec<Effort> = entry
+        .effort_levels
+        .iter()
+        .filter_map(|name| Effort::parse_name(name))
+        .filter(|level| !matches!(level, Effort::None))
+        .collect();
+    levels.sort_by_key(|level| level.rank().unwrap_or(u8::MAX));
+    levels.dedup();
+    if levels.is_empty() {
+        return None;
+    }
+    Some(levels.into_boxed_slice())
+}
+
 /// Direct path ("<provider>/<model>"): the provider's enabled keys — which must arrive in global
 /// (position, id) order (the store's ORDER BY contract), each paired with its resolved secret —
 /// all serving the same upstream model. Returns the candidates plus the excluded ones with their reasons.
@@ -67,6 +91,7 @@ pub fn expand_direct(
     let mut candidates = Vec::new();
     let mut excluded = Vec::new();
     for (key, secret) in keys {
+        let supported = supported_efforts(&key, upstream_model);
         if !key.enabled {
             excluded.push((
                 Candidate {
@@ -76,6 +101,7 @@ pub fn expand_direct(
                     upstream_model: upstream_model.to_owned(),
                     route_alias: None,
                     entry_cap: None,
+                    supported_efforts: supported.clone(),
                 },
                 SkipReason::Disabled,
             ));
@@ -90,6 +116,7 @@ pub fn expand_direct(
                     upstream_model: upstream_model.to_owned(),
                     route_alias: None,
                     entry_cap: None,
+                    supported_efforts: supported.clone(),
                 },
                 SkipReason::ModelNotAllowed,
             ));
@@ -102,6 +129,7 @@ pub fn expand_direct(
             upstream_model: upstream_model.to_owned(),
             route_alias: None,
             entry_cap: None,
+            supported_efforts: supported,
         });
     }
     (candidates, excluded)
@@ -203,5 +231,7 @@ fn make_candidate(
         entry_cap: entry
             .max_concurrency
             .and_then(|cap| i32::try_from(cap).ok()),
+        supported_efforts: supported_efforts(key, model),
     }
 }
+

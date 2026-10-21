@@ -322,6 +322,9 @@ struct AttemptContext<'a> {
     opencode_seed: Option<&'a str>,
     /// This candidate's Chat-body adaptations (none for the common request).
     fixups: ChatFixups,
+    /// This candidate model's supported effort levels (ascending, named only);
+    /// `None` = unconstrained.
+    supported_efforts: Option<&'a [Effort]>,
 }
 
 /// Shared send for both attempt flavors: prepare (passthrough or translated),
@@ -348,6 +351,7 @@ async fn send_attempt(
         vendor_skip,
         opencode_seed,
         fixups,
+        supported_efforts,
     } = *ctx;
     // The selected capability IS the upstream protocol: passthrough when it
     // matches the client protocol, translation target otherwise.
@@ -1609,6 +1613,7 @@ pub async fn dispatch_at(
                         vendor_skip,
                         opencode_seed: opencode_seed.as_deref(),
                         fixups,
+                        supported_efforts: candidate.supported_efforts.as_deref(),
                     },
                     target_model,
                     request,
