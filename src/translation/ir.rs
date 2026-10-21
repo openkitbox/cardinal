@@ -79,6 +79,38 @@ impl Effort {
         }
     }
 
+    /// The ordered dial position of a named level. `None` (explicit off) and
+    /// `Budget` have no position — callers fold budgets via
+    /// [`Self::from_budget`] first.
+    pub fn rank(self) -> Option<u8> {
+        match self {
+            Self::None | Self::Budget(_) => None,
+            Self::Low => Some(0),
+            Self::Medium => Some(1),
+            Self::High => Some(2),
+            Self::Xhigh => Some(3),
+            Self::Max => Some(4),
+        }
+    }
+
+    /// The nearest supported level at or below `self`; the lowest supported
+    /// level when `self` sits below all of them; `self` unchanged when the
+    /// supported set is empty. `supported` must be ascending named levels.
+    pub fn clamp_to(self, supported: &[Self]) -> Self {
+        let Some(lowest) = supported.first() else {
+            return self;
+        };
+        let Some(rank) = self.rank() else {
+            return self;
+        };
+        supported
+            .iter()
+            .rev()
+            .find(|level| level.rank().is_some_and(|r| r <= rank))
+            .copied()
+            .unwrap_or(*lowest)
+    }
+
     /// The wire name for the Chat-family emitters (Chat `reasoning_effort`,
     /// Responses `reasoning.effort`). Each variant maps back to its canonical
     /// wire name — the gateway does not clamp; the upstream decides what it
