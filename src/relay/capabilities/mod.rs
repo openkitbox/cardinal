@@ -29,6 +29,7 @@ mod opencode;
 use crate::protocol::ProtocolId;
 use crate::providers::AuthScheme;
 use crate::translation;
+use crate::translation::ir::Effort;
 
 /// One protocol a provider can serve natively.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,15 +66,58 @@ pub(crate) fn provider_kind(name: &str) -> (&str, bool) {
     (vendor, segments.any(|segment| segment == "code"))
 }
 
-/// The wire name a vendor's Chat-family effort dial uses for the explicit-off
-/// state. Vendors disagree (`off` on Kimi, `none` on DeepSeek/OpenAI), so the
-/// relay normalizes the client's `none`/`off` to the target's own marker
-/// instead of forwarding a value the upstream rejects. Unknown vendors keep
-/// the OpenAI spelling.
-pub fn effort_off_name(provider_name: &str) -> &'static str {
+/// 五档标准刻度(升序):Kimi/DeepSeek 直连与 commandcode 的 chat 端点实测
+/// 全收;opencode 按模型族裁剪。
+pub(crate) const STANDARD_TIERS: &[Effort] = &[
+    Effort::Low,
+    Effort::Medium,
+    Effort::High,
+    Effort::Xhigh,
+    Effort::Max,
+];
+
+/// 一个 (provider, model) 的 effort 方言:可接受档位集 + 显式 off 策略。
+/// 粒度必须是模型族而非 provider——实测 opencode 的 kimi 族只收
+/// low/high/max、glm 族是纯思考模型,provider 级单表不成立。
+/// 零分配:全部 &'static,`Copy`。
+#[derive(Clone, Copy, Debug)]
+pub struct EffortDial {
+    pub accepted: Accepted,
+    pub off: OffPolicy,
+}
+
+/// 模型实际接受的 effort 档位集。
+#[derive(Clone, Copy, Debug)]
+pub enum Accepted {
+    /// 实测可接受集合(升序)。
+    Known(&'static [Effort]),
+    /// 未实测的标准 OpenAI 兼容方:规范名原样转发,不按任何集合裁剪。
+    Permissive,
+    /// 已知该模型行为不明:原样转发命名档(不新增、不删除、不猜测)。
+    Unknown,
+}
+
+/// 客户端显式关思考(`none`/`off`)的出站策略。
+#[derive(Clone, Copy, Debug)]
+pub enum OffPolicy {
+    /// 用厂商自己的线名发送。
+    Wire(&'static str),
+    /// 模型拒绝显式 off(纯思考):降级为最低可接受档。
+    Lowest,
+}
+
+/// The (provider, model family) effort dialect. 默认 arm:未实测的开放
+/// provider 按 Permissive + OpenAI 拼写处理,不丢功能、不裁剪。
+pub fn effort_dial(provider_name: &str, model: &str) -> EffortDial {
     match provider_kind(provider_name) {
-        ("kimi", _) => "off",
-        _ => "none",
+        ("kimi", _) => kimi::effort_dial(),
+        ("deepseek", _) => deepseek::effort_dial(),
+        ("opencode", _) => opencode::effort_dial(model),
+        ("commandcode", _) => commandcode::effort_dial(model),
+        _ => EffortDial {
+            accepted: Accepted::Permissive,
+            off: OffPolicy::Wire("none"),
+        },
     }
 }
 

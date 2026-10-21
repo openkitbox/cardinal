@@ -52,3 +52,12 @@ pub(super) fn validate_base_url(path: String, code: bool) -> anyhow::Result<()> 
     }
     Ok(())
 }
+
+/// Kimi 直连:chat 实测收 off|low|medium|high|xhigh|max,显式 off 线名 `off`
+/// (2026-10-21 实测;`none` 400)。
+pub(super) fn effort_dial() -> super::EffortDial {
+    super::EffortDial {
+        accepted: super::Accepted::Known(super::STANDARD_TIERS),
+        off: super::OffPolicy::Wire("off"),
+    }
+}

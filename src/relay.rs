@@ -3,7 +3,7 @@
 //! Gateway auth is an HTTP-surface hoop and lives in `api`, not here.
 
 mod candidates;
-pub(crate) mod capabilities;
+pub mod capabilities;
 mod dialects;
 pub mod dispatcher;
 mod failover;
@@ -337,8 +337,10 @@ struct AttemptContext<'a> {
     /// The vendor-declared default level, used to repair names outside the
     /// closed vocabulary.
     default_effort: Option<Effort>,
-    /// The vendor's explicit-off wire marker (`off` on Kimi, `none` elsewhere).
-    effort_off_name: &'static str,
+    /// 路由层固定 effort 档位;`None` = 直连或 legacy 路由(快照 clamp)。
+    route_efforts: Option<&'a [Effort]>,
+    /// 当前候选 (provider, model family) 的 effort 方言。
+    dial: capabilities::EffortDial,
 }
 
 /// Shared send for both attempt flavors: prepare (passthrough or translated),
@@ -367,7 +369,8 @@ async fn send_attempt(
         fixups,
         supported_efforts,
         default_effort,
-        effort_off_name,
+        route_efforts,
+        dial,
     } = *ctx;
     // The selected capability IS the upstream protocol: passthrough when it
     // matches the client protocol, translation target otherwise.
@@ -420,13 +423,13 @@ async fn send_attempt(
         let current: &Value = adapted_body
             .as_ref()
             .map_or(&request.body, std::borrow::Cow::as_ref);
-        let rewrites = translation::effort_clamp::plan(
-            protocol,
-            current,
-            supported_efforts.unwrap_or(&[]),
-            default_effort,
-            effort_off_name,
-        );
+        let effort_target = translation::effort_clamp::EffortTarget {
+            route: route_efforts,
+            snapshot: supported_efforts.unwrap_or(&[]),
+            default: default_effort.unwrap_or(Effort::Medium),
+            dial,
+        };
+        let rewrites = translation::effort_clamp::plan(protocol, current, &effort_target);
         if !rewrites.is_empty() {
             let body = adapted_body
                 .get_or_insert(std::borrow::Cow::Borrowed(&request.body))
@@ -468,6 +471,8 @@ async fn send_attempt(
                     skip: fields,
                     fixups,
                     supported_efforts,
+                    route_efforts,
+                    dial,
                 },
             )
         }
@@ -646,6 +651,10 @@ struct WireTweaks<'a> {
     fixups: ChatFixups,
     /// The target model's supported effort levels; `None` = unconstrained.
     supported_efforts: Option<&'a [Effort]>,
+    /// 路由层固定 effort 档位;`None` = legacy(快照 clamp)。
+    route_efforts: Option<&'a [Effort]>,
+    /// 当前候选的 effort 方言。
+    dial: capabilities::EffortDial,
 }
 
 /// Request preparation for the translation path: source to_ir → target from_ir → target prepare.
@@ -662,22 +671,35 @@ fn prepare_translated(
     let source_dialect = translation::dialect(source)?;
     let upstream_dialect = translation::dialect(upstream)?;
     let (mut ir, _) = (source_dialect.to_ir)(source_body, translation::ir::NO_DECLARED_LIMIT)?;
-    if let (Some(supported), Some(effort)) = (tweaks.supported_efforts, ir.effort)
-        && !supported.is_empty()
-    {
-        let clamped = effort.clamp_against(supported);
-        if clamped != effort {
+    // 与 passthrough 同一套归一:路由列表(已配置)或 legacy 快照 → 方言
+    // 可接受集。显式 off 不在此 clamp——它在下方按厂商标记注入。
+    if let Some(effort) = ir.effort {
+        let effort_target = translation::effort_clamp::EffortTarget {
+            route: tweaks.route_efforts,
+            snapshot: tweaks.supported_efforts.unwrap_or(&[]),
+            // IR 路径无原始字符串,修复值用不到;占位即可。
+            default: Effort::Medium,
+            dial: tweaks.dial,
+        };
+        let resolved = translation::effort_clamp::resolve_level(effort, &effort_target);
+        if resolved != effort {
             tracing::info!(
                 target: EFFORT_TARGET,
                 model = target.upstream_model,
                 from = ?effort,
-                to = ?clamped,
+                to = ?resolved,
                 "effort clamped to upstream model support"
             );
-            ir.effort = Some(clamped);
+            ir.effort = Some(resolved);
         }
     }
     let (mut upstream_value, _) = (upstream_dialect.from_ir)(&ir, target.upstream_model)?;
+    // Chat 发射器对显式 off 省略字段;按厂商方言注入 off 标记,让"关思考"
+    // 在翻译路径真正生效(纯思考模型由方言降级为最低档)。
+    if upstream == ProtocolId::OpenAiChat && matches!(ir.effort, Some(Effort::None)) {
+        upstream_value["reasoning_effort"] =
+            Value::String(translation::effort_clamp::off_wire_name(tweaks.dial).to_owned());
+    }
     // The rebuilt tree is already owned, so the DeepSeek dialect edits land in
     // place: a calling assistant turn must be followed straight away by its
     // tool results, and a partially-reasoning history still needs the gaps
@@ -731,6 +753,10 @@ enum Resolution {
         excluded: Vec<(candidates::Candidate, trace::SkipReason)>,
         window_skipped: usize,
         secret_skipped: usize,
+        /// 路由层固定 effort 档位(升序,解析自 `RouteRow.efforts`):
+        /// `Some` = 路由已配置(含显式空表 = 不 clamp),`None` = 直连路径
+        /// 或 legacy 路由(快照 clamp)。每次请求解析一次,各 attempt 共享引用。
+        efforts: Option<Box<[Effort]>>,
     },
     /// `"provider/"` — the direct path with an empty upstream model.
     EmptySuffix,
@@ -780,6 +806,7 @@ fn resolve(
                 excluded,
                 window_skipped: 0,
                 secret_skipped,
+                efforts: None,
             });
         }
         // No enabled provider with this name: fall through to the route lookup
@@ -804,6 +831,15 @@ fn resolve(
             for candidate in &mut candidates {
                 candidate.route_alias = Some(route.alias.clone());
             }
+            // 读路径宽容:store 写时已归一化;这里防御性解析,坏名跳过。
+            let efforts = route.efforts.as_deref().map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| Effort::parse_name(name))
+                    .filter(|level| !matches!(level, Effort::None))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            });
             Ok(Resolution::Candidates {
                 alias: Some(route.alias),
                 strategy: route.strategy,
@@ -811,6 +847,7 @@ fn resolve(
                 excluded,
                 window_skipped: expansion.window_skipped,
                 secret_skipped,
+                efforts,
             })
         }
         None => Ok(Resolution::NoRoute),
@@ -1285,7 +1322,7 @@ pub async fn dispatch_at(
 
     // Model resolution: direct `provider/model` first, then the route table.
     // `now` (one read per request) is what route active windows are judged against.
-    let (alias, strategy, expanded, excluded, window_skipped, secret_skipped) =
+    let (alias, strategy, expanded, excluded, window_skipped, secret_skipped, efforts) =
         match resolve(route_cache, &model, now) {
             Ok(Resolution::Candidates {
                 alias,
@@ -1294,6 +1331,7 @@ pub async fn dispatch_at(
                 excluded,
                 window_skipped,
                 secret_skipped,
+                efforts,
             }) => (
                 alias,
                 strategy,
@@ -1301,6 +1339,7 @@ pub async fn dispatch_at(
                 excluded,
                 window_skipped,
                 secret_skipped,
+                efforts,
             ),
             Ok(Resolution::EmptySuffix) => {
                 return DispatchOutcome::Failed {
@@ -1694,7 +1733,8 @@ pub async fn dispatch_at(
                         fixups,
                         supported_efforts: candidate.supported_efforts.as_deref(),
                         default_effort: candidate.default_effort,
-                        effort_off_name: capabilities::effort_off_name(&provider.name),
+                        route_efforts: efforts.as_deref(),
+                        dial: capabilities::effort_dial(&provider.name, target_model),
                     },
                     target_model,
                     request,

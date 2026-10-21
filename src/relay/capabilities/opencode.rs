@@ -34,3 +34,39 @@ pub(super) fn validate_base_url(path: String) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// OpenCode(zen/go 聚合):接受集按模型族实测(2026-10-21)。
+/// deepseek/qwen 族全档 + off 线名 `none`;glm 族纯思考(off→最低档);
+/// kimi 族只收 low/high/max + `none`(medium/xhigh 400);未实测模型
+/// Unknown——原样转发,绝不猜测。
+pub(super) fn effort_dial(model: &str) -> super::EffortDial {
+    use super::{Accepted, EffortDial, OffPolicy};
+    const KIMI_TIERS: &[super::Effort] =
+        &[super::Effort::Low, super::Effort::High, super::Effort::Max];
+    let family = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .split('-')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    match family.as_str() {
+        "deepseek" | "qwen" => EffortDial {
+            accepted: Accepted::Known(super::STANDARD_TIERS),
+            off: OffPolicy::Wire("none"),
+        },
+        "glm" => EffortDial {
+            accepted: Accepted::Known(super::STANDARD_TIERS),
+            off: OffPolicy::Lowest,
+        },
+        "kimi" => EffortDial {
+            accepted: Accepted::Known(KIMI_TIERS),
+            off: OffPolicy::Wire("none"),
+        },
+        _ => EffortDial {
+            accepted: Accepted::Unknown,
+            off: OffPolicy::Wire("none"),
+        },
+    }
+}

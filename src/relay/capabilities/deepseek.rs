@@ -30,3 +30,12 @@ pub(super) fn validate_base_url(path: String) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// DeepSeek:chat 实测收 none|minimal|low|medium|high|xhigh|ultra|max,
+/// 显式 off 线名 `none`(`off` 400)。
+pub(super) fn effort_dial() -> super::EffortDial {
+    super::EffortDial {
+        accepted: super::Accepted::Known(super::STANDARD_TIERS),
+        off: super::OffPolicy::Wire("none"),
+    }
+}

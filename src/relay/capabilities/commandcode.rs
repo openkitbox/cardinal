@@ -34,3 +34,18 @@ pub(super) fn validate_base_url(path: String) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// CommandCode:chat schema 全 provider 收 off|low|medium|high|xhigh|max,
+/// 但显式 off 仅 deepseek 族模型返回 200;其余模型 400
+/// "Only models that can turn thinking off accept it." → 降级最低档
+/// (2026-10-21 实测)。
+pub(super) fn effort_dial(model: &str) -> super::EffortDial {
+    super::EffortDial {
+        accepted: super::Accepted::Known(super::STANDARD_TIERS),
+        off: if model.to_ascii_lowercase().contains("deepseek") {
+            super::OffPolicy::Wire("off")
+        } else {
+            super::OffPolicy::Lowest
+        },
+    }
+}
