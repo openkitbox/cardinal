@@ -171,6 +171,26 @@ impl Effort {
         }
         names.into_iter().map(str::to_owned).collect()
     }
+
+    /// 路由层固定档位列表的入库归一化:别名归一(`minimal→low`、`ultra→max`),
+    /// 拒绝显式 off 标记(`none`/`off`——off 永远接受、永不入表)与未知名,
+    /// 结果按 rank 升序去重。`Err` 携带被拒的原始名,供调用方拼错误消息。
+    pub fn route_levels(names: &[String]) -> Result<Vec<String>, String> {
+        let mut levels = Vec::new();
+        for name in names {
+            let level = Self::parse_name(name).ok_or_else(|| name.clone())?;
+            if matches!(level, Self::None) {
+                return Err(name.clone());
+            }
+            levels.push(level);
+        }
+        levels.sort_by_key(|level| level.rank().unwrap_or(u8::MAX));
+        levels.dedup();
+        Ok(levels
+            .iter()
+            .map(|level| level.chat_name().to_owned())
+            .collect())
+    }
 }
 
 /// The only two roles that survive translation; every other wire role is

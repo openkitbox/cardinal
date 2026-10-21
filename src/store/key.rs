@@ -586,6 +586,12 @@ pub struct RouteRow {
     /// relay resolution path — it exists for the GUI's route header only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// 路由层固定对外 effort 档位(规范名,升序):`None` = legacy 派生
+    /// (/v1/models 走成员快照交集), `Some([])` = 显式无变体,
+    /// `Some([..])` = 固定列表,数组顺序即展示顺序。写路径经
+    /// [`crate::translation::ir::Effort::route_levels`] 归一化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efforts: Option<Vec<String>>,
 }
 
 /// One concurrency-limited key, joined with its provider name so UIs can read it directly.

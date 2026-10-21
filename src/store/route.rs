@@ -1,6 +1,7 @@
 use sqlx::PgPool;
 
 use super::key::{RouteEntry, RouteRow, RouteStrategy};
+use crate::translation::ir::Effort;
 
 /// One raw `gateway_routes` row straight off SQL, before entries/strategy parsing.
 type RawRouteRow = (
@@ -9,32 +10,44 @@ type RawRouteRow = (
     Option<i64>,
     String,
     Option<String>,
+    Option<serde_json::Value>,
 );
 
 pub async fn list_routes(pool: &PgPool) -> anyhow::Result<Vec<RouteRow>> {
     let rows: Vec<RawRouteRow> = sqlx::query_as(
-        "SELECT alias, entries, context_window, strategy, note FROM gateway_routes ORDER BY alias",
+        "SELECT alias, entries, context_window, strategy, note, efforts FROM gateway_routes ORDER BY alias",
     )
     .fetch_all(pool)
     .await?;
     rows.into_iter()
-        .map(|(alias, entries, context_window, strategy, note)| {
-            parse_route(alias, entries, context_window, &strategy, note)
-        })
+        .map(
+            |(alias, entries, context_window, strategy, note, efforts)| {
+                parse_route(alias, entries, context_window, &strategy, note, efforts)
+            },
+        )
         .collect()
 }
 
 pub async fn get_route(pool: &PgPool, alias: &str) -> anyhow::Result<Option<RouteRow>> {
     let row: Option<RawRouteRow> = sqlx::query_as(
-            "SELECT alias, entries, context_window, strategy, note FROM gateway_routes WHERE alias = $1",
+            "SELECT alias, entries, context_window, strategy, note, efforts FROM gateway_routes WHERE alias = $1",
         )
     .bind(alias)
     .fetch_optional(pool)
     .await?;
-    row.map(|(alias, entries, context_window, strategy, note)| {
-        parse_route(alias, entries, context_window, &strategy, note)
-    })
+    row.map(
+        |(alias, entries, context_window, strategy, note, efforts)| {
+            parse_route(alias, entries, context_window, &strategy, note, efforts)
+        },
+    )
     .transpose()
+}
+
+/// `PUT /api/routes` 的 efforts 三态:字段缺席保留库值(旧客户端重存不抹掉
+/// 已配置列表),显式 `null` 清除回 legacy 派生,数组设置新列表。
+pub enum EffortsUpdate {
+    Preserve,
+    Set(Option<Vec<String>>),
 }
 
 /// Validate and write one route: every referenced key must exist (the same
@@ -48,6 +61,7 @@ pub async fn put_route(
     context_window: Option<i64>,
     strategy: RouteStrategy,
     note: Option<String>,
+    efforts: EffortsUpdate,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!alias.is_empty(), "route alias must not be empty");
     anyhow::ensure!(!entries.is_empty(), "route entries must not be empty");
@@ -98,16 +112,30 @@ pub async fn put_route(
             entry.key_id
         );
     }
+    let preserve = matches!(efforts, EffortsUpdate::Preserve);
+    let efforts_json = match efforts {
+        EffortsUpdate::Preserve | EffortsUpdate::Set(None) => None,
+        EffortsUpdate::Set(Some(names)) => {
+            let levels = Effort::route_levels(&names).map_err(|bad| {
+                anyhow::anyhow!(
+                    "route {alias} has an invalid effort level {bad:?} (allowed: low, medium, high, xhigh, max)"
+                )
+            })?;
+            Some(serde_json::to_value(levels)?)
+        }
+    };
     let json = serde_json::to_value(entries)?;
     sqlx::query(
-    "INSERT INTO gateway_routes (alias, entries, context_window, strategy, note) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (alias) DO UPDATE SET entries = EXCLUDED.entries, context_window = EXCLUDED.context_window, strategy = EXCLUDED.strategy, note = EXCLUDED.note",
+    "INSERT INTO gateway_routes (alias, entries, context_window, strategy, note, efforts) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (alias) DO UPDATE SET entries = EXCLUDED.entries, context_window = EXCLUDED.context_window, strategy = EXCLUDED.strategy, note = EXCLUDED.note, efforts = CASE WHEN $7 THEN gateway_routes.efforts ELSE EXCLUDED.efforts END",
   )
   .bind(alias)
   .bind(json)
   .bind(context_window)
   .bind(strategy.as_str())
   .bind(note)
+  .bind(efforts_json)
+  .bind(preserve)
   .execute(&mut *tx)
   .await?;
     tx.commit().await?;
@@ -128,6 +156,7 @@ fn parse_route(
     context_window: Option<i64>,
     strategy: &str,
     note: Option<String>,
+    efforts: Option<serde_json::Value>,
 ) -> anyhow::Result<RouteRow> {
     // Empty entries are a legitimate state: deleting a key cascades it out of
     // every route, and the emptied route keeps its alias so it can be
@@ -136,11 +165,23 @@ fn parse_route(
         .map_err(|e| anyhow::anyhow!("route {alias} has invalid entries JSON: {e}"))?;
     let strategy =
         RouteStrategy::from_column(strategy).map_err(|e| anyhow::anyhow!("route {alias}: {e}"))?;
+    // 读路径宽容:手写过 SQL 的坏 JSON 不阻塞启动,降级为 legacy 派生并告警。
+    let efforts = efforts.and_then(|value| {
+        serde_json::from_value::<Vec<String>>(value)
+            .map_err(|error| {
+                tracing::warn!(
+                    "route {alias} has invalid efforts JSON (treated as unset): {error}"
+                );
+                error
+            })
+            .ok()
+    });
     Ok(RouteRow {
         alias,
         entries,
         context_window,
         strategy,
         note,
+        efforts,
     })
 }

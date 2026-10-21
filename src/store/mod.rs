@@ -43,7 +43,7 @@ pub use rest::{
     ActiveRestRow, RestRow, active_rest_rows, clear_provider_rests, clear_rest,
     clear_rest_for_model, insert_rest, list_rests,
 };
-pub use route::{delete_route, get_route, list_routes, put_route};
+pub use route::{EffortsUpdate, delete_route, get_route, list_routes, put_route};
 pub use usage::{
     CallerFilter, TrendRow, TrendSplit, UsageRow, UsageWindow, hourly_buckets, usage_by_day,
     usage_trend, usage_window,
