@@ -306,7 +306,9 @@ fn parse_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
             }
             let effort_levels = entry
                 .effort
-                .map(|effort| effort.supported_levels)
+                .map(|effort| {
+                    crate::translation::ir::Effort::canonical_levels(&effort.supported_levels)
+                })
                 .unwrap_or_default();
             Some(ProbeModel {
                 id,

@@ -72,7 +72,13 @@ pub fn route_model_object(route: &RouteRow, keys: &[KeyModels], chat_capable: bo
     // route accepts image input, so the route advertises it unconditionally
     // regardless of what each provider's /models snapshot reports.
     object["modalities"] = json!({ "input": ["text", "image"] });
-    let efforts = intersection(members.iter().map(|model| model.effort_levels.as_slice()));
+    // Snapshots may predate the probe-side normalization: canonicalize on the
+    // way in so the advertised levels always match the request-side vocabulary.
+    let normalized: Vec<Vec<String>> = members
+        .iter()
+        .map(|model| crate::translation::ir::Effort::canonical_levels(&model.effort_levels))
+        .collect();
+    let efforts = intersection(normalized.iter().map(Vec::as_slice));
     if !efforts.is_empty() {
         object["reasoning"] = true.into();
         object["supported_reasoning_levels"] = efforts

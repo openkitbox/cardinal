@@ -113,9 +113,9 @@ impl Effort {
 
     /// The wire name for the Chat-family emitters (Chat `reasoning_effort`,
     /// Responses `reasoning.effort`). Each variant maps back to its canonical
-    /// wire name — the gateway does not clamp; the upstream decides what it
-    /// supports. `None` never reaches this function — both emitters omit the
-    /// field for it.
+    /// wire name; dispatch clamps the dial against the candidate model's
+    /// supported levels before emission (see [`Effort::clamp_against`]).
+    /// `None` never reaches this function — both emitters omit the field for it.
     pub fn chat_name(self) -> &'static str {
         match self {
             Self::None | Self::Low => "low",
@@ -125,6 +125,28 @@ impl Effort {
             Self::Max => "max",
             Self::Budget(_) => "high",
         }
+    }
+
+    /// Canonical wire names for a vendor-declared supported-levels list:
+    /// unknown names and the explicit-off marker are dropped, duplicates
+    /// collapse in first-seen order. The probe stores this shape and
+    /// `/v1/models` re-normalizes through it, so snapshots written before this
+    /// normalization age out without a migration.
+    pub fn canonical_levels(levels: &[String]) -> Vec<String> {
+        let mut names: Vec<&'static str> = Vec::new();
+        for name in levels {
+            let Some(level) = Self::parse_name(name) else {
+                continue;
+            };
+            if matches!(level, Self::None) {
+                continue;
+            }
+            let canonical = level.chat_name();
+            if !names.contains(&canonical) {
+                names.push(canonical);
+            }
+        }
+        names.into_iter().map(str::to_owned).collect()
     }
 }
 
