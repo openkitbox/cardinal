@@ -516,3 +516,17 @@ impl StreamDecoder {
         self.content_seen
     }
 }
+
+/// Synthesized terminal frames for a post-commit upstream truncation:
+/// the protocol's own `error` stream event, then the stream terminates.
+pub fn stream_error_frames(message: &str) -> Vec<RawFrame> {
+    let payload = serde_json::json!({
+        "type": "error",
+        "error": {"type": "api_error", "message": message},
+    });
+    vec![RawFrame {
+        event: Some("error".to_owned()),
+        id: None,
+        data: bytes::Bytes::from(payload.to_string()),
+    }]
+}
