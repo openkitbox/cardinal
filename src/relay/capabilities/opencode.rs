@@ -43,30 +43,25 @@ pub(super) fn effort_dial(model: &str) -> super::EffortDial {
     use super::{Accepted, EffortDial, OffPolicy};
     const KIMI_TIERS: &[super::Effort] =
         &[super::Effort::Low, super::Effort::High, super::Effort::Max];
-    let family = model
+    // 模型 id 可能是裸名(`qwen3.8-max`、`kimi-k3`)或带厂商前缀
+    // (`moonshotai/Kimi-K3`);按末段前缀匹配族名,因为版本号不带分隔符
+    // (`qwen3.8`,不是 `qwen-3.8`),取 `-` 前一段会把 qwen 族判成未知。
+    let model = model
         .rsplit('/')
         .next()
         .unwrap_or(model)
-        .split('-')
-        .next()
-        .unwrap_or(model)
         .to_ascii_lowercase();
-    match family.as_str() {
-        "deepseek" | "qwen" => EffortDial {
-            accepted: Accepted::Known(super::STANDARD_TIERS),
-            off: OffPolicy::Wire("none"),
-        },
-        "glm" => EffortDial {
-            accepted: Accepted::Known(super::STANDARD_TIERS),
-            off: OffPolicy::Lowest,
-        },
-        "kimi" => EffortDial {
-            accepted: Accepted::Known(KIMI_TIERS),
-            off: OffPolicy::Wire("none"),
-        },
-        _ => EffortDial {
-            accepted: Accepted::Unknown,
-            off: OffPolicy::Wire("none"),
-        },
+    let dial = |accepted, off| EffortDial { accepted, off };
+    if model.starts_with("deepseek") || model.starts_with("qwen") {
+        dial(
+            Accepted::Known(super::STANDARD_TIERS),
+            OffPolicy::Wire("none"),
+        )
+    } else if model.starts_with("glm") {
+        dial(Accepted::Known(super::STANDARD_TIERS), OffPolicy::Lowest)
+    } else if model.starts_with("kimi") {
+        dial(Accepted::Known(KIMI_TIERS), OffPolicy::Wire("none"))
+    } else {
+        dial(Accepted::Unknown, OffPolicy::Wire("none"))
     }
 }
