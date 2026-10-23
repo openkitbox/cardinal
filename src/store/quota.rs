@@ -2,6 +2,18 @@ use sqlx::PgPool;
 
 use crate::quota::KeyQuota;
 
+// ---------- quota history (append-only probe samples for the card trend) ----------
+
+/// One recorded probe reading of one window, as the GUI's trend chart reads
+/// it. Flat rather than grouped: the chart filters by key and window name.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct QuotaHistoryPoint {
+    pub key_id: i64,
+    pub window_name: String,
+    pub used_pct: f64,
+    pub probed_at: chrono::DateTime<chrono::Utc>,
+}
+
 // ---------- quota snapshots (decorative GUI card cache, one row per key) ----------
 
 /// Persist one key's probed quota reading, refreshing the probe timestamp.
@@ -78,4 +90,75 @@ pub async fn list_quota_snapshots_by_keys(
         }
     }
     Ok(snapshots)
+}
+
+// ---------- quota history (append-only probe samples, card trend chart) ----------
+
+/// Append one history row per plan window after a successful probe, then drop
+/// this key's rows older than any chart can show (a monthly window is the
+/// longest at ~31 days; a fortnight of slack covers a probe gap).
+///
+/// History exists only because the snapshot table keeps the latest reading
+/// alone — the card's cumulative trend needs the samples behind it. Callers
+/// log a failure and carry on: quota is decorative.
+pub async fn quota_history_insert(
+    pool: &PgPool,
+    key_id: i64,
+    quota: &KeyQuota,
+) -> anyhow::Result<()> {
+    for window in &quota.windows {
+        sqlx::query(
+            "INSERT INTO gateway_key_quota_history (key_id, window_name, used_pct, resets_at)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(key_id)
+        .bind(&window.name)
+        .bind(window.used_pct)
+        .bind(window.resets_at)
+        .execute(pool)
+        .await?;
+    }
+    sqlx::query(
+        "DELETE FROM gateway_key_quota_history
+         WHERE key_id = $1 AND probed_at < now() - interval '45 days'",
+    )
+    .bind(key_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The chart series for every key/window: the LAST probe of each UTC day over
+/// the last 35 days. A day bucket's last sample carries that day's end value
+/// (window usage is cumulative), so daily downsampling loses no shape; the
+/// point keeps its real `probed_at`, so the chart maps it to an exact x.
+///
+/// Rows from a previous window (before its reset) are included here and
+/// filtered by the GUI against the current window's start — the gateway does
+/// not need to know each window's period to serve the series.
+pub async fn list_quota_history(pool: &PgPool) -> anyhow::Result<Vec<QuotaHistoryPoint>> {
+    let rows = sqlx::query_as::<_, (i64, String, f64, chrono::DateTime<chrono::Utc>)>(
+        "SELECT key_id, window_name, used_pct, probed_at
+         FROM (
+             SELECT DISTINCT ON (key_id, window_name, (probed_at AT TIME ZONE 'UTC')::date)
+                    key_id, window_name, used_pct, probed_at
+             FROM gateway_key_quota_history
+             WHERE probed_at >= now() - interval '35 days'
+             ORDER BY key_id, window_name, (probed_at AT TIME ZONE 'UTC')::date, probed_at DESC
+         ) per_day
+         ORDER BY key_id, window_name, probed_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(key_id, window_name, used_pct, probed_at)| QuotaHistoryPoint {
+                key_id,
+                window_name,
+                used_pct,
+                probed_at,
+            },
+        )
+        .collect())
 }

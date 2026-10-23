@@ -35,7 +35,10 @@ pub use provider::{
     get_provider, get_provider_by_name, insert_provider, list_providers, list_providers_by_ids,
     seed_from_config, set_provider_enabled, update_provider,
 };
-pub use quota::{list_quota_snapshots, list_quota_snapshots_by_keys, quota_snapshot_upsert};
+pub use quota::{
+    QuotaHistoryPoint, list_quota_history, list_quota_snapshots, list_quota_snapshots_by_keys,
+    quota_history_insert, quota_snapshot_upsert,
+};
 pub use request::{
     AttemptLog, RequestRow, insert_request_logs, list_recent_requests, request_row_anchor,
 };

@@ -96,6 +96,11 @@ pub struct Bootstrap {
     pub rests: Vec<store::RestRow>,
     /// The stored vendor quota readings (instant; the live probe is `/api/quotas`).
     pub quota_snapshots: Vec<KeyQuotaSnapshotRow>,
+    /// Daily probe samples behind the quota readings, for the account cards'
+    /// cumulative trend charts. Older gateways omit the field; the GUI then
+    /// renders the current point alone.
+    #[serde(default)]
+    pub quota_history: Vec<store::QuotaHistoryPoint>,
     pub gateway_keys: Vec<store::GatewayKeyRow>,
     /// Latest successful request time per (key, model).
     pub model_success: Vec<store::ModelSuccessRow>,
@@ -221,6 +226,12 @@ pub async fn probe_all_quotas(
                 if let Err(error) = store::quota_snapshot_upsert(pool, key_id, &quota).await {
                     tracing::warn!(key_id, error = %format!("{error:#}"), "quota snapshot upsert failed");
                 }
+                // The trend chart's series: one row per window per probe. A
+                // failure never loses the reading itself (the snapshot above
+                // and the in-memory cache below still carry it).
+                if let Err(error) = store::quota_history_insert(pool, key_id, &quota).await {
+                    tracing::warn!(key_id, error = %format!("{error:#}"), "quota history insert failed");
+                }
                 quotas.push(KeyQuotaRow { key_id, quota });
             }
             Ok((key_id, None)) => tracing::debug!(key_id, "quota probe: no reading"),
@@ -327,6 +338,7 @@ impl Admin {
             routes: store::list_routes(&self.pool).await?,
             rests: store::list_rests(&self.pool).await?,
             quota_snapshots: self.quota_snapshots().await,
+            quota_history: store::list_quota_history(&self.pool).await?,
             gateway_keys: store::list_gateway_keys(&self.pool).await?,
             model_success: store::last_model_success(&self.pool).await?,
         })
