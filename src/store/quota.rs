@@ -128,9 +128,11 @@ pub async fn quota_history_insert(
     Ok(())
 }
 
-/// The chart series for every key/window: the LAST probe of each UTC day over
-/// the last 35 days. A day bucket's last sample carries that day's end value
-/// (window usage is cumulative), so daily downsampling loses no shape; the
+/// The chart series for every key/window: the LAST probe of each hour over
+/// the last 48 hours, and of each day before that (out to 35 days). Window
+/// usage is cumulative, so a bucket's last sample carries its end value and
+/// downsampling loses no shape — hourly keeps a freshly deployed gateway's
+/// curve visible within hours, daily keeps the month-scale shape cheap. The
 /// point keeps its real `probed_at`, so the chart maps it to an exact x.
 ///
 /// Rows from a previous window (before its reset) are included here and
@@ -138,14 +140,25 @@ pub async fn quota_history_insert(
 /// not need to know each window's period to serve the series.
 pub async fn list_quota_history(pool: &PgPool) -> anyhow::Result<Vec<QuotaHistoryPoint>> {
     let rows = sqlx::query_as::<_, (i64, String, f64, chrono::DateTime<chrono::Utc>)>(
-        "SELECT key_id, window_name, used_pct, probed_at
-         FROM (
-             SELECT DISTINCT ON (key_id, window_name, (probed_at AT TIME ZONE 'UTC')::date)
+        "WITH recent AS (
+             SELECT DISTINCT ON (key_id, window_name, date_trunc('hour', probed_at))
+                    key_id, window_name, used_pct, probed_at
+             FROM gateway_key_quota_history
+             WHERE probed_at >= now() - interval '48 hours'
+             ORDER BY key_id, window_name, date_trunc('hour', probed_at), probed_at DESC
+         ), older AS (
+             SELECT DISTINCT ON (key_id, window_name, date_trunc('day', probed_at))
                     key_id, window_name, used_pct, probed_at
              FROM gateway_key_quota_history
              WHERE probed_at >= now() - interval '35 days'
-             ORDER BY key_id, window_name, (probed_at AT TIME ZONE 'UTC')::date, probed_at DESC
-         ) per_day
+               AND probed_at <  now() - interval '48 hours'
+             ORDER BY key_id, window_name, date_trunc('day', probed_at), probed_at DESC
+         )
+         SELECT key_id, window_name, used_pct, probed_at
+         FROM recent
+         UNION ALL
+         SELECT key_id, window_name, used_pct, probed_at
+         FROM older
          ORDER BY key_id, window_name, probed_at",
     )
     .fetch_all(pool)
