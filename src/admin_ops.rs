@@ -193,6 +193,14 @@ pub async fn probe_all_quotas(
         }
     };
     let mut tasks = tokio::task::JoinSet::new();
+    // Per-key quota anchors (quota_overrides) fill vendor-hidden monthly
+    // resets; a store failure leaves every reading as the vendor reported it.
+    let anchors = store::list_quota_reset_anchors(pool)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(error = %format!("{error:#}"), "quota probe: reset anchors unavailable");
+            std::collections::HashMap::new()
+        });
     for provider in providers.iter().filter(|provider| provider.enabled) {
         let keys = match store::list_provider_keys(pool, provider.id).await {
             Ok(keys) => keys,
@@ -209,11 +217,13 @@ pub async fn probe_all_quotas(
             let key_id = key.id;
             let provider_name = provider.name.clone();
             let base_url = provider.base_url.clone();
+            let anchor = anchors.get(&key_id).copied();
             tasks.spawn(async move {
-                (
-                    key_id,
-                    quota::fetch_quota(&provider_name, &base_url, &api_key).await,
-                )
+                let mut quota = quota::fetch_quota(&provider_name, &base_url, &api_key).await;
+                if let (Some(day), Some(quota)) = (anchor, quota.as_mut()) {
+                    quota::apply_monthly_anchor(quota, day, chrono::Utc::now());
+                }
+                (key_id, quota)
             });
         }
     }

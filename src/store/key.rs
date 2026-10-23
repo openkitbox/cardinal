@@ -618,3 +618,29 @@ pub async fn list_limited_keys(pool: &PgPool) -> anyhow::Result<Vec<LimitedKeyRo
   .await?;
     Ok(rows)
 }
+
+/// The per-key quota anchors the probe merges into vendor readings:
+/// (key_id, monthly reset day-of-month in UTC). Keys without a configured
+/// `monthly_reset_day` are absent — the chart simply stays resetless for them.
+///
+/// Column overrides live on `gateway_provider_keys.quota_overrides` and are
+/// read straight from the JSON: the row struct stays narrow and this stays a
+/// probe-only concern.
+pub async fn list_quota_reset_anchors(
+    pool: &PgPool,
+) -> anyhow::Result<std::collections::HashMap<i64, u32>> {
+    let rows: Vec<(i64, Option<i32>)> = sqlx::query_as(
+        "SELECT id, (quota_overrides ->> 'monthly_reset_day')::int
+         FROM gateway_provider_keys
+         WHERE quota_overrides ? 'monthly_reset_day'",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, day)| {
+            day.and_then(|day| u32::try_from(day).ok())
+                .map(|day| (id, day))
+        })
+        .collect())
+}
