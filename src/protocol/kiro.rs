@@ -26,10 +26,16 @@
 //!   The reference's `LegacyThinkingDecoder` and `tool-call-text` detector
 //!   rewrite assistant text the model never described as reasoning/tools; this
 //!   kernel only reports what the upstream's own events said.
-//! * **No token accounting.** `meteringEvent` carries credits, not tokens, and
-//!   `contextUsageEvent` a percentage, so both are diagnostics only: [`usage`]
-//!   is always `None` and no counter is ever fabricated from them. The relay
-//!   therefore omits `usage` on the client wire and records none in the ledger.
+//! * **Estimated token accounting is ledger-only.** Input is `floor(advertised
+//!   context window × contextUsagePercentage / 100)`; output is `floor(total
+//!   chars / 4)` across accumulated text, reasoning and every tool call's
+//!   arguments. These are estimates, not vendor-reported token counts. A
+//!   missing window or percentage omits usage entirely rather than fabricating
+//!   zeros. `meteringEvent` credits remain diagnostics only and never enter
+//!   [`UsageCounts`]: KAS bills credits, but cardinal's ledger prices tokens
+//!   against the models.dev/manual price table for every provider and never
+//!   converts credits into money. Kiro does not produce `StreamEvent::Usage`,
+//!   so these estimates never enter client-visible frames.
 //! * **`metadataEvent` is the only normal-end evidence.** Its `stopReason` is
 //!   never trusted (real tool-calling responses report `END_TURN`); the
 //!   terminal state is inferred — tools present ⇒ `tool_calls`, a tool whose
@@ -54,11 +60,12 @@
 //!   shows it to the client. This kernel forwards every reasoning delta as
 //!   [`StreamEvent::ReasoningDelta`], so a GPT route shows the placeholder as
 //!   visible thinking. Not hidden yet: the IR has no opaque-reasoning concept.
-//! * **Post-`metadataEvent` diagnostics are not observed on the stream.** The
-//!   relay's translated pump stops at the `Finish` event, so a `meteringEvent`
-//!   or `contextUsageEvent` KAS sends after `metadataEvent` never reaches the
-//!   decoder. Buffered responses observe the whole body. The difference is
-//!   diagnostics only — no client-visible content or billed token count.
+//! * **Post-`metadataEvent` frames are drained after the terminal.** KAS sends
+//!   `contextUsageEvent`/`meteringEvent` after `metadataEvent`; the relay's
+//!   translated pump keeps reading for a bounded window after the `Finish`
+//!   event and observes — never forwards — those frames. That read is what
+//!   gives the ledger its usage estimate on streamed responses; a buffered
+//!   response observes the whole body by construction.
 //! * **The streaming decoder accumulates the full text and reasoning.** The
 //!   same [`StreamDecoder`] backs the streamed and buffered paths (one state
 //!   machine, no drift), so a streamed response keeps a second copy of every
@@ -156,9 +163,10 @@ pub struct ToolCall {
 
 /// Raw `meteringEvent` evidence, kept for diagnostics only.
 ///
-/// KAS bills credits, not tokens: these values are never turned into
-/// [`UsageCounts`]. Fields stay optional so nothing is invented for an absent
-/// or wrongly-typed field.
+/// KAS bills credits, not tokens: these values are never converted into token
+/// counts. The [`StreamDecoder::usage`] estimate comes from the context
+/// percentage and accumulated content instead. Fields stay optional so nothing
+/// is invented for an absent or wrongly-typed field.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Metering {
     pub usage: Option<f64>,
@@ -192,14 +200,22 @@ pub struct StreamDecoder {
     stop_reason: Option<String>,
     metering: Option<Metering>,
     context_usage_percentage: Option<f64>,
+    /// The served model's declared context window (`tokenLimits.maxInputTokens`
+    /// from KAS `ListAvailableModels`), used to convert `contextUsagePercentage`
+    /// into prompt tokens. `None` when the snapshot carries no window, and
+    /// `None` means "no input estimate" — never zero.
+    context_window: Option<u64>,
     /// Set by the first undecodable/invalid frame; every later frame is
     /// refused, so content is never spliced across a known-broken span.
     failed: bool,
 }
 
 impl StreamDecoder {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(context_window: Option<u64>) -> Self {
+        Self {
+            context_window,
+            ..Self::default()
+        }
     }
 
     /// Decode one completed AWS message.
@@ -317,6 +333,10 @@ impl StreamDecoder {
                     .and_then(Value::as_f64);
                 tracing::debug!(
                     context_usage_percentage = ?percentage,
+                    // Diagnostics only: the pair that would yield a prompt-token
+                    // estimate, logged so a missing window is visible next to
+                    // the percentage it would scale.
+                    context_window = self.context_window,
                     "KAS context usage"
                 );
                 self.context_usage_percentage = percentage;
@@ -433,10 +453,33 @@ impl StreamDecoder {
         }
     }
 
-    /// Always `None`: KAS reports credits and context percentages, not token
-    /// usage. Never fabricate an all-zero count.
+    /// Estimate token usage from the upstream context reading and content.
+    ///
+    /// These are **estimates**, not vendor-reported token counts: input is the
+    /// upstream's context percentage times the advertised window, and output
+    /// uses a chars/4 heuristic over text, reasoning and tool arguments. A
+    /// missing window or percentage yields `None`, never zero-filled counts;
+    /// non-finite and negative percentages are rejected as corrupt evidence.
     pub fn usage(&self) -> Option<UsageCounts> {
-        None
+        let context_window = self.context_window?;
+        let percentage = self.context_usage_percentage?;
+        if !percentage.is_finite() || percentage < 0.0 {
+            return None;
+        }
+        let input_tokens = (context_window as f64 * percentage / 100.0).floor() as u64;
+        let total_chars = self.text.chars().count()
+            + self.reasoning.chars().count()
+            + self
+                .tools
+                .iter()
+                .map(|call| call.arguments.chars().count())
+                .sum::<usize>();
+        let output_tokens = (total_chars / 4) as u64;
+        Some(UsageCounts {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        })
     }
 
     pub fn terminal_seen(&self) -> bool {
@@ -526,7 +569,7 @@ fn diagnostic_str(payload: &serde_json::Map<String, Value>, field: &str) -> Opti
 ///
 /// A partial frame at the end of the body is [`AwsError::Truncated`], never a
 /// silent clean end, so callers can never observe half a response.
-pub fn aggregate(body: &[u8]) -> Result<StreamDecoder, ProtocolError> {
+pub fn aggregate(body: &[u8], context_window: Option<u64>) -> Result<StreamDecoder, ProtocolError> {
     let mut framer = Framer::new();
     let messages = framer
         .push(body)
@@ -534,7 +577,7 @@ pub fn aggregate(body: &[u8]) -> Result<StreamDecoder, ProtocolError> {
     framer
         .finish()
         .map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
-    let mut decoder = StreamDecoder::new();
+    let mut decoder = StreamDecoder::new(context_window);
     for message in &messages {
         decoder.observe(message)?;
     }
@@ -543,10 +586,18 @@ pub fn aggregate(body: &[u8]) -> Result<StreamDecoder, ProtocolError> {
 
 /// Observe one complete (aggregated) KAS response.
 ///
-/// KAS reports no token usage, so `usage` is `None` — the relay omits it on the
-/// client wire and the ledger records no fabricated counts.
-pub fn parse_json(body: &[u8]) -> Result<ObservedResponse, ProtocolError> {
-    let decoder = aggregate(body)?;
+/// `usage` estimates input tokens from `context_window` and the KAS context
+/// percentage, and output tokens from accumulated content with a chars/4
+/// heuristic. Missing input evidence omits usage rather than recording zeros;
+/// the estimates are ledger-only and never appear on the client wire.
+/// `context_window` is the served model's declared input window; the decoder
+/// combines it with the context percentage for the input estimate rather than
+/// inventing one from a bare percentage.
+pub fn parse_json(
+    body: &[u8],
+    context_window: Option<u64>,
+) -> Result<ObservedResponse, ProtocolError> {
+    let decoder = aggregate(body, context_window)?;
     Ok(ObservedResponse {
         usage: decoder.usage(),
         terminal: decoder.finish(),

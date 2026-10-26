@@ -164,12 +164,14 @@ IR 增加可选 `prompt_cache_key` 槽，Chat 与 Responses 不再无条件丢�
 - reasoningContentEvent -> reasoning 增量；signature 只在内部保留，不虚构跨协议签名。
 - toolUseEvent -> 按 toolUseId 分配稳定 index，支持并行工具；不能固定 index 0。
 - metadataEvent -> 正常收尾证据；有工具调用时 finish_reason 为 tool_calls。
-- meteringEvent -> 保存原始 usage；不从 credits 反推 token。
-- contextUsageEvent -> 仅诊断，不写入 token usage。
+- meteringEvent -> 保存原始 credits 供诊断；credits 永不反推 token 或折算美元。
+- contextUsageEvent -> prompt token 估算的证据：`input = floor(模型窗口 × contextUsagePercentage / 100)`，窗口取 key 模型快照的 KAS `tokenLimits.maxInputTokens`；缺窗口或缺百分比则省略整个 usage。
 - error/exception -> 保留上游错误类别并进入截断/错误处理。
 - 半帧 EOF、CRC/JSON 错误 -> 让现有 pump 合成可见错误终结帧并写账本。
 
 观测不到 token usage 时，客户端 body 省略 usage，不返回 prompt/completion/total 三个硬编码 0。账本同样不得把未知伪造成真实计量。
+
+Kiro 的 token 是估算值而非厂商计量：它只进账本/GUI，客户端 body 与流式帧都不出现（`translation::Dialect::estimates_usage` 负责把非流式 body 里的估算剥掉）。流式响应在 `metadataEvent` 之后继续有界读取 `contextUsageEvent`/`meteringEvent`（tail drain，只观测不转发），所以流式与非流式都能记账。费用仍按全局规则由 token × models.dev 目录价或人工固定价计算，Kiro 也不例外。
 
 protocol kernel 只产出 ObservedResponse；IR 转换留在 translation 层，避免 protocol -> translation -> protocol 的依赖倒置。
 

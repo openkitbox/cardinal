@@ -21,7 +21,7 @@
 - 参考源码：`parser/header.ts`、`parser/frame.ts`、`retry-executor.ts`、`token-manager.ts`、`client-profile.ts`、`model/events/base.ts`、`claude/converter.ts`。
 - AWS 帧硬约束：prelude 12 字节；header name length **1 字节**；string/bytes length 2 字节；type 8 timestamp、9 UUID；两段 CRC；16 MiB 上限；半帧 EOF 是错误。
 - KAS body 没有 `stream` 字段。流式与非流式客户端请求都打同一个 KAS endpoint，差别只在 cardinal 如何聚合/翻译响应。
-- `meteringEvent` 的 credits 不是 token。没有 token 观测时 `usage=None`，不得返回三个 0。
+- `meteringEvent` 的 credits 不是 token，也永不折算成美元。有 key 快照窗口 + `contextUsagePercentage` 时按 `窗口 × 百分比 / 100` 估算 input、按内容字符数/4 估算 output；二者缺一即 `usage=None`，不得返回三个 0。估算只进账本/GUI，不进客户端 body 或流式帧。
 
 ### 文件结构
 
@@ -576,7 +576,7 @@ Expected: FAIL，Kiro Decoder/response 聚合尚未实现。
 
 状态包含文本/reasoning 聚合、`HashMap<String,u32>` 工具 index、按 index 的名称/参数累积、metadata 标志、原始 metering 诊断、失败标志。`assistantResponseEvent.content` -> `TextDelta`；`reasoningContentEvent.text` -> `ReasoningDelta`（signature 可内部保留，不对外伪造）；toolUseEvent 校验非空 id/name、input string、stop bool，以 ID 查/分配 index。
 
-`metadataEvent` 只作为正常结束证据，stopReason 不决定是否工具终止。`meteringEvent` 保存原始 `usage/unit/unitPlural` 供诊断，不填 `UsageCounts`；`contextUsageEvent` 只诊断。`error`/`exception` 返回包含安全 error code/exception type 的 `InvalidUpstreamResponse`，未知普通 event 忽略，未知 message-type 报错。
+`metadataEvent` 只作为正常结束证据，stopReason 不决定是否工具终止。`meteringEvent` 保存原始 `usage/unit/unitPlural` 供诊断，不填 `UsageCounts`（credits 永不折 token/美元）；`contextUsageEvent` 给出 prompt 估算的百分比，配合 key 模型快照窗口由 `usage()` 换算，缺失即 None。`error`/`exception` 返回包含安全 error code/exception type 的 `InvalidUpstreamResponse`，未知普通 event 忽略，未知 message-type 报错。
 
 `parse_json(Kiro)` 用 AWS Framer 解完整 body并复用 Decoder，返回 `ObservedResponse { usage: None, .. }`；不能构造全零 usage。`translation::kiro::response_to_ir(&[u8])` 复用同一 Decoder 聚合内容，避免 protocol 反向依赖 translation。
 

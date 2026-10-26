@@ -198,3 +198,34 @@ credits 换算成钱。据此：
   修正"无 token 记账"的旧结论，登记本文件"偏差"节的 4 条。
 - `src/protocol/kiro.rs` 模块文档复核（偏差清单与代码一致）。
 - `git add -f` 本计划文件；worktree 内提交随各任务；最后按仓库流程 squash 合入 main。
+
+## 验收记录（2026-10-26，本地 gateway + 真实 KAS）
+
+- **窗口标定**：直连 KAS 解码原始帧（临时脚本，跑完即删）。短提示词
+  `contextUsagePercentage=0.16616052389144897`，约 40k 字符提示词 `1.1425162553787231`，
+  `Δchars=40502`、`Δpct=0.9763557314872742`。以该填充文本的真实切分密度
+  （≈4.5 字符/token）反解得窗口 ≈921,841，与 key 快照的
+  `tokenLimits.maxInputTokens = 922000` 一致（偏差 0.017%），且与路由声明的
+  262144 明显不符 → 确认分母就是上游声明窗口，不是路由声明值。
+- **价格**：`~/.ox/models-dev.json` mtime 调旧重启触发目录同步，
+  `gateway_model_prices` 出现 `provider_id=0`、`source='catalog'` 的
+  `gpt-5.6-sol`（4 / 20）与 `gpt-5.6-luna`（0.2 / 1.2），均为 models.dev 的
+  `openai` maker 条目。没有新增任何 Kiro 专用计价代码。
+- **真实请求**：非流式 `input=1533 output=2 cost=0.00030900`；流式
+  `input=1533 output=3 cost=0.00031000 ttft=718ms`。两者 cost 均等于
+  `token × 目录价`，`error` 为 NULL，`/api/requests`（GUI 数据源）同样返回这些字段。
+- **客户端可见性**：非流式 body 与流式帧都不含估算 usage（流式 `stop` + `[DONE]`，
+  无 usage 帧；非流式 body 无 `usage` 字段）。为此在 `Dialect` 上加了
+  `estimates_usage` 标记：Kiro 为 true，`attempt_json` 把估算从 IR 取出交给账本、
+  不放进客户端 body。这是计划"估算只进账本/GUI"的实现手段，不影响任何其它方言。
+- **回归**：deepseek（静态 key、chat 直通）非流式 `35/14 cost=0.00001400`、
+  流式 `36/32 cost=0.00002500`，均来自厂商原始 usage，与改造前同口径。
+- **临时测试（已删除）**：`protocol::kiro::temp_usage_estimate` 5/5 通过——
+  缺窗口 → None、缺百分比 → None、`922000 × 0.16616…% → 1532`、
+  reasoning 与工具参数计入 output、非法/缺失百分比 → None。
+- **尾帧缺失容错未做实机假上游**：Kiro 凭证管理器有刻意的
+  `EndpointMismatch` 守卫（`src/upstream/kiro_tokens.rs`），provider base_url 必须等于
+  `https://runtime.{apiRegion}.kiro.dev`，因此 loopback 假 KAS 无法在不放宽该守卫的
+  前提下走通 kernel。相应保障来自代码路径本身：`drain_tail` 只观测不转发、
+  读取失败/超时不写 `interrupted`、不合成错误帧，缺百分比时 `usage()` 返回 None
+  （已由上述临时测试覆盖）；正常 EOF 与完整尾帧已用真实 KAS 验证。

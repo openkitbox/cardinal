@@ -40,6 +40,11 @@ pub struct Candidate {
     /// The vendor-declared default level for this model, canonical; `None`
     /// when the snapshot does not name one.
     pub default_effort: Option<Effort>,
+    /// The context window the vendor advertises for THIS candidate's upstream
+    /// model, from the key's cached model-list snapshot (`ProbeModel::context`,
+    /// i.e. the model's input window). `None` when the snapshot has no such
+    /// entry, which the Kiro decoder reads as "no input estimate" — never zero.
+    pub context_window: Option<u64>,
 }
 
 impl Candidate {
@@ -96,6 +101,16 @@ fn effort_support(key: &ProviderKeyRow, model: &str) -> (Option<Box<[Effort]>>, 
     (Some(levels.into_boxed_slice()), default)
 }
 
+/// The candidate model's declared context window from the key's cached
+/// model-list snapshot. A missing snapshot or entry yields `None`.
+fn model_context(key: &ProviderKeyRow, model: &str) -> Option<u64> {
+    key.models
+        .as_ref()?
+        .iter()
+        .find(|entry| entry.id == model)
+        .and_then(|entry| entry.context)
+}
+
 /// Direct path ("<provider>/<model>"): the provider's enabled keys — which must arrive in global
 /// (position, id) order (the store's ORDER BY contract), each paired with its resolved secret —
 /// all serving the same upstream model. Returns the candidates plus the excluded ones with their reasons.
@@ -108,6 +123,7 @@ pub fn expand_direct(
     let mut excluded = Vec::new();
     for (key, secret) in keys {
         let (supported, default) = effort_support(&key, upstream_model);
+        let context_window = model_context(&key, upstream_model);
         if !key.enabled {
             excluded.push((
                 Candidate {
@@ -119,6 +135,7 @@ pub fn expand_direct(
                     entry_cap: None,
                     supported_efforts: supported.clone(),
                     default_effort: default,
+                    context_window,
                 },
                 SkipReason::Disabled,
             ));
@@ -135,6 +152,7 @@ pub fn expand_direct(
                     entry_cap: None,
                     supported_efforts: supported.clone(),
                     default_effort: default,
+                    context_window,
                 },
                 SkipReason::ModelNotAllowed,
             ));
@@ -149,6 +167,7 @@ pub fn expand_direct(
             entry_cap: None,
             supported_efforts: supported,
             default_effort: default,
+            context_window,
         });
     }
     (candidates, excluded)
@@ -253,5 +272,6 @@ fn make_candidate(
             .and_then(|cap| i32::try_from(cap).ok()),
         supported_efforts: supported,
         default_effort: default,
+        context_window: model_context(key, model),
     }
 }

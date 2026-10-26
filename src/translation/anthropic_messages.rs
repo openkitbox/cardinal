@@ -520,7 +520,10 @@ pub fn from_ir(
 
 /// Rebuild an Anthropic response body from the parsed IR response.
 /// Parse an upstream Messages response body into the IR response.
-pub fn response_to_ir(raw: &[u8]) -> Result<super::ir::IrResponse, ProtocolError> {
+pub fn response_to_ir(
+    raw: &[u8],
+    _context_window: Option<u64>,
+) -> Result<super::ir::IrResponse, ProtocolError> {
     let body: Value = serde_json::from_slice(raw).map_err(|_| ProtocolError::UpstreamError)?;
     let mut content = Vec::new();
     for block in body

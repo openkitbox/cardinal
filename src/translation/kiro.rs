@@ -1521,8 +1521,11 @@ fn dedup_notes(notes: Vec<&'static str>) -> Vec<&'static str> {
 /// [`ProtocolError::InvalidUpstreamResponse`], as is a truncated body with
 /// nothing recoverable. Tool arguments that are not a JSON object are likewise
 /// refused: `{}` could execute a different action.
-pub fn response_to_ir(raw: &[u8]) -> Result<IrResponse, ProtocolError> {
-    let decoder = crate::protocol::kiro::aggregate(raw)?;
+pub fn response_to_ir(
+    raw: &[u8],
+    context_window: Option<u64>,
+) -> Result<IrResponse, ProtocolError> {
+    let decoder = crate::protocol::kiro::aggregate(raw, context_window)?;
     if decoder.failed() {
         return Err(ProtocolError::InvalidUpstreamResponse);
     }

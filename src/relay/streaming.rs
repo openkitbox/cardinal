@@ -61,6 +61,9 @@ pub(super) enum StreamPump {
     Translated {
         upstream: ProtocolId,
         translator: translation::stream::StreamTranslator,
+        /// The served model's declared context window, handed to the upstream
+        /// decoder (Kiro derives prompt tokens from it).
+        context_window: Option<u64>,
     },
 }
 
@@ -91,6 +94,11 @@ const HOLD_MAX_BYTES: usize = 1024 * 1024;
 /// upstream is not a dead one). The request deadline bounds the hold window
 /// from above — the reader never outlives the request budget.
 const HOLD_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long the pump waits for the upstream to close after its terminal
+/// event. KAS sends its usage tail (`contextUsageEvent`, `meteringEvent`)
+/// after `metadataEvent`, so the pump cannot stop at the terminal; the bound
+/// keeps an upstream that holds its socket open from stalling the close.
+const TAIL_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Streaming hold: client frames are buffered until the
 /// response provably commits — first content, a terminal frame, a full
@@ -183,6 +191,24 @@ async fn read_frame(
         Ok(Some(frame)) => PumpRead::Frame(frame),
         Ok(None) => PumpRead::Eof,
         Err(error) => PumpRead::Transport(error),
+    }
+}
+
+/// Read the upstream to EOF after the terminal event, observing frames but
+/// never forwarding them.
+///
+/// The terminal event is not the end of the wire: KAS reports its context
+/// usage and billing after `metadataEvent`, and the ledger's usage estimate
+/// comes from those frames. Every failure here is diagnostics only — the
+/// response already completed, so a broken, truncated or silent tail must
+/// not mark the stream interrupted or synthesize an error frame. Bounded by
+/// `TAIL_DRAIN` so a lingering upstream only costs that much.
+async fn drain_tail(reader: &mut StreamReader, upstream: &mut protocol::Decoder) {
+    let deadline = tokio::time::Instant::now() + TAIL_DRAIN;
+    while let Ok(Ok(Some(frame))) =
+        tokio::time::timeout_at(deadline, reader.next_wire_frame()).await
+    {
+        let _ = upstream.observe_wire(&frame);
     }
 }
 
@@ -560,8 +586,9 @@ async fn drive_stream(
         StreamPump::Translated {
             upstream,
             mut translator,
+            context_window,
         } => {
-            let mut upstream = protocol::Decoder::new(upstream);
+            let mut upstream = protocol::Decoder::new(upstream, context_window);
             let mut done = false;
             while !done {
                 if hold.is_some() && tx.is_closed() {
@@ -687,6 +714,7 @@ async fn drive_stream(
                             }
                         }
                         if terminal_at_eof {
+                            drain_tail(reader, &mut upstream).await;
                             done = true;
                         }
                     }
@@ -807,6 +835,13 @@ async fn drive_stream(
                         done = true;
                     }
                 }
+            }
+            // The decoder's final state is authoritative: KAS reports its
+            // context usage only in the tail drained above, and every other
+            // kernel's last observed counts are the same ones its `Usage`
+            // events already delivered.
+            if let Some(counts) = upstream.usage() {
+                usage = Some(counts);
             }
         }
     }
