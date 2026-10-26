@@ -3,6 +3,7 @@
 //! Endpoints:
 //! - `GET/POST /api/providers`, `GET/PATCH/DELETE /api/providers/:id` — provider = protocol + endpoint (+ auth scheme), no credential
 //! - `GET/POST /api/providers/:id/keys`, `PATCH/DELETE /api/providers/:id/keys/:key_id` — every credential is a named key
+//!   (a Kiro key carries `auth_kind: "kiro_oidc"` + `oauth` instead of `api_key`; PATCH replaces that bundle only on an existing Kiro key)
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
 //!   plaintext-serving endpoint; the list shape stays masked)
 //! - `PUT /api/keys/order` `{ids: [..]}` — assign global positions sequentially in array order (one transaction)
@@ -36,6 +37,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::agent;
+use crate::kiro::{KeyCredential, KiroOAuth, resolve_key_credential};
 use crate::store::{self, ProviderInput, RouteEntry, RouteStrategy};
 
 /// Admin key SHA-256 (shared in-process, injected by main from config).
@@ -150,6 +152,7 @@ fn admin(depot: &Depot) -> crate::admin_ops::Admin {
         state.rest_cache.clone(),
         state.activity.clone(),
     )
+    .with_kiro_tokens(Arc::clone(&state.kiro_tokens))
     .with_dispatcher(state.dispatcher.clone())
 }
 
@@ -1089,7 +1092,17 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
 #[derive(Deserialize)]
 struct KeyBody {
     label: String,
-    api_key: String,
+    /// The static credential. Absent/empty is only valid for a Kiro OIDC key.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// `static` (default) or `kiro_oidc`; decides which credential field the
+    /// new row carries. Unknown values are rejected by the resolver.
+    #[serde(default)]
+    auth_kind: Option<String>,
+    /// The Kiro OIDC bundle; only accepted with `auth_kind = "kiro_oidc"` on
+    /// a provider whose protocol is `kiro`.
+    #[serde(default)]
+    oauth: Option<KiroOAuth>,
     /// Per-key in-flight cap; absent or null = unlimited.
     #[serde(default)]
     max_concurrency: Option<i32>,
@@ -1113,6 +1126,10 @@ struct PatchKeyBody {
     /// array = set the whitelist.
     #[serde(default, deserialize_with = "tri_state")]
     allowed_models: Option<Option<Vec<String>>>,
+    /// Replacement OAuth bundle for an EXISTING Kiro OIDC key. Not accepted on
+    /// a static key: a credential-kind conversion is not a patch.
+    #[serde(default)]
+    oauth: Option<KiroOAuth>,
 }
 
 /// Presence-capturing deserializer for a tri-state field: serde only calls
@@ -1171,20 +1188,57 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         let _ = response.body("invalid key body");
         return;
     };
-    // Keychain-first: the secret is stored under a freshly minted reference
-    // BEFORE the row exists; a failed insert rolls the secret back (see
-    // admin_ops::create_key).
+    // The credential shape depends on the provider's protocol, so read the
+    // row first: a Kiro OIDC key is only valid under a `kiro` provider.
+    let provider = match store::get_provider(pool, provider_id).await {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            not_found(response, "provider");
+            return;
+        }
+        Err(error) => {
+            internal(response, error);
+            return;
+        }
+    };
+    let credential = match resolve_key_credential(
+        &provider.protocol,
+        body.auth_kind.as_deref(),
+        body.api_key.as_deref(),
+        body.oauth.as_ref(),
+    ) {
+        Ok(credential) => credential,
+        Err(error) => {
+            bad_request(response, error);
+            return;
+        }
+    };
+    // The token manager seeds each key's state from the bundle, so a freshly
+    // created OIDC key must be visible to it before the first dispatch.
+    let created_oauth = match credential {
+        KeyCredential::KiroOidc(oauth) => Some(oauth.clone()),
+        KeyCredential::Static(_) => None,
+    };
     match crate::admin_ops::create_key(
         pool,
         provider_id,
         &body.label,
-        &body.api_key,
+        credential,
         body.max_concurrency,
         body.allowed_models,
     )
     .await
     {
         Ok(id) => {
+            if let Some(oauth) = created_oauth {
+                // The row already holds the bundle; replace also serializes with
+                // any refresh and proves disk and memory agree before the key
+                // can dispatch.
+                state(depot)
+                    .kiro_tokens
+                    .replace(pool, provider_id, id, oauth)
+                    .await;
+            }
             let _ = state(depot).route_cache.refresh(pool).await;
             response.status_code(StatusCode::CREATED);
             json_response(response, &json!({"id": id}));
@@ -1208,18 +1262,40 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
         let _ = response.body("invalid key patch body");
         return;
     };
-    match store::update_provider_key(
+    // One store transaction applies the OAuth rotation (when supplied) and
+    // every other field: all inputs are validated before the first write, so
+    // a rejected field never leaves a rotated credential behind. The OAuth
+    // branch only accepts an existing Kiro OIDC key — a static target is a
+    // 400, a missing key a 404. After a successful replace the in-memory token
+    // manager adopts the operator's bundle (serialized with any in-flight
+    // refresh, so an older refresh can never write itself over it).
+    // Cloned before the transaction: the match scrutinee's temporaries (the
+    // `KeyPatch` borrowing the body) live through the arms.
+    let rotated_oauth = body.oauth.clone();
+    match store::patch_provider_key(
         pool,
         provider_id,
         key_id,
-        body.label.as_deref(),
-        body.enabled,
-        body.max_concurrency,
-        body.allowed_models,
+        store::KeyPatch {
+            label: body.label.as_deref(),
+            enabled: body.enabled,
+            max_concurrency: body.max_concurrency,
+            allowed_models: body.allowed_models,
+            oauth: body.oauth.as_ref(),
+        },
     )
     .await
     {
         Ok(true) => {
+            if let Some(oauth) = rotated_oauth {
+                // Rewrites the row under the key's lock: a stale in-flight
+                // refresh cannot leave the row on the old bundle after this
+                // returns, and memory adopts exactly what the row now holds.
+                state(depot)
+                    .kiro_tokens
+                    .replace(pool, provider_id, key_id, oauth)
+                    .await;
+            }
             let _ = state(depot).route_cache.refresh(pool).await;
             json_response(response, &json!({"ok": true}))
         }
@@ -1260,6 +1336,7 @@ async fn delete_key(request: &mut Request, depot: &mut Depot, response: &mut Res
     match crate::admin_ops::delete_key(pool, provider_id, key_id).await {
         Ok(deleted) => {
             if deleted {
+                state(depot).kiro_tokens.remove(key_id);
                 let _ = state(depot).route_cache.refresh(pool).await;
                 json_response(response, &json!({"ok": true}))
             } else {

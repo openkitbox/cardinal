@@ -16,6 +16,7 @@ use regex::Regex;
 
 use super::optional;
 use crate::protocol::ProtocolError;
+use crate::upstream::kiro_tokens::KiroTokenError;
 use crate::upstream::transport::TransportError;
 
 /// Mapping transport failures → protocol error codes is orchestration policy, owned by the relay layer;
@@ -54,6 +55,12 @@ pub enum AttemptError {
     /// [`Failure::Other`] — so a pre-commit abort rests and retries exactly
     /// like a mid-read transport error.
     AbortedStream,
+    /// The candidate's Kiro OIDC credential could not produce a bearer (lazy
+    /// refresh failed) or the runtime host did not match the credential's
+    /// region. Carries the token module's own verdict — never a token — so the
+    /// relay can skip a dead account without either blaming the request or
+    /// forwarding a token-plane error to the client.
+    KiroTokenError(KiroTokenError),
     Protocol(ProtocolError),
 }
 
@@ -77,6 +84,7 @@ impl AttemptError {
             // An abort only ever surfaces when every candidate died pre-commit: the
             // upstream family, not the request's fault.
             Self::AbortedStream => ProtocolError::UpstreamError.status(),
+            Self::KiroTokenError(error) => error.client_status(),
             Self::Protocol(error) => error.status(),
         }
     }
@@ -99,6 +107,7 @@ impl AttemptError {
             Self::Transport(error) => as_protocol_error(error).code(),
             Self::ConcurrencyBusy { .. } => "concurrency_busy",
             Self::AbortedStream => ProtocolError::UpstreamError.code(),
+            Self::KiroTokenError(error) => error.code(),
             Self::Protocol(error) => error.code(),
         }
     }
@@ -113,6 +122,8 @@ impl AttemptError {
                 )
             }
             Self::AbortedStream => "upstream stream died before the response committed".to_owned(),
+            // Safe to surface: the token error carries no OAuth material.
+            Self::KiroTokenError(error) => error.to_string(),
             Self::Protocol(error) => format!("{error:?}"),
         }
     }
@@ -122,6 +133,7 @@ impl AttemptError {
     pub fn retry_after_duration(&self) -> Option<std::time::Duration> {
         match self {
             Self::Transport(error) => error.retry_after().and_then(|d| d.to_std().ok()),
+            Self::KiroTokenError(error) => error.retry_after().and_then(|d| d.to_std().ok()),
             _ => None,
         }
     }
@@ -285,6 +297,28 @@ pub fn classify(error: &AttemptError) -> Failure {
         // Pre-commit stream abort: the upstream died before producing anything —
         // the connection/timeout family, resting and retrying like a mid-read error.
         AttemptError::AbortedStream => return Failure::Other,
+        // The credential plane, not the request: a dead refresh token (or a
+        // runtime host that contradicts its region) is permanent — fail over
+        // without resting or blaming anybody; the account needs a re-import,
+        // which is the operator's call, not a backoff's. Everything temporary
+        // (429, 5xx, timeout, unreachable) follows the existing transient
+        // policy, and a 429 keeps its Retry-After.
+        AttemptError::KiroTokenError(error) => {
+            return match error {
+                KiroTokenError::Invalidated
+                | KiroTokenError::MissingCredential
+                | KiroTokenError::EndpointMismatch => Failure::Blameless,
+                KiroTokenError::Status {
+                    status: 429,
+                    retry_after,
+                } => Failure::Rate {
+                    retry_after: retry_after
+                        .as_deref()
+                        .and_then(crate::upstream::transport::parse_retry_after),
+                },
+                _ => Failure::Other,
+            };
+        }
         // Request-shape problems: the request itself is at fault.
         AttemptError::Protocol(_) => return Failure::Request,
     };

@@ -10,7 +10,8 @@
 
 use super::dns::Resolvers;
 use crate::protocol::Prepared;
-use crate::protocol::sse::{Framer, RawFrame, SseError};
+use crate::protocol::ProtocolId;
+use crate::protocol::wire::{WireError, WireFrame, WireFramer};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER};
 use std::{
     collections::{HashMap, VecDeque},
@@ -594,15 +595,22 @@ impl Transport {
         Ok(body)
     }
 
-    /// Wrap a streaming response in a bounded, deadline-aware frame reader.
-    pub fn stream(&self, response: reqwest::Response, deadline: Instant) -> StreamReader {
+    /// Wrap a streaming response in a bounded, deadline-aware frame reader for
+    /// the protocol's response wire.
+    pub fn stream(
+        &self,
+        response: reqwest::Response,
+        deadline: Instant,
+        protocol: ProtocolId,
+    ) -> StreamReader {
         StreamReader {
             response,
-            framer: Framer::new(),
+            framer: WireFramer::for_protocol(protocol),
             idle: self.limits.idle,
             deadline,
             pending: VecDeque::new(),
             finished: false,
+            broken: false,
         }
     }
 }
@@ -652,19 +660,27 @@ fn body_snippet(body: &[u8]) -> String {
     text.trim().chars().take(200).collect()
 }
 
-/// Incremental SSE reader with an idle ceiling and the request deadline.
+/// Incremental wire reader (SSE or AWS Event Stream) with an idle ceiling and
+/// the request deadline.
 pub struct StreamReader {
     response: reqwest::Response,
-    framer: Framer,
+    framer: WireFramer,
     idle: Duration,
     deadline: Instant,
-    pending: VecDeque<RawFrame>,
+    pending: VecDeque<WireFrame>,
     finished: bool,
+    /// A framing failure is terminal for the whole response body: every later
+    /// read reports [`TransportError::InvalidBody`] instead of looking like a
+    /// clean EOF.
+    broken: bool,
 }
 
 impl StreamReader {
-    /// Next complete frame without copying the data payload into a String.
-    pub async fn next_raw_frame(&mut self) -> Result<Option<RawFrame>, TransportError> {
+    /// Next complete frame without copying the payload into a String.
+    pub async fn next_wire_frame(&mut self) -> Result<Option<WireFrame>, TransportError> {
+        if self.broken {
+            return Err(TransportError::InvalidBody);
+        }
         if let Some(frame) = self.pending.pop_front() {
             return Ok(Some(frame));
         }
@@ -682,13 +698,36 @@ impl StreamReader {
                 Ok(Err(error)) if error.is_timeout() => return Err(TransportError::Timeout),
                 Ok(Err(_)) => return Err(TransportError::InvalidBody),
                 Ok(Ok(None)) => {
+                    // Mark the stream finished only after the framer accepted the
+                    // end: a frame cut short by EOF is a terminal error, and a
+                    // later read must not degrade it into a clean EOF.
+                    let frames = match self.framer.finish() {
+                        Ok(frames) => frames,
+                        Err(error) => {
+                            self.broken = true;
+                            tracing::warn!(
+                                wire_error = ?error,
+                                "upstream wire ended mid-frame; refusing a clean EOF"
+                            );
+                            return Err(TransportError::from(error));
+                        }
+                    };
                     self.finished = true;
-                    let frames = self.framer.finish_raw().map_err(map_sse)?;
                     self.pending.extend(frames);
                     return Ok(self.pending.pop_front());
                 }
                 Ok(Ok(Some(chunk))) => {
-                    let frames = self.framer.push_raw(&chunk).map_err(map_sse)?;
+                    let frames = match self.framer.push(&chunk) {
+                        Ok(frames) => frames,
+                        Err(error) => {
+                            self.broken = true;
+                            tracing::warn!(
+                                wire_error = ?error,
+                                "upstream wire framing failed; ending the stream"
+                            );
+                            return Err(TransportError::from(error));
+                        }
+                    };
                     self.pending.extend(frames);
                     if let Some(frame) = self.pending.pop_front() {
                         return Ok(Some(frame));
@@ -699,10 +738,11 @@ impl StreamReader {
     }
 }
 
-fn map_sse(error: SseError) -> TransportError {
-    match error {
-        SseError::InvalidUtf8 | SseError::LineTooLong | SseError::EventTooLarge => {
-            TransportError::InvalidBody
-        }
+/// Every framing failure — an SSE size limit, an invalid UTF-8 payload, an AWS
+/// CRC mismatch or a frame cut short by EOF — means the upstream body cannot
+/// be trusted. One verdict, and never a partial success.
+impl From<WireError> for TransportError {
+    fn from(_error: WireError) -> Self {
+        Self::InvalidBody
     }
 }

@@ -44,6 +44,7 @@ use crate::protocol::{self, ProtocolError, TargetView};
 use crate::store::{self, AttemptLog};
 use crate::translation;
 use crate::translation::ir::Effort;
+use crate::upstream::kiro_tokens::{self, KiroCallContext, KiroTokens};
 use crate::upstream::transport::{self, Transport};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -148,7 +149,8 @@ pub fn extract_effort(protocol: ProtocolId, body: &Value) -> Option<String> {
         }
         // Neither carries an effort dial: Gemini's effort lives in
         // `generationConfig`, and a retrieval call generates nothing at all.
-        ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => None,
+        // Kiro never arrives inbound — it is a translation target only.
+        ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => None,
     }
 }
 
@@ -314,6 +316,19 @@ async fn attempt(
     }
 }
 
+/// Everything the Kiro token plane needs for one candidate: the key row (its
+/// stored bundle seeds the manager and its id keys the per-key lock), the
+/// gateway database (rereads and write-backs), and the manager itself.
+///
+/// Bundled as one optional field so every non-Kiro candidate pays nothing for
+/// it — and so the credential path reads as one thing at the construction site.
+#[derive(Clone, Copy)]
+struct KiroDeps<'a> {
+    key: &'a crate::store::ProviderKeyRow,
+    pool: &'a sqlx::PgPool,
+    tokens: &'a KiroTokens,
+}
+
 /// The unchanging surroundings of one dispatch attempt: transport, the chosen
 /// upstream capability, credential material, the learned-refusal registry, the
 /// vendor fixup fields this candidate's upstream must never see, and — for
@@ -341,6 +356,9 @@ struct AttemptContext<'a> {
     route_efforts: Option<&'a [Effort]>,
     /// 当前候选 (provider, model family) 的 effort 方言。
     dial: capabilities::EffortDial,
+    /// Kiro only: this candidate's token plumbing. `None` for every non-Kiro
+    /// protocol, which therefore never touches the token manager or PG.
+    kiro: Option<KiroDeps<'a>>,
 }
 
 /// Shared send for both attempt flavors: prepare (passthrough or translated),
@@ -371,15 +389,83 @@ async fn send_attempt(
         default_effort,
         route_efforts,
         dial,
+        kiro,
     } = *ctx;
     // The selected capability IS the upstream protocol: passthrough when it
     // matches the client protocol, translation target otherwise.
     let protocol = capability.protocol;
+    // Kiro: one logical call per dispatch attempt (the reference's one
+    // `execute()`). The invocation id and attempt counter live here, outside
+    // the send/re-prepare loop, so an optional-field strip re-prepare advances
+    // the attempt instead of presenting the upstream with an invocation it has
+    // never seen. A failover to the next candidate enters this function again
+    // and therefore starts a new logical call.
+    let kas_call = (protocol == ProtocolId::Kiro).then(crate::kiro::KasCall::default);
+    // Kiro's bearer rotates, so it is resolved per attempt. A still-fresh token
+    // costs one lock acquisition and no I/O; a stale one refreshes under the
+    // key's lock (single-flight) and persists the rotated bundle. The KAS
+    // body's `profileArn` comes from the same live bundle, so a refresh that
+    // moved the account identity is reflected before the body is prepared.
+    let mut kiro_call: Option<KiroCallContext> = match (protocol, kiro) {
+        (ProtocolId::Kiro, Some(deps)) => {
+            // Pin the destination BEFORE resolving a credential: a bearer must
+            // only ever travel to the credential's own runtime host, never to
+            // an operator-editable `base_url`. Fail closed on a mismatch.
+            let api_region = deps
+                .key
+                .oauth
+                .as_ref()
+                .map(|oauth| oauth.api_region.as_str())
+                .ok_or(failover::AttemptError::KiroTokenError(
+                    kiro_tokens::KiroTokenError::MissingCredential,
+                ))?;
+            if !kiro_tokens::kas_endpoint_matches(&capability.endpoint, api_region) {
+                tracing::warn!(
+                    provider_id = deps.key.provider_id,
+                    key_id = deps.key.id,
+                    "Kiro runtime endpoint contradicts the credential's API region; refusing to send the bearer"
+                );
+                return Err(failover::AttemptError::KiroTokenError(
+                    kiro_tokens::KiroTokenError::EndpointMismatch,
+                ));
+            }
+            let call = deps
+                .tokens
+                .access_token(deps.pool, deps.key)
+                .await
+                .map_err(failover::AttemptError::KiroTokenError)?;
+            // Reassert against the RESOLVED bundle: the pre-check read the
+            // route cache's copy, which can lag a region move. The bearer must
+            // only ever travel to its own credential's runtime host.
+            if !kiro_tokens::kas_endpoint_matches(&capability.endpoint, &call.api_region) {
+                tracing::warn!(
+                    provider_id = deps.key.provider_id,
+                    key_id = deps.key.id,
+                    "Kiro credential's API region contradicts the runtime endpoint after token resolution; refusing to send the bearer"
+                );
+                return Err(failover::AttemptError::KiroTokenError(
+                    kiro_tokens::KiroTokenError::EndpointMismatch,
+                ));
+            }
+            Some(call)
+        }
+        (ProtocolId::Kiro, None) => {
+            return Err(failover::AttemptError::KiroTokenError(
+                kiro_tokens::KiroTokenError::MissingCredential,
+            ));
+        }
+        _ => None,
+    };
+    // The account identity the prepared body carries (updated if a 401 refresh
+    // rotates it mid-attempt). Owned: the call context it came from is replaced
+    // by the refresh, while the strip round still prepares from this copy.
+    let mut kiro_profile_arn = kiro_call.as_ref().and_then(|call| call.profile_arn.clone());
     let target = TargetView {
         protocol,
         endpoint: &capability.endpoint,
         stream_endpoint: capability.stream_endpoint.as_deref(),
         upstream_model: target_model,
+        kas_call: kas_call.as_ref(),
     };
 
     // Fields the wire must not carry, all known before the send: the vendor
@@ -450,7 +536,7 @@ async fn send_attempt(
     let passthrough_body: &Value = adapted_body
         .as_ref()
         .map_or(&request.body, std::borrow::Cow::as_ref);
-    let prepare = |fields: &[&str]| {
+    let prepare = |fields: &[&str], profile_arn: Option<&str>| {
         if request.protocol == protocol {
             protocol::prepare(
                 protocol,
@@ -473,24 +559,38 @@ async fn send_attempt(
                     supported_efforts,
                     route_efforts,
                     dial,
+                    kiro_profile_arn: profile_arn,
                 },
             )
         }
     };
-    let mut prepared = prepare(&skip).map_err(failover::AttemptError::Protocol)?;
+    let mut prepared =
+        prepare(&skip, kiro_profile_arn.as_deref()).map_err(failover::AttemptError::Protocol)?;
     // OpenCode's gateway (Zen or Go) refuses requests that name no conversation
     // (400 MissingSessionID), so its header family rides beside the credential.
     // The session seed derives from the first user message — top-level field
     // strips never move it — and was computed once per dispatch.
-    let mut headers = credential.headers();
+    // Kiro's Authorization is the call-context bearer; the row's own credential
+    // (the static-scheme placeholder, or a secret an operator typed on a Kiro
+    // row) never goes upstream.
+    let mut headers = match &kiro_call {
+        Some(call) => vec![("authorization", format!("Bearer {}", call.bearer()))],
+        None => credential.headers(),
+    };
     if let Some(seed) = opencode_seed {
         headers.extend(opencode_headers(seed));
     }
+    let query_pairs = if kiro_call.is_some() {
+        Vec::new()
+    } else {
+        credential.query_pairs()
+    };
 
     let mut rounds = 0u32;
+    let mut kiro_retried = false;
     loop {
         let response = transport
-            .send_with_headers(&prepared, &headers, &credential.query_pairs(), deadline)
+            .send_with_headers(&prepared, &headers, &query_pairs, deadline)
             .await
             .map_err(failover::AttemptError::Transport)?;
         let status = response.status().as_u16();
@@ -505,6 +605,66 @@ async fn send_attempt(
             .read_body(response, transport::MAX_ERROR_BODY, deadline)
             .await
             .unwrap_or_default();
+        // Kiro: the runtime's own invalidation signal licenses exactly one
+        // refresh-and-resend of this SAME invocation (same URL, same body,
+        // attempt advanced in place). Any other 401/403 — or a second rejection
+        // after the refresh — falls through to the ordinary failure path.
+        if !kiro_retried
+            && kiro_tokens::bearer_token_invalid(status, &body)
+            && let (Some(deps), Some(call)) = (kiro, &kiro_call)
+        {
+            kiro_retried = true;
+            let old_bearer = call.bearer().to_owned();
+            let old_profile_arn = call.profile_arn.clone();
+            // Concurrent requests that presented the same stale bearer
+            // de-duplicate in the manager: one CreateToken, everyone reuses.
+            let recovered = deps
+                .tokens
+                .recover_invalidated(deps.pool, deps.key, &old_bearer)
+                .await
+                .map_err(failover::AttemptError::KiroTokenError)?;
+            // The refreshed bundle may have moved to another API region (an
+            // operator rotation): reassert before resending this bearer.
+            if !kiro_tokens::kas_endpoint_matches(&capability.endpoint, &recovered.api_region) {
+                tracing::warn!(
+                    provider_id = deps.key.provider_id,
+                    key_id = deps.key.id,
+                    "recovered Kiro credential's API region no longer matches the runtime endpoint; refusing to resend the bearer"
+                );
+                return Err(failover::AttemptError::KiroTokenError(
+                    kiro_tokens::KiroTokenError::EndpointMismatch,
+                ));
+            }
+            if recovered.profile_arn != old_profile_arn
+                && let Some(profile_arn) = recovered.profile_arn.as_deref()
+            {
+                // Cold path: the account identity moved, so the already-built
+                // KAS body must name the new profile or the call is rejected.
+                set_profile_arn(&mut prepared, profile_arn);
+            }
+            kiro_profile_arn = recovered.profile_arn.clone();
+            headers = vec![("authorization", format!("Bearer {}", recovered.bearer()))];
+            kiro_call = Some(recovered);
+            // Same logical call, one attempt later: REPLACE the retry headers in
+            // place. The transport appends a caller's header list, so appending
+            // a second triple would send duplicate, contradictory values.
+            if let Some(call) = &kas_call {
+                let attempt = call.next_attempt();
+                crate::kiro::profile::replace_retry_headers(
+                    &mut prepared.headers,
+                    call.invocation(),
+                    attempt,
+                    crate::kiro::profile::KIRO_MAX_ATTEMPTS,
+                    chrono::Utc::now(),
+                );
+            }
+            tracing::warn!(
+                key_id = deps.key.id,
+                status,
+                "Kiro runtime rejected the bearer; refreshed once, resending the same call"
+            );
+            continue;
+        }
         // Refusal detection skips Anthropic upstreams (its API never names
         // request fields in errors).
         if protocol != ProtocolId::AnthropicMessages
@@ -517,7 +677,7 @@ async fn send_attempt(
                 // client tree — cheaper than parsing and re-serializing the wire
                 // body, and it covers kernel-injected fields identically.
                 skip.extend(refused.iter().copied());
-                if let Ok(retried) = prepare(&skip) {
+                if let Ok(retried) = prepare(&skip, kiro_profile_arn.as_deref()) {
                     for field in &refused {
                         unfit.record(provider_id, protocol, field);
                     }
@@ -536,7 +696,15 @@ async fn send_attempt(
         // A vendor error body can echo the credential it just rejected; excise it
         // before the body becomes the attempt's error — that error is what the
         // caller reads, what the attempt log prints, and what the request row keeps.
-        let body = match credential.redact(&body) {
+        let redacted = match &kiro_call {
+            Some(call) => crate::providers::AuthSchemeMaterial::new(
+                crate::providers::AuthScheme::Bearer,
+                call.bearer(),
+            )
+            .redact(&body),
+            None => credential.redact(&body),
+        };
+        let body = match redacted {
             Some(redacted) => bytes::Bytes::from(redacted),
             None => bytes::Bytes::from(body),
         };
@@ -547,6 +715,33 @@ async fn send_attempt(
                 None => failover::AttemptError::Transport(transport::TransportError::InvalidBody),
             },
         );
+    }
+}
+
+/// Point an already-prepared KAS body at a rotated account identity.
+///
+/// One cold-path parse/re-render, taken at most once per attempt: the body was
+/// built from the bundle the token manager knew before the 401, and a refresh
+/// that returned a new `profileArn` invalidates that copy. A body that cannot
+/// be parsed is left untouched (the resend then fails upstream like any other
+/// malformed request, which is the honest outcome).
+fn set_profile_arn(prepared: &mut protocol::Prepared, profile_arn: &str) {
+    let Ok(mut body) = serde_json::from_slice::<Value>(&prepared.body) else {
+        return;
+    };
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if object.get("profileArn").and_then(Value::as_str) == Some(profile_arn) {
+        return;
+    }
+    object.insert(
+        "profileArn".to_owned(),
+        Value::String(profile_arn.to_owned()),
+    );
+    match serde_json::to_vec(&body) {
+        Ok(rendered) => prepared.body = bytes::Bytes::from(rendered),
+        Err(_) => tracing::warn!("Kiro profileArn update could not re-render the prepared body"),
     }
 }
 
@@ -563,7 +758,7 @@ async fn attempt_stream(
 ) -> Result<RelayOutcome, failover::AttemptError> {
     let (status, response, protocol) =
         send_attempt(ctx, target_model, request, true, deadline).await?;
-    let reader = Box::new(ctx.transport.stream(response, deadline));
+    let reader = Box::new(ctx.transport.stream(response, deadline, protocol));
 
     let pump = if request.protocol == protocol {
         StreamPump::PassThrough {
@@ -612,9 +807,19 @@ async fn attempt_json(
             translation::dialect(protocol).map_err(failover::AttemptError::Protocol)?;
         let source_dialect =
             translation::dialect(request.protocol).map_err(failover::AttemptError::Protocol)?;
-        let ir =
+        let mut ir =
             (upstream_dialect.response_to_ir)(&body).map_err(failover::AttemptError::Protocol)?;
-        let bytes = (source_dialect.emit_response_json)(&ir);
+        // Kiro reports no model identity. The client body must still carry a
+        // sensible model, so fill an empty one with the model this attempt
+        // actually requested (never an invented id). The ledger keeps the
+        // evidence honest: an absent upstream model stays `None` there and
+        // falls back to the requested target (AttemptLog::from_observed).
+        let reported_model = !ir.model.is_empty();
+        if !reported_model {
+            ir.model = target_model.to_owned();
+        }
+        let bytes =
+            (source_dialect.emit_response_json)(&ir).map_err(failover::AttemptError::Protocol)?;
         if request.payload_log {
             tracing::debug!(target: PAYLOAD_TARGET, direction = "upstream_response", translated = true, body = %truncate_payload(&String::from_utf8_lossy(&bytes), bytes.len()));
         }
@@ -626,9 +831,11 @@ async fn attempt_json(
             status,
             body: bytes,
             observed: protocol::ObservedResponse {
-                usage: Some(ir.usage),
+                // A translated upstream that reported no token usage stays
+                // unknown; the ledger must not record fabricated zeroes.
+                usage: ir.usage,
                 terminal,
-                upstream_model: Some(ir.model),
+                upstream_model: reported_model.then_some(ir.model),
             },
         });
     };
@@ -655,6 +862,11 @@ struct WireTweaks<'a> {
     route_efforts: Option<&'a [Effort]>,
     /// 当前候选的 effort 方言。
     dial: capabilities::EffortDial,
+    /// Kiro only: the KAS body's `profileArn` — the live bundle's account
+    /// identity, resolved by the token manager before preparing (a refresh may
+    /// have rotated it). `None` for every other target, and also when this
+    /// login carried no profile.
+    kiro_profile_arn: Option<&'a str>,
 }
 
 /// Request preparation for the translation path: source to_ir → target from_ir → target prepare.
@@ -710,7 +922,21 @@ fn prepare_translated(
         join_split_tool_call_turns(&mut upstream_value);
         fill_missing_reasoning(&mut upstream_value);
     }
-    if stream {
+    if upstream == ProtocolId::Kiro {
+        // A KAS request body has no `stream` field at all: whether the client
+        // asked to stream is cardinal's reading of the AWS event-stream
+        // response, not a request knob. Injecting the Chat field here would
+        // hand KAS a body shape it never sends.
+        if let Some(profile_arn) = tweaks.kiro_profile_arn {
+            // The candidate's own login is the only profile identity — there is
+            // no provider-level cache to read (two keys of one provider are two
+            // accounts).
+            upstream_value["profileArn"] = Value::String(profile_arn.to_owned());
+        }
+        if upstream_value.get("stream").is_some() {
+            return Err(ProtocolError::InvalidRequest);
+        }
+    } else if stream {
         // The IR has no stream concept, so `from_ir` never emits it; the client
         // asked for a stream, and both kernels whitelist the field — inject it
         // here or the upstream answers with one non-streaming JSON blob.
@@ -764,15 +990,37 @@ enum Resolution {
     NoRoute,
 }
 
-/// Credentials now ride on the key rows themselves (0013): a row without an
-/// `api_key` is dropped from candidacy with a warning — never cooled, since a
-/// missing credential is not an upstream failure.
+/// Credentials now ride on the key rows themselves (0013). The branch is on
+/// `auth_kind` before the `api_key` emptiness check, because the two shapes are
+/// disjoint by construction:
+///
+/// * `static` — the row's plaintext key is the credential (unchanged);
+/// * `kiro_oidc` — the row's OAuth bundle is the credential and `api_key` is
+///   NULL. The access token inside that bundle rotates, so it is resolved per
+///   attempt by [`crate::upstream::KiroTokens`], not carried in the candidate:
+///   the candidate's placeholder secret is empty and never reaches the wire.
+///
+/// A row missing the credential its `auth_kind` requires is dropped from
+/// candidacy with a warning — never cooled, since a missing credential is not an
+/// upstream failure.
 fn fetch_key_secrets(
     keys: Vec<crate::store::ProviderKeyRow>,
 ) -> (Vec<(crate::store::ProviderKeyRow, SecretString)>, usize) {
     let mut resolved = Vec::with_capacity(keys.len());
     let mut skipped = 0usize;
     for key in keys.into_iter().filter(|key| key.enabled) {
+        if key.auth_kind == "kiro_oidc" {
+            if key.oauth.is_some() {
+                resolved.push((key, SecretString::from(String::new())));
+            } else {
+                skipped += 1;
+                tracing::warn!(
+                    key_id = key.id,
+                    "Kiro provider key has no OAuth bundle; skipped"
+                );
+            }
+            continue;
+        }
         match key.api_key.clone() {
             Some(api_key) => resolved.push((key, SecretString::from(api_key))),
             None => {
@@ -1127,16 +1375,24 @@ pub struct Observability<'a> {
     pub activity: &'a ActivitySink,
 }
 
-/// The shared dependencies every dispatch threads through: pool, upstream
+/// The shared dependencies every dispatch threads through: the upstream
 /// transport, dispatcher queue wait, failover state and the provider-key
 /// secret store (the relay resolves credentials from it at resolve time).
-/// Bundled because they always travel together. No `pool` field: the request
-/// path never touches PG (reads are cached, writes go through `ledger`).
+/// Bundled because they always travel together.
+///
+/// `pool` is the one deliberate PG touch on the request path, and only Kiro
+/// candidates reach it: an OIDC access token expires hourly, so the credential
+/// plane must reread the row (another process may have rotated it) and persist
+/// the rotated bundle. Every other candidate still reads cached state only, and
+/// every other write still goes through `ledger`.
 pub struct DispatchDeps<'a> {
+    pub pool: &'a sqlx::PgPool,
     pub transport: &'a Transport,
     pub queue_timeout: std::time::Duration,
     pub dispatcher: &'a tokio::sync::mpsc::UnboundedSender<dispatcher::DispatchEvent>,
     pub failover: &'a std::sync::Arc<Failover>,
+    /// Per-key Kiro OIDC token manager (lazy refresh, single-flight, write-back).
+    pub kiro_tokens: &'a KiroTokens,
     /// Routing trace ring: each dispatch pushes its decision record here.
     pub trace_ring: &'a trace::TraceRing,
     /// In-memory quota snapshots for Smart ordering — no PG read on the
@@ -1257,10 +1513,12 @@ pub async fn dispatch_at(
     now: chrono::DateTime<chrono::Local>,
 ) -> DispatchOutcome {
     let &DispatchDeps {
+        pool,
         transport,
         queue_timeout,
         dispatcher,
         failover,
+        kiro_tokens,
         trace_ring,
         smart_cache,
         rotate_cursors,
@@ -1735,6 +1993,12 @@ pub async fn dispatch_at(
                         default_effort: candidate.default_effort,
                         route_efforts: efforts.as_deref(),
                         dial: capabilities::effort_dial(&provider.name, target_model),
+                        // Only a Kiro candidate touches token state or PG.
+                        kiro: (capability.protocol == ProtocolId::Kiro).then_some(KiroDeps {
+                            key: &candidate.key,
+                            pool,
+                            tokens: kiro_tokens,
+                        }),
                     },
                     target_model,
                     request,
@@ -2038,15 +2302,10 @@ pub async fn dispatch_at(
                         _ => 0,
                     };
                     if retried < retries_left {
-                        let retry_after = match &error {
-                            failover::AttemptError::Transport(
-                                transport::TransportError::Status {
-                                    retry_after: Some(_),
-                                    ..
-                                },
-                            ) => error.retry_after_duration(),
-                            _ => None,
-                        };
+                        // Total over both failure families: a Kiro OIDC 429
+                        // carries its own Retry-After, and the token error's
+                        // variant is not the transport one.
+                        let retry_after = error.retry_after_duration();
                         let pause = retry_after.unwrap_or_else(|| {
                             failover.retry_pause().saturating_mul(1u32 << retried)
                         });

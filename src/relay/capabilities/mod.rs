@@ -149,6 +149,10 @@ fn protocol_suffix(protocol: ProtocolId) -> &'static str {
         // vendor module. A gemini protocol on a non-gemini name yields NO
         // capability (config error).
         ProtocolId::Gemini => unreachable!("gemini rows are served by the vendor module"),
+        // KAS takes no path leaf: its base_url IS the runtime host root
+        // (`https://runtime.{region}.kiro.dev/`), so the capability endpoint is
+        // the base_url plus a single trailing '/'.
+        ProtocolId::Kiro => "",
     }
 }
 
@@ -218,6 +222,10 @@ pub fn capabilities(
 
 /// Single-protocol rows (standard glm included): the row's protocol at the
 /// version root plus its canonical leaf, with the row's auth scheme.
+///
+/// Kiro takes this arm too, with an empty leaf: its endpoint is the provider's
+/// `base_url` root. The row's static auth scheme is only a placeholder for Kiro
+/// — the OIDC token manager replaces the Authorization header on the wire.
 fn single_protocol(row_protocol: &str, row_auth_scheme: &str, base: &str) -> Vec<Capability> {
     let (Some(protocol), Ok(auth_scheme)) = (
         ProtocolId::parse(row_protocol),

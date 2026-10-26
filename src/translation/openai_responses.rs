@@ -17,15 +17,8 @@ use serde_json::Value;
 /// are stateless-relay concerns: the kernel refuses their non-default values
 /// on the pass-through path; on a translated hop the concept has no upstream
 /// meaning at all, so a non-default value is recorded, not rejected.
-/// `prompt_cache_key` is an upstream cache-routing hint with no IR slot — the
-/// chat adapter records it the same way.
-const DROPPED_FIELDS: &[&str] = &[
-    "metadata",
-    "include",
-    "truncation",
-    "service_tier",
-    "prompt_cache_key",
-];
+/// `prompt_cache_key` is not listed: it has an IR slot and survives the hop.
+const DROPPED_FIELDS: &[&str] = &["metadata", "include", "truncation", "service_tier"];
 
 /// Parse a Responses request body into the IR. Unknown input items hard-fail:
 /// refusing beats silently dropping content the client believes was sent.
@@ -166,6 +159,12 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
         .and_then(|reasoning| reasoning.get("effort"))
         .and_then(Value::as_str)
         .and_then(Effort::parse_name);
+    // The upstream cache-routing hint rides the IR (Kiro derives its
+    // conversation id from it); a present-but-unusable value is a recorded loss.
+    let prompt_cache_key = super::ir::prompt_cache_key_of(object);
+    if prompt_cache_key.is_none() && object.contains_key("prompt_cache_key") {
+        dropped.push("prompt_cache_key");
+    }
     // SH-07: the IR carries the source envelope. Responses `text.format` is the
     // flat shape (type/name/schema/strict side by side); the Chat emitter
     // rebuilds its nested envelope from it.
@@ -198,6 +197,7 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
             effort,
             parallel_tool_calls: object.get("parallel_tool_calls").and_then(Value::as_bool),
             structured_output,
+            prompt_cache_key,
         },
         dropped,
     ))
@@ -389,7 +389,9 @@ fn tool_output_text(output: &Value) -> Result<String, ProtocolError> {
 /// Rebuild a Responses body from the IR response — the return leg of the
 /// Responses → Chat hop, where the upstream answer re-enters the client
 /// dialect.
-pub fn emit_response_json(response: &IrResponse) -> Vec<u8> {
+pub fn emit_response_json(
+    response: &IrResponse,
+) -> Result<Vec<u8>, crate::protocol::ProtocolError> {
     let mut output: Vec<Value> = Vec::new();
     let mut pending = String::new();
     let mut thinking = String::new();
@@ -446,20 +448,6 @@ pub fn emit_response_json(response: &IrResponse) -> Vec<u8> {
         ),
         IrStop::Stop | IrStop::ToolUse | IrStop::Other(_) => ("completed", None),
     };
-    let usage = &response.usage;
-    // Details objects appear only when a real value was observed — a fabricated
-    // zero is worse than absence (the streaming arm follows the same rule).
-    let mut usage_json = serde_json::json!({
-      "input_tokens": usage.input_tokens,
-      "output_tokens": usage.output_tokens,
-      "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens),
-    });
-    if let Some(cached) = usage.cached_input_tokens {
-        usage_json["input_tokens_details"] = serde_json::json!({"cached_tokens": cached});
-    }
-    if let Some(reasoning) = usage.reasoning_output_tokens {
-        usage_json["output_tokens_details"] = serde_json::json!({"reasoning_tokens": reasoning});
-    }
     let mut body = serde_json::json!({
       "id": format!("resp_{:032x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().unsigned_abs()),
       "object": "response",
@@ -467,12 +455,28 @@ pub fn emit_response_json(response: &IrResponse) -> Vec<u8> {
       "status": status,
       "model": response.model,
       "output": output,
-      "usage": usage_json,
     });
+    // Unknown usage stays unknown: an absent `usage` is honest, three zeroes
+    // are not (same rule as the streaming terminal).
+    if let Some(usage) = &response.usage {
+        let mut usage_json = serde_json::json!({
+          "input_tokens": usage.input_tokens,
+          "output_tokens": usage.output_tokens,
+          "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens),
+        });
+        if let Some(cached) = usage.cached_input_tokens {
+            usage_json["input_tokens_details"] = serde_json::json!({"cached_tokens": cached});
+        }
+        if let Some(reasoning) = usage.reasoning_output_tokens {
+            usage_json["output_tokens_details"] =
+                serde_json::json!({"reasoning_tokens": reasoning});
+        }
+        body["usage"] = usage_json;
+    }
     if let Some(details) = incomplete_details {
         body["incomplete_details"] = details;
     }
-    serde_json::to_vec(&body).unwrap_or_default()
+    serde_json::to_vec(&body).map_err(|_| crate::protocol::ProtocolError::InvalidUpstreamResponse)
 }
 
 fn message_item(seq: u64, text: String) -> Value {

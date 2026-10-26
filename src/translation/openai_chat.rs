@@ -180,9 +180,11 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
         .get("reasoning_effort")
         .and_then(Value::as_str)
         .and_then(Effort::parse_name);
-    // prompt_cache_key is rejected by the Responses kernel, so no translated
-    // hop can carry it; strip it audibly instead of a field that never emits.
-    if object.contains_key("prompt_cache_key") {
+    // The upstream cache-routing hint rides the IR; Kiro derives its
+    // conversation id from it. A present-but-unusable value is a recorded loss,
+    // never a claimed hint.
+    let prompt_cache_key = super::ir::prompt_cache_key_of(object);
+    if prompt_cache_key.is_none() && object.contains_key("prompt_cache_key") {
         dropped.push("prompt_cache_key");
     }
     let mut stop = Vec::new();
@@ -226,6 +228,7 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
             effort,
             parallel_tool_calls: object.get("parallel_tool_calls").and_then(Value::as_bool),
             structured_output: object.get("response_format").cloned(),
+            prompt_cache_key,
         },
         dropped,
     ))
@@ -243,6 +246,11 @@ pub fn from_ir(
     // missing one with HTTP 400 — misread as a pairing bug). So Thinking is
     // always kept here; vendors that ignore the field do no harm with it.
     let mut dropped: Vec<&'static str> = Vec::new();
+    // No Chat-family upstream consumes the cache-routing hint; record the loss
+    // instead of emitting a field the target never asked for.
+    if request.prompt_cache_key.is_some() {
+        dropped.push("prompt_cache_key");
+    }
     let mut messages: Vec<Value> = Vec::new();
     // Tool results must follow their call's assistant turn; images a tool
     // returned ride in a following user message (Chat tool messages hold text).
@@ -557,12 +565,16 @@ pub fn response_to_ir(raw: &[u8]) -> Result<super::ir::IrResponse, ProtocolError
             .to_owned(),
         content: parts,
         stop: stop_from_chat(choice.get("finish_reason").and_then(Value::as_str)),
-        usage: usage_from_chat(body.get("usage")).unwrap_or_default(),
+        usage: usage_from_chat(body.get("usage")),
     })
 }
 
 /// Rebuild a Chat response body from the parsed IR response.
-pub fn emit_response_json(response: &super::ir::IrResponse) -> Vec<u8> {
+///
+/// A source that reported no token usage (`usage: None`, e.g. Kiro) yields a
+/// body without a `usage` object at all: three fabricated zeroes would be read
+/// as a free request and mis-bill it.
+pub fn emit_response_json(response: &super::ir::IrResponse) -> Result<Vec<u8>, ProtocolError> {
     let mut content: Option<String> = None;
     let mut calls: Vec<Value> = Vec::new();
     let mut reasoning = String::new();
@@ -603,16 +615,17 @@ pub fn emit_response_json(response: &super::ir::IrResponse) -> Vec<u8> {
         IrStop::Other(reason) if reason == "content_filter" => "content_filter",
         IrStop::Other(_) => "stop",
     };
-    let usage = usage_to_chat(&response.usage);
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
       "id": format!("chatcmpl-{:032x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().unsigned_abs()),
       "object": "chat.completion",
       "created": chrono::Utc::now().timestamp(),
       "model": response.model,
       "choices": [{"index": 0, "message": Value::Object(message), "finish_reason": finish_reason}],
-      "usage": usage,
     });
-    serde_json::to_vec(&body).unwrap_or_default()
+    if let Some(usage) = &response.usage {
+        body["usage"] = usage_to_chat(usage);
+    }
+    serde_json::to_vec(&body).map_err(|_| ProtocolError::InvalidUpstreamResponse)
 }
 
 /// Chat usage wire shape from `UsageCounts`.

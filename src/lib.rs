@@ -26,6 +26,7 @@ pub mod config;
 pub mod db;
 pub mod gateway;
 pub mod http_client;
+pub mod kiro;
 pub mod metering;
 pub mod models;
 pub mod prices;

@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
+use crate::kiro::KeyCredential;
 use crate::probe::{self, ProbeModel};
 use crate::quota::{self, KeyQuota};
 use crate::store::{self, ProviderInput};
@@ -142,24 +143,45 @@ pub fn key_view(row: &store::ProviderKeyRow, api_key: String) -> KeyView {
     }
 }
 
+/// Create a key with the credential its create request resolved to: a static
+/// api_key row, or a Kiro OIDC row whose OAuth bundle replaces the api_key.
+/// The caller ([`crate::admin::router`]'s create endpoint) resolves the
+/// provider's protocol and validates the bundle via
+/// [`crate::kiro::resolve_key_credential`]; the empty-static-key guard stays
+/// here as well so this public facade cannot store a blank credential.
 pub async fn create_key(
     pool: &PgPool,
     provider_id: i64,
     label: &str,
-    api_key: &str,
+    credential: KeyCredential<'_>,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
 ) -> anyhow::Result<i64> {
-    anyhow::ensure!(!api_key.is_empty(), "api_key must not be empty");
-    store::insert_provider_key(
-        pool,
-        provider_id,
-        label,
-        api_key,
-        max_concurrency,
-        allowed_models,
-    )
-    .await
+    match credential {
+        KeyCredential::Static(api_key) => {
+            anyhow::ensure!(!api_key.trim().is_empty(), "api_key must not be empty");
+            store::insert_provider_key(
+                pool,
+                provider_id,
+                label,
+                api_key,
+                max_concurrency,
+                allowed_models,
+            )
+            .await
+        }
+        KeyCredential::KiroOidc(oauth) => {
+            store::insert_kiro_provider_key(
+                pool,
+                provider_id,
+                label,
+                oauth,
+                max_concurrency,
+                allowed_models,
+            )
+            .await
+        }
+    }
 }
 
 /// Delete a key row (route entries are stripped in the same transaction).
@@ -173,6 +195,13 @@ pub async fn delete_key(pool: &PgPool, provider_id: i64, key_id: i64) -> anyhow:
 /// (`gateway_key_quota_snapshots`), and return the live readings for the HTTP
 /// admin surface. One task per probe; each reading is persisted as it joins.
 ///
+/// Two probe kinds: a static key asks its provider's vendor endpoint
+/// ([`quota::fetch_quota`]) with its own credential, while a Kiro key has no
+/// api_key — its OAuth bundle (and the AWS region host the usage call lives on)
+/// comes from the shared [`crate::upstream::KiroTokens`] instance
+/// ([`quota::fetch_kiro_quota`]). That instance is the same one dispatch uses,
+/// so a probe's token refresh is a chat's refresh too, never a second cache.
+///
 /// Quota is decorative: a key whose probe fails (or whose provider has no quota
 /// source) simply has no entry, and a store failure degrades to a warning —
 /// both logged, never an error. This is the single fan-out shared by the
@@ -184,7 +213,15 @@ pub async fn delete_key(pool: &PgPool, provider_id: i64, key_id: i64) -> anyhow:
 pub async fn probe_all_quotas(
     pool: &PgPool,
     smart_cache: Option<&crate::relay::SmartCache>,
+    kiro_tokens: Option<&Arc<crate::upstream::KiroTokens>>,
 ) -> Vec<KeyQuotaRow> {
+    /// Which credential a key's probe uses.
+    enum QuotaSource {
+        /// The row's own api_key, at its provider's vendor endpoint.
+        Static(String),
+        /// The shared Kiro token manager, at the credential's region host.
+        Kiro(Arc<crate::upstream::KiroTokens>),
+    }
     let providers = match store::list_providers(pool).await {
         Ok(providers) => providers,
         Err(error) => {
@@ -212,14 +249,38 @@ pub async fn probe_all_quotas(
         // Only enabled keys get probed — filter BEFORE the probe: a disabled
         // key never costs a vendor call.
         let keys: Vec<_> = keys.into_iter().filter(|key| key.enabled).collect();
-        for key in keys {
-            let Some(api_key) = key.api_key else { continue }; // no credential — nothing to probe
+        for mut key in keys {
             let key_id = key.id;
+            // Kiro's quota source is decided by the provider's protocol, not by
+            // the presence of an api_key (a Kiro row never carries one). Every
+            // other provider keeps the credential-or-nothing rule.
+            let source = if provider.protocol == "kiro" {
+                let Some(tokens) = kiro_tokens else {
+                    // Without the live manager there is no bearer to reuse, and
+                    // minting a second cache would race dispatch's refreshes.
+                    // Kiro quotas stay unprobed (decorative, and the GUI's last
+                    // snapshot remains) instead of spending vendor traffic.
+                    tracing::warn!(provider = %provider.name, "quota probe: no Kiro token manager wired; skipping its keys");
+                    break;
+                };
+                QuotaSource::Kiro(Arc::clone(tokens))
+            } else {
+                match key.api_key.take() {
+                    Some(api_key) => QuotaSource::Static(api_key),
+                    None => continue, // no credential — nothing to probe
+                }
+            };
             let provider_name = provider.name.clone();
             let base_url = provider.base_url.clone();
             let anchor = anchors.get(&key_id).copied();
+            let pool = pool.clone();
             tasks.spawn(async move {
-                let mut quota = quota::fetch_quota(&provider_name, &base_url, &api_key).await;
+                let mut quota = match &source {
+                    QuotaSource::Kiro(tokens) => quota::fetch_kiro_quota(&pool, tokens, &key).await,
+                    QuotaSource::Static(api_key) => {
+                        quota::fetch_quota(&provider_name, &base_url, api_key).await
+                    }
+                };
                 if let (Some(day), Some(quota)) = (anchor, quota.as_mut()) {
                     quota::apply_monthly_anchor(quota, day, chrono::Utc::now());
                 }
@@ -282,6 +343,11 @@ pub struct Admin {
     /// Live-activity publisher: quota probes push a refresh notification so
     /// subscribed GUIs update their cards without polling.
     activity: crate::activity::ActivitySink,
+    /// The process's single Kiro token manager (None until
+    /// [`Self::with_kiro_tokens`] wires it). Kiro quota probes resolve their
+    /// bearer through it — the same single-flight cache dispatch uses — so a
+    /// refresh is shared instead of duplicated.
+    kiro_tokens: Option<Arc<crate::upstream::KiroTokens>>,
     /// Centralized dispatcher: queried for live slot occupancy (None until
     /// [`Self::with_dispatcher`] wires it).
     dispatcher: Option<tokio::sync::mpsc::UnboundedSender<crate::relay::dispatcher::DispatchEvent>>,
@@ -309,8 +375,17 @@ impl Admin {
             route_cache,
             rest_cache,
             activity,
+            kiro_tokens: None,
             dispatcher: None,
         }
+    }
+
+    /// Wire the live Kiro token manager so Kiro quota probes share dispatch's
+    /// single-flight credential cache. Called once by the admin surface which
+    /// owns the same instance.
+    pub fn with_kiro_tokens(mut self, kiro_tokens: Arc<crate::upstream::KiroTokens>) -> Self {
+        self.kiro_tokens = Some(kiro_tokens);
+        self
     }
 
     /// Wire the dispatcher for live inflight queries. Called once by the
@@ -459,7 +534,12 @@ impl Admin {
     /// probe/persist fan-out; the HTTP response shape (`{"items": [...]}`) is
     /// unchanged.
     pub async fn quotas(&self) -> Vec<KeyQuotaRow> {
-        let rows = probe_all_quotas(&self.pool, Some(&self.smart_cache)).await;
+        let rows = probe_all_quotas(
+            &self.pool,
+            Some(&self.smart_cache),
+            self.kiro_tokens.as_ref(),
+        )
+        .await;
         if !rows.is_empty() {
             self.activity.quota_refreshed();
         }
@@ -570,15 +650,15 @@ impl Admin {
     }
 
     /// Add a named key to a provider; returns the new key id.
+    /// `credential`: the validated credential shape — a static api_key or a
+    /// Kiro OIDC bundle (see [`crate::kiro::resolve_key_credential`]).
     /// `max_concurrency`: per-key in-flight cap (None = unlimited).
     /// `allowed_models`: the key's model whitelist (None/empty = unrestricted).
-    /// The secret goes to the secret store first (Keychain-first ordering, see
-    /// [`create_key`]); the row stores only its reference.
     pub async fn create_key(
         &self,
         provider_id: i64,
         label: &str,
-        api_key: &str,
+        credential: KeyCredential<'_>,
         max_concurrency: Option<i32>,
         allowed_models: Option<Vec<String>>,
     ) -> anyhow::Result<i64> {
@@ -586,7 +666,7 @@ impl Admin {
             &self.pool,
             provider_id,
             label,
-            api_key,
+            credential,
             max_concurrency,
             allowed_models,
         )

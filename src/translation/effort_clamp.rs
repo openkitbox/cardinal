@@ -148,7 +148,10 @@ pub fn plan(protocol: ProtocolId, body: &Value, target: &EffortTarget<'_>) -> Ve
             );
             push_budget(&mut rewrites, body, target);
         }
-        ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => {}
+        // No effort dial to rewrite: Gemini keeps its own `generationConfig`,
+        // retrieval generates nothing, and Kiro's effort mapping belongs to its
+        // emitter (the kernel refuses before this point today).
+        ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {}
     }
     rewrites
 }

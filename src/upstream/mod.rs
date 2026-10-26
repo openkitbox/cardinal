@@ -9,4 +9,7 @@
 //! (retry policy belongs to `relay`).
 
 pub(crate) mod dns;
+pub mod kiro_tokens;
 pub mod transport;
+
+pub use kiro_tokens::{KiroCallContext, KiroTokenError, KiroTokens};

@@ -1,5 +1,6 @@
 use sqlx::PgPool;
 
+use crate::kiro::{KeyCredential, KiroOAuth};
 use crate::probe::ProbeModel;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -25,6 +26,17 @@ pub struct ProviderKeyRow {
     /// (relay candidate filtering).
     #[sqlx(json(nullable))]
     pub allowed_models: Option<Vec<String>>,
+    /// How the row authenticates upstream: `static` (the plaintext api_key
+    /// above) or `kiro_oidc` (the OAuth bundle below). Mirrors the column's
+    /// CHECK constraint (migrations/0007).
+    pub auth_kind: String,
+    /// The Kiro OIDC bundle for `auth_kind = "kiro_oidc"` rows; NULL for every
+    /// static key (the DB keeps the two credential shapes disjoint). Never
+    /// serialized: this row is an internal read shape and the tokens must not
+    /// reach any JSON surface (the bootstrap/reveal views carry no credential).
+    #[sqlx(json(nullable))]
+    #[serde(skip)]
+    pub oauth: Option<KiroOAuth>,
 }
 
 /// Public view of ProviderKeyRow: hides api_key. `inflight` is the live
@@ -73,7 +85,7 @@ pub async fn list_provider_keys(
     provider_id: i64,
 ) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth FROM gateway_provider_keys
          WHERE provider_id = $1 ORDER BY position, id",
   )
   .bind(provider_id)
@@ -86,7 +98,7 @@ pub async fn list_provider_keys(
 /// /v1/models route-object derivation resolves route entries against it.
 pub async fn list_all_keys(pool: &PgPool) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth FROM gateway_provider_keys
          ORDER BY position, id",
   )
   .fetch_all(pool)
@@ -146,7 +158,7 @@ pub async fn list_enabled_key_models(pool: &PgPool) -> anyhow::Result<Vec<Enable
 /// Keys by id (route expansion), in global (position, id) order.
 pub async fn list_keys_by_ids(pool: &PgPool, ids: &[i64]) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth FROM gateway_provider_keys
          WHERE id = ANY($1) ORDER BY position, id",
   )
   .bind(ids)
@@ -179,6 +191,9 @@ pub async fn update_key_models(
 /// `api_key` is the plaintext credential stored in the row (DB-backed since
 /// 0013 — the Keychain round-trip caused per-read authorization prompts and
 /// bought nothing for a single-user local service).
+///
+/// This is the static-credential shape (`auth_kind = "static"`) every
+/// pre-Kiro provider uses; [`insert_kiro_provider_key`] owns the OAuth shape.
 pub async fn insert_provider_key(
     pool: &PgPool,
     provider_id: i64,
@@ -187,6 +202,54 @@ pub async fn insert_provider_key(
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
 ) -> anyhow::Result<i64> {
+    insert_key_row(
+        pool,
+        provider_id,
+        label,
+        KeyCredential::Static(api_key),
+        max_concurrency,
+        allowed_models,
+    )
+    .await
+}
+
+/// Insert a Kiro OIDC key: no api_key, the OAuth bundle stored under
+/// `auth_kind = "kiro_oidc"`. The bundle is validated here too — the store
+/// never persists an incomplete credential, whatever the caller checked.
+pub async fn insert_kiro_provider_key(
+    pool: &PgPool,
+    provider_id: i64,
+    label: &str,
+    oauth: &KiroOAuth,
+    max_concurrency: Option<i32>,
+    allowed_models: Option<Vec<String>>,
+) -> anyhow::Result<i64> {
+    oauth.validate()?;
+    insert_key_row(
+        pool,
+        provider_id,
+        label,
+        KeyCredential::KiroOidc(oauth),
+        max_concurrency,
+        allowed_models,
+    )
+    .await
+}
+
+/// Shared insert body for both credential shapes: validates, normalizes and
+/// appends under the position lock.
+async fn insert_key_row(
+    pool: &PgPool,
+    provider_id: i64,
+    label: &str,
+    credential: KeyCredential<'_>,
+    max_concurrency: Option<i32>,
+    allowed_models: Option<Vec<String>>,
+) -> anyhow::Result<i64> {
+    let (api_key, auth_kind, oauth) = match credential {
+        KeyCredential::Static(api_key) => (Some(api_key), "static", None),
+        KeyCredential::KiroOidc(oauth) => (None, "kiro_oidc", Some(oauth)),
+    };
     anyhow::ensure!(!label.is_empty(), "label must not be empty");
     ensure_valid_max_concurrency(max_concurrency)?;
     let allowed_models = normalize_allowed_models(allowed_models)?;
@@ -195,18 +258,78 @@ pub async fn insert_provider_key(
         .execute(&mut *tx)
         .await?;
     let id: (i64,) = sqlx::query_as(
-    "INSERT INTO gateway_provider_keys (provider_id, label, api_key, position, max_concurrency, allowed_models)
-         VALUES ($1, $2, $3, (SELECT COALESCE(MAX(position) + 1, 0) FROM gateway_provider_keys), $4, $5) RETURNING id",
+    "INSERT INTO gateway_provider_keys (provider_id, label, api_key, auth_kind, oauth, position, max_concurrency, allowed_models)
+         VALUES ($1, $2, $3, $4, $5, (SELECT COALESCE(MAX(position) + 1, 0) FROM gateway_provider_keys), $6, $7) RETURNING id",
   )
   .bind(provider_id)
   .bind(label)
   .bind(api_key)
+  .bind(auth_kind)
+  .bind(oauth.map(serde_json::to_value).transpose()?)
   .bind(max_concurrency)
   .bind(allowed_models.map(serde_json::to_value).transpose()?)
   .fetch_one(&mut *tx)
   .await?;
     tx.commit().await?;
     Ok(id.0)
+}
+
+/// Replace an existing Kiro key's OAuth bundle (admin credential rotation).
+///
+/// Only a `kiro_oidc` row is a valid target: converting a static key to OIDC
+/// is not a supported transition, so that case errors instead of writing.
+/// Returns false when no such key exists.
+pub async fn replace_kiro_oauth(
+    pool: &PgPool,
+    provider_id: i64,
+    key_id: i64,
+    oauth: &KiroOAuth,
+) -> anyhow::Result<bool> {
+    oauth.validate()?;
+    let result = sqlx::query(
+        "UPDATE gateway_provider_keys SET oauth = $3
+         WHERE id = $1 AND provider_id = $2 AND auth_kind = 'kiro_oidc'",
+    )
+    .bind(key_id)
+    .bind(provider_id)
+    .bind(serde_json::to_value(oauth)?)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() > 0 {
+        return Ok(true);
+    }
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT auth_kind FROM gateway_provider_keys WHERE id = $1 AND provider_id = $2",
+    )
+    .bind(key_id)
+    .bind(provider_id)
+    .fetch_optional(pool)
+    .await?;
+    match existing {
+        Some((auth_kind,)) => {
+            anyhow::bail!("oauth can only be updated on a Kiro OIDC key (auth_kind: {auth_kind})")
+        }
+        None => Ok(false),
+    }
+}
+
+/// One key's stored OAuth bundle, read fresh from the row.
+///
+/// The token manager calls this under its per-key lock before refreshing: a
+/// bundle written by another process (or by kiro-cli, or by the admin plane) is
+/// newer than the route cache's copy, and refreshing from a stale refresh token
+/// would either fail or rotate it twice. `Ok(None)` means the row is gone.
+pub async fn kiro_oauth(pool: &PgPool, key_id: i64) -> anyhow::Result<Option<KiroOAuth>> {
+    let stored = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT oauth FROM gateway_provider_keys WHERE id = $1",
+    )
+    .bind(key_id)
+    .fetch_optional(pool)
+    .await?;
+    match stored.flatten() {
+        Some(value) => Ok(Some(serde_json::from_value(value)?)),
+        None => Ok(None),
+    }
 }
 
 /// The concurrency cap must be positive when set (mirrors the column CHECK,
@@ -240,12 +363,101 @@ fn normalize_allowed_models(models: Option<Vec<String>>) -> anyhow::Result<Optio
     Ok((!out.is_empty()).then_some(out))
 }
 
-/// Partial update (PATCH semantics): only the supplied fields change.
+/// The fields of a key PATCH besides the row identity, plus an optional
+/// credential replacement. Three-state options keep PATCH semantics: outer
+/// `None` = untouched, inner `None` = clear to the default.
+#[derive(Clone, Debug, Default)]
+pub struct KeyPatch<'a> {
+    pub label: Option<&'a str>,
+    pub enabled: Option<bool>,
+    pub max_concurrency: Option<Option<i32>>,
+    pub allowed_models: Option<Option<Vec<String>>>,
+    /// Replacement OAuth bundle; only accepted on an existing `kiro_oidc` row.
+    pub oauth: Option<&'a KiroOAuth>,
+}
+
+/// Partial update (PATCH semantics) that may also rotate the credential:
+/// every supplied field, the OAuth bundle included, commits in one
+/// transaction, and every input is validated before the first write — a
+/// rejected field never leaves a rotated credential behind.
+///
 /// `max_concurrency` is three-state: outer None = untouched, inner None = clear to unlimited.
 /// `allowed_models` is three-state likewise: outer None = untouched, inner None
 /// (or an empty list) = clear to unrestricted (stored as NULL).
-/// Credential rotation is deliberately NOT here: rotate by delete + recreate
-/// (a new row gets a fresh position and a fresh cooldown identity).
+/// Returns false when no such key exists. An `oauth` bundle on a `static` row
+/// is an error: converting a key's credential kind is not a patch.
+pub async fn patch_provider_key(
+    pool: &PgPool,
+    provider_id: i64,
+    key_id: i64,
+    patch: KeyPatch<'_>,
+) -> anyhow::Result<bool> {
+    if let Some(label) = patch.label {
+        anyhow::ensure!(!label.is_empty(), "label must not be empty");
+    }
+    ensure_valid_max_concurrency(patch.max_concurrency.flatten())?;
+    let allowed_models = match patch.allowed_models {
+        Some(list) => Some(normalize_allowed_models(list)?),
+        None => None,
+    };
+    if let Some(oauth) = patch.oauth {
+        oauth.validate()?;
+    }
+    let oauth = patch.oauth.map(serde_json::to_value).transpose()?;
+    // One statement, so the credential replacement and the other fields share
+    // a commit. The `auth_kind` guard refuses the conversion; a zero row count
+    // is disambiguated below (absent row vs rejected conversion).
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query(
+        "UPDATE gateway_provider_keys SET
+           label = COALESCE($3, label),
+           enabled = COALESCE($4, enabled),
+           max_concurrency = CASE WHEN $5 THEN $6 ELSE max_concurrency END,
+           allowed_models = CASE WHEN $7 THEN $8 ELSE allowed_models END,
+           oauth = CASE WHEN $9 THEN $10 ELSE oauth END
+         WHERE id = $1 AND provider_id = $2
+           AND (NOT $9 OR auth_kind = 'kiro_oidc')",
+    )
+    .bind(key_id)
+    .bind(provider_id)
+    .bind(patch.label)
+    .bind(patch.enabled)
+    .bind(patch.max_concurrency.is_some())
+    .bind(patch.max_concurrency.flatten())
+    .bind(allowed_models.is_some())
+    .bind(
+        allowed_models
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()?,
+    )
+    .bind(oauth.is_some())
+    .bind(oauth)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT auth_kind FROM gateway_provider_keys WHERE id = $1 AND provider_id = $2",
+        )
+        .bind(key_id)
+        .bind(provider_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.rollback().await?;
+        return match existing {
+            Some((auth_kind,)) => anyhow::bail!(
+                "oauth can only be updated on a Kiro OIDC key (auth_kind: {auth_kind})"
+            ),
+            None => Ok(false),
+        };
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Partial update of the non-credential fields; the plaintext credential is
+/// never replaced here (delete + recreate such a row instead), and an OAuth
+/// rotation goes through [`patch_provider_key`].
 pub async fn update_provider_key(
     pool: &PgPool,
     provider_id: i64,
@@ -255,38 +467,19 @@ pub async fn update_provider_key(
     max_concurrency: Option<Option<i32>>,
     allowed_models: Option<Option<Vec<String>>>,
 ) -> anyhow::Result<bool> {
-    if let Some(label) = label {
-        anyhow::ensure!(!label.is_empty(), "label must not be empty");
-    }
-    ensure_valid_max_concurrency(max_concurrency.flatten())?;
-    let allowed_models = match allowed_models {
-        Some(list) => Some(normalize_allowed_models(list)?),
-        None => None,
-    };
-    let result = sqlx::query(
-        "UPDATE gateway_provider_keys SET
-           label = COALESCE($3, label),
-           enabled = COALESCE($4, enabled),
-           max_concurrency = CASE WHEN $5 THEN $6 ELSE max_concurrency END,
-           allowed_models = CASE WHEN $7 THEN $8 ELSE allowed_models END
-         WHERE id = $1 AND provider_id = $2",
+    patch_provider_key(
+        pool,
+        provider_id,
+        key_id,
+        KeyPatch {
+            label,
+            enabled,
+            max_concurrency,
+            allowed_models,
+            oauth: None,
+        },
     )
-    .bind(key_id)
-    .bind(provider_id)
-    .bind(label)
-    .bind(enabled)
-    .bind(max_concurrency.is_some())
-    .bind(max_concurrency.flatten())
-    .bind(allowed_models.is_some())
-    .bind(
-        allowed_models
-            .flatten()
-            .map(serde_json::to_value)
-            .transpose()?,
-    )
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+    .await
 }
 
 /// The key's stored secret reference (None = no such row or no reference).

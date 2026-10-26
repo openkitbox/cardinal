@@ -304,6 +304,8 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
             effort,
             parallel_tool_calls: object.get("parallel_tool_calls").and_then(Value::as_bool),
             structured_output: None,
+            // Anthropic has no cache-routing key concept.
+            prompt_cache_key: None,
         },
         dropped,
     ))
@@ -320,6 +322,10 @@ pub fn from_ir(
     // The Anthropic kernel rejects parallel_tool_calls on the wire.
     if request.parallel_tool_calls.is_some() {
         dropped.push("parallel_tool_calls");
+    }
+    // Nor does Anthropic consume the cache-routing hint: record the loss.
+    if request.prompt_cache_key.is_some() {
+        dropped.push("prompt_cache_key");
     }
     // SH-07: Anthropic has no structured-output envelope; a translated hop
     // drops the constraint audibly instead of silently losing the guarantee.
@@ -573,23 +579,32 @@ pub fn response_to_ir(raw: &[u8]) -> Result<super::ir::IrResponse, ProtocolError
             .to_owned(),
         content,
         stop: stop_from_anthropic(body.get("stop_reason").and_then(Value::as_str)),
-        usage: usage_from_anthropic(body.get("usage")).unwrap_or_default(),
+        usage: usage_from_anthropic(body.get("usage")),
     })
 }
 
 /// Inverse of the usage mapping the kernel uses: Messages usage object to
 /// `UsageCounts`, folding cache reads/writes into billable input like the
 /// protocol observer does.
+///
+/// Partial usage objects are real (a stream can report only one side), so each
+/// token field falls back to zero independently — the Chat parser's rule. A
+/// known input is never dropped just because the output count is absent.
 pub(crate) fn usage_from_anthropic(
     usage: Option<&Value>,
 ) -> Option<crate::protocol::usage::UsageCounts> {
     let usage = usage?;
-    let input = usage.get("input_tokens").and_then(Value::as_u64)?;
-    let output = usage.get("output_tokens").and_then(Value::as_u64)?;
+    let input = usage.get("input_tokens").and_then(Value::as_u64);
+    let output = usage.get("output_tokens").and_then(Value::as_u64);
     let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
     let cache_creation = usage
         .get("cache_creation_input_tokens")
         .and_then(Value::as_u64);
+    if input.is_none() && output.is_none() && cache_read.is_none() && cache_creation.is_none() {
+        return None;
+    }
+    let input = input.unwrap_or(0);
+    let output = output.unwrap_or(0);
     let billable_input = input
         .checked_add(cache_read.unwrap_or(0))?
         .checked_add(cache_creation.unwrap_or(0))?;
@@ -613,7 +628,9 @@ pub(crate) fn stop_from_anthropic(stop: Option<&str>) -> IrStop {
     }
 }
 
-pub fn emit_response_json(response: &super::ir::IrResponse) -> Vec<u8> {
+pub fn emit_response_json(
+    response: &super::ir::IrResponse,
+) -> Result<Vec<u8>, crate::protocol::ProtocolError> {
     let mut content: Vec<Value> = Vec::new();
     for part in &response.content {
         match part {
@@ -655,8 +672,7 @@ pub fn emit_response_json(response: &super::ir::IrResponse) -> Vec<u8> {
             Value::String(reason.clone()),
         ),
     };
-    let usage = &response.usage;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
       "id": format!("msg_{:024x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().unsigned_abs()),
       "type": "message",
       "role": "assistant",
@@ -664,13 +680,17 @@ pub fn emit_response_json(response: &super::ir::IrResponse) -> Vec<u8> {
       "content": content,
       "stop_reason": stop_reason,
       "stop_sequence": stop_sequence,
-      "usage": {
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "cache_read_input_tokens": usage.cached_input_tokens.unwrap_or(0),
-      },
     });
-    serde_json::to_vec(&body).unwrap_or_default()
+    // An upstream that reported no token usage leaves the field out entirely:
+    // zeroes would be read as a real (free) measurement.
+    if let Some(usage) = &response.usage {
+        body["usage"] = serde_json::json!({
+          "input_tokens": usage.input_tokens,
+          "output_tokens": usage.output_tokens,
+          "cache_read_input_tokens": usage.cached_input_tokens.unwrap_or(0),
+        });
+    }
+    serde_json::to_vec(&body).map_err(|_| crate::protocol::ProtocolError::InvalidUpstreamResponse)
 }
 
 pub(crate) fn effort_name(effort: Effort) -> &'static str {

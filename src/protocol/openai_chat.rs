@@ -286,15 +286,15 @@ impl StreamDecoder {
         if value.get("error").is_some_and(|error| !error.is_null()) {
             return Err(ProtocolError::UpstreamError);
         }
-        if self.upstream_id.is_none() {
-            if let Some(id) = value.get("id").and_then(Value::as_str) {
-                self.upstream_id = Some(id.to_owned());
-            }
+        if self.upstream_id.is_none()
+            && let Some(id) = value.get("id").and_then(Value::as_str)
+        {
+            self.upstream_id = Some(id.to_owned());
         }
-        if self.upstream_model.is_none() {
-            if let Some(model) = value.get("model").and_then(Value::as_str) {
-                self.upstream_model = Some(model.to_owned());
-            }
+        if self.upstream_model.is_none()
+            && let Some(model) = value.get("model").and_then(Value::as_str)
+        {
+            self.upstream_model = Some(model.to_owned());
         }
         if let Some(usage) = usage_from(&value) {
             events.push(StreamEvent::Usage(usage.clone()));
@@ -419,15 +419,15 @@ impl StreamDecoder {
         if value.get("error").is_some_and(|error| !error.is_null()) {
             return Err(ProtocolError::UpstreamError);
         }
-        if self.upstream_id.is_none() {
-            if let Some(id) = value.get("id").and_then(Value::as_str) {
-                self.upstream_id = Some(id.to_owned());
-            }
+        if self.upstream_id.is_none()
+            && let Some(id) = value.get("id").and_then(Value::as_str)
+        {
+            self.upstream_id = Some(id.to_owned());
         }
-        if self.upstream_model.is_none() {
-            if let Some(model) = value.get("model").and_then(Value::as_str) {
-                self.upstream_model = Some(model.to_owned());
-            }
+        if self.upstream_model.is_none()
+            && let Some(model) = value.get("model").and_then(Value::as_str)
+        {
+            self.upstream_model = Some(model.to_owned());
         }
         if let Some(usage) = usage_from(&value) {
             self.usage = Some(usage);

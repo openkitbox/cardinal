@@ -314,6 +314,24 @@ pub struct IrRequest {
     /// Survivor hop: Chat `response_format` ↔ Responses `text.format` ↔ Gemini
     /// `responseSchema`.
     pub structured_output: Option<serde_json::Value>,
+    /// Upstream prompt-cache routing hint (Chat/Responses `prompt_cache_key`).
+    /// Chat and Responses parse it instead of dropping it: a translated hop may
+    /// still reach an upstream that understands the concept (Kiro derives its
+    /// conversation id from it), while emitters whose target has no such concept
+    /// record the loss as dropped.
+    pub prompt_cache_key: Option<String>,
+}
+
+/// The cache-routing hint an envelope carries: a non-empty string, else `None`.
+/// A present-but-unusable value stays the caller's to record as dropped.
+pub(crate) fn prompt_cache_key_of(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    object
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
 }
 
 /// Why generation stopped, normalized across dialects.
@@ -329,10 +347,14 @@ pub enum IrStop {
 
 /// One translated response, used to rebuild a non-streaming body in the entry
 /// dialect.
+///
+/// `usage` is optional because not every upstream reports token usage: KAS
+/// reports credits/context percentages only. `None` means "unknown", and every
+/// emitter must then omit its usage field rather than fabricate three zeroes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IrResponse {
     pub model: String,
     pub content: Vec<IrPart>,
     pub stop: IrStop,
-    pub usage: UsageCounts,
+    pub usage: Option<UsageCounts>,
 }

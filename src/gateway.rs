@@ -69,6 +69,10 @@ struct Core {
     /// In-memory quota snapshots for Smart ordering — the prober writes,
     /// relay reads; no PG round-trip on the request path.
     smart_cache: relay::SmartCache,
+    /// The process's single Kiro token manager: dispatch, the admin surface and
+    /// the quota prober all share this instance, so a Kiro credential refresh
+    /// happens once and its rotated bundle is visible to every caller.
+    kiro_tokens: Arc<crate::upstream::KiroTokens>,
     /// Per-alias round-robin cursors for Rotate ordering — one atomic
     /// increment per dispatch, no lock, no allocation.
     rotate_cursors: relay::RotateCursors,
@@ -158,9 +162,16 @@ impl Core {
             crate::relay::ledger_writer::DEFAULT_FLUSH_INTERVAL,
             crate::relay::ledger_writer::DEFAULT_BATCH_SIZE,
         );
+        // One upstream transport for the whole process: chat dispatch, OIDC
+        // token refreshes and the vendor-quota probe share its destination
+        // policy and connection pool. The Kiro token manager owns a handle to
+        // it, so the quota probe reaches Kiro through the same policy.
+        let transport = transport::Transport::new(limits(config))?;
+        let kiro_tokens = Arc::new(crate::upstream::KiroTokens::new(transport.clone()));
         Ok(Self {
             pool,
-            transport: transport::Transport::new(limits(config))?,
+            transport,
+            kiro_tokens,
             queue_timeout,
             failover: relay::Failover::new(),
             trace_ring: Arc::new(relay::trace::TraceRing::new()),
@@ -196,6 +207,7 @@ impl Core {
 async fn quota_prober(
     pool: sqlx::PgPool,
     smart_cache: relay::SmartCache,
+    kiro_tokens: Arc<crate::upstream::KiroTokens>,
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(QUOTA_PROBE_INTERVAL);
@@ -206,7 +218,7 @@ async fn quota_prober(
     loop {
         tokio::select! {
           _ = ticker.tick() => {
-            admin_ops::probe_all_quotas(&pool, Some(&smart_cache)).await;
+            admin_ops::probe_all_quotas(&pool, Some(&smart_cache), Some(&kiro_tokens)).await;
           }
           // Shutdown: stop between rounds (a round in flight finishes; the pool
           // stays open until this task's owner proceeds past the cancel).
@@ -311,6 +323,7 @@ impl Gateway {
         let prober_handle = tokio::spawn(quota_prober(
             core.pool.clone(),
             core.smart_cache.clone(),
+            Arc::clone(&core.kiro_tokens),
             core.prober_cancel.clone(),
         ));
         *core.prober_join.lock().expect("prober_join poisoned") = Some(prober_handle);
@@ -339,6 +352,7 @@ impl Gateway {
             route_cache: core.route_cache.clone(),
             rest_cache: core.rest_cache.clone(),
             price_cache: core.price_cache.clone(),
+            kiro_tokens: core.kiro_tokens.clone(),
             ledger: core.ledger.clone(),
             payload_log: core.payload_log,
         });

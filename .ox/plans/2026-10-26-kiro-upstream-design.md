@@ -191,8 +191,8 @@ profileArn
 3. 刷新前重读 DB 中该 key 最新 OAuth，避免 RouteCache 的旧 refresh token 污染进程。
 4. OIDC CreateToken 使用 camelCase：clientId/clientSecret/refreshToken/grantType。
 5. 成功后保存完整 access token、expiry、profileArn 与可选轮换 refresh token；响应未给新 refresh token 时保留旧值。
-6. runtime bearer-invalid 401/403：按旧 bearer 去重，强制刷新并仅重试当前 candidate 一次。
-7. invalid_grant：永久凭证错误，跳过 candidate，并给出需要重新导入的可操作错误。
+6. runtime bearer-invalid 401/403：按旧 bearer 去重；刷新前在锁内重读 DB，若外部登录已写入不同的新鲜 bearer 则直接复用，否则以 DB 中较新的 bundle 作为刷新基；仅重试当前 candidate 一次。
+7. invalid_grant：先按参考实现的窄路径恢复——内存已知与 DB 一致时锁内重读一次；DB 中 refresh token/client identity/auth region 确实变化时用新 bundle 重试 CreateToken 至多一次，未变化则视为永久凭证错误，跳过 candidate 并要求重新导入。同一 bundle 永不重试，内存不因失败回滚。
 8. OIDC 429/5xx 与网络错误：保持临时故障语义，不混入永久失效。
 9. 持久化失败：不记录秘密；保留已刷新内存凭证并 warn，不能继续写回旧轮换令牌。
 
@@ -294,6 +294,9 @@ period_minutes = 30 天近似值
 9. 保留 cardinal failover 与流式截断终结，不移植 kiro2claude 下游错误格式。
 10. 凭证存 PostgreSQL，不回写 kiro-cli SQLite；账号由 cardinal 独占。
 11. 测试验证后删除，不建立常驻测试体系。
+12. OIDC `CreateToken` 响应要求 `expiresIn`：参考实现缺失时保留旧 expiry，cardinal 以 `InvalidResponse` 拒绝——没有可信 expiry 的 bearer 无法参与新鲜度判断。
+13. OIDC 请求不手写参考实现的 `host` 与 `Connection: close` 头：`reqwest` 从 URL 派生 `Host`，连接生命周期由 transport 的 idle/opening deadline 管理，强制关闭会无收益地禁用连接复用。
+14. `invalid_grant` 仅匹配 HTTP 400 + 有界 body 中的 `invalid_grant`，不再额外要求人类可读的 `Invalid refresh token provided`：OAuth 错误码才是稳定的机器字段，该句式已在 AWS 端点间漂移；body 只用于分类，绝不记录或转发。
 
 ## 15. 安全与交付约束
 

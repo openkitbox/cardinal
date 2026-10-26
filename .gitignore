@@ -4,3 +4,6 @@ Taskfile.yml
 config.toml
 reference
 .worktrees/
+# One-shot Kiro account exports carry OAuth secrets; never stage them.
+kiro-account-*.json
+scripts/__pycache__/

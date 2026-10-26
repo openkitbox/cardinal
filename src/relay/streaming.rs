@@ -6,6 +6,7 @@
 //! vendor or dialect knowledge lives here (see [`super::dialects`]).
 
 use crate::protocol::sse::RawFrame;
+use crate::protocol::wire::WireFrame;
 use crate::protocol::{self, ProtocolId};
 
 use crate::activity::ActivitySink;
@@ -150,7 +151,7 @@ impl HoldState {
 
 /// One read step of the pump loop.
 enum PumpRead {
-    Frame(RawFrame),
+    Frame(WireFrame),
     Eof,
     /// The hold's commit window expired while waiting: commit with whatever was
     /// buffered and continue as a normal stream.
@@ -162,7 +163,7 @@ enum PumpRead {
 /// window while the hold stands. The read future is passed in (the caller
 /// borrows the reader) so unit tests can drive the timing with a fake read.
 async fn read_frame(
-    read: impl std::future::Future<Output = Result<Option<RawFrame>, transport::TransportError>>,
+    read: impl std::future::Future<Output = Result<Option<WireFrame>, transport::TransportError>>,
     hold: Option<&HoldState>,
 ) -> PumpRead {
     let result = match hold {
@@ -183,6 +184,12 @@ async fn read_frame(
         Ok(None) => PumpRead::Eof,
         Err(error) => PumpRead::Transport(error),
     }
+}
+
+/// The client- and ledger-facing note for a post-commit upstream read failure.
+/// One wording for both pumps, so the requests page and the log agree.
+fn interruption_note(error: &transport::TransportError) -> String {
+    format!("upstream stream interrupted: {error}")
 }
 
 /// Flush the held buffer to the client and lift the hold. `false` = the
@@ -404,12 +411,29 @@ async fn drive_stream(
                     signal_hold(&mut commit_tx, HoldSignal::ClientGone);
                     return (None, ttft_ms, captured, None);
                 }
-                match read_frame(reader.next_raw_frame(), hold.as_ref()).await {
+                let mut read = read_frame(reader.next_wire_frame(), hold.as_ref()).await;
+                // Passthrough only ever serves SSE protocols (Kiro has no client
+                // endpoint), so an AWS frame here is a wire mismatch. It is a
+                // terminal framing failure, not a frame to skip: dropping it and
+                // continuing would dress the corruption up as a clean EOF.
+                if matches!(&read, PumpRead::Frame(WireFrame::Aws(_))) {
+                    tracing::warn!(
+                        "passthrough stream received an AWS frame; failing the upstream wire"
+                    );
+                    read = PumpRead::Transport(transport::TransportError::InvalidBody);
+                }
+                match read {
                     PumpRead::WindowExpired => {
                         // The wait cap commits the hold with whatever was buffered.
                         commit_hold(tx, &mut hold, &mut commit_tx, &mut activity, &mut wire).await;
                     }
                     PumpRead::Frame(frame) => {
+                        let frame = match frame {
+                            WireFrame::Sse(frame) => frame,
+                            // Normalized above; stop rather than panic if that
+                            // invariant ever changes.
+                            WireFrame::Aws(_) => return (None, ttft_ms, captured, None),
+                        };
                         if payload_log {
                             tracing::debug!(
                               target: PAYLOAD_TARGET,
@@ -513,7 +537,7 @@ async fn drive_stream(
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "upstream stream interrupted: {error}"
                         );
-                        let message = format!("upstream stream interrupted: {error}");
+                        let message = interruption_note(&error);
                         for frame in decoder.stream_error_frames(&message) {
                             if let Some(captured) = &mut captured {
                                 captured.push(&frame.data);
@@ -544,25 +568,62 @@ async fn drive_stream(
                     signal_hold(&mut commit_tx, HoldSignal::ClientGone);
                     return (None, ttft_ms, captured, None);
                 }
-                match read_frame(reader.next_raw_frame(), hold.as_ref()).await {
+                let mut read = read_frame(reader.next_wire_frame(), hold.as_ref()).await;
+                // AWS framing/event failures are terminal: a malformed KAS frame
+                // means the wire cannot be trusted, so it takes the same path as a
+                // broken socket (pre-commit abort for failover; post-commit
+                // interrupted + Incomplete close). SSE keeps its historical
+                // leniency below: a bad payload is skipped, never fatal.
+                let mut decoded: Option<Vec<protocol::StreamEvent>> = None;
+                if let PumpRead::Frame(frame @ WireFrame::Aws(_)) = &read {
+                    match upstream.observe_wire(frame) {
+                        Ok(events) => decoded = Some(events),
+                        Err(error) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                error = %error,
+                                "translated stream: AWS frame failed to decode; failing the upstream wire"
+                            );
+                            read = PumpRead::Transport(transport::TransportError::InvalidBody);
+                        }
+                    }
+                }
+                match read {
                     PumpRead::WindowExpired => {
                         commit_hold(tx, &mut hold, &mut commit_tx, &mut activity, &mut wire).await;
                     }
                     PumpRead::Frame(frame) => {
                         if payload_log {
-                            tracing::debug!(
-                              target: PAYLOAD_TARGET,
-                              direction = "upstream_frame",
-                              event = frame.event.as_deref().unwrap_or(""),
-                              data = %truncate_payload(&String::from_utf8_lossy(&frame.data), frame.data.len()),
-                            );
+                            match &frame {
+                                WireFrame::Sse(frame) => tracing::debug!(
+                                    target: PAYLOAD_TARGET,
+                                    direction = "upstream_frame",
+                                    event = frame.event.as_deref().unwrap_or(""),
+                                    data = %truncate_payload(&String::from_utf8_lossy(&frame.data), frame.data.len()),
+                                ),
+                                WireFrame::Aws(message) => tracing::debug!(
+                                    target: PAYLOAD_TARGET,
+                                    direction = "upstream_frame",
+                                    event = "",
+                                    data = %truncate_payload(&String::from_utf8_lossy(&message.payload), message.payload.len()),
+                                ),
+                            }
                         }
-                        // Observe + synthesize events straight from the raw frame bytes:
-                        // no `String` re-framing hop, no per-frame payload copy. An
-                        // undecodable frame (bad UTF-8 or bad JSON) is skipped whole.
-                        let Ok(events) = upstream.observe_raw(&frame) else {
-                            tracing::warn!("translated stream: undecodable upstream frame skipped");
-                            continue;
+                        // AWS events were decoded before the frame could be
+                        // downgraded to a transport failure; SSE is observed here,
+                        // where an undecodable payload (bad UTF-8 or bad JSON) is
+                        // still skipped whole.
+                        let events = match decoded {
+                            Some(events) => events,
+                            None => match upstream.observe_wire(&frame) {
+                                Ok(events) => events,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "translated stream: undecodable upstream frame skipped"
+                                    );
+                                    continue;
+                                }
+                            },
                         };
                         if events.is_empty() {
                             continue;
@@ -631,12 +692,18 @@ async fn drive_stream(
                     }
                     PumpRead::Eof => {
                         if hold.is_some() {
-                            if HoldState::delivers(upstream.finish()) {
-                                // Empty-but-complete: close the translator into the hold so
-                                // the client receives the full (empty) stream.
-                                if let Ok(frames) =
+                            let ceiling = upstream.output_ceiling_reached();
+                            if HoldState::delivers(upstream.finish()) || ceiling {
+                                // A Completed stream — or an explicit output
+                                // ceiling, which is a legitimate truncated
+                                // terminal — is a legal (possibly empty)
+                                // response: deliver it, never fail it over.
+                                let closed = if ceiling {
+                                    translator.close_after_limit()
+                                } else {
                                     translator.close_after_eof(protocol::Terminal::Completed)
-                                {
+                                };
+                                if let Ok(frames) = closed {
                                     if let Some(captured) = &mut captured {
                                         for frame in &frames {
                                             captured.push(&frame.data);
@@ -678,7 +745,14 @@ async fn drive_stream(
                             }
                             protocol::Terminal::Incomplete
                         };
-                        if let Ok(frames) = translator.close_after_eof(verdict) {
+                        // An explicit ceiling closes as length; a broken EOF
+                        // keeps the generic truncation marker.
+                        let closed = if upstream.output_ceiling_reached() {
+                            translator.close_after_limit()
+                        } else {
+                            translator.close_after_eof(verdict)
+                        };
+                        if let Ok(frames) = closed {
                             if let Some(captured) = &mut captured {
                                 for frame in &frames {
                                     captured.push(&frame.data);
@@ -710,7 +784,7 @@ async fn drive_stream(
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "upstream stream interrupted: {error}"
                         );
-                        interrupted = Some(format!("upstream stream interrupted: {error}"));
+                        interrupted = Some(interruption_note(&error));
                         if let Ok(frames) =
                             translator.close_after_eof(protocol::Terminal::Incomplete)
                         {

@@ -110,9 +110,18 @@ impl StreamTranslator {
                 State::Open => match event {
                     StreamEvent::Usage(usage) => {
                         let input = usage.input_tokens;
+                        let output = usage.output_tokens;
                         self.state = content_state(Some(input));
-                        if let State::Content { usage: latest, .. } = &mut self.state {
+                        if let State::Content {
+                            usage: latest,
+                            output_tokens,
+                            ..
+                        } = &mut self.state
+                        {
                             *latest = Some(Box::new(usage.clone()));
+                            // A usage event carries both counts; the close frame
+                            // must not report a fabricated output of 0.
+                            *output_tokens = output;
                         }
                         self.open_frames(&mut out, Some(usage));
                     }
@@ -141,6 +150,23 @@ impl StreamTranslator {
         &mut self,
         terminal: Terminal,
     ) -> Result<Vec<RawFrame>, crate::protocol::ProtocolError> {
+        self.close_after_eof_with(terminal, None)
+    }
+
+    /// The upstream reported an explicit output-ceiling terminal (Kiro's benign
+    /// `ContentLengthExceededException`). The stream is truncated but
+    /// legitimate, so it closes with the dialect's length reason instead of the
+    /// generic truncation marker (which a Chat client would read as a null
+    /// `finish_reason`).
+    pub fn close_after_limit(&mut self) -> Result<Vec<RawFrame>, crate::protocol::ProtocolError> {
+        self.close_after_eof_with(Terminal::Incomplete, Some("length"))
+    }
+
+    fn close_after_eof_with(
+        &mut self,
+        terminal: Terminal,
+        explicit_reason: Option<&str>,
+    ) -> Result<Vec<RawFrame>, crate::protocol::ProtocolError> {
         let mut out = Vec::new();
         if !matches!(self.state, State::Closed) {
             if matches!(self.state, State::Open) {
@@ -153,10 +179,11 @@ impl StreamTranslator {
             // a null finish_reason so no client reads it as a clean stop, and
             // Responses clients get the terminal event that matches the verdict —
             // their vocabulary has distinct completed/incomplete/failed frames.
-            let reason = if matches!(terminal, Terminal::Completed) {
-                "stop".to_owned()
-            } else {
-                "max_tokens_truncated".to_owned()
+            // An explicit ceiling is the one truncation whose reason is known.
+            let reason = match explicit_reason {
+                Some(reason) => reason.to_owned(),
+                None if matches!(terminal, Terminal::Completed) => "stop".to_owned(),
+                None => "max_tokens_truncated".to_owned(),
             };
             self.close(&mut out, &StreamEvent::Finish { reason }, Some(terminal))?;
         }
@@ -207,7 +234,9 @@ impl StreamTranslator {
                     None,
                 ));
             }
-            ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => {
+            ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
+                // Kiro is an upstream-only target: it is never a translating
+                // client.
                 unreachable!("only the three chat protocols are translation clients")
             }
         }
@@ -296,7 +325,7 @@ impl StreamTranslator {
                             None,
                         ));
                     }
-                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => {
+                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
                         unreachable!("only the three chat protocols are translation clients")
                     }
                 }
@@ -380,7 +409,7 @@ impl StreamTranslator {
                             None,
                         ));
                     }
-                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => {
+                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
                         unreachable!("only the three chat protocols are translation clients")
                     }
                 }
@@ -517,7 +546,7 @@ impl StreamTranslator {
               None,
             ));
                     }
-                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => {
+                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
                         unreachable!("only the three chat protocols are translation clients")
                     }
                 }
@@ -655,19 +684,29 @@ impl StreamTranslator {
                     serde_json::json!({"type": "message_stop"}),
                 ));
             }
-            _ => {
+            ProtocolId::OpenAiChat => {
                 let finish_reason = stop_chat_name(&reason);
                 let finish_reason = if finish_reason.is_empty() {
                     Value::Null
                 } else {
                     serde_json::json!(finish_reason)
                 };
+                // Usage is evidence, not a shape to fill: only an upstream
+                // Usage event licenses a usage object. Kiro reports no token
+                // usage, so its translated Chat close must omit the field
+                // entirely — `{"completion_tokens":0}` reads as a measured
+                // free request and mis-bills it.
+                let usage_seen = usage.is_some() || input_tokens.is_some();
                 out.push(chat_chunk(
                     &self.model,
                     Value::Null,
                     finish_reason,
-                    *input_tokens,
-                    Some(*output_tokens),
+                    if usage_seen { *input_tokens } else { None },
+                    if usage_seen {
+                        Some(*output_tokens)
+                    } else {
+                        None
+                    },
                 ));
                 // SH-02: `[DONE]` is an SSE framing marker, not JSON — the wire must
                 // carry `data: [DONE]` (no quotes). JSON-serializing a string value
@@ -677,6 +716,9 @@ impl StreamTranslator {
                     id: None,
                     data: Bytes::from_static(b"[DONE]"),
                 });
+            }
+            ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
+                unreachable!("only the three chat protocols are translation clients")
             }
         }
         self.state = State::Closed;

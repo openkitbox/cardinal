@@ -10,11 +10,12 @@
 //! Chat, and Responses → Anthropic Messages (Responses as a *client* only —
 //! nothing translates into a Responses upstream; the kimi arm routes every
 //! upstream connection over Anthropic, so a Responses client on kimi needs
-//! this pair).
+//! this pair). Kiro opens one more: Chat → Kiro, an upstream-only dialect.
 
 pub mod anthropic_messages;
 pub mod effort_clamp;
 pub mod ir;
+pub mod kiro;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod stream;
@@ -31,6 +32,9 @@ const OPENED: &[(ProtocolId, ProtocolId)] = &[
     (ProtocolId::AnthropicMessages, ProtocolId::OpenAiChat),
     (ProtocolId::OpenAiResponses, ProtocolId::OpenAiChat),
     (ProtocolId::OpenAiResponses, ProtocolId::AnthropicMessages),
+    // Kiro is a translation target only: nothing serves Kiro's wire inbound,
+    // so it never appears as the `from` side of a pair.
+    (ProtocolId::OpenAiChat, ProtocolId::Kiro),
 ];
 
 pub fn translatable(from: ProtocolId, to: ProtocolId) -> bool {
@@ -41,10 +45,11 @@ pub fn translatable(from: ProtocolId, to: ProtocolId) -> bool {
 }
 
 /// The dialects that take part in translation.
-pub const MATRIX_DIALECTS: [ProtocolId; 3] = [
+pub const MATRIX_DIALECTS: [ProtocolId; 4] = [
     ProtocolId::OpenAiChat,
     ProtocolId::AnthropicMessages,
     ProtocolId::OpenAiResponses,
+    ProtocolId::Kiro,
 ];
 
 /// Parse result: the IR plus structured notes on concepts that did not survive.
@@ -55,7 +60,7 @@ pub type Parsed<T> = Result<(T, Vec<&'static str>), crate::protocol::ProtocolErr
 pub struct Dialect {
     pub to_ir: fn(&serde_json::Value, u64) -> Parsed<ir::IrRequest>,
     pub from_ir: fn(&ir::IrRequest, &str) -> Parsed<serde_json::Value>,
-    pub emit_response_json: fn(&ir::IrResponse) -> Vec<u8>,
+    pub emit_response_json: fn(&ir::IrResponse) -> Result<Vec<u8>, crate::protocol::ProtocolError>,
     pub response_to_ir: fn(&[u8]) -> Result<ir::IrResponse, crate::protocol::ProtocolError>,
 }
 
@@ -86,6 +91,15 @@ pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
         // Embeddings is likewise passthrough-only, and structurally so: a
         // retrieval call carries no conversation to put in the IR.
         ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings => None,
+        // Target-only dialect: `from_ir` renders the KAS session and
+        // `response_to_ir` decodes its event stream, while the ingress half
+        // refuses explicitly — nothing serves Kiro's wire.
+        ProtocolId::Kiro => Some(Dialect {
+            to_ir: kiro::to_ir,
+            from_ir: kiro::from_ir,
+            emit_response_json: kiro::emit_response_json,
+            response_to_ir: kiro::response_to_ir,
+        }),
     }
 }
 

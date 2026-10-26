@@ -41,6 +41,10 @@ pub struct AppState {
     pub rest_cache: relay::RestCache,
     /// In-memory price cache.
     pub price_cache: relay::PriceCache,
+    /// Per-key Kiro OIDC token manager: lazy refresh, single-flight per key and
+    /// write-back of the rotated bundle. The admin plane updates it on
+    /// credential replace/delete.
+    pub kiro_tokens: Arc<crate::upstream::KiroTokens>,
     /// Batch ledger writer: relay dispatch queues attempt rows here.
     pub ledger: relay::LedgerWriter,
     /// `[gateway].payloads`: relay mirrors request/response bodies into the log.
@@ -191,10 +195,12 @@ async fn relay_dispatch(
         activity: &state.activity,
     };
     let deps = relay::DispatchDeps {
+        pool: &state.pool,
         transport: &state.transport,
         queue_timeout: state.queue_timeout,
         dispatcher: &state.dispatcher,
         failover: &state.failover,
+        kiro_tokens: state.kiro_tokens.as_ref(),
         trace_ring: &state.trace_ring,
         smart_cache: &state.smart_cache,
         rotate_cursors: &state.rotate_cursors,
