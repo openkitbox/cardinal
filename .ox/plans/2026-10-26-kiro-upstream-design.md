@@ -14,7 +14,7 @@
 - 以 `/Users/john/github/kiro2claude` 为规范参考实现；所有有意偏离必须登记。
 - 当前目录的 kiro-account-lite JSON 只由一次性导入脚本处理，不新增常驻导入 API 或 GUI 导入。
 - 导入后账号由 cardinal 独占刷新；其他程序不得再旋转同一账号的 refresh token。
-- 首版不接 Kiro 配额查询，Smart 路由将相应 key 视为未知额度。
+- 首版接入 Kiro 配额查询，复用现有 GUI key 卡片、配额历史与 Smart 路由额度缓存。
 - 遵守仓库约定：验证测试临建、运行、记录结果后删除，不建立常驻测试体系。
 
 ## 2. 方案比较
@@ -61,7 +61,7 @@ Kiro 只作为翻译目标加入 IR 矩阵。非流式与流式复用同一个 K
 - static 认证继续要求非空 `api_key`。
 - `kiro_oidc` 使用空 `api_key`，并要求完整 OAuth 字段。
 - 普通 key 列表不得返回 OAuth；现有 reveal 响应结构也不因新增字段而自动泄露 secrets。
-- 模型与配额探测首版拒绝或不调度 Kiro，模型配置走手工入口。
+- 模型列表探测首版不调度 Kiro，模型配置走手工入口；配额探测走专用 Kiro 分支。
 
 ### 4.3 Relay 依赖
 
@@ -198,18 +198,71 @@ profileArn
 
 刷新路径上的锁使用可跨 await 的异步互斥；热路径锁不得 unwrap/expect，失败须降级并 warn。
 
-## 11. 实施阶段
+## 11. Kiro 配额查询与 GUI
+
+### 11.1 复用边界
+
+不新增 GUI 组件或前端协议。Kiro 读数转换为现有 `quota::KeyQuota`，后续沿用：
+
+- `gateway_key_quota_snapshots` 持久化与首次绘制
+- 每 300 秒后台配额探测器
+- `SmartCache` 的额度窗口与剩余时间排序
+- GUI provider key 卡片的进度条、剩余额度、重置时间和趋势图
+- Admin 手动刷新与 `QuotaRefreshed` 推送
+
+### 11.2 请求
+
+`GetUsageLimits` 使用 **Shell 请求画像**，不是聊天 KAS 画像：
+
+- host：`codewhisperer.us-east-1.amazonaws.com`；非 `us-east-1` 按参考表使用 `q.{region}.amazonaws.com`
+- `x-amz-target: AmazonCodeWhispererService.GetUsageLimits`
+- content-type、Shell user-agent、x-amz-user-agent
+- `amz-sdk-invocation-id`、`amz-sdk-request`；不发送没有抓包证据的 `x-kiro-attempt`
+- 单次调用，不重试
+- `profileArn` 同时放 query string 与 JSON body
+- `isEmailRequired=false`：额度卡片不需要邮箱，避免额外拉取 PII
+
+探测通过 KiroTokens 获取有效 bearer，与聊天共用 single-flight，不能另建独立刷新路径。
+
+探测 fan-out 必须在“跳过无 api_key 的 key”之前按 `provider.protocol` 分支：Kiro key 的静态 api_key 本来为空。后台探测器与 Admin 手动刷新共用同一 Kiro 分支，因此两者都需要拿到共享 KiroTokens，不能只在启动路径注入。
+
+### 11.3 映射
+
+主额度来自 `usageBreakdownList` 中 `resourceType=CREDIT` 的条目：
+
+```text
+name           = "本月 Credits"
+used_pct       = currentUsageWithPrecision / usageLimitWithPrecision × 100
+total          = "<usageLimitWithPrecision 或 usageLimit> Credits"
+resets_at      = usageBreakdown.nextDateReset 或顶层 nextDateReset（Unix 秒）
+period_minutes = 30 天近似值
+```
+
+`used_pct` clamp 到 0–100。没有 precision 字段时退回整数 `currentUsage/usageLimit`。GUI 的“剩余 x / total”由现有百分比渲染逻辑生成。
+
+首版不把 `bonuses` 重复加到主额度，也不把 credits 换算成 token；这些需要独立的产品语义，不能伪造。
+
+### 11.4 生命周期
+
+- 成功：解析后排序窗口，写快照、更新 SmartCache，并推送 GUI 刷新。
+- 空 `usageBreakdownList` 或无可识别 CREDIT 条目：视为无有效读数，保留上一快照并 warn。
+- 401/403：先走共享 token manager；刷新仍失败则保留旧快照。
+- 429/5xx/网络/超时：配额是装饰信息，warn 后保留旧快照，不影响聊天。
+- 探测日志不得输出完整响应中的用户标识；只记录状态、窗口数和安全错误摘要。
+
+## 12. 实施阶段
 
 1. Schema/Admin：migration、认证校验、key 查询与 secret 边界。
 2. 协议身份：ProtocolId、capabilities、全部穷尽 match、IR cache key。
 3. 帧与 kernel：纯帧层、WireFramer 行为保持重构、KAS prepare、stream 字段门控。
 4. 翻译：请求会话/工具/模型/effort、响应状态机、IR 矩阵、usage 省略。
 5. OIDC：DispatchDeps、single-flight、最新 DB 凭证、完整持久化、401 恢复、永久错误。
-6. 导入与验收：一次性脚本、手工模型配置、假上游和真实账号端到端验证。
+6. 配额：Shell 请求画像、GetUsageLimits 解析、共享 token、快照/SmartCache/GUI 链路。
+7. 导入与验收：一次性脚本、手工模型配置、假上游和真实账号端到端验证。
 
 每阶段至少运行 `cargo build` 与 `cargo clippy -- -D warnings`。临时行为测试的红绿结果记入实施记录，随后删除测试。
 
-## 12. 验收矩阵
+## 13. 验收矩阵
 
 | 类别 | 必须场景 |
 | --- | --- |
@@ -220,6 +273,7 @@ profileArn
 | 工具 | 并行 index、参数增量、结果配对、缺失/孤立结果安全处理 |
 | Reasoning | 文本增量、effort 映射、GPT 显式 off 不变成 low |
 | Token | 新鲜复用、并发单刷、轮换落库、重启复用、401 单次恢复、invalid_grant |
+| 配额 | CREDIT 窗口映射、重置时间、旧快照保留、Smart 排序参与、GUI 无需改动即可显示 |
 | 流式错误 | post-commit 截断合成错误帧并记账；异常不视为正常 EOF |
 | Usage | 有 metering 保留原值；未知时省略，不伪造 token 0 |
 | 真实链路 | 流式/非流式问答、多轮、实际工具往返、刷新后重启 |
@@ -227,18 +281,21 @@ profileArn
 
 假上游必须把响应拆成多个 HTTP chunk，并至少把一帧从中间劈开；整包一次写出不算覆盖增量解析。
 
-## 13. 相对 kiro2claude 的偏差清单
+## 14. 相对 kiro2claude 的偏差清单
 
 1. 使用 cardinal IR/relay，不移植 Node 服务与插件体系。
 2. 首版只验收 OpenAI Chat -> Kiro；Responses 仅保留 cache key，不新增专项端点验收。
 3. 无 prompt_cache_key 时稳定派生会话 ID，而非每请求随机。
-4. 不接 Kiro 配额、MCP、subagent、GUI 导入或常驻导入器。
-5. 不伪造 Anthropic 签名思考块，不把 credits 换算成 token。
-6. 保留 cardinal failover 与流式截断终结，不移植 kiro2claude 下游错误格式。
-7. 凭证存 PostgreSQL，不回写 kiro-cli SQLite；账号由 cardinal 独占。
-8. 测试验证后删除，不建立常驻测试体系。
+4. 不接 MCP、subagent、GUI 导入或常驻导入器。
+5. 配额请求不发 `isEmailRequired=true`，不把邮箱拉进 gateway。
+6. 配额窗口使用 30 天近似周期作为排序/趋势键，重置时刻仍用上游真实时间。
+7. 不把 bonuses 重复计入主额度，不把 credits 换算成 token。
+8. 不伪造 Anthropic 签名思考块。
+9. 保留 cardinal failover 与流式截断终结，不移植 kiro2claude 下游错误格式。
+10. 凭证存 PostgreSQL，不回写 kiro-cli SQLite；账号由 cardinal 独占。
+11. 测试验证后删除，不建立常驻测试体系。
 
-## 14. 安全与交付约束
+## 15. 安全与交付约束
 
 - 不把账号 JSON、token、client secret 或含秘密的日志加入提交。
 - 不改动无关用户文件。
