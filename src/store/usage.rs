@@ -106,6 +106,7 @@ pub struct TrendRow {
     pub category: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cached_input_tokens: i64,
     pub requests: i64,
     /// Attempts that ended in an error (same convention as [`UsageWindow`]).
     pub failed: i64,
@@ -180,6 +181,7 @@ pub async fn usage_trend(
     "SELECT {bucket} AS bucket, {category} AS category,
             COALESCE(SUM(r.input_tokens), 0)::bigint AS input_tokens,
             COALESCE(SUM(r.output_tokens), 0)::bigint AS output_tokens,
+            COALESCE(SUM(r.cached_input_tokens), 0)::bigint AS cached_input_tokens,
             COUNT(*)::bigint AS requests,
             COUNT(*) FILTER (WHERE r.error IS NOT NULL)::bigint AS failed,
             SUM(r.cost_usd)::float8 AS cost_usd,

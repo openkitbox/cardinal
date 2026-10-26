@@ -17,7 +17,11 @@
 //! - **No reasoning signatures.** The IR's `Thinking` carries no signature (no
 //!   translated hop can produce one) and KAS rejects an unsigned
 //!   `reasoningContent`, so history reasoning is dropped and there is no
-//!   signature-strip retry.
+//!   signature-strip retry. In current Cardinal usage, Kiro GPT multi-turn tool
+//!   calls continue to work through `conversationId`, message history, and
+//!   tool-call/result pairing without this replay; opaque replay is therefore
+//!   a potential context/cache/provider-state preservation feature, not a
+//!   proven functional prerequisite.
 //! - **Explicit off** follows the reference `buildAdditionalModelRequestFields`:
 //!   a non-native model sends nothing, GPT sends `{reasoning:{effort:"none"}}`,
 //!   Claude sends `{thinking:{type:"disabled"}}`, and the always-on schemas
