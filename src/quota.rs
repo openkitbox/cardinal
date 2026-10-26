@@ -45,7 +45,8 @@ pub struct QuotaWindow {
     #[serde(default)]
     pub period_minutes: Option<i64>,
     /// The window's full allowance ("$70.00") for a money-window (a credit
-    /// pool), so the card can render "used / total" instead of a bare percent.
+    /// pool), so the card can render "remaining / total" instead of a bare
+    /// percent. Omit the unit when the window name already carries it.
     /// `None` for a window without a known total (e.g. a rate window's count
     /// is already folded into `used_pct`).
     #[serde(default)]
@@ -934,7 +935,9 @@ fn parse_kiro_quota(body: &str) -> Option<KeyQuota> {
             .or(response.next_reset.as_ref())
             .and_then(unix_seconds),
         period_minutes: Some(30 * 1440),
-        total: Some(format!("{} Credits", credit_amount(limit))),
+        // No unit suffix: the window name already says Credits, and the card
+        // renders "remaining/total", so a suffix would be printed twice.
+        total: Some(credit_amount(limit)),
     }];
     sort_windows(&mut windows);
     Some(KeyQuota {
