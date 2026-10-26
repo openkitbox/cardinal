@@ -89,6 +89,10 @@ pub enum TrendSplit {
     /// same display rule as the requests page (`named_client`). Rows with
     /// neither group as NULL (the GUI renders them as 本机).
     Client,
+    /// Caller identity recorded in `caller_key`: authenticated requests use the
+    /// gateway key label; loopback requests may use a self-named value or agent;
+    /// unrecognized callers are NULL. The GUI displays NULL as 本机.
+    User,
 }
 
 /// One bucket × category aggregate behind the usage trend chart.
@@ -170,6 +174,7 @@ pub async fn usage_trend(
             "",
             "",
         ),
+        TrendSplit::User => ("r.caller_key", "", ""),
     };
     let sql = format!(
     "SELECT {bucket} AS bucket, {category} AS category,

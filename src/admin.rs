@@ -15,7 +15,7 @@
 //!   replace: a strategy-preserving client MUST send it back, or the save resets to `ordered`
 //! - `GET /api/rests`, `DELETE /api/rests/keys/:key_id`, `DELETE /api/rests/providers/:provider_id` — cooldowns, identity = key
 //! - `GET /api/usage?days=N` (aggregated by day × alias; `caller` restricts to one caller identity, `caller=null` = unidentified)
-//! - `GET /api/usage/trend?since&until&split&offset_seconds` (bucket × category aggregates for the trend chart; `caller` as above)
+//! - `GET /api/usage/trend?since&until&split&offset_seconds` (bucket × category aggregates for the trend chart; `split` = `route`|`model`|`provider`|`client`|`user`; `caller` as above)
 //! - `GET /api/usage/window?since&until` (whole-window aggregate behind the KPI cards; `caller` as above)
 //! - `GET /api/requests?limit=N` (recent requests)
 //! - `GET /api/requests/:id/bodies` (captured request/response bodies from the hourly payload files)
@@ -462,8 +462,8 @@ fn resolve_window(
 }
 
 /// Query form of `GET /api/usage/trend`. `split` is the category dimension
-/// (route|model|provider, default route); `offset_seconds` shifts bucket
-/// labels to the caller's wall clock (the GUI passes its local offset);
+/// (route|model|provider|client|user, default route); `offset_seconds` shifts
+/// bucket labels to the caller's wall clock (the GUI passes its local offset);
 /// `caller` restricts to one caller identity (`null` = unidentified 本机
 /// rows, anything else = a gateway key label / self-named caller).
 /// Window bounds resolve via [`resolve_window`].
@@ -493,7 +493,7 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
         Ok(query) => query,
         Err(_) => {
             response.status_code(StatusCode::BAD_REQUEST);
-            let _ = response.body("invalid trend query (since/until as RFC3339, split = route|model|provider|client, offset_seconds)");
+            let _ = response.body("invalid trend query (since/until as RFC3339, split = route|model|provider|client|user, offset_seconds)");
             return;
         }
     };

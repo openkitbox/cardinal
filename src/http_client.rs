@@ -254,7 +254,8 @@ impl GatewayHttpClient {
         json(self.get("/api/usage/window").query(&params)).await
     }
 
-    /// Usage aggregated by bucket × category for the trend chart;
+    /// Usage aggregated by bucket × category for the trend chart. `split` is
+    /// one of `route`, `model`, `provider`, `client`, or `user`;
     /// `local_offset` shifts bucket labels to the caller's wall clock;
     /// `caller` restricts to one caller identity (same spelling as
     /// [`Self::usage_window`]).
