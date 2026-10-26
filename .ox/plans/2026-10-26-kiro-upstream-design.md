@@ -61,7 +61,8 @@ Kiro 只作为翻译目标加入 IR 矩阵。非流式与流式复用同一个 K
 - static 认证继续要求非空 `api_key`。
 - `kiro_oidc` 使用空 `api_key`，并要求完整 OAuth 字段。
 - 普通 key 列表不得返回 OAuth；现有 reveal 响应结构也不因新增字段而自动泄露 secrets。
-- 模型列表探测首版不调度 Kiro，模型配置走手工入口；配额探测走专用 Kiro 分支。
+- 模型列表探测：Kiro 走控制面 `KiroControlPlaneBearerService.ListAvailableModels`（`https://management.{api_region}.kiro.dev/`，body `{origin, profileArn}`），bearer 复用同一 `KiroTokens`；`modelId` + `tokenLimits` + `supportedInputTypes` 写入 key 的模型快照（`/api/keys/{id}/models` 因此对 Kiro 返回真实条目，不再是 500）。上游 `additionalModelRequestFieldsSchema` 暂不映射成 effort 档位：Kiro kernel 尚不编码 effort，广告无法履行的档位等于撒谎。
+- 配额探测走专用 Kiro 分支（`GetUsageLimits`）。
 
 ### 4.3 Relay 依赖
 
@@ -296,6 +297,7 @@ period_minutes = 30 天近似值
 11. 测试验证后删除，不建立常驻测试体系。
 12. OIDC `CreateToken` 响应要求 `expiresIn`：参考实现缺失时保留旧 expiry，cardinal 以 `InvalidResponse` 拒绝——没有可信 expiry 的 bearer 无法参与新鲜度判断。
 13. OIDC 请求不手写参考实现的 `host` 与 `Connection: close` 头：`reqwest` 从 URL 派生 `Host`，连接生命周期由 transport 的 idle/opening deadline 管理，强制关闭会无收益地禁用连接复用。
+14. 模型目录探测用捕获的 `api/kirocontrolplanebearer` UA 打 `ListAvailableModels`；参考的手工探针（`claude-rate-probe.ts`）发的是 KAS 静态头，捕获样本才是真实客户端的 wire。上游的逐模型 effort schema 不进入 `ProbeModel.effort_levels`，理由见 4.2。
 14. `invalid_grant` 仅匹配 HTTP 400 + 有界 body 中的 `invalid_grant`，不再额外要求人类可读的 `Invalid refresh token provided`：OAuth 错误码才是稳定的机器字段，该句式已在 AWS 端点间漂移；body 只用于分类，绝不记录或转发。
 
 ## 15. 安全与交付约束

@@ -4,6 +4,11 @@
 //! ids the route editor offers for picking. Nothing here is on the relay hot
 //! path; requests are plain GETs with a per-attempt timeout and a bounded
 //! body read.
+//!
+//! Kiro is the one vendor whose catalogue is neither a `/models` GET nor keyed
+//! by an API key: [`fetch_kiro_models`] POSTs the control plane
+//! (`KiroControlPlaneBearerService.ListAvailableModels`) with the OIDC bearer
+//! and parses the AWS JSON answer.
 
 use anyhow::Context as _;
 
@@ -380,4 +385,131 @@ fn parse_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
         })
         .collect();
     Ok(models)
+}
+
+// ---------- Kiro (control-plane model catalogue) ----------
+
+/// Fetch a Kiro key's model catalogue.
+///
+/// The call lives on the KAS control plane (`management.{api_region}.kiro.dev`)
+/// — neither the runtime host the chat path speaks to nor the CodeWhisperer
+/// host of the quota probe answers `ListAvailableModels` — and its bearer is
+/// the shared token manager's, so this probe and dispatch run over one
+/// credential cache and one refresh path. Region and `profileArn` come from
+/// that credential, never from the provider row: the region becomes part of
+/// the hostname, and the bearer travels with the call.
+///
+/// Effort/reasoning schemas (`additionalModelRequestFieldsSchema`) are
+/// deliberately not mapped into [`ProbeModel::effort_levels`]: the Kiro kernel
+/// does not encode effort yet, so advertising levels it cannot honor would
+/// over-promise.
+pub async fn fetch_kiro_models(
+    transport: &crate::upstream::transport::Transport,
+    context: &crate::upstream::KiroCallContext,
+) -> anyhow::Result<Vec<ProbeModel>> {
+    anyhow::ensure!(
+        crate::upstream::kiro_tokens::valid_region(&context.api_region),
+        "Kiro API region {:?} cannot form a control-plane host",
+        context.api_region
+    );
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "origin".to_owned(),
+        serde_json::Value::String("KIRO_CLI".to_owned()),
+    );
+    if let Some(profile_arn) = &context.profile_arn {
+        body.insert(
+            "profileArn".to_owned(),
+            serde_json::Value::String(profile_arn.clone()),
+        );
+    }
+    let prepared = crate::protocol::Prepared {
+        protocol: crate::protocol::ProtocolId::Kiro,
+        url: crate::kiro::profile::management_endpoint(&context.api_region),
+        content_type: "application/x-amz-json-1.0",
+        body: bytes::Bytes::from(serde_json::Value::Object(body).to_string()),
+        stream: false,
+        headers: crate::kiro::profile::models_static_headers(),
+    };
+    let auth = [("authorization", format!("Bearer {}", context.bearer()))];
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let response = transport
+        .send_with_headers(&prepared, &auth, &[], deadline)
+        .await
+        .context("Kiro 模型列表请求失败")?;
+    let status = response.status();
+    let body = transport
+        .read_body(response, MAX_BODY, deadline)
+        .await
+        .context("Kiro 模型列表响应不可读")?;
+    if !status.is_success() {
+        let snippet: String = String::from_utf8_lossy(&body)
+            .chars()
+            .take(ERROR_SNIPPET)
+            .collect();
+        anyhow::bail!("Kiro 模型列表: {status} {snippet}");
+    }
+    parse_kiro_models(&String::from_utf8_lossy(&body)).context("Kiro 模型列表响应格式不认识")
+}
+
+/// Parse the control plane's `{"models": [...]}` answer into [`ProbeModel`]s.
+///
+/// `tokenLimits` carries the windows the account actually holds, so a route
+/// object derived from this snapshot advertises the real context/output caps;
+/// `supportedInputTypes` names the modalities beyond text. `auto` is kept — it
+/// is a model the vendor dispatches server-side, not a placeholder.
+fn parse_kiro_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
+    #[derive(serde::Deserialize)]
+    struct List {
+        #[serde(default)]
+        models: Vec<Entry>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        model_id: Option<String>,
+        token_limits: Option<TokenLimits>,
+        #[serde(default)]
+        supported_input_types: Vec<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TokenLimits {
+        max_input_tokens: Option<u64>,
+        max_output_tokens: Option<u64>,
+    }
+    let list: List = serde_json::from_str(body)?;
+    Ok(list
+        .models
+        .into_iter()
+        .filter_map(|entry| {
+            let id = entry.model_id?.trim().to_owned();
+            if id.is_empty() {
+                return None;
+            }
+            let input_modalities = entry
+                .supported_input_types
+                .into_iter()
+                .map(|kind| kind.trim().to_ascii_lowercase())
+                .filter(|kind| !kind.is_empty() && kind != "text")
+                .collect();
+            let limits = entry.token_limits;
+            Some(ProbeModel {
+                id,
+                context: limits
+                    .as_ref()
+                    .and_then(|limits| limits.max_input_tokens)
+                    .filter(|tokens| *tokens > 0),
+                max_output: limits
+                    .as_ref()
+                    .and_then(|limits| limits.max_output_tokens)
+                    .filter(|tokens| *tokens > 0),
+                input_modalities,
+                // See the fetch's doc: the vendor's effort schemas are not
+                // encoded by the Kiro kernel, so they are not advertised.
+                effort_levels: Vec::new(),
+                default_effort: None,
+            })
+        })
+        .collect())
 }

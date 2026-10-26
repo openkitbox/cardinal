@@ -600,6 +600,11 @@ impl Admin {
     /// probe also refreshes the key's persisted model-list snapshot (the
     /// /v1/models route-object derivation reads it); a snapshot-store failure
     /// degrades to a warning — the fresh list is still returned.
+    ///
+    /// Two credential shapes reach two catalogues: a static key asks its
+    /// provider's `/models` with `api_key`; a Kiro key has no api_key and its
+    /// catalogue lives on the credential's control plane
+    /// ([`Self::probe_kiro_models`]).
     pub async fn list_key_models(&self, key_id: i64) -> anyhow::Result<Vec<probe::ProbeModel>> {
         let keys = store::list_keys_by_ids(&self.pool, &[key_id]).await?;
         let Some(key) = keys.into_iter().next() else {
@@ -608,16 +613,22 @@ impl Admin {
         let Some(provider) = store::get_provider(&self.pool, key.provider_id).await? else {
             anyhow::bail!("key {key_id} 的 provider {} 不存在", key.provider_id)
         };
-        let models = probe::fetch_models(
-            &provider.base_url,
-            &provider.protocol,
-            &provider.auth_scheme,
-            key.api_key
+        let models = if provider.protocol == "kiro" {
+            self.probe_kiro_models(&key).await?
+        } else {
+            let api_key = key
+                .api_key
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("key {key_id} has no api_key to probe with"))?,
-        )
-        .await
-        .map_err(ProbeError)?;
+                .ok_or_else(|| anyhow::anyhow!("key {key_id} has no api_key to probe with"))?;
+            probe::fetch_models(
+                &provider.base_url,
+                &provider.protocol,
+                &provider.auth_scheme,
+                api_key,
+            )
+            .await
+            .map_err(ProbeError)?
+        };
         if let Err(error) = store::update_key_models(&self.pool, key_id, &models).await {
             tracing::warn!(key_id, error = %format!("{error:#}"), "model snapshot persist failed");
         }
@@ -628,6 +639,29 @@ impl Admin {
             tracing::warn!(key_id, error = %format!("{error:#}"), "route cache refresh after model snapshot failed");
         }
         Ok(models)
+    }
+
+    /// One Kiro key's model catalogue via the control plane's
+    /// `ListAvailableModels`. The bearer comes from the shared
+    /// [`crate::upstream::KiroTokens`] instance — the same single-flight cache
+    /// dispatch uses — and the host is derived from the credential's
+    /// `api_region`, never from the provider row's runtime `base_url`.
+    async fn probe_kiro_models(
+        &self,
+        key: &store::ProviderKeyRow,
+    ) -> anyhow::Result<Vec<ProbeModel>> {
+        let Some(tokens) = &self.kiro_tokens else {
+            // Without the live manager there is no bearer to reuse, and a
+            // second cache would race dispatch's refresh-token rotation.
+            anyhow::bail!("Kiro 模型列表需要已接线的 token 管理器")
+        };
+        let context = tokens
+            .access_token(&self.pool, key)
+            .await
+            .map_err(|error| ProbeError(error.into()))?;
+        probe::fetch_kiro_models(tokens.transport(), &context)
+            .await
+            .map_err(|error| ProbeError(error).into())
     }
 
     /// Persist a key's model-list snapshot. The add-account flow already holds

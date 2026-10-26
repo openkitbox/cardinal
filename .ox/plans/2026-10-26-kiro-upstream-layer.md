@@ -13,7 +13,7 @@
 ## 0. 执行约束与事实底座
 
 - 设计权威：`.ox/plans/2026-10-26-kiro-upstream-design.md`。本计划替代此前同名草案中的错误帧格式、凭证和会话细节。
-- 首版只开放 `OpenAiChat -> Kiro`；不新增 Kiro 入站端点，不接 MCP/subagent，不做模型列表探测，不改 GUI。
+- 首版只开放 `OpenAiChat -> Kiro`；不新增 Kiro 入站端点，不接 MCP/subagent，不改 GUI。（后续增量：模型目录探测已接入控制面 `ListAvailableModels`，见设计文档 4.2 与偏差 14。）
 - 测试遵守仓库约定：每个行为测试先红后绿，记录命令与结果，提交前删除临时测试；不得把测试留在最终提交。
 - 并发测试用 barrier/oneshot 和 bounded wait 同步，禁止用固定 sleep 判断刷新或流式状态。
 - 不提交账号 JSON、OAuth 日志或真实凭证。当前 `kiro-account-*.json` 保持未跟踪且不被脚本删除。

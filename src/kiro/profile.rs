@@ -23,6 +23,11 @@
 //!   (`linux` / `darwin` / `win32`): the kernel release KAS appends is not
 //!   available without libc, and a fabricated release would be worse than the
 //!   legal, shorter token.
+//! - the control-plane catalogue call ([`models_static_headers`]) uses the
+//!   captured `api/kirocontrolplanebearer` user agent. The reference's manual
+//!   probe (`claude-rate-probe.ts`) sends the KAS static headers instead; the
+//!   capture in `fixtures/kiro-cli-profile.json` is the real client's wire and
+//!   is what a fresh kiro-cli presents.
 
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -31,12 +36,21 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub const KAS_TARGET: &str = "KiroRuntimeService.GenerateAssistantResponse";
 /// `x-amz-target` of the quota call the Rust shell sends (GetUsageLimits).
 pub const USAGE_TARGET: &str = "AmazonCodeWhispererService.GetUsageLimits";
+/// `x-amz-target` of the control-plane model catalogue (ListAvailableModels).
+pub const MODELS_TARGET: &str = "KiroControlPlaneBearerService.ListAvailableModels";
 /// Attempts kiro-cli declares to the upstream in both retry headers.
 pub const KIRO_MAX_ATTEMPTS: u32 = 3;
 
 /// The KAS origin for a runtime region. Every KAS call POSTs to the root.
 pub fn kas_endpoint(region: &str) -> String {
     format!("https://runtime.{region}.kiro.dev/")
+}
+
+/// The KAS control-plane origin for an AWS region. The model catalogue
+/// ([`MODELS_TARGET`]) POSTs to its root; neither the runtime nor the
+/// CodeWhisperer host answers that target.
+pub fn management_endpoint(region: &str) -> String {
+    format!("https://management.{region}.kiro.dev/")
 }
 
 /// The AWS service host of a runtime region: CodeWhisperer in `us-east-1`,
@@ -165,6 +179,39 @@ pub fn shell_x_amz_user_agent() -> String {
     render(
         "aws-sdk-rust/1.3.10 ua/2.1 api/codewhispererruntime/0.1.10231 os/{os} \
          lang/rust/1.94.1 m/F,C app/AmazonQ-For-CLI",
+    )
+}
+
+/// The control-plane catalogue's static headers (`ListAvailableModels`):
+/// everything besides the credential and `content-type` (which rides
+/// [`crate::protocol::Prepared::content_type`]). The opt-out header is the
+/// privacy hard rule again — the catalogue names models, never conversations,
+/// but the client identity stays the same one KAS presents.
+pub fn models_static_headers() -> Vec<(&'static str, String)> {
+    vec![
+        ("user-agent", models_user_agent()),
+        ("x-amz-user-agent", models_x_amz_user_agent()),
+        ("x-amz-target", MODELS_TARGET.to_owned()),
+        ("x-amzn-codewhisperer-optout", "true".to_owned()),
+        ("x-amzn-kiro-client-attribution", "kiro-cli".to_owned()),
+    ]
+}
+
+/// KAS' `user-agent` for control-plane calls (the bearer-service SDK shape the
+/// captured `ListAvailableModels` request carries).
+fn models_user_agent() -> String {
+    render(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{jsOs} lang/js md/nodejs#22.22.2 \
+         api/kirocontrolplanebearer#1.0.0 m/N KiroCLI/2.34.0 KAS/0.66.62 os/{platform} \
+         md/appVersion-2.34.0 app/AmazonQ-For-CLI acp-client/kiro-cli",
+    )
+}
+
+/// The same control-plane identity without the SDK-only fields.
+fn models_x_amz_user_agent() -> String {
+    render(
+        "aws-sdk-js/1.0.0 KiroCLI/2.34.0 KAS/0.66.62 os/{platform} \
+         md/appVersion-2.34.0 app/AmazonQ-For-CLI acp-client/kiro-cli",
     )
 }
 
