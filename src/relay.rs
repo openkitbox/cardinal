@@ -427,7 +427,7 @@ async fn send_attempt(
                 .ok_or(failover::AttemptError::KiroTokenError(
                     kiro_tokens::KiroTokenError::MissingCredential,
                 ))?;
-            if !kiro_tokens::kas_endpoint_matches(&capability.endpoint, api_region) {
+            if !crate::kiro::kas_endpoint_matches(&capability.endpoint, api_region) {
                 tracing::warn!(
                     provider_id = deps.key.provider_id,
                     key_id = deps.key.id,
@@ -445,7 +445,7 @@ async fn send_attempt(
             // Reassert against the RESOLVED bundle: the pre-check read the
             // route cache's copy, which can lag a region move. The bearer must
             // only ever travel to its own credential's runtime host.
-            if !kiro_tokens::kas_endpoint_matches(&capability.endpoint, &call.api_region) {
+            if !crate::kiro::kas_endpoint_matches(&capability.endpoint, &call.api_region) {
                 tracing::warn!(
                     provider_id = deps.key.provider_id,
                     key_id = deps.key.id,
@@ -633,7 +633,7 @@ async fn send_attempt(
                 .map_err(failover::AttemptError::KiroTokenError)?;
             // The refreshed bundle may have moved to another API region (an
             // operator rotation): reassert before resending this bearer.
-            if !kiro_tokens::kas_endpoint_matches(&capability.endpoint, &recovered.api_region) {
+            if !crate::kiro::kas_endpoint_matches(&capability.endpoint, &recovered.api_region) {
                 tracing::warn!(
                     provider_id = deps.key.provider_id,
                     key_id = deps.key.id,

@@ -4,7 +4,8 @@
 The vendor export is not the credential shape cardinal stores, so this tool is
 the one bridge between them — and it is a whitelist by construction. It reads
 exactly ``accounts[i].credentials.{clientId,clientSecret,refreshToken,
-accessToken,expiresAt,region}`` and ``accounts[i].profileArn``; the account's
+accessToken,expiresAt,region}`` and, when present, a non-empty string
+``accounts[i].profileArn``; the account's
 password, email, csrfToken, machineId, nickname, usage and subscription are
 never extracted, never sent, and never printed.
 
@@ -17,14 +18,16 @@ division so no float rounding can land the token one second off.
 Rows are written through the existing admin API only — there is no import
 endpoint:
 
-- ``GET /api/providers`` then ``POST /api/providers`` (absent) or
-  ``PATCH /api/providers/{id}`` (present, and only when it already speaks
-  ``protocol=kiro``; a foreign protocol is never converted). The PATCH is
-  applied after the key write so a refused credential leaves it untouched.
-- ``GET /api/providers/{id}/keys`` then ``POST .../keys`` (absent) or
-  ``PATCH .../keys/{key_id}`` with the OAuth bundle (present). The server
-  refuses an OAuth bundle on a static-credential key, so a same-label
-  credential-kind conflict fails closed instead of overwriting a static key.
+- ``GET /api/providers`` then ``POST /api/providers`` (absent) or reuse
+  an existing Kiro provider with the same endpoint. A same-name provider for
+  another protocol or region is rejected; use a distinct name for another
+  region. A provider is deleted with the ``if-empty`` endpoint only when the
+  POST returned a valid id and this invocation proved ownership; an ambiguous
+  POST response is never assigned ownership from a later GET.
+- ``POST /api/providers/{id}/kiro-key`` atomically creates or replaces the
+  OAuth key selected by its label. The response supplies the key id and
+  whether it was created; no key listing or separate credential PATCH is
+  needed.
 
 Both steps match by name/label, so importing the same export twice updates the
 same two rows — one provider, one key — instead of duplicating them.
@@ -54,10 +57,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-# The AWS region grammar, mirrored from kiro_tokens::valid_region: the region is
-# interpolated into a hostname, so anything but lowercase letters, digits and
-# hyphens must be refused before it can introduce another host, port or path.
-_REGION_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+# The AWS region grammar, mirrored from kiro::valid_region: the region is
+# interpolated into a hostname, so malformed region components must be refused
+# before they can introduce another host, port or path.
 # An epoch below this cannot be a millisecond expiry (10^12 ms is 2001-09-09;
 # a Unix-seconds value from this century is ~1.7 * 10^9), so it is a malformed
 # export rather than a value to divide.
@@ -79,7 +81,18 @@ def fail(message):
 
 def valid_region(region):
     """Whether `region` is a bare AWS region (same rule as the gateway)."""
-    return 0 < len(region) <= 32 and set(region) <= _REGION_CHARACTERS
+    if not 0 < len(region) <= 32:
+        return False
+    parts = region.split("-")
+    return (
+        len(parts) >= 3
+        and 2 <= len(parts[0]) <= 4
+        and parts[0].islower()
+        and parts[0].isalpha()
+        and all(part.isalpha() and part.islower() for part in parts[1:-1])
+        and parts[-1].isdigit()
+        and all(char.isascii() for char in region)
+    )
 
 
 def is_loopback(hostname):
@@ -162,10 +175,6 @@ def read_account_bundle(path, index):
     if not valid_region(region):
         fail(f"accounts[{index}].credentials.region is not an AWS region")
 
-    profile_arn = account.get("profileArn")
-    if not isinstance(profile_arn, str) or not profile_arn.strip():
-        fail(f"accounts[{index}].profileArn is missing or empty")
-
     oauth = {
         "clientId": values["clientId"],
         "clientSecret": values["clientSecret"],
@@ -175,8 +184,11 @@ def read_account_bundle(path, index):
         "region": region,
         "authRegion": region,
         "apiRegion": region,
-        "profileArn": profile_arn.strip(),
     }
+    profile_arn = account.get("profileArn")
+    if not isinstance(profile_arn, str) or not profile_arn.strip():
+        profile_arn = None
+    oauth["profileArn"] = profile_arn.strip() if profile_arn is not None else None
     return oauth, region
 
 
@@ -241,12 +253,15 @@ class AdminApi:
             # must never surface as a traceback: those exception messages can
             # carry peer-controlled bytes (or the request's own headers).
             raise AdminError(f"{method} {path} failed: invalid HTTP exchange") from None
-        if expect is not None and status != expect:
+        expected = expect if isinstance(expect, tuple) else (expect,)
+        if expect is not None and status not in expected:
             raise AdminError(
-                f"{method} {path} returned HTTP {status} (expected {expect}); "
+                f"{method} {path} returned HTTP {status} (expected one of {expected}); "
                 "response body withheld",
                 status,
             )
+        if not raw:
+            return None
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -271,20 +286,19 @@ def match_existing(rows, field, value, what):
 
 
 def created_id(document, what):
-    """The `{"id": n}` body of a create endpoint."""
+    """Return the integer id from a create response or raise AdminError."""
     value = document.get("id") if isinstance(document, dict) else None
     if isinstance(value, bool) or not isinstance(value, int):
-        fail(f"the admin API did not return the created {what} id")
+        raise AdminError(f"the admin API did not return the created {what} id")
     return value
 
 
 def ensure_provider(api, name, region):
-    """Create the provider, or return the PATCH that aligns the existing one.
+    """Create the provider, or reuse an equivalent existing one.
 
-    The update is deferred so the caller can rotate the key first: a refused
-    key write must not leave the provider already re-pointed at a new region.
-    Returns (provider_id, action, pending_patch) where pending_patch is None
-    for a freshly created provider.
+    A provider owns one endpoint, so a different region requires a different
+    provider name. Refusing a mismatch keeps the import all-or-nothing: the
+    key endpoint is the only mutating operation after provider selection.
     """
     spec = {
         "name": name,
@@ -296,60 +310,41 @@ def ensure_provider(api, name, region):
     providers = api.call("GET", "/api/providers", expect=200)
     existing = match_existing(providers, "name", name, "provider")
     if existing is None:
-        created = api.call("POST", "/api/providers", spec, expect=201)
-        return created_id(created, "provider"), "created", None
+        try:
+            created = api.call("POST", "/api/providers", spec, expect=201)
+        except AdminError as error:
+            # The POST may have committed before its response was lost. A
+            # later GET cannot prove that an equivalent row belongs to this
+            # invocation, so never mark it as owned or authorize cleanup.
+            raise error
+        return created_id(created, "provider"), "created"
     provider_id, provider = existing
     if provider.get("protocol") != "kiro":
         fail(
             f"provider {name!r} already exists with a non-Kiro protocol; "
             "refusing to convert it to Kiro"
         )
-    enabled = provider.get("enabled")
-    if not isinstance(enabled, bool):
-        fail(f"provider {name!r} has an unreadable enabled flag; refusing to rewrite it")
-    # Never flip the operator's enable flag: an import refreshes a credential,
-    # it does not change whether the provider is in service.
-    spec["enabled"] = enabled
-    return provider_id, "updated", (f"/api/providers/{provider_id}", spec)
+    if provider.get("base_url", "").rstrip("/") != spec["base_url"]:
+        fail(
+            f"provider {name!r} already points at a different Kiro region; "
+            "use a different provider name"
+        )
+    return provider_id, "reused"
 
 
 def ensure_key(api, provider_id, label, oauth):
-    """Create the key, or rotate the OAuth bundle of the existing same-label one."""
-    keys = api.call("GET", f"/api/providers/{provider_id}/keys", expect=200)
-    existing = match_existing(keys, "label", label, "key")
-    if existing is None:
-        created = api.call(
-            "POST",
-            f"/api/providers/{provider_id}/keys",
-            {
-                "label": label,
-                "auth_kind": "kiro_oidc",
-                # A Kiro OIDC row stores its credential in `oauth`; the
-                # plaintext column is explicitly null (migrations/0007 CHECK).
-                "api_key": None,
-                "oauth": oauth,
-            },
-            expect=201,
-        )
-        return created_id(created, "key"), "created"
-    key_id, _ = existing
-    try:
-        # Only the credential rotates: label, enablement, concurrency and the
-        # model whitelist stay as the operator left them.
-        api.call(
-            "PATCH",
-            f"/api/providers/{provider_id}/keys/{key_id}",
-            {"oauth": oauth},
-            expect=200,
-        )
-    except AdminError as error:
-        hint = (
-            " (the existing key holds a static credential and cannot be converted)"
-            if error.status == 400
-            else ""
-        )
-        fail(f"{error.message}{hint}")
-    return key_id, "updated"
+    """Atomically create or replace the OAuth key selected by ``label``."""
+    result = api.call(
+        "POST",
+        f"/api/providers/{provider_id}/kiro-key",
+        {"label": label, "oauth": oauth},
+        expect=(200, 201),
+    )
+    key_id = created_id(result, "key")
+    created = result.get("created") if isinstance(result, dict) else None
+    if not isinstance(created, bool):
+        fail("the admin API did not return whether the Kiro key was created")
+    return key_id, "created" if created else "updated"
 
 
 def main(argv=None):
@@ -398,15 +393,19 @@ def main(argv=None):
     oauth, region = read_account_bundle(args.input, args.account)
 
     api = AdminApi(base_url, admin_key)
+    provider_created = False
     try:
-        provider_id, provider_action, provider_patch = ensure_provider(
+        provider_id, provider_action = ensure_provider(
             api, args.provider.strip(), region
         )
+        provider_created = provider_action == "created"
         key_id, key_action = ensure_key(api, provider_id, args.label.strip(), oauth)
-        if provider_patch is not None:
-            path, spec = provider_patch
-            api.call("PATCH", path, spec, expect=200)
     except AdminError as error:
+        if provider_created:
+            try:
+                api.call("DELETE", f"/api/providers/{provider_id}/if-empty", expect=(200, 204))
+            except AdminError:
+                fail("清理未完成")
         fail(error.message)
     print(f"provider {provider_id} ({provider_action}); key {key_id} ({key_action})")
 

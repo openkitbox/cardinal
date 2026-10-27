@@ -36,6 +36,7 @@ use futures::StreamExt as _;
 use crate::activity::{ActivityEvent, ActivityReceiver};
 use crate::admin_ops::{ConcurrencyView, KeyQuotaRow, KeyQuotaSnapshotRow, KeyView};
 use crate::body_log::CapturedBodies;
+use crate::kiro::KiroOAuth;
 use crate::probe::ProbeModel;
 use crate::relay::DispatchTrace;
 use crate::store::{
@@ -209,6 +210,14 @@ impl GatewayHttpClient {
     /// credential is NOT here: it stays behind [`Self::reveal_key`].
     pub async fn bootstrap(&self) -> Result<crate::admin_ops::Bootstrap, ClientError> {
         json(self.get("/api/bootstrap")).await
+    }
+
+    /// One provider's credential-free keys, used by idempotent import flows.
+    pub async fn provider_keys(
+        &self,
+        provider_id: i64,
+    ) -> Result<Vec<crate::store::ProviderKeyView>, ClientError> {
+        json(self.get(&format!("/api/providers/{provider_id}/keys"))).await
     }
 
     /// One key's full view, plaintext credential included. The ONLY
@@ -452,21 +461,44 @@ impl GatewayHttpClient {
         &self,
         input: &ProviderInput<'_>,
     ) -> Result<i64, ClientError> {
+        self.create_or_reuse_provider(input).await.map(|(id, _)| id)
+    }
+
+    /// Create a provider after an initial name lookup. If another writer wins
+    /// the insert race, re-read the name and reuse only an equivalent provider.
+    pub async fn create_or_reuse_provider(
+        &self,
+        input: &ProviderInput<'_>,
+    ) -> Result<(i64, bool), ClientError> {
         match self.create_provider(input).await {
-            Ok(id) => Ok(id),
+            Ok(id) => Ok((id, true)),
             Err(create_error) => {
-                let existing = self.providers().await.ok().and_then(|providers| {
-                    providers
-                        .into_iter()
-                        .find(|provider| provider.name.trim() == input.name.trim())
-                });
-                match existing {
-                    Some(provider) if provider.base_url.trim() == input.base_url.trim() => {
-                        Ok(provider.id)
-                    }
-                    Some(_) => Err(create_error),
-                    None => Err(create_error),
+                let providers = self.providers().await.map_err(|lookup_error| {
+                    ClientError::Decode(format!(
+                        "provider creation failed: {create_error}; provider lookup failed: {lookup_error}"
+                    ))
+                })?;
+                let Some(provider) = providers
+                    .into_iter()
+                    .find(|provider| provider.name.trim() == input.name.trim())
+                else {
+                    return Err(create_error);
+                };
+                if provider.protocol != input.protocol {
+                    return Err(ClientError::Decode(format!(
+                        "provider {} has incompatible protocol {}",
+                        input.name, provider.protocol
+                    )));
                 }
+                if provider.base_url.trim().trim_end_matches('/')
+                    != input.base_url.trim().trim_end_matches('/')
+                {
+                    return Err(ClientError::Decode(format!(
+                        "provider {} has incompatible endpoint {}",
+                        input.name, provider.base_url
+                    )));
+                }
+                Ok((provider.id, false))
             }
         }
     }
@@ -501,6 +533,12 @@ impl GatewayHttpClient {
     /// Delete a provider. Errors (404) when the id does not exist.
     pub async fn delete_provider(&self, id: i64) -> Result<(), ClientError> {
         ok(self.delete(&format!("/api/providers/{id}"))).await
+    }
+
+    /// Delete a provider only if it has no keys. A 409 response means the
+    /// provider still has keys; 404 means the provider does not exist.
+    pub async fn delete_provider_if_empty(&self, id: i64) -> Result<(), ClientError> {
+        ok(self.delete(&format!("/api/providers/{id}/if-empty"))).await
     }
 
     // ---------- gateway key management ----------
@@ -549,6 +587,30 @@ impl GatewayHttpClient {
                 .json(&body),
         )
         .await
+    }
+
+    /// Probe then atomically create or replace a Kiro OIDC key selected by its
+    /// label; returns `(key_id, created)`. The gateway validates the supplied
+    /// credential against the Kiro model catalogue before persisting anything,
+    /// so a failure here leaves an existing key's credential untouched.
+    pub async fn upsert_kiro_key(
+        &self,
+        provider_id: i64,
+        label: &str,
+        oauth: &KiroOAuth,
+    ) -> Result<(i64, bool), ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Upserted {
+            id: i64,
+            created: bool,
+        }
+        let body = serde_json::json!({ "label": label, "oauth": oauth });
+        let result: Upserted = json(
+            self.post(&format!("/api/providers/{provider_id}/kiro-key"))
+                .json(&body),
+        )
+        .await?;
+        Ok((result.id, result.created))
     }
 
     /// Patch a key's label/enabled/concurrency cap/whitelist. `max_concurrency`

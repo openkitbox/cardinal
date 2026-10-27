@@ -185,6 +185,30 @@ pub async fn update_key_models(
     Ok(result.rows_affected() > 0)
 }
 
+/// Persist a model snapshot only while the key still carries the OAuth bundle
+/// that produced it. A concurrent import or rotation must not attach an old
+/// probe result to a newer credential.
+pub async fn update_key_models_for_oauth(
+    pool: &PgPool,
+    key_id: i64,
+    oauth: &KiroOAuth,
+    models: &[ProbeModel],
+) -> anyhow::Result<bool> {
+    let payload = serde_json::to_value(models)?;
+    let oauth = serde_json::to_value(oauth)?;
+    let result = sqlx::query(
+        "UPDATE gateway_provider_keys
+         SET models = $3, models_probed_at = now()
+         WHERE id = $1 AND auth_kind = 'kiro_oidc' AND oauth = $2",
+    )
+    .bind(key_id)
+    .bind(oauth)
+    .bind(payload)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Every key is named and holds a credential; new keys append to the end of the global ordering.
 /// The advisory lock serializes the MAX(position)+1 append against concurrent inserts and reorders.
 /// `allowed_models`: the key's model whitelist (None/empty = unrestricted).
@@ -236,6 +260,159 @@ pub async fn insert_kiro_provider_key(
     .await
 }
 
+/// Find a Kiro OIDC key by provider and label, or create it atomically.
+///
+/// The provider row lock serializes this operation with provider-scoped key
+/// changes; the position advisory lock then serializes the global append.
+/// Duplicate labels fail closed rather than choosing an arbitrary row.
+#[derive(Debug, thiserror::Error)]
+pub enum KiroUpsertError {
+    #[error("invalid Kiro key input: {0}")]
+    InvalidInput(String),
+    #[error("provider {0} does not exist")]
+    ProviderNotFound(i64),
+    #[error("provider {0} is not a Kiro provider")]
+    ProviderProtocolMismatch(i64),
+    #[error("Kiro key upsert conflicts with a concurrent or incompatible key update")]
+    Conflict,
+    #[error("Kiro key store operation failed")]
+    Internal(#[source] anyhow::Error),
+}
+
+/// The provider/label state observed before a Kiro credential probe.
+///
+/// The OAuth bundle is retained only for the compare-and-swap check performed
+/// after probing; it is never included in a conflict error or log message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KiroUpsertExpectation {
+    Missing,
+    Existing { key_id: i64, oauth: Box<KiroOAuth> },
+}
+
+pub async fn kiro_upsert_expectation(
+    pool: &PgPool,
+    provider_id: i64,
+    label: &str,
+) -> Result<KiroUpsertExpectation, KiroUpsertError> {
+    let rows: Vec<(i64, String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT id, auth_kind, oauth FROM gateway_provider_keys
+         WHERE provider_id = $1 AND label = $2 ORDER BY id",
+    )
+    .bind(provider_id)
+    .bind(label)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+    match rows.as_slice() {
+        [] => Ok(KiroUpsertExpectation::Missing),
+        [(key_id, auth_kind, Some(value))] if auth_kind == "kiro_oidc" => {
+            let oauth = serde_json::from_value(value.clone())
+                .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+            Ok(KiroUpsertExpectation::Existing {
+                key_id: *key_id,
+                oauth: Box::new(oauth),
+            })
+        }
+        _ => Err(KiroUpsertError::Conflict),
+    }
+}
+
+pub async fn upsert_kiro_key_by_label(
+    pool: &PgPool,
+    provider_id: i64,
+    label: &str,
+    oauth: &KiroOAuth,
+    expected: &KiroUpsertExpectation,
+) -> Result<(i64, bool), KiroUpsertError> {
+    if label.is_empty() {
+        return Err(KiroUpsertError::InvalidInput(
+            "label must not be empty".to_owned(),
+        ));
+    }
+    oauth
+        .validate()
+        .map_err(|error| KiroUpsertError::InvalidInput(format!("{error:#}")))?;
+    let oauth = serde_json::to_value(oauth)
+        .map_err(|error| KiroUpsertError::Internal(anyhow::Error::new(error)))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+
+    let provider: Option<(i64, String, String)> = sqlx::query_as(
+        "SELECT id, protocol, base_url FROM gateway_providers WHERE id = $1 FOR UPDATE",
+    )
+    .bind(provider_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+    let Some((_, protocol, base_url)) = provider else {
+        return Err(KiroUpsertError::ProviderNotFound(provider_id));
+    };
+    if protocol != "kiro" {
+        return Err(KiroUpsertError::ProviderProtocolMismatch(provider_id));
+    }
+    let oauth_bundle: KiroOAuth = serde_json::from_value(oauth.clone())
+        .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+    if !crate::kiro::kas_endpoint_matches(&base_url, &oauth_bundle.api_region) {
+        return Err(KiroUpsertError::InvalidInput(
+            "Kiro provider endpoint does not match the OAuth API region".to_owned(),
+        ));
+    }
+
+    let rows: Vec<(i64, String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT id, auth_kind, oauth FROM gateway_provider_keys
+         WHERE provider_id = $1 AND label = $2 ORDER BY id FOR UPDATE",
+    )
+    .bind(provider_id)
+    .bind(label)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+    match rows.as_slice() {
+        [] if matches!(expected, KiroUpsertExpectation::Missing) => {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext('gateway_provider_keys.position'))")
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO gateway_provider_keys
+                    (provider_id, label, api_key, auth_kind, oauth, position, max_concurrency, allowed_models)
+                 VALUES ($1, $2, NULL, 'kiro_oidc', $3,
+                    (SELECT COALESCE(MAX(position) + 1, 0) FROM gateway_provider_keys), NULL, NULL)
+                 RETURNING id",
+            )
+            .bind(provider_id)
+            .bind(label)
+            .bind(oauth)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+            tx.commit()
+                .await
+                .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+            Ok((id, true))
+        }
+        [(id, auth_kind, current_oauth)] if matches!(expected, KiroUpsertExpectation::Existing { key_id, oauth: expected_oauth } if *key_id == *id && auth_kind == "kiro_oidc" && current_oauth.as_ref().and_then(|value| serde_json::from_value::<KiroOAuth>(value.clone()).ok()).as_ref() == Some(expected_oauth)) =>
+        {
+            sqlx::query(
+                "UPDATE gateway_provider_keys SET oauth = $3 WHERE id = $1 AND provider_id = $2",
+            )
+            .bind(id)
+            .bind(provider_id)
+            .bind(oauth)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+            tx.commit()
+                .await
+                .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+            Ok((*id, false))
+        }
+        _ => Err(KiroUpsertError::Conflict),
+    }
+}
+
 /// Shared insert body for both credential shapes: validates, normalizes and
 /// appends under the position lock.
 async fn insert_key_row(
@@ -254,6 +431,38 @@ async fn insert_key_row(
     ensure_valid_max_concurrency(max_concurrency)?;
     let allowed_models = normalize_allowed_models(allowed_models)?;
     let mut tx = pool.begin().await?;
+    let provider: Option<(i64, String)> =
+        sqlx::query_as("SELECT id, protocol FROM gateway_providers WHERE id = $1 FOR UPDATE")
+            .bind(provider_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((_, protocol)) = provider else {
+        anyhow::bail!("provider {provider_id} does not exist");
+    };
+    match auth_kind {
+        "static" => anyhow::ensure!(
+            protocol != "kiro",
+            "a provider with protocol \"kiro\" requires auth_kind \"kiro_oidc\""
+        ),
+        "kiro_oidc" => anyhow::ensure!(
+            protocol == "kiro",
+            "auth_kind \"kiro_oidc\" requires a provider with protocol \"kiro\" (got {protocol:?})"
+        ),
+        _ => unreachable!("credential resolved to an unknown auth kind"),
+    }
+    let duplicate: (bool,) = sqlx::query_as(
+        "SELECT EXISTS(
+             SELECT 1 FROM gateway_provider_keys WHERE provider_id = $1 AND label = $2
+         )",
+    )
+    .bind(provider_id)
+    .bind(label)
+    .fetch_one(&mut *tx)
+    .await?;
+    anyhow::ensure!(
+        !duplicate.0,
+        "a key with label {label:?} already exists for provider {provider_id}"
+    );
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('gateway_provider_keys.position'))")
         .execute(&mut *tx)
         .await?;
@@ -283,16 +492,19 @@ pub async fn replace_kiro_oauth(
     pool: &PgPool,
     provider_id: i64,
     key_id: i64,
+    expected: &KiroOAuth,
     oauth: &KiroOAuth,
 ) -> anyhow::Result<bool> {
     oauth.validate()?;
+    let expected = serde_json::to_value(expected)?;
     let result = sqlx::query(
         "UPDATE gateway_provider_keys SET oauth = $3
-         WHERE id = $1 AND provider_id = $2 AND auth_kind = 'kiro_oidc'",
+         WHERE id = $1 AND provider_id = $2 AND auth_kind = 'kiro_oidc' AND oauth = $4",
     )
     .bind(key_id)
     .bind(provider_id)
     .bind(serde_json::to_value(oauth)?)
+    .bind(expected)
     .execute(pool)
     .await?;
     if result.rows_affected() > 0 {
@@ -408,6 +620,33 @@ pub async fn patch_provider_key(
     // a commit. The `auth_kind` guard refuses the conversion; a zero row count
     // is disambiguated below (absent row vs rejected conversion).
     let mut tx = pool.begin().await?;
+    // Every key mutation takes the provider row lock first. This keeps label
+    // uniqueness checks ordered with inserts and avoids a provider/key lock
+    // inversion under concurrent admin writes.
+    let provider_exists: Option<(i64,)> =
+        sqlx::query_as("SELECT id FROM gateway_providers WHERE id = $1 FOR UPDATE")
+            .bind(provider_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if provider_exists.is_none() {
+        return Ok(false);
+    }
+    if let Some(label) = patch.label {
+        let duplicate: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM gateway_provider_keys
+             WHERE provider_id = $1 AND label = $2 AND id <> $3
+             LIMIT 1",
+        )
+        .bind(provider_id)
+        .bind(label)
+        .bind(key_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            duplicate.is_none(),
+            "a key with label {label:?} already exists for provider {provider_id}"
+        );
+    }
     let result = sqlx::query(
         "UPDATE gateway_provider_keys SET
            label = COALESCE($3, label),
@@ -505,15 +744,22 @@ pub async fn delete_provider_key(
     pool: &PgPool,
     provider_id: i64,
     key_id: i64,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<bool>> {
     let mut tx = pool.begin().await?;
-    let result =
-        sqlx::query("DELETE FROM gateway_provider_keys WHERE id = $1 AND provider_id = $2")
-            .bind(key_id)
-            .bind(provider_id)
-            .execute(&mut *tx)
-            .await?;
-    if result.rows_affected() > 0 {
+    sqlx::query("SELECT id FROM gateway_providers WHERE id = $1 FOR UPDATE")
+        .bind(provider_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let deleted: Option<(String,)> = sqlx::query_as(
+        "DELETE FROM gateway_provider_keys
+         WHERE id = $1 AND provider_id = $2
+         RETURNING auth_kind",
+    )
+    .bind(key_id)
+    .bind(provider_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if deleted.is_some() {
         // Cascade into routes: an entry pointing at a deleted key is a dangling
         // reference that resolves to zero candidates (a misleading 404). Strip it
         // in the same transaction; a route left empty keeps its alias so it can be
@@ -531,7 +777,7 @@ pub async fn delete_provider_key(
     .await?;
     }
     tx.commit().await?;
-    Ok(result.rows_affected() > 0)
+    Ok(deleted.map(|(auth_kind,)| auth_kind == "kiro_oidc"))
 }
 
 /// Reorder keys globally: `ids` must list every key exactly once (full-list contract keeps the

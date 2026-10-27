@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
-use crate::kiro::KeyCredential;
+use crate::kiro::{KeyCredential, KiroOAuth};
 use crate::probe::{self, ProbeModel};
 use crate::quota::{self, KeyQuota};
 use crate::store::{self, ProviderInput};
@@ -115,9 +115,31 @@ pub struct NoSuchKey(pub i64);
 /// An outbound probe failed: the vendor rejected the credential, DNS,
 /// timeout, or an undecodable payload. The admin HTTP surface maps this to
 /// 502 Bad Gateway — the request was well-formed; the dependency failed.
-#[derive(Debug, thiserror::Error)]
-#[error("{0:#}")]
-pub struct ProbeError(pub anyhow::Error);
+#[derive(Debug)]
+pub enum ProbeError {
+    /// A regular provider probe keeps its detailed diagnostic for the GUI.
+    Regular(anyhow::Error),
+    /// Kiro probe details may include upstream-controlled content and must not
+    /// cross the admin API boundary.
+    Kiro(anyhow::Error),
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Regular(error) => write!(formatter, "{error:#}"),
+            Self::Kiro(_) => formatter.write_str("upstream probe failed"),
+        }
+    }
+}
+
+impl std::error::Error for ProbeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Regular(error) | Self::Kiro(error) => Some(error.as_ref()),
+        }
+    }
+}
 
 /// A key row plus its live slot occupancy (`inflight` = Some only for
 /// limited keys) as a view — used by the loopback-only reveal endpoint
@@ -186,7 +208,11 @@ pub async fn create_key(
 
 /// Delete a key row (route entries are stripped in the same transaction).
 /// Returns whether the row existed and was deleted.
-pub async fn delete_key(pool: &PgPool, provider_id: i64, key_id: i64) -> anyhow::Result<bool> {
+pub async fn delete_key(
+    pool: &PgPool,
+    provider_id: i64,
+    key_id: i64,
+) -> anyhow::Result<Option<bool>> {
     store::delete_provider_key(pool, provider_id, key_id).await
 }
 
@@ -593,7 +619,7 @@ impl Admin {
             api_key,
         )
         .await
-        .map_err(ProbeError)?)
+        .map_err(ProbeError::Regular)?)
     }
 
     /// The models a saved key can list (route editor's picker). A successful
@@ -627,10 +653,14 @@ impl Admin {
                 api_key,
             )
             .await
-            .map_err(ProbeError)?
+            .map_err(ProbeError::Regular)?
         };
         if let Err(error) = store::update_key_models(&self.pool, key_id, &models).await {
-            tracing::warn!(key_id, error = %format!("{error:#}"), "model snapshot persist failed");
+            tracing::warn!(
+                key_id,
+                error = %format!("{error:#}"),
+                "model snapshot persistence failed after a successful probe"
+            );
         }
         // The route cache is the only read path for /v1/models; refresh it so a
         // successful persist is visible immediately. A refresh failure degrades
@@ -658,10 +688,10 @@ impl Admin {
         let context = tokens
             .access_token(&self.pool, key)
             .await
-            .map_err(|error| ProbeError(error.into()))?;
+            .map_err(|error| ProbeError::Kiro(error.into()))?;
         probe::fetch_kiro_models(tokens.transport(), &context)
             .await
-            .map_err(|error| ProbeError(error).into())
+            .map_err(|error| ProbeError::Kiro(error).into())
     }
 
     /// Persist a key's model-list snapshot. The add-account flow already holds
@@ -681,6 +711,110 @@ impl Admin {
             tracing::warn!(key_id, error = %format!("{error:#}"), "route cache refresh after model snapshot failed");
         }
         Ok(updated)
+    }
+
+    /// Find-or-create a Kiro key from an operator-supplied OAuth bundle, but
+    /// only after that candidate proves usable against the Kiro model
+    /// catalogue.
+    ///
+    /// The probe is deliberately pre-persistence: a failed probe leaves any
+    /// existing key's credential and model snapshot untouched and creates no
+    /// row. A stale candidate access token is refreshed in memory through the
+    /// shared [`crate::upstream::KiroTokens`] lifecycle (no DB write), and the
+    /// refreshed bundle — not the submitted one — is stored once the catalogue
+    /// answers. That catalogue response is also the key's model snapshot (stored
+    /// best-effort: a snapshot-write failure never undoes a proven credential),
+    /// so the already-probed credential is not sent upstream a second time.
+    ///
+    /// Returns `(key_id, created)` like [`store::upsert_kiro_key_by_label`].
+    pub async fn upsert_kiro_key(
+        &self,
+        provider_id: i64,
+        label: &str,
+        oauth: KiroOAuth,
+    ) -> anyhow::Result<(i64, bool)> {
+        if label.is_empty() {
+            return Err(
+                store::KiroUpsertError::InvalidInput("label must not be empty".to_owned()).into(),
+            );
+        }
+        oauth
+            .validate()
+            .map_err(|error| store::KiroUpsertError::InvalidInput(format!("{error:#}")))?;
+        // Both regions become URL hosts (the OIDC token endpoint and the
+        // control plane), so the grammar guard dispatch shares applies before
+        // any request is built — an unusable region is caller error, not a
+        // vendor failure.
+        for region in [&oauth.api_region, &oauth.auth_region] {
+            if !crate::kiro::valid_region(region) {
+                return Err(store::KiroUpsertError::InvalidInput(
+                    "Kiro OAuth regions must be AWS region names".to_owned(),
+                )
+                .into());
+            }
+        }
+        // Reject a missing/mismatched provider before spending a vendor probe.
+        // The store repeats both checks under its transaction lock.
+        let Some(provider) = store::get_provider(&self.pool, provider_id).await? else {
+            return Err(store::KiroUpsertError::ProviderNotFound(provider_id).into());
+        };
+        if provider.protocol != "kiro" {
+            return Err(store::KiroUpsertError::ProviderProtocolMismatch(provider_id).into());
+        }
+        if !crate::kiro::kas_endpoint_matches(&provider.base_url, &oauth.api_region) {
+            return Err(store::KiroUpsertError::InvalidInput(
+                "Kiro provider endpoint does not match the OAuth API region".to_owned(),
+            )
+            .into());
+        }
+        let expectation = store::kiro_upsert_expectation(&self.pool, provider_id, label).await?;
+        let Some(tokens) = &self.kiro_tokens else {
+            // Without the live manager there is no bearer to reuse, and minting
+            // a second cache would race dispatch's refresh-token rotation.
+            anyhow::bail!("Kiro 模型列表需要已接线的 token 管理器")
+        };
+        let candidate = tokens
+            .candidate_for_probe(oauth)
+            .await
+            .map_err(|error| ProbeError::Kiro(error.into()))?;
+        let models = probe::fetch_kiro_models(tokens.transport(), &candidate.call)
+            .await
+            .map_err(ProbeError::Kiro)?;
+        let candidate_oauth = candidate.oauth;
+        let (key_id, created) = store::upsert_kiro_key_by_label(
+            &self.pool,
+            provider_id,
+            label,
+            &candidate_oauth,
+            &expectation,
+        )
+        .await?;
+        // The catalogue answer also becomes the key's model snapshot. That is a
+        // second write, so its failure must not fail an import whose credential
+        // is already proven and adopted: losing the snapshot only defers the
+        // derived /v1/models attributes until the next successful probe — the
+        // same degradation `list_key_models` accepts.
+        let models_saved =
+            store::update_key_models_for_oauth(&self.pool, key_id, &candidate_oauth, &models).await;
+        tokens
+            .adopt_persisted(&self.pool, provider_id, key_id, candidate_oauth)
+            .await;
+        if let Err(error) = self.route_cache.refresh(&self.pool).await {
+            tracing::warn!(key_id, error = %format!("{error:#}"), "route cache refresh after Kiro key upsert failed");
+        }
+        match models_saved {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                key_id,
+                "Kiro key row vanished before its model snapshot could be stored"
+            ),
+            Err(error) => tracing::warn!(
+                key_id,
+                error = %format!("{error:#}"),
+                "Kiro model snapshot was not stored after a successful credential probe"
+            ),
+        }
+        Ok((key_id, created))
     }
 
     /// Add a named key to a provider; returns the new key id.
@@ -711,7 +845,7 @@ impl Admin {
     /// Errors when the key does not exist.
     pub async fn delete_key(&self, provider_id: i64, key_id: i64) -> anyhow::Result<()> {
         let deleted = delete_key(&self.pool, provider_id, key_id).await?;
-        anyhow::ensure!(deleted, "no such key {key_id}");
+        anyhow::ensure!(deleted.is_some(), "no such key {key_id}");
         Ok(())
     }
 

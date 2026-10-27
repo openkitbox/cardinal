@@ -731,7 +731,7 @@ fn kiro_usage_request(
     profile_arn: Option<&str>,
     bearer: &str,
 ) -> Option<KiroUsageCall> {
-    if !crate::upstream::kiro_tokens::valid_region(api_region) {
+    if !crate::kiro::valid_region(api_region) {
         return None;
     }
     let mut body = serde_json::Map::new();

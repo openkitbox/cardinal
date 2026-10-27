@@ -40,15 +40,6 @@ fn as_protocol_error(error: &TransportError) -> ProtocolError {
 #[derive(Debug)]
 pub enum AttemptError {
     Transport(TransportError),
-    /// Every candidate's concurrency gate saturated and the dispatch's queue
-    /// wait elapsed: the gateway is the limiting factor, not any upstream. The
-    /// client gets 429 with a Retry-After (the configured queue wait) — waiting
-    /// is exactly what a healthy caller should do; the ledger must be able to
-    /// tell this apart from a real upstream timeout (which reads as 504).
-    #[allow(dead_code)] // Will be used by the dispatcher in the future
-    ConcurrencyBusy {
-        queue_timeout: std::time::Duration,
-    },
     /// The stream's upstream died before the pump's commit point (the 200
     /// headers were out but nothing reached the client): the attempt may fail
     /// over invisibly. It classifies as the connection/timeout family —
@@ -79,8 +70,6 @@ impl AttemptError {
         match self {
             Self::Transport(TransportError::Status { status, .. }) => *status,
             Self::Transport(error) => as_protocol_error(error).status(),
-            // Gateway-side saturation: the caller should retry after the queue wait.
-            Self::ConcurrencyBusy { .. } => 429,
             // An abort only ever surfaces when every candidate died pre-commit: the
             // upstream family, not the request's fault.
             Self::AbortedStream => ProtocolError::UpstreamError.status(),
@@ -105,7 +94,6 @@ impl AttemptError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Transport(error) => as_protocol_error(error).code(),
-            Self::ConcurrencyBusy { .. } => "concurrency_busy",
             Self::AbortedStream => ProtocolError::UpstreamError.code(),
             Self::KiroTokenError(error) => error.code(),
             Self::Protocol(error) => error.code(),
@@ -115,12 +103,6 @@ impl AttemptError {
     pub fn message(&self) -> String {
         match self {
             Self::Transport(error) => error.to_string(),
-            Self::ConcurrencyBusy { queue_timeout } => {
-                format!(
-                    "gateway busy: every candidate at its concurrency limit, queue timed out after {}s",
-                    queue_timeout.as_secs()
-                )
-            }
             Self::AbortedStream => "upstream stream died before the response committed".to_owned(),
             // Safe to surface: the token error carries no OAuth material.
             Self::KiroTokenError(error) => error.to_string(),
@@ -291,9 +273,6 @@ pub fn classify(error: &AttemptError) -> Failure {
         // no cool-down, no counter, no failover. The `Other` mapping here stays as
         // a defensive fallback should a future call site skip the special case.
         AttemptError::Transport(_) => return Failure::Other,
-        // Gateway-side saturation never reaches classify either: the gate path
-        // `continue`s before classify (busy ≠ broken — no cooldown, no counter).
-        AttemptError::ConcurrencyBusy { .. } => return Failure::Other,
         // Pre-commit stream abort: the upstream died before producing anything —
         // the connection/timeout family, resting and retrying like a mid-read error.
         AttemptError::AbortedStream => return Failure::Other,

@@ -2,8 +2,10 @@
 //!
 //! Endpoints:
 //! - `GET/POST /api/providers`, `GET/PATCH/DELETE /api/providers/:id` — provider = protocol + endpoint (+ auth scheme), no credential
+//! - `DELETE /api/providers/:id/if-empty` — atomically delete a provider only when it has no keys
 //! - `GET/POST /api/providers/:id/keys`, `PATCH/DELETE /api/providers/:id/keys/:key_id` — every credential is a named key
 //!   (a Kiro key carries `auth_kind: "kiro_oidc"` + `oauth` instead of `api_key`; PATCH replaces that bundle only on an existing Kiro key)
+//! - `POST /api/providers/:id/kiro-key` `{label, oauth}` — probe then find-or-create a Kiro OIDC key by label
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
 //!   plaintext-serving endpoint; the list shape stays masked)
 //! - `PUT /api/keys/order` `{ids: [..]}` — assign global positions sequentially in array order (one transaction)
@@ -304,11 +306,38 @@ async fn delete_provider(request: &mut Request, depot: &mut Depot, response: &mu
         return;
     };
     match store::delete_provider(pool, id).await {
-        Ok(true) => {
+        Ok(store::ProviderDeleteOutcome::Deleted { kiro_key_ids }) => {
+            state(depot).kiro_tokens.remove_provider(&kiro_key_ids);
             let _ = state(depot).route_cache.refresh(pool).await;
             json_response(response, &json!({"ok": true}))
         }
-        Ok(false) => not_found(response, "provider"),
+        Ok(store::ProviderDeleteOutcome::Missing) => not_found(response, "provider"),
+        Err(error) => internal(response, error),
+    }
+}
+
+#[handler]
+async fn delete_provider_if_empty(
+    request: &mut Request,
+    depot: &mut Depot,
+    response: &mut Response,
+) {
+    let Some(id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("bad id");
+        return;
+    };
+    let pool = state_pool(depot);
+    match store::delete_provider_if_empty(pool, id).await {
+        Ok(store::EmptyProviderDeleteOutcome::Deleted) => {
+            let _ = state(depot).route_cache.refresh(pool).await;
+            json_response(response, &json!({"ok": true}))
+        }
+        Ok(store::EmptyProviderDeleteOutcome::HasKeys) => {
+            response.status_code(StatusCode::CONFLICT);
+            let _ = response.body("provider has keys");
+        }
+        Ok(store::EmptyProviderDeleteOutcome::Missing) => not_found(response, "provider"),
         Err(error) => internal(response, error),
     }
 }
@@ -1003,14 +1032,18 @@ fn try_bad_gateway(response: &mut Response, error: &anyhow::Error) -> bool {
         return false;
     };
     response.status_code(StatusCode::BAD_GATEWAY);
-    let _ = response.body(format!("upstream probe failed: {probe}"));
+    let message = match probe {
+        crate::admin_ops::ProbeError::Kiro(_) => "upstream probe failed".to_owned(),
+        crate::admin_ops::ProbeError::Regular(_) => format!("upstream probe failed: {probe}"),
+    };
+    let _ = response.body(message);
     true
 }
 
 fn internal(response: &mut Response, error: anyhow::Error) {
     tracing::error!("admin api: {error:#}");
     response.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-    let _ = response.body(format!("internal error: {error:#}"));
+    let _ = response.body("internal error");
 }
 
 /// `/api/*` sub-router (loopback-only + admin auth). Mounted on the main router.
@@ -1031,11 +1064,13 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
                 .patch(update_provider)
                 .delete(delete_provider),
         )
+        .push(Router::with_path("providers/{id}/if-empty").delete(delete_provider_if_empty))
         .push(
             Router::with_path("providers/{id}/keys")
                 .get(list_keys)
                 .post(create_key),
         )
+        .push(Router::with_path("providers/{id}/kiro-key").post(upsert_kiro_key))
         .push(
             Router::with_path("providers/{id}/keys/{key_id}")
                 .patch(patch_key)
@@ -1109,6 +1144,12 @@ struct KeyBody {
     /// Model whitelist; absent or null = unrestricted.
     #[serde(default)]
     allowed_models: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct KiroKeyBody {
+    label: String,
+    oauth: KiroOAuth,
 }
 
 #[derive(Deserialize)]
@@ -1213,8 +1254,8 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
             return;
         }
     };
-    // The token manager seeds each key's state from the bundle, so a freshly
-    // created OIDC key must be visible to it before the first dispatch.
+    // The token manager verifies the committed row and reconciles it with any
+    // in-memory refresh under the key lock before the first dispatch.
     let created_oauth = match credential {
         KeyCredential::KiroOidc(oauth) => Some(oauth.clone()),
         KeyCredential::Static(_) => None,
@@ -1231,12 +1272,11 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
     {
         Ok(id) => {
             if let Some(oauth) = created_oauth {
-                // The row already holds the bundle; replace also serializes with
-                // any refresh and proves disk and memory agree before the key
-                // can dispatch.
+                // Verify the committed row and reconcile it with any newer
+                // in-memory refresh under the token manager's key lock.
                 state(depot)
                     .kiro_tokens
-                    .replace(pool, provider_id, id, oauth)
+                    .adopt_persisted(pool, provider_id, id, oauth)
                     .await;
             }
             let _ = state(depot).route_cache.refresh(pool).await;
@@ -1244,6 +1284,49 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
             json_response(response, &json!({"id": id}));
         }
         Err(error) => bad_request(response, error),
+    }
+}
+
+#[handler]
+async fn upsert_kiro_key(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(provider_id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid provider id");
+        return;
+    };
+    let Ok(body) = request.parse_json::<KiroKeyBody>().await else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid Kiro key body");
+        return;
+    };
+    match admin(depot)
+        .upsert_kiro_key(provider_id, &body.label, body.oauth)
+        .await
+    {
+        Ok((id, created)) => {
+            response.status_code(if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            });
+            json_response(response, &json!({"id": id, "created": created}));
+        }
+        Err(error) if try_bad_gateway(response, &error) => {}
+        Err(error) => match error.downcast::<store::KiroUpsertError>() {
+            Ok(store::KiroUpsertError::InvalidInput(message)) => {
+                bad_request(response, anyhow::anyhow!(message))
+            }
+            Ok(store::KiroUpsertError::ProviderNotFound(_)) => not_found(response, "provider"),
+            Ok(
+                store::KiroUpsertError::ProviderProtocolMismatch(_)
+                | store::KiroUpsertError::Conflict,
+            ) => {
+                response.status_code(StatusCode::CONFLICT);
+                let _ = response.body("Kiro key conflicts with the existing provider or key");
+            }
+            Ok(store::KiroUpsertError::Internal(error)) => internal(response, error),
+            Err(error) => internal(response, error),
+        },
     }
 }
 
@@ -1266,9 +1349,9 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
     // every other field: all inputs are validated before the first write, so
     // a rejected field never leaves a rotated credential behind. The OAuth
     // branch only accepts an existing Kiro OIDC key — a static target is a
-    // 400, a missing key a 404. After a successful replace the in-memory token
-    // manager adopts the operator's bundle (serialized with any in-flight
-    // refresh, so an older refresh can never write itself over it).
+    // 400, a missing key a 404. After a successful patch the in-memory token
+    // manager verifies and reconciles the committed row under the key lock; an
+    // older refresh cannot overwrite it.
     // Cloned before the transaction: the match scrutinee's temporaries (the
     // `KeyPatch` borrowing the body) live through the arms.
     let rotated_oauth = body.oauth.clone();
@@ -1288,12 +1371,11 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
     {
         Ok(true) => {
             if let Some(oauth) = rotated_oauth {
-                // Rewrites the row under the key's lock: a stale in-flight
-                // refresh cannot leave the row on the old bundle after this
-                // returns, and memory adopts exactly what the row now holds.
+                // Verify the committed row and reconcile it with any newer
+                // in-memory refresh under the token manager's key lock.
                 state(depot)
                     .kiro_tokens
-                    .replace(pool, provider_id, key_id, oauth)
+                    .adopt_persisted(pool, provider_id, key_id, oauth)
                     .await;
             }
             let _ = state(depot).route_cache.refresh(pool).await;
@@ -1334,15 +1416,16 @@ async fn delete_key(request: &mut Request, depot: &mut Depot, response: &mut Res
     };
     let pool = state_pool(depot);
     match crate::admin_ops::delete_key(pool, provider_id, key_id).await {
-        Ok(deleted) => {
-            if deleted {
+        Ok(Some(is_kiro)) => {
+            if is_kiro {
                 state(depot).kiro_tokens.remove(key_id);
-                let _ = state(depot).route_cache.refresh(pool).await;
-                json_response(response, &json!({"ok": true}))
-            } else {
-                response.status_code(StatusCode::NOT_FOUND);
-                let _ = response.body("key not found");
             }
+            let _ = state(depot).route_cache.refresh(pool).await;
+            json_response(response, &json!({"ok": true}))
+        }
+        Ok(None) => {
+            response.status_code(StatusCode::NOT_FOUND);
+            let _ = response.body("key not found");
         }
         Err(error) => internal(response, error),
     }

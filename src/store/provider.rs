@@ -173,12 +173,98 @@ pub async fn set_provider_enabled(pool: &PgPool, id: i64, enabled: bool) -> anyh
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn delete_provider(pool: &PgPool, id: i64) -> anyhow::Result<bool> {
-    let result = sqlx::query("DELETE FROM gateway_providers WHERE id = $1")
-        .bind(id)
-        .execute(pool)
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProviderDeleteOutcome {
+    Missing,
+    Deleted { kiro_key_ids: Vec<i64> },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum EmptyProviderDeleteOutcome {
+    Missing,
+    HasKeys,
+    Deleted,
+}
+
+pub async fn delete_provider(pool: &PgPool, id: i64) -> anyhow::Result<ProviderDeleteOutcome> {
+    let mut tx = pool.begin().await?;
+    let provider: Option<(i64,)> =
+        sqlx::query_as("SELECT id FROM gateway_providers WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if provider.is_none() {
+        tx.rollback().await?;
+        return Ok(ProviderDeleteOutcome::Missing);
+    }
+    let keys: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, auth_kind FROM gateway_provider_keys WHERE provider_id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let key_ids: Vec<i64> = keys
+        .iter()
+        .filter(|(_, auth_kind)| auth_kind == "kiro_oidc")
+        .map(|(key_id, _)| *key_id)
+        .collect();
+    let all_key_ids: Vec<i64> = keys.into_iter().map(|(key_id, _)| key_id).collect();
+    if !all_key_ids.is_empty() {
+        sqlx::query(
+            "UPDATE gateway_routes
+             SET entries = COALESCE(
+                 (SELECT jsonb_agg(entry) FROM jsonb_array_elements(entries) AS entry
+                  WHERE NOT ((entry->>'key_id')::bigint = ANY($1))),
+                 '[]'::jsonb)
+             WHERE EXISTS (
+                 SELECT 1 FROM jsonb_array_elements(entries) AS entry
+                 WHERE (entry->>'key_id')::bigint = ANY($1))",
+        )
+        .bind(&all_key_ids)
+        .execute(&mut *tx)
         .await?;
-    Ok(result.rows_affected() > 0)
+    }
+    sqlx::query("DELETE FROM gateway_providers WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(ProviderDeleteOutcome::Deleted {
+        kiro_key_ids: key_ids,
+    })
+}
+
+/// Delete a provider only while it has no keys. The predicate is part of the
+/// DELETE so a concurrent key insert cannot turn this into an orphaning race.
+pub async fn delete_provider_if_empty(
+    pool: &PgPool,
+    id: i64,
+) -> anyhow::Result<EmptyProviderDeleteOutcome> {
+    let mut tx = pool.begin().await?;
+    let provider: Option<(i64,)> =
+        sqlx::query_as("SELECT id FROM gateway_providers WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(_) = provider else {
+        tx.rollback().await?;
+        return Ok(EmptyProviderDeleteOutcome::Missing);
+    };
+    let keys: Vec<(i64,)> =
+        sqlx::query_as("SELECT id FROM gateway_provider_keys WHERE provider_id = $1")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    if !keys.is_empty() {
+        tx.rollback().await?;
+        return Ok(EmptyProviderDeleteOutcome::HasKeys);
+    }
+    sqlx::query("DELETE FROM gateway_providers WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(EmptyProviderDeleteOutcome::Deleted)
 }
 
 pub async fn list_providers_by_ids(pool: &PgPool, ids: &[i64]) -> anyhow::Result<Vec<ProviderRow>> {

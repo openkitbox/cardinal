@@ -25,14 +25,11 @@
 //!   refresh memory becomes newer than the row (`persisted = false`) and is
 //!   written back; a persistence failure leaves it that way so a later reread
 //!   can never restore the stale refresh token.
-//! * **Admin replacement serializes with refresh.** [`KiroTokens::replace`]
-//!   takes the key's lock, makes the operator's bundle authoritative in memory
-//!   with `persisted = false`, and writes that exact bundle to the row before
-//!   returning. An in-flight refresh therefore either wrote before the operator
-//!   bundle (and the operator write corrects the row) or runs after it under the
-//!   lock and starts from the operator bundle; on success disk and memory agree.
-//!   A failed replacement write keeps the operator bundle in memory with
-//!   `persisted = false` and warns — it is never reported as persisted.
+//! * **Admin adoption serializes with refresh.** [`KiroTokens::adopt_persisted`]
+//!   rereads the committed row outside the state lock, then reconciles it under
+//!   the key lock. A committed candidate is adopted when it still matches the
+//!   row; a different stored bundle replaces a persisted or newly seeded state,
+//!   while a newer pending in-memory refresh is retained.
 //! * **Refresh-token rotation is total.** A response without `refreshToken`
 //!   keeps the old one; otherwise the whole bundle (access token, expiry, refresh
 //!   token, `profileArn`) is replaced in memory and persisted as one JSONB
@@ -81,13 +78,15 @@
 //!   AWS endpoints. The body remains sensitive: it is read only to classify,
 //!   never logged and never forwarded.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use secrecy::{ExposeSecret as _, SecretString};
+use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::kiro::{KiroOAuth, profile};
 use crate::protocol::{Prepared, ProtocolId};
@@ -107,7 +106,6 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// few hundred bytes; 64 KiB leaves room for unknown fields without buffering
 /// an unbounded body.
 const MAX_TOKEN_BODY: usize = 64 * 1024;
-
 /// The failure of one token acquisition/refresh.
 ///
 /// Deliberately carries no upstream body and no OAuth material: this value is
@@ -252,6 +250,20 @@ impl KiroCallContext {
     }
 }
 
+/// A not-yet-persisted candidate bundle resolved for a pre-persistence probe.
+///
+/// `oauth` is what the caller must persist *iff* the probe succeeds: either the
+/// submitted bundle (its access token was fresh) or the in-memory refresh of it.
+/// Nothing in [`KiroTokens::candidate_for_probe`] writes this bundle to the
+/// database or to the key-state map.
+#[derive(Debug)]
+pub struct KiroProbeCredential {
+    /// The bundle to persist after a successful probe.
+    pub oauth: KiroOAuth,
+    /// The bearer/profile for the probe itself.
+    pub call: KiroCallContext,
+}
+
 /// Never prints the bearer (nor anything else secret).
 impl std::fmt::Debug for KiroCallContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -270,6 +282,13 @@ pub struct KiroTokenState {
     /// memory is newer (a refresh whose write-back has not succeeded yet) and
     /// must never be overwritten by a database reread.
     pub persisted: bool,
+    /// The exact bundle that was used to produce `oauth` when a refresh is
+    /// pending persistence. CAS write-back must never replace a row changed
+    /// since that exchange started.
+    pending_expected: Option<KiroOAuth>,
+    /// Changes whenever the bundle or persistence marker changes. Async work
+    /// snapshots this value and may commit only if it is still current.
+    generation: u64,
 }
 
 /// Per-key Kiro OIDC token manager. Cheap to clone: the state map is shared,
@@ -283,6 +302,150 @@ pub struct KiroTokenState {
 pub struct KiroTokens {
     transport: Transport,
     states: Arc<DashMap<i64, Arc<Mutex<KiroTokenState>>>>,
+    refresh_gates: Arc<DashMap<[u8; 32], Arc<KiroRefreshGate>>>,
+}
+
+/// The last exchange result shared by dispatch and pre-persistence probes.
+///
+/// Keeping the result only until all waiters have observed it lets a probe that
+/// races a dispatch reuse the exchange without retaining OAuth material in the
+/// single-flight map permanently. Failures are shared as well, so concurrent
+/// callers do not each repeat a failed exchange.
+struct KiroRefreshGate {
+    result: StdMutex<Option<Result<RefreshExchange, KiroTokenError>>>,
+    users: AtomicUsize,
+    closed: AtomicBool,
+    started: AtomicBool,
+    notify: Notify,
+}
+
+fn lock_gate_result(
+    gate: &KiroRefreshGate,
+) -> std::sync::MutexGuard<'_, Option<Result<RefreshExchange, KiroTokenError>>> {
+    match gate.result.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("Kiro refresh gate mutex was poisoned; recovering its state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// The exchange result is deliberately independent of the caller's OAuth
+/// context. In particular, api_region and profile_arn belong to the caller,
+/// not to whichever waiter happened to become the gate owner.
+#[derive(Clone)]
+struct RefreshExchange {
+    access_token: String,
+    expires_at: i64,
+    refresh_token: Option<String>,
+    profile_arn: Option<String>,
+}
+
+struct RefreshOwner {
+    gate: Arc<KiroRefreshGate>,
+    identity: [u8; 32],
+    gates: Arc<DashMap<[u8; 32], Arc<KiroRefreshGate>>>,
+}
+
+impl RefreshOwner {
+    fn new(
+        gate: Arc<KiroRefreshGate>,
+        identity: [u8; 32],
+        gates: Arc<DashMap<[u8; 32], Arc<KiroRefreshGate>>>,
+    ) -> Self {
+        Self {
+            gate,
+            identity,
+            gates,
+        }
+    }
+}
+
+impl Drop for RefreshOwner {
+    fn drop(&mut self) {
+        let mut result = lock_gate_result(&self.gate);
+        if result.is_none() {
+            *result = Some(Err(KiroTokenError::Network));
+            self.gate.closed.store(true, Ordering::Release);
+            self.gate.notify.notify_waiters();
+            self.gates.remove_if(&self.identity, |_, existing| {
+                Arc::ptr_eq(existing, &self.gate)
+            });
+        }
+    }
+}
+
+struct StateSnapshot {
+    oauth: KiroOAuth,
+    persisted: bool,
+    pending_expected: Option<KiroOAuth>,
+    generation: u64,
+}
+
+impl StateSnapshot {
+    fn matches(&self, state: &KiroTokenState) -> bool {
+        state.generation == self.generation
+            && state.oauth == self.oauth
+            && state.persisted == self.persisted
+            && state.pending_expected == self.pending_expected
+    }
+}
+
+fn snapshot(state: &KiroTokenState) -> StateSnapshot {
+    StateSnapshot {
+        oauth: state.oauth.clone(),
+        persisted: state.persisted,
+        pending_expected: state.pending_expected.clone(),
+        generation: state.generation,
+    }
+}
+
+fn commit(
+    state: &mut KiroTokenState,
+    snapshot: &StateSnapshot,
+    oauth: KiroOAuth,
+    persisted: bool,
+    expected: Option<KiroOAuth>,
+) -> bool {
+    if !snapshot.matches(state) {
+        return false;
+    }
+    state.oauth = oauth;
+    state.persisted = persisted;
+    state.pending_expected = expected;
+    state.generation = state.generation.wrapping_add(1);
+    true
+}
+
+fn merged_exchange(current: &KiroOAuth, exchange: RefreshExchange) -> KiroOAuth {
+    let mut next = current.clone();
+    next.access_token = exchange.access_token;
+    next.expires_at = exchange.expires_at;
+    if let Some(refresh_token) = exchange
+        .refresh_token
+        .filter(|token| !token.trim().is_empty())
+    {
+        next.refresh_token = refresh_token;
+    }
+    if let Some(profile_arn) = exchange.profile_arn.filter(|arn| !arn.trim().is_empty()) {
+        next.profile_arn = Some(profile_arn);
+    }
+    next
+}
+
+fn exchange_identity_digest(oauth: &KiroOAuth) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for value in [
+        oauth.refresh_token.as_str(),
+        oauth.client_id.as_str(),
+        oauth.client_secret.as_str(),
+        oauth.auth_region.as_str(),
+    ] {
+        hasher.update(value.len().to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.finalize().into()
 }
 
 impl KiroTokens {
@@ -290,6 +453,7 @@ impl KiroTokens {
         Self {
             transport,
             states: Arc::new(DashMap::new()),
+            refresh_gates: Arc::new(DashMap::new()),
         }
     }
 
@@ -300,31 +464,47 @@ impl KiroTokens {
         &self.transport
     }
 
-    /// Drop a key's cached state (key deletion). The next access re-seeds from
-    /// the route cache / row.
-    pub fn remove(&self, key_id: i64) {
-        self.states.remove(&key_id);
+    /// Resolve an operator-supplied candidate bundle for a probe that must
+    /// succeed before anything is persisted (the `kiro-key` import).
+    ///
+    /// A candidate whose access token is still fresh is used as-is. A stale one
+    /// is exchanged through the same [`Self::refresh`] path dispatch uses, but
+    /// the result stays in memory: this method touches neither the key-state
+    /// map nor the database. The caller persists `oauth` only after the probe
+    /// it enables has succeeded.
+    pub async fn candidate_for_probe(
+        &self,
+        candidate: KiroOAuth,
+    ) -> Result<KiroProbeCredential, KiroTokenError> {
+        let now = chrono::Utc::now().timestamp();
+        let oauth = if candidate.fresh_for(now) {
+            candidate
+        } else {
+            merged_exchange(&candidate, self.refresh(None, &candidate).await?)
+        };
+        let call = call_context(&oauth);
+        Ok(KiroProbeCredential { oauth, call })
     }
 
-    /// Adopt a bundle the admin plane just persisted (create or credential
-    /// rotation) and make disk match it before returning.
-    ///
-    /// Serializes with any in-flight refresh: the operator bundle becomes
-    /// authoritative in memory (`persisted = false`), and the exact same bundle
-    /// is written to the row while the key's lock is held. An older refresh that
-    /// already wrote the row is corrected here; one that runs later takes the
-    /// lock and starts from the operator bundle. A failed write keeps the
-    /// operator bundle in memory with `persisted = false` and warns — memory is
-    /// newer, and no caller is told the row holds it.
-    pub async fn replace(&self, pool: &PgPool, provider_id: i64, key_id: i64, oauth: KiroOAuth) {
+    /// Read the committed row outside the state lock, then reconcile it under
+    /// the key lock. A committed candidate is adopted when it still matches the
+    /// row; a different stored bundle replaces persisted or newly seeded state,
+    /// while a newer pending in-memory refresh is retained.
+    pub async fn adopt_persisted(
+        &self,
+        pool: &PgPool,
+        provider_id: i64,
+        key_id: i64,
+        candidate: KiroOAuth,
+    ) {
         let state = match self.states.get(&key_id) {
             Some(existing) => Arc::clone(existing.value()),
             None => {
-                // Clone only when this may be a new entry: the entry API needs
-                // an owned candidate, and on a race the losing insert is dropped.
                 let created = Arc::new(Mutex::new(KiroTokenState {
-                    oauth: oauth.clone(),
+                    oauth: candidate.clone(),
                     persisted: false,
+                    pending_expected: None,
+                    generation: 0,
                 }));
                 match self.states.entry(key_id) {
                     dashmap::mapref::entry::Entry::Occupied(entry) => Arc::clone(entry.get()),
@@ -335,11 +515,46 @@ impl KiroTokens {
                 }
             }
         };
-        let mut guard = state.lock().await;
-        guard.oauth = oauth;
-        guard.persisted = false;
-        self.persist_pending(pool, provider_id, key_id, &mut guard)
-            .await;
+        let before = {
+            let guard = state.lock().await;
+            snapshot(&guard)
+        };
+        match store::kiro_oauth(pool, key_id).await {
+            Ok(Some(stored)) if stored == candidate => {
+                let mut guard = state.lock().await;
+                commit(&mut guard, &before, candidate, true, None);
+            }
+            Ok(Some(stored)) => {
+                let mut guard = state.lock().await;
+                if before.persisted || before.oauth == candidate {
+                    commit(&mut guard, &before, stored, true, None);
+                }
+            }
+            Ok(None) => tracing::warn!(
+                key_id,
+                provider_id,
+                "Kiro credential adoption found no persisted row"
+            ),
+            Err(error) => tracing::warn!(
+                key_id,
+                provider_id,
+                error = %error,
+                "Kiro credential adoption could not verify the persisted row"
+            ),
+        }
+    }
+
+    /// Drop a key's cached state (key deletion). The next access re-seeds from
+    /// the route cache / row.
+    pub fn remove(&self, key_id: i64) {
+        self.states.remove(&key_id);
+    }
+
+    /// Drop all cached states for a provider after its rows are deleted.
+    pub fn remove_provider(&self, key_ids: &[i64]) {
+        for key_id in key_ids {
+            self.states.remove(key_id);
+        }
     }
 
     /// The credential for one dispatch: a fresh bearer plus the profile ARN the
@@ -350,24 +565,39 @@ impl KiroTokens {
         key: &ProviderKeyRow,
     ) -> Result<KiroCallContext, KiroTokenError> {
         let state = self.state_for(key)?;
-        let mut guard = state.lock().await;
-        let now = chrono::Utc::now().timestamp();
-        if guard.oauth.fresh_for(now) {
-            self.persist_pending(pool, key.provider_id, key.id, &mut guard)
-                .await;
-            return Ok(call_context(&guard.oauth));
-        }
-        // Refresh is due. While memory is known to match the row, another
-        // process (or kiro-cli) may have rotated the credential already: reread
-        // under the lock and prefer a fresh row over a second refresh.
-        if guard.persisted {
-            self.reload_if_persisted(pool, key, &mut guard).await;
-            if guard.oauth.fresh_for(now) {
+        loop {
+            let before = {
+                let guard = state.lock().await;
+                snapshot(&guard)
+            };
+            let now = chrono::Utc::now().timestamp();
+            if before.oauth.fresh_for(now) {
+                if !before.persisted {
+                    self.persist_snapshot(pool, key.provider_id, key.id, &state, &before)
+                        .await;
+                }
+                let guard = state.lock().await;
                 return Ok(call_context(&guard.oauth));
             }
+            if before.persisted
+                && let Ok(Some(stored)) = store::kiro_oauth(pool, key.id).await
+            {
+                let mut guard = state.lock().await;
+                commit(&mut guard, &before, stored, true, None);
+                continue;
+            }
+            let (refreshed, expected) = self.refresh_from_snapshot(pool, key, &before).await?;
+            let mut guard = state.lock().await;
+            if !commit(&mut guard, &before, refreshed, false, Some(expected)) {
+                continue;
+            }
+            let after = snapshot(&guard);
+            drop(guard);
+            self.persist_snapshot(pool, key.provider_id, key.id, &state, &after)
+                .await;
+            let guard = state.lock().await;
+            return Ok(call_context(&guard.oauth));
         }
-        self.refresh_locked(pool, key, &mut guard).await?;
-        Ok(call_context(&guard.oauth))
     }
 
     /// The bearer was rejected by the runtime service: rotate once. Concurrent
@@ -381,8 +611,12 @@ impl KiroTokens {
         old_bearer: &str,
     ) -> Result<KiroCallContext, KiroTokenError> {
         let state = self.state_for(key)?;
-        let mut guard = state.lock().await;
-        if guard.oauth.access_token != old_bearer {
+        let before = {
+            let guard = state.lock().await;
+            snapshot(&guard)
+        };
+        if before.oauth.access_token != old_bearer {
+            let guard = state.lock().await;
             return Ok(call_context(&guard.oauth));
         }
         let now = chrono::Utc::now().timestamp();
@@ -392,17 +626,19 @@ impl KiroTokens {
         // fresh replaces memory only when memory is known to match the row
         // (`persisted`) or when it proved newer by carrying a different bearer;
         // otherwise it could only roll a pending newer refresh token back.
+        let mut base = before;
         match store::kiro_oauth(pool, key.id).await {
             Ok(Some(stored)) => {
                 let newer_access = stored.access_token != old_bearer;
                 if newer_access && stored.fresh_for(now) {
-                    guard.oauth = stored;
-                    guard.persisted = true;
+                    let mut guard = state.lock().await;
+                    commit(&mut guard, &base, stored, true, None);
                     return Ok(call_context(&guard.oauth));
                 }
-                if guard.persisted || newer_access {
-                    guard.oauth = stored;
-                    guard.persisted = true;
+                if base.persisted || newer_access {
+                    base.oauth = stored;
+                    base.persisted = true;
+                    base.pending_expected = None;
                 }
             }
             Ok(None) => tracing::warn!(
@@ -415,7 +651,9 @@ impl KiroTokens {
                 "Kiro token reread failed; recovering from memory"
             ),
         }
-        self.refresh_locked(pool, key, &mut guard).await?;
+        let (refreshed, expected) = self.refresh_from_snapshot(pool, key, &base).await?;
+        let mut guard = state.lock().await;
+        commit(&mut guard, &base, refreshed, false, Some(expected));
         Ok(call_context(&guard.oauth))
     }
 
@@ -432,6 +670,8 @@ impl KiroTokens {
         let created = Arc::new(Mutex::new(KiroTokenState {
             oauth,
             persisted: true,
+            pending_expected: None,
+            generation: 0,
         }));
         match self.states.entry(key.id) {
             dashmap::mapref::entry::Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
@@ -442,32 +682,11 @@ impl KiroTokens {
         }
     }
 
-    /// Reread the row while memory is known to match it, adopting whatever the
-    /// row holds as the refresh base (or as the answer, if it is fresh). The
-    /// caller then rechecks freshness and refreshes from it.
-    async fn reload_if_persisted(
-        &self,
-        pool: &PgPool,
-        key: &ProviderKeyRow,
-        state: &mut KiroTokenState,
-    ) {
-        match store::kiro_oauth(pool, key.id).await {
-            Ok(Some(stored)) => state.oauth = stored,
-            Ok(None) => tracing::warn!(
-                key_id = key.id,
-                "Kiro token row vanished; refreshing from memory"
-            ),
-            Err(error) => tracing::warn!(
-                key_id = key.id,
-                error = %error,
-                "Kiro token reread failed; refreshing from memory"
-            ),
-        }
-    }
-
     /// Refresh the bundle currently in `state` and persist the result, applying
     /// the reference's narrow reload-and-retry for `invalid_grant`. The caller
-    /// holds the key's lock.
+    /// holds the key's lock. A pre-persistence candidate
+    /// ([`Self::candidate_for_probe`]) has no shared key state yet, so it calls
+    /// this directly and simply drops the result if its probe fails.
     ///
     /// A 400 `invalid_grant` may simply mean another holder rotated the
     /// credential after this process seeded memory. When memory is known to match
@@ -477,87 +696,89 @@ impl KiroTokens {
     /// and is never done; an unchanged row stays permanently invalidated. Memory
     /// is replaced only by a successful exchange or the fresh stored bearer, so
     /// a failed recovery cannot roll a newer in-memory bundle backwards.
-    async fn refresh_locked(
+    async fn refresh_from_snapshot(
         &self,
         pool: &PgPool,
         key: &ProviderKeyRow,
-        state: &mut KiroTokenState,
-    ) -> Result<(), KiroTokenError> {
-        match self.refresh(key.id, &state.oauth).await {
-            Ok(refreshed) => {
-                state.oauth = refreshed;
-                state.persisted = false;
-                self.persist_pending(pool, key.provider_id, key.id, state)
-                    .await;
-                Ok(())
-            }
-            Err(KiroTokenError::Invalidated) if state.persisted => {
-                let attempted = state.oauth.clone();
-                let stored = match store::kiro_oauth(pool, key.id).await {
-                    Ok(Some(stored)) => stored,
-                    Ok(None) => {
-                        tracing::warn!(
-                            key_id = key.id,
-                            "Kiro token row vanished while recovering from invalid_grant"
-                        );
-                        return Err(KiroTokenError::Invalidated);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            key_id = key.id,
-                            error = %error,
-                            "Kiro token reread failed while recovering from invalid_grant"
-                        );
-                        return Err(KiroTokenError::Invalidated);
-                    }
+        before: &StateSnapshot,
+    ) -> Result<(KiroOAuth, KiroOAuth), KiroTokenError> {
+        let refreshed = match self.refresh(Some(key.id), &before.oauth).await {
+            Ok(exchange) => merged_exchange(&before.oauth, exchange),
+            Err(KiroTokenError::Invalidated) if before.persisted => {
+                let Some(stored) = store::kiro_oauth(pool, key.id)
+                    .await
+                    .map_err(|_| KiroTokenError::Invalidated)?
+                else {
+                    return Err(KiroTokenError::Invalidated);
                 };
-                let now = chrono::Utc::now().timestamp();
-                if stored.access_token != attempted.access_token && stored.fresh_for(now) {
-                    // Another holder already refreshed: adopt its bearer instead
-                    // of exchanging the dead refresh token a second time.
-                    state.oauth = stored;
-                    state.persisted = true;
-                    return Ok(());
+                if stored.access_token != before.oauth.access_token
+                    && stored.fresh_for(chrono::Utc::now().timestamp())
+                {
+                    return Ok((stored.clone(), stored));
                 }
-                if !exchange_identity_changed(&stored, &attempted) {
-                    // The row still holds the bundle OIDC just rejected: this is
-                    // a permanent invalidation, not a rotation.
+                if !same_exchange_identity(&stored, &before.oauth) {
+                    let refreshed =
+                        merged_exchange(&stored, self.refresh(Some(key.id), &stored).await?);
+                    return Ok((refreshed, stored));
+                } else {
                     return Err(KiroTokenError::Invalidated);
                 }
-                tracing::warn!(
-                    key_id = key.id,
-                    "Kiro OIDC rejected the cached refresh token; row holds a rotated bundle, retrying once"
-                );
-                let refreshed = self.refresh(key.id, &stored).await?;
-                state.oauth = refreshed;
-                state.persisted = false;
-                self.persist_pending(pool, key.provider_id, key.id, state)
-                    .await;
-                Ok(())
             }
-            Err(error) => Err(error),
-        }
+            Err(error) => return Err(error),
+        };
+        Ok((refreshed, before.oauth.clone()))
     }
 
-    /// Best-effort write-back of a memory-newer bundle. Failure is a warning,
-    /// never an error: the refreshed token is valid in memory and the next
-    /// access retries the write.
-    async fn persist_pending(
+    /// Best-effort write-back of a memory-newer bundle. The state lock is
+    /// acquired only to commit the CAS outcome; database I/O is never done
+    /// while it is held.
+    async fn persist_snapshot(
         &self,
         pool: &PgPool,
         provider_id: i64,
         key_id: i64,
-        state: &mut KiroTokenState,
+        state: &Arc<Mutex<KiroTokenState>>,
+        before: &StateSnapshot,
     ) {
-        if state.persisted {
+        if before.persisted {
             return;
         }
-        match store::replace_kiro_oauth(pool, provider_id, key_id, &state.oauth).await {
-            Ok(true) => state.persisted = true,
-            Ok(false) => tracing::warn!(
+        let Some(expected) = before.pending_expected.as_ref() else {
+            tracing::warn!(
                 key_id,
-                "Kiro token bundle write-back matched no OIDC row; serving from memory"
-            ),
+                "Kiro token bundle has no CAS baseline; serving from memory"
+            );
+            return;
+        };
+        match store::replace_kiro_oauth(pool, provider_id, key_id, expected, &before.oauth).await {
+            Ok(true) => {
+                let mut guard = state.lock().await;
+                if before.matches(&guard) {
+                    guard.persisted = true;
+                    guard.pending_expected = None;
+                    guard.generation = guard.generation.wrapping_add(1);
+                }
+            }
+            Ok(false) => match store::kiro_oauth(pool, key_id).await {
+                Ok(Some(stored)) => {
+                    let mut guard = state.lock().await;
+                    if before.matches(&guard) {
+                        guard.oauth = stored;
+                        guard.persisted = true;
+                        guard.pending_expected = None;
+                        guard.generation = guard.generation.wrapping_add(1);
+                    }
+                }
+                Ok(None) => tracing::warn!(
+                    key_id,
+                    "Kiro token bundle write-back found no OIDC row; serving from memory"
+                ),
+                Err(error) => tracing::warn!(
+                    key_id,
+                    error = %error,
+                    "Kiro token bundle write-back lost its CAS race and could not reread the row"
+                ),
+            },
             // The error text never contains the bundle (it is a bind value, not
             // part of the message), and the bundle itself is never logged.
             Err(error) => tracing::warn!(
@@ -570,36 +791,143 @@ impl KiroTokens {
 
     /// One AWS SSO OIDC `CreateToken` exchange against the credential's auth
     /// region. The caller holds the key's lock.
-    async fn refresh(&self, key_id: i64, current: &KiroOAuth) -> Result<KiroOAuth, KiroTokenError> {
-        let answer = self.create_token(key_id, current).await?;
-        let mut next = current.clone();
-        next.access_token = answer.access_token;
-        next.expires_at = chrono::Utc::now().timestamp() + answer.expires_in;
-        // Rotation: an omitted refresh token keeps the old one (the credential
-        // stays usable); a returned profileArn replaces the account identity.
-        if let Some(refresh_token) = answer
-            .refresh_token
-            .filter(|token| !token.trim().is_empty())
-        {
-            next.refresh_token = refresh_token;
+    async fn refresh(
+        &self,
+        key_id: Option<i64>,
+        current: &KiroOAuth,
+    ) -> Result<RefreshExchange, KiroTokenError> {
+        let identity = exchange_identity_digest(current);
+        let gate = match self.refresh_gates.entry(identity) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => Arc::clone(entry.get()),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let gate = Arc::new(KiroRefreshGate {
+                    result: StdMutex::new(None),
+                    users: AtomicUsize::new(0),
+                    closed: AtomicBool::new(false),
+                    started: AtomicBool::new(false),
+                    notify: Notify::new(),
+                });
+                entry.insert(Arc::clone(&gate));
+                gate
+            }
+        };
+        if gate.closed.load(Ordering::Acquire) {
+            if let Some(result) = self.closed_refresh_result(&gate).await {
+                return result;
+            }
+            self.refresh_gates
+                .remove_if(&identity, |_, existing| Arc::ptr_eq(existing, &gate));
+            return Box::pin(self.refresh(key_id, current)).await;
         }
-        if let Some(profile_arn) = answer.profile_arn.filter(|arn| !arn.trim().is_empty()) {
-            next.profile_arn = Some(profile_arn);
+        gate.users.fetch_add(1, Ordering::AcqRel);
+        if gate.closed.load(Ordering::Acquire) {
+            self.release_refresh_gate(identity, &gate);
+            if let Some(result) = self.closed_refresh_result(&gate).await {
+                return result;
+            }
+            return Box::pin(self.refresh(key_id, current)).await;
         }
-        if next.access_token.trim().is_empty() || answer.expires_in <= 0 {
-            return Err(KiroTokenError::InvalidResponse);
+        let notified = gate.notify.notified();
+        let existing = {
+            let guard = lock_gate_result(&gate);
+            guard.as_ref().cloned()
+        };
+        if let Some(result) = existing {
+            match result {
+                Ok(exchange) => {
+                    self.release_refresh_gate(identity, &gate);
+                    return Ok(exchange);
+                }
+                Err(error) => {
+                    self.release_refresh_gate(identity, &gate);
+                    return Err(error);
+                }
+            }
         }
-        Ok(next)
+        if gate.started.swap(true, Ordering::AcqRel) {
+            notified.await;
+            let result = lock_gate_result(&gate);
+            let answer = result.as_ref().cloned();
+            drop(result);
+            self.release_refresh_gate(identity, &gate);
+            match answer {
+                Some(Ok(exchange)) => return Ok(exchange),
+                Some(Err(error)) => return Err(error),
+                None => return Err(KiroTokenError::Network),
+            }
+        }
+        let owner = RefreshOwner::new(Arc::clone(&gate), identity, Arc::clone(&self.refresh_gates));
+        let answer = match self.create_token(key_id, current).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                let mut result = lock_gate_result(&gate);
+                *result = Some(Err(error.clone()));
+                drop(result);
+                gate.notify.notify_waiters();
+                drop(owner);
+                self.release_refresh_gate(identity, &gate);
+                return Err(error);
+            }
+        };
+        let exchange = RefreshExchange {
+            access_token: answer.access_token,
+            expires_at: chrono::Utc::now().timestamp() + answer.expires_in,
+            refresh_token: answer.refresh_token,
+            profile_arn: answer.profile_arn,
+        };
+        if exchange.access_token.trim().is_empty() || answer.expires_in <= 0 {
+            let error = KiroTokenError::InvalidResponse;
+            let mut result = lock_gate_result(&gate);
+            *result = Some(Err(error.clone()));
+            drop(result);
+            gate.notify.notify_waiters();
+            drop(owner);
+            self.release_refresh_gate(identity, &gate);
+            return Err(error);
+        }
+        let mut result = lock_gate_result(&gate);
+        *result = Some(Ok(exchange.clone()));
+        drop(result);
+        gate.notify.notify_waiters();
+        drop(owner);
+        self.release_refresh_gate(identity, &gate);
+        Ok(exchange)
+    }
+
+    /// Reuse an exchange that finished just before this caller acquired its
+    /// gate reference. A closed gate is removed promptly, but its result must be
+    /// observed first or the caller can start a duplicate exchange for the same
+    /// refresh-token identity.
+    async fn closed_refresh_result(
+        &self,
+        gate: &KiroRefreshGate,
+    ) -> Option<Result<RefreshExchange, KiroTokenError>> {
+        let guard = lock_gate_result(gate);
+        match guard.as_ref() {
+            Some(Ok(exchange)) => Some(Ok(exchange.clone())),
+            Some(Err(error)) => Some(Err(error.clone())),
+            _ => None,
+        }
+    }
+
+    fn release_refresh_gate(&self, identity: [u8; 32], gate: &Arc<KiroRefreshGate>) {
+        if gate.users.fetch_sub(1, Ordering::AcqRel) == 1 {
+            gate.closed.store(true, Ordering::Release);
+            self.refresh_gates
+                .remove_if(&identity, |_, existing| Arc::ptr_eq(existing, gate));
+        }
     }
 
     /// The raw OIDC call. The request body carries the OIDC client secret and
     /// the refresh token; it is never logged, never included in an error.
     async fn create_token(
         &self,
-        key_id: i64,
+        key_id: Option<i64>,
         oauth: &KiroOAuth,
     ) -> Result<CreateTokenResponse, KiroTokenError> {
-        if !valid_region(&oauth.auth_region) || !valid_region(&oauth.api_region) {
+        if !crate::kiro::valid_region(&oauth.auth_region)
+            || !crate::kiro::valid_region(&oauth.api_region)
+        {
             // A region string becomes part of the URL host: anything outside
             // AWS' region grammar could point the credential elsewhere.
             return Err(KiroTokenError::Invalidated);
@@ -648,7 +976,11 @@ impl KiroTokens {
                 .await
                 .unwrap_or_default();
             // Log the numeric facts only: the OIDC body can echo request fields.
-            tracing::warn!(key_id, status, "Kiro OIDC CreateToken rejected the refresh");
+            if let Some(key_id) = key_id {
+                tracing::warn!(key_id, status, "Kiro OIDC CreateToken rejected the refresh");
+            } else {
+                tracing::warn!(status, "Kiro OIDC CreateToken rejected the refresh");
+            }
             if status == 400 && String::from_utf8_lossy(&body).contains("invalid_grant") {
                 return Err(KiroTokenError::Invalidated);
             }
@@ -678,15 +1010,11 @@ fn call_context(oauth: &KiroOAuth) -> KiroCallContext {
     }
 }
 
-/// Whether a reloaded bundle could make the same `CreateToken` attempt succeed:
-/// the refresh token, the OIDC client identity, or the auth region that builds
-/// the token URL changed. `region` and `api_region` never reach that exchange, so
-/// a difference there must not cause a pointless retry of the same dead token.
-fn exchange_identity_changed(stored: &KiroOAuth, attempted: &KiroOAuth) -> bool {
-    stored.refresh_token != attempted.refresh_token
-        || stored.client_id != attempted.client_id
-        || stored.client_secret != attempted.client_secret
-        || stored.auth_region != attempted.auth_region
+fn same_exchange_identity(left: &KiroOAuth, right: &KiroOAuth) -> bool {
+    left.refresh_token == right.refresh_token
+        && left.client_id == right.client_id
+        && left.client_secret == right.client_secret
+        && left.auth_region == right.auth_region
 }
 
 fn send_error(error: TransportError) -> KiroTokenError {
@@ -705,40 +1033,6 @@ fn send_error(error: TransportError) -> KiroTokenError {
 /// another host, a port or a path. Public because every host-building caller
 /// shares this guard (the token URL here, the usage host in
 /// [`crate::quota::fetch_kiro_quota`]).
-pub fn valid_region(region: &str) -> bool {
-    !region.is_empty()
-        && region.len() <= 32
-        && region
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-/// Whether an endpoint is exactly the KAS origin for `api_region`:
-/// `https://runtime.{api_region}.kiro.dev` on port 443, with no userinfo, no
-/// query and the bare root path.
-///
-/// The bearer must only ever travel to the credential's own runtime host. A
-/// provider row's `base_url` is operator-editable, so a bad or malicious value
-/// could otherwise send a live token to an arbitrary server.
-pub fn kas_endpoint_matches(endpoint: &str, api_region: &str) -> bool {
-    if !valid_region(api_region) {
-        return false;
-    }
-    let Ok(url) = reqwest::Url::parse(endpoint) else {
-        return false;
-    };
-    url.scheme() == "https"
-        && url.port_or_known_default() == Some(443)
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.path() == "/"
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case(&format!("runtime.{api_region}.kiro.dev"))
-        })
-}
-
 /// The runtime's own invalidation signal: a 401/403 whose bounded body says
 /// the bearer was invalid. Only this exact combination licenses the one-shot
 /// refresh-and-retry (any other 401/403 is a regular authentication failure).

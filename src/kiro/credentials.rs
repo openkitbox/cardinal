@@ -11,7 +11,7 @@
 /// Debug output redacts every secret: this value travels through
 /// error paths and logs, and a leaked token grants the account.
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroOAuth {
     /// Bearer token for the Kiro API (secret).
@@ -53,6 +53,16 @@ impl KiroOAuth {
                 "Kiro OAuth {name} must not be empty"
             );
         }
+        for (name, value) in [
+            ("region", &self.region),
+            ("auth_region", &self.auth_region),
+            ("api_region", &self.api_region),
+        ] {
+            anyhow::ensure!(
+                valid_region(value),
+                "Kiro OAuth {name} is not an AWS region"
+            );
+        }
         if let Some(profile_arn) = &self.profile_arn {
             anyhow::ensure!(
                 !profile_arn.trim().is_empty(),
@@ -67,6 +77,47 @@ impl KiroOAuth {
     pub fn fresh_for(&self, now: i64) -> bool {
         self.expires_at > now + 600
     }
+}
+
+/// AWS region names are safe hostname labels and have the standard
+/// partition/service/number shape (for example `us-east-1` or
+/// `us-gov-west-1`).
+pub fn valid_region(region: &str) -> bool {
+    if region.is_empty() || region.len() > 32 {
+        return false;
+    }
+    let parts: Vec<&str> = region.split('-').collect();
+    parts.len() >= 3
+        && (2..=4).contains(&parts[0].len())
+        && parts[0].bytes().all(|byte| byte.is_ascii_lowercase())
+        && parts[1..parts.len() - 1]
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_lowercase()))
+        && parts
+            .last()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether an endpoint is exactly the KAS origin for `api_region`:
+/// `https://runtime.{api_region}.kiro.dev` on port 443, with no userinfo, query,
+/// fragment, or non-root path.
+pub fn kas_endpoint_matches(endpoint: &str, api_region: &str) -> bool {
+    if !valid_region(api_region) {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case(&format!("runtime.{api_region}.kiro.dev"))
+        })
 }
 
 /// Never prints the access token, refresh token, client secret — nor the

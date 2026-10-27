@@ -20,19 +20,21 @@ pub use gateway_key::{
     seed_gateway_key, set_gateway_key_enabled, touch_gateway_key,
 };
 pub use key::{
-    ActiveWindow, AvailabilityRule, EnabledKeyModels, KeyModels, KeyPatch, LimitedKeyRow,
-    ProviderKeyRow, ProviderKeyView, RouteEntry, RouteRow, RouteStrategy, RuleEffect,
-    delete_provider_key, insert_kiro_provider_key, insert_provider_key, key_api_key, kiro_oauth,
-    list_all_key_models, list_all_keys, list_enabled_key_models, list_keys_by_ids,
-    list_limited_keys, list_provider_keys, list_quota_reset_anchors, patch_provider_key,
-    reorder_keys, replace_kiro_oauth, update_key_models, update_provider_key,
+    ActiveWindow, AvailabilityRule, EnabledKeyModels, KeyModels, KeyPatch, KiroUpsertError,
+    KiroUpsertExpectation, LimitedKeyRow, ProviderKeyRow, ProviderKeyView, RouteEntry, RouteRow,
+    RouteStrategy, RuleEffect, delete_provider_key, insert_kiro_provider_key, insert_provider_key,
+    key_api_key, kiro_oauth, kiro_upsert_expectation, list_all_key_models, list_all_keys,
+    list_enabled_key_models, list_keys_by_ids, list_limited_keys, list_provider_keys,
+    list_quota_reset_anchors, patch_provider_key, reorder_keys, replace_kiro_oauth,
+    update_key_models, update_key_models_for_oauth, update_provider_key, upsert_kiro_key_by_label,
 };
 pub use price::{
     ModelPrice, ModelSuccessRow, PriceTier, get_price, last_model_success,
     served_models_for_pricing, upsert_catalog_price,
 };
 pub use provider::{
-    ProviderInput, ProviderRow, default_auth_scheme, delete_provider, find_or_create_provider,
+    EmptyProviderDeleteOutcome, ProviderDeleteOutcome, ProviderInput, ProviderRow,
+    default_auth_scheme, delete_provider, delete_provider_if_empty, find_or_create_provider,
     get_provider, get_provider_by_name, insert_provider, list_providers, list_providers_by_ids,
     seed_from_config, set_provider_enabled, update_provider,
 };

@@ -17,9 +17,8 @@ use anyhow::Context as _;
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 /// A model list is a few hundred small objects; 8 MiB caps abuse/misconfig.
 const MAX_BODY: usize = 8 << 20;
-/// How much of an error body's text is quoted in the failure message.
+/// How much of a regular probe error body's text is quoted in diagnostics.
 const ERROR_SNIPPET: usize = 200;
-
 /// One model a key can list at its provider, with the attributes the list
 /// carries. Most vendor endpoints return ids only; the optional fields are
 /// populated when the wire says so. Two attribute namings are read:
@@ -426,7 +425,7 @@ pub async fn fetch_kiro_models(
     context: &crate::upstream::KiroCallContext,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     anyhow::ensure!(
-        crate::upstream::kiro_tokens::valid_region(&context.api_region),
+        crate::kiro::valid_region(&context.api_region),
         "Kiro API region {:?} cannot form a control-plane host",
         context.api_region
     );
@@ -454,20 +453,19 @@ pub async fn fetch_kiro_models(
     let response = transport
         .send_with_headers(&prepared, &auth, &[], deadline)
         .await
-        .context("Kiro 模型列表请求失败")?;
+        .map_err(|_| anyhow::anyhow!("模型目录服务请求失败"))?;
     let status = response.status();
     let body = transport
         .read_body(response, MAX_BODY, deadline)
         .await
-        .context("Kiro 模型列表响应不可读")?;
+        .map_err(|_| anyhow::anyhow!("模型目录响应不可读"))?;
     if !status.is_success() {
-        let snippet: String = String::from_utf8_lossy(&body)
-            .chars()
-            .take(ERROR_SNIPPET)
-            .collect();
-        anyhow::bail!("Kiro 模型列表: {status} {snippet}");
+        // The control plane's error body is upstream-controlled and may quote
+        // request context; the fixed message is all that crosses the admin API.
+        anyhow::bail!("模型目录服务拒绝请求");
     }
-    parse_kiro_models(&String::from_utf8_lossy(&body)).context("Kiro 模型列表响应格式不认识")
+    parse_kiro_models(&String::from_utf8_lossy(&body))
+        .map_err(|_| anyhow::anyhow!("模型目录响应无效"))
 }
 
 /// Parse the control plane's `{"models": [...]}` answer into [`ProbeModel`]s.
@@ -499,7 +497,8 @@ fn parse_kiro_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
         max_output_tokens: Option<u64>,
     }
     let list: List = serde_json::from_str(body)?;
-    Ok(list
+    anyhow::ensure!(!list.models.is_empty(), "Kiro model catalogue is empty");
+    let models: Vec<_> = list
         .models
         .into_iter()
         .filter_map(|entry| {
@@ -532,5 +531,10 @@ fn parse_kiro_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
                 default_effort: None,
             })
         })
-        .collect())
+        .collect();
+    anyhow::ensure!(
+        !models.is_empty(),
+        "Kiro model catalogue has no usable models"
+    );
+    Ok(models)
 }
