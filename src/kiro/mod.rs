@@ -13,7 +13,9 @@ use anyhow::anyhow;
 mod credentials;
 pub mod profile;
 
-pub use credentials::{KiroOAuth, kas_endpoint_matches, valid_region};
+pub use credentials::{
+    AuthMethod, KiroOAuth, kas_endpoint_matches, parse_import_credentials, valid_region,
+};
 pub use profile::KasCall;
 
 /// How a `gateway_provider_keys` row authenticates upstream, mirroring the

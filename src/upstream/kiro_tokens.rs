@@ -1,12 +1,12 @@
-//! Kiro OIDC token lifecycle: lazy refresh, per-key single-flight, and
+//! Kiro credential lifecycle: lazy refresh, per-key single-flight, and
 //! persistence back into the key's `oauth` bundle.
 //!
-//! Kiro authenticates with AWS SSO OIDC (device-code / Builder ID). A key row
-//! carries the whole credential bundle ([`crate::kiro::KiroOAuth`]), and the
-//! access token inside it expires (typically hourly). The gateway therefore
-//! must refresh it itself — the downstream client never holds the refresh
-//! token — and write the rotated bundle back so a restart does not resurrect a
-//! token upstream has already invalidated.
+//! Kiro authenticates either with Social credentials or AWS SSO OIDC
+//! (device-code / Builder ID). A key row carries the whole credential bundle
+//! ([`crate::kiro::KiroOAuth`]), and the access token inside it expires (typically
+//! hourly). The gateway therefore must refresh it itself — the downstream client
+//! never holds the refresh token — and write the rotated bundle back so a restart
+//! does not resurrect a token upstream has already invalidated.
 //!
 //! Semantics follow the reference `kiro2claude`
 //! (`packages/core/src/kiro/token-manager.ts`):
@@ -62,10 +62,11 @@
 //! Deliberate deviations from the reference (its SQLite source is replaced by
 //! the gateway database, which the manager rereads under the same lock):
 //!
-//! * `expiresIn` is required. The reference treats a missing `expiresIn` as
-//!   "keep the old expiry"; cardinal refuses the answer as
-//!   [`KiroTokenError::InvalidResponse`] — persisting a bearer with no honest
-//!   expiry would make every later freshness decision a guess.
+//! * `expiresIn` is required and positive for IdC. Social responses use a
+//!   positive `expiresIn`; omitted, zero, and negative values use the bounded
+//!   3600-second default from the local reference behavior. An unrepresentable
+//!   `now + expiresIn` is rejected as an invalid response, and an empty access
+//!   token is never accepted.
 //! * The OIDC request omits the reference's explicit `host` and
 //!   `Connection: close` headers. `reqwest` derives `Host` from the URL, and the
 //!   transport owns connection lifetime (its `idle` deadline bounds a stuck
@@ -88,7 +89,7 @@ use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
 use tokio::sync::{Mutex, Notify};
 
-use crate::kiro::{KiroOAuth, profile};
+use crate::kiro::{AuthMethod, KiroOAuth, profile};
 use crate::protocol::{Prepared, ProtocolId};
 use crate::store::{self, ProviderKeyRow};
 use crate::upstream::transport::{self, Transport, TransportError};
@@ -106,6 +107,9 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// few hundred bytes; 64 KiB leaves room for unknown fields without buffering
 /// an unbounded body.
 const MAX_TOKEN_BODY: usize = 64 * 1024;
+/// Social token responses may omit or send a nonpositive lifetime. Match the
+/// local reference behavior without allowing an unbounded or immediate expiry.
+const SOCIAL_DEFAULT_EXPIRES_IN: i64 = 3600;
 /// The failure of one token acquisition/refresh.
 ///
 /// Deliberately carries no upstream body and no OAuth material: this value is
@@ -343,12 +347,32 @@ struct RefreshExchange {
 }
 
 struct RefreshOwner {
+    user: RefreshGateUser,
+}
+
+impl RefreshOwner {
+    fn new(user: RefreshGateUser) -> Self {
+        Self { user }
+    }
+}
+
+impl Drop for RefreshOwner {
+    fn drop(&mut self) {
+        let mut result = lock_gate_result(&self.user.gate);
+        if result.is_none() {
+            *result = Some(Err(KiroTokenError::Network));
+            self.user.gate.notify.notify_waiters();
+        }
+    }
+}
+
+struct RefreshGateUser {
     gate: Arc<KiroRefreshGate>,
     identity: [u8; 32],
     gates: Arc<DashMap<[u8; 32], Arc<KiroRefreshGate>>>,
 }
 
-impl RefreshOwner {
+impl RefreshGateUser {
     fn new(
         gate: Arc<KiroRefreshGate>,
         identity: [u8; 32],
@@ -362,17 +386,20 @@ impl RefreshOwner {
     }
 }
 
-impl Drop for RefreshOwner {
+impl Drop for RefreshGateUser {
     fn drop(&mut self) {
-        let mut result = lock_gate_result(&self.gate);
-        if result.is_none() {
-            *result = Some(Err(KiroTokenError::Network));
-            self.gate.closed.store(true, Ordering::Release);
-            self.gate.notify.notify_waiters();
-            self.gates.remove_if(&self.identity, |_, existing| {
-                Arc::ptr_eq(existing, &self.gate)
-            });
-        }
+        release_refresh_gate(&self.gates, self.identity, &self.gate);
+    }
+}
+
+fn release_refresh_gate(
+    gates: &DashMap<[u8; 32], Arc<KiroRefreshGate>>,
+    identity: [u8; 32],
+    gate: &Arc<KiroRefreshGate>,
+) {
+    if gate.users.fetch_sub(1, Ordering::AcqRel) == 1 {
+        gate.closed.store(true, Ordering::Release);
+        gates.remove_if(&identity, |_, existing| Arc::ptr_eq(existing, gate));
     }
 }
 
@@ -436,11 +463,30 @@ fn merged_exchange(current: &KiroOAuth, exchange: RefreshExchange) -> KiroOAuth 
 
 fn exchange_identity_digest(oauth: &KiroOAuth) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    let (auth_method, endpoint) = match oauth.effective_auth_method() {
+        AuthMethod::Social => (
+            "social",
+            profile::social_refresh_endpoint(&oauth.auth_region),
+        ),
+        AuthMethod::Idc => (
+            "idc",
+            format!("https://oidc.{}.amazonaws.com/token", oauth.auth_region),
+        ),
+    };
+    for value in [auth_method, endpoint.as_str()] {
+        hasher.update(value.len().to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
     for value in [
         oauth.refresh_token.as_str(),
-        oauth.client_id.as_str(),
-        oauth.client_secret.as_str(),
-        oauth.auth_region.as_str(),
+        match oauth.effective_auth_method() {
+            AuthMethod::Social => "",
+            AuthMethod::Idc => oauth.client_id.as_str(),
+        },
+        match oauth.effective_auth_method() {
+            AuthMethod::Social => "",
+            AuthMethod::Idc => oauth.client_secret.as_str(),
+        },
     ] {
         hasher.update(value.len().to_le_bytes());
         hasher.update(value.as_bytes());
@@ -581,6 +627,7 @@ impl KiroTokens {
             }
             if before.persisted
                 && let Ok(Some(stored)) = store::kiro_oauth(pool, key.id).await
+                && persisted_reread_changed(&before.oauth, &stored)
             {
                 let mut guard = state.lock().await;
                 commit(&mut guard, &before, stored, true, None);
@@ -611,50 +658,57 @@ impl KiroTokens {
         old_bearer: &str,
     ) -> Result<KiroCallContext, KiroTokenError> {
         let state = self.state_for(key)?;
-        let before = {
-            let guard = state.lock().await;
-            snapshot(&guard)
-        };
-        if before.oauth.access_token != old_bearer {
+        loop {
+            let before = {
+                let guard = state.lock().await;
+                snapshot(&guard)
+            };
+            if before.oauth.access_token != old_bearer {
+                let guard = state.lock().await;
+                return Ok(call_context(&guard.oauth));
+            }
+            let now = chrono::Utc::now().timestamp();
+            // Reconcile the row snapshot with a short state-lock commit. The lock
+            // is deliberately not held during the database or refresh awaits.
+            let mut base = before;
+            match store::kiro_oauth(pool, key.id).await {
+                Ok(Some(stored)) => {
+                    let newer_access = stored.access_token != old_bearer;
+                    if newer_access && stored.fresh_for(now) {
+                        let mut guard = state.lock().await;
+                        if commit(&mut guard, &base, stored, true, None) {
+                            return Ok(call_context(&guard.oauth));
+                        }
+                        continue;
+                    }
+                    if base.persisted || newer_access {
+                        base.oauth = stored;
+                        base.persisted = true;
+                        base.pending_expected = None;
+                    }
+                }
+                Ok(None) => tracing::warn!(
+                    key_id = key.id,
+                    "Kiro token row vanished; recovering from memory"
+                ),
+                Err(error) => tracing::warn!(
+                    key_id = key.id,
+                    error = %error,
+                    "Kiro token reread failed; recovering from memory"
+                ),
+            }
+            let (refreshed, expected) = self.refresh_from_snapshot(pool, key, &base).await?;
+            let mut guard = state.lock().await;
+            if !commit(&mut guard, &base, refreshed, false, Some(expected)) {
+                continue;
+            }
+            let after = snapshot(&guard);
+            drop(guard);
+            self.persist_snapshot(pool, key.provider_id, key.id, &state, &after)
+                .await;
             let guard = state.lock().await;
             return Ok(call_context(&guard.oauth));
         }
-        let now = chrono::Utc::now().timestamp();
-        // Reread the row under the lock: an external login may have written a
-        // newer bundle. A fresh stored bearer that differs from the rejected one
-        // is the recovery, no CreateToken needed. A stored bundle that is not
-        // fresh replaces memory only when memory is known to match the row
-        // (`persisted`) or when it proved newer by carrying a different bearer;
-        // otherwise it could only roll a pending newer refresh token back.
-        let mut base = before;
-        match store::kiro_oauth(pool, key.id).await {
-            Ok(Some(stored)) => {
-                let newer_access = stored.access_token != old_bearer;
-                if newer_access && stored.fresh_for(now) {
-                    let mut guard = state.lock().await;
-                    commit(&mut guard, &base, stored, true, None);
-                    return Ok(call_context(&guard.oauth));
-                }
-                if base.persisted || newer_access {
-                    base.oauth = stored;
-                    base.persisted = true;
-                    base.pending_expected = None;
-                }
-            }
-            Ok(None) => tracing::warn!(
-                key_id = key.id,
-                "Kiro token row vanished; recovering from memory"
-            ),
-            Err(error) => tracing::warn!(
-                key_id = key.id,
-                error = %error,
-                "Kiro token reread failed; recovering from memory"
-            ),
-        }
-        let (refreshed, expected) = self.refresh_from_snapshot(pool, key, &base).await?;
-        let mut guard = state.lock().await;
-        commit(&mut guard, &base, refreshed, false, Some(expected));
-        Ok(call_context(&guard.oauth))
     }
 
     /// The key's state entry, seeded from the route cache's bundle on first use
@@ -820,8 +874,9 @@ impl KiroTokens {
             return Box::pin(self.refresh(key_id, current)).await;
         }
         gate.users.fetch_add(1, Ordering::AcqRel);
+        let user =
+            RefreshGateUser::new(Arc::clone(&gate), identity, Arc::clone(&self.refresh_gates));
         if gate.closed.load(Ordering::Acquire) {
-            self.release_refresh_gate(identity, &gate);
             if let Some(result) = self.closed_refresh_result(&gate).await {
                 return result;
             }
@@ -835,11 +890,9 @@ impl KiroTokens {
         if let Some(result) = existing {
             match result {
                 Ok(exchange) => {
-                    self.release_refresh_gate(identity, &gate);
                     return Ok(exchange);
                 }
                 Err(error) => {
-                    self.release_refresh_gate(identity, &gate);
                     return Err(error);
                 }
             }
@@ -849,14 +902,14 @@ impl KiroTokens {
             let result = lock_gate_result(&gate);
             let answer = result.as_ref().cloned();
             drop(result);
-            self.release_refresh_gate(identity, &gate);
+            drop(user);
             match answer {
                 Some(Ok(exchange)) => return Ok(exchange),
                 Some(Err(error)) => return Err(error),
                 None => return Err(KiroTokenError::Network),
             }
         }
-        let owner = RefreshOwner::new(Arc::clone(&gate), identity, Arc::clone(&self.refresh_gates));
+        let owner = RefreshOwner::new(user);
         let answer = match self.create_token(key_id, current).await {
             Ok(answer) => answer,
             Err(error) => {
@@ -865,24 +918,35 @@ impl KiroTokens {
                 drop(result);
                 gate.notify.notify_waiters();
                 drop(owner);
-                self.release_refresh_gate(identity, &gate);
                 return Err(error);
             }
         };
+        let now = chrono::Utc::now().timestamp();
+        let expires_at =
+            match refresh_expiry(current.effective_auth_method(), answer.expires_in, now) {
+                Ok(expires_at) => expires_at,
+                Err(error) => {
+                    let mut result = lock_gate_result(&gate);
+                    *result = Some(Err(error.clone()));
+                    drop(result);
+                    gate.notify.notify_waiters();
+                    drop(owner);
+                    return Err(error);
+                }
+            };
         let exchange = RefreshExchange {
             access_token: answer.access_token,
-            expires_at: chrono::Utc::now().timestamp() + answer.expires_in,
+            expires_at,
             refresh_token: answer.refresh_token,
             profile_arn: answer.profile_arn,
         };
-        if exchange.access_token.trim().is_empty() || answer.expires_in <= 0 {
+        if exchange.access_token.trim().is_empty() {
             let error = KiroTokenError::InvalidResponse;
             let mut result = lock_gate_result(&gate);
             *result = Some(Err(error.clone()));
             drop(result);
             gate.notify.notify_waiters();
             drop(owner);
-            self.release_refresh_gate(identity, &gate);
             return Err(error);
         }
         let mut result = lock_gate_result(&gate);
@@ -890,7 +954,6 @@ impl KiroTokens {
         drop(result);
         gate.notify.notify_waiters();
         drop(owner);
-        self.release_refresh_gate(identity, &gate);
         Ok(exchange)
     }
 
@@ -910,16 +973,8 @@ impl KiroTokens {
         }
     }
 
-    fn release_refresh_gate(&self, identity: [u8; 32], gate: &Arc<KiroRefreshGate>) {
-        if gate.users.fetch_sub(1, Ordering::AcqRel) == 1 {
-            gate.closed.store(true, Ordering::Release);
-            self.refresh_gates
-                .remove_if(&identity, |_, existing| Arc::ptr_eq(existing, gate));
-        }
-    }
-
-    /// The raw OIDC call. The request body carries the OIDC client secret and
-    /// the refresh token; it is never logged, never included in an error.
+    /// The raw credential exchange. Request bodies carry secrets; they are never
+    /// logged or included in an error.
     async fn create_token(
         &self,
         key_id: Option<i64>,
@@ -932,26 +987,25 @@ impl KiroTokens {
             // AWS' region grammar could point the credential elsewhere.
             return Err(KiroTokenError::Invalidated);
         }
-        let request = CreateTokenRequest {
-            client_id: &oauth.client_id,
-            client_secret: &oauth.client_secret,
-            refresh_token: &oauth.refresh_token,
-            grant_type: "refresh_token",
-        };
-        let body = serde_json::to_vec(&request).map_err(|_| KiroTokenError::InvalidResponse)?;
+        let body = serde_json::to_vec(&refresh_request(oauth))
+            .map_err(|_| KiroTokenError::InvalidResponse)?;
+        let mut headers = profile::retry_headers(
+            &uuid::Uuid::new_v4().to_string(),
+            1,
+            OIDC_MAX_ATTEMPTS,
+            false,
+            chrono::Utc::now(),
+        );
+        if oauth.effective_auth_method() == AuthMethod::Social {
+            headers.splice(0..0, profile::social_static_headers());
+        }
         let prepared = Prepared {
             protocol: ProtocolId::Kiro,
-            url: self.token_url(&oauth.auth_region),
+            url: self.refresh_url(oauth),
             content_type: "application/json",
             body: bytes::Bytes::from(body),
             stream: false,
-            headers: profile::retry_headers(
-                &uuid::Uuid::new_v4().to_string(),
-                1,
-                OIDC_MAX_ATTEMPTS,
-                false,
-                chrono::Utc::now(),
-            ),
+            headers,
         };
         let deadline = Instant::now() + TOKEN_TIMEOUT;
         let response = self
@@ -970,11 +1024,37 @@ impl KiroTokens {
                 .map(str::to_owned);
             // Drain a bounded body only to classify `invalid_grant`; it is never
             // logged and never forwarded.
-            let body = self
+            let body = match self
                 .transport
                 .read_body(response, transport::MAX_ERROR_BODY, deadline)
                 .await
-                .unwrap_or_default();
+            {
+                Ok(body) => body,
+                Err(error) => {
+                    if let Some(key_id) = key_id {
+                        tracing::warn!(
+                            key_id,
+                            status,
+                            category = %error_category(&error),
+                            "Kiro OIDC CreateToken error body could not be read"
+                        );
+                    } else {
+                        tracing::warn!(
+                            status,
+                            category = %error_category(&error),
+                            "Kiro OIDC CreateToken error body could not be read"
+                        );
+                    }
+                    return Err(match error {
+                        TransportError::Timeout => KiroTokenError::Network,
+                        TransportError::Connect
+                        | TransportError::BodyTooLarge
+                        | TransportError::InvalidBody
+                        | TransportError::ClientGone
+                        | TransportError::Status { .. } => KiroTokenError::InvalidResponse,
+                    });
+                }
+            };
             // Log the numeric facts only: the OIDC body can echo request fields.
             if let Some(key_id) = key_id {
                 tracing::warn!(key_id, status, "Kiro OIDC CreateToken rejected the refresh");
@@ -997,6 +1077,13 @@ impl KiroTokens {
         serde_json::from_slice(&body).map_err(|_| KiroTokenError::InvalidResponse)
     }
 
+    fn refresh_url(&self, oauth: &KiroOAuth) -> String {
+        match oauth.effective_auth_method() {
+            AuthMethod::Social => profile::social_refresh_endpoint(&oauth.auth_region),
+            AuthMethod::Idc => self.token_url(&oauth.auth_region),
+        }
+    }
+
     fn token_url(&self, auth_region: &str) -> String {
         format!("https://oidc.{auth_region}.amazonaws.com/token")
     }
@@ -1005,16 +1092,13 @@ impl KiroTokens {
 fn call_context(oauth: &KiroOAuth) -> KiroCallContext {
     KiroCallContext {
         bearer: SecretString::from(oauth.access_token.clone()),
-        profile_arn: oauth.profile_arn.clone(),
+        profile_arn: oauth.effective_profile_arn().map(str::to_owned),
         api_region: oauth.api_region.clone(),
     }
 }
 
 fn same_exchange_identity(left: &KiroOAuth, right: &KiroOAuth) -> bool {
-    left.refresh_token == right.refresh_token
-        && left.client_id == right.client_id
-        && left.client_secret == right.client_secret
-        && left.auth_region == right.auth_region
+    exchange_identity_digest(left) == exchange_identity_digest(right)
 }
 
 fn send_error(error: TransportError) -> KiroTokenError {
@@ -1025,6 +1109,17 @@ fn send_error(error: TransportError) -> KiroTokenError {
         | TransportError::InvalidBody
         | TransportError::ClientGone
         | TransportError::Status { .. } => KiroTokenError::Network,
+    }
+}
+
+fn error_category(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::Timeout => "timeout",
+        TransportError::Connect => "connect",
+        TransportError::BodyTooLarge => "body_too_large",
+        TransportError::InvalidBody => "invalid_body",
+        TransportError::ClientGone => "client_gone",
+        TransportError::Status { .. } => "status",
     }
 }
 
@@ -1042,27 +1137,49 @@ pub fn bearer_token_invalid(status: u16, body: &[u8]) -> bool {
             .contains("The bearer token included in the request is invalid")
 }
 
-/// Strict camelCase Smithy wire shape for `CreateToken`.
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateTokenRequest<'a> {
-    client_id: &'a str,
-    client_secret: &'a str,
-    refresh_token: &'a str,
-    grant_type: &'a str,
+fn refresh_request(oauth: &KiroOAuth) -> serde_json::Value {
+    match oauth.effective_auth_method() {
+        AuthMethod::Social => serde_json::json!({
+            "refreshToken": oauth.refresh_token,
+        }),
+        AuthMethod::Idc => serde_json::json!({
+            "clientId": oauth.client_id,
+            "clientSecret": oauth.client_secret,
+            "refreshToken": oauth.refresh_token,
+            "grantType": "refresh_token",
+        }),
+    }
+}
+
+fn persisted_reread_changed(before: &KiroOAuth, stored: &KiroOAuth) -> bool {
+    before != stored
+}
+
+fn refresh_expiry(
+    auth_method: AuthMethod,
+    expires_in: Option<i64>,
+    now: i64,
+) -> Result<i64, KiroTokenError> {
+    let lifetime = match auth_method {
+        AuthMethod::Social => expires_in
+            .filter(|expires_in| *expires_in > 0)
+            .unwrap_or(SOCIAL_DEFAULT_EXPIRES_IN),
+        AuthMethod::Idc => expires_in
+            .filter(|expires_in| *expires_in > 0)
+            .ok_or(KiroTokenError::InvalidResponse)?,
+    };
+    now.checked_add(lifetime)
+        .ok_or(KiroTokenError::InvalidResponse)
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateTokenResponse {
     access_token: String,
-    /// Required, deliberately: the reference keeps the old expiry when this is
-    /// absent, but a bearer with no honest expiry cannot inform a later
-    /// freshness decision, so cardinal rejects such an answer
-    /// ([`KiroTokenError::InvalidResponse`]) instead of persisting a fiction.
-    expires_in: i64,
-    #[serde(default)]
+    /// Social refresh responses may omit this field; IdC responses must include
+    /// a positive value. Missing or nonpositive Social values use the bounded
+    /// default lifetime in [`SOCIAL_DEFAULT_EXPIRES_IN`].
+    expires_in: Option<i64>,
     refresh_token: Option<String>,
-    #[serde(default)]
     profile_arn: Option<String>,
 }

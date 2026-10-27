@@ -6,6 +6,7 @@
 //! - `GET/POST /api/providers/:id/keys`, `PATCH/DELETE /api/providers/:id/keys/:key_id` — every credential is a named key
 //!   (a Kiro key carries `auth_kind: "kiro_oidc"` + `oauth` instead of `api_key`; PATCH replaces that bundle only on an existing Kiro key)
 //! - `POST /api/providers/:id/kiro-key` `{label, oauth}` — probe then find-or-create a Kiro OIDC key by label
+//! - `POST /api/providers/:id/kiro-import` `{label, account?, credentials}` — allow-listed import of a raw `kiro.rs` object or account array
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
 //!   plaintext-serving endpoint; the list shape stays masked)
 //! - `PUT /api/keys/order` `{ids: [..]}` — assign global positions sequentially in array order (one transaction)
@@ -1071,6 +1072,7 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
                 .post(create_key),
         )
         .push(Router::with_path("providers/{id}/kiro-key").post(upsert_kiro_key))
+        .push(Router::with_path("providers/{id}/kiro-import").post(import_kiro_key))
         .push(
             Router::with_path("providers/{id}/keys/{key_id}")
                 .patch(patch_key)
@@ -1150,6 +1152,17 @@ struct KeyBody {
 struct KiroKeyBody {
     label: String,
     oauth: KiroOAuth,
+}
+
+/// Raw Kiro import body. `credentials` stays a JSON value until the pure
+/// allow-list parser extracts the runtime OAuth fields. It accepts a `kiro.rs`
+/// credential object/array or the IDE account export with nested credentials.
+#[derive(Deserialize)]
+struct KiroImportBody {
+    label: String,
+    #[serde(default)]
+    account: usize,
+    credentials: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -1284,6 +1297,60 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
             json_response(response, &json!({"id": id}));
         }
         Err(error) => bad_request(response, error),
+    }
+}
+
+/// Import a raw `kiro.rs` credential object or account array. Parsing is
+/// allow-listed and happens before the existing probe/upsert path, so raw
+/// provider metadata is never persisted and a failed probe leaves the row
+/// unchanged.
+#[handler]
+async fn import_kiro_key(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(provider_id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid provider id");
+        return;
+    };
+    let Ok(body) = request.parse_json::<KiroImportBody>().await else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid Kiro import body");
+        return;
+    };
+    let oauth = match crate::kiro::parse_import_credentials(&body.credentials, body.account) {
+        Ok(oauth) => oauth,
+        Err(error) => {
+            bad_request(response, error);
+            return;
+        }
+    };
+    match admin(depot)
+        .upsert_kiro_key(provider_id, &body.label, oauth)
+        .await
+    {
+        Ok((id, created)) => {
+            response.status_code(if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            });
+            json_response(response, &json!({"id": id, "created": created}));
+        }
+        Err(error) if try_bad_gateway(response, &error) => {}
+        Err(error) => match error.downcast::<store::KiroUpsertError>() {
+            Ok(store::KiroUpsertError::InvalidInput(message)) => {
+                bad_request(response, anyhow::anyhow!(message))
+            }
+            Ok(store::KiroUpsertError::ProviderNotFound(_)) => not_found(response, "provider"),
+            Ok(
+                store::KiroUpsertError::ProviderProtocolMismatch(_)
+                | store::KiroUpsertError::Conflict,
+            ) => {
+                response.status_code(StatusCode::CONFLICT);
+                let _ = response.body("Kiro key conflicts with the existing provider or key");
+            }
+            Ok(store::KiroUpsertError::Internal(error)) => internal(response, error),
+            Err(error) => internal(response, error),
+        },
     }
 }
 

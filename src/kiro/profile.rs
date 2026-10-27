@@ -53,6 +53,11 @@ pub fn management_endpoint(region: &str) -> String {
     format!("https://management.{region}.kiro.dev/")
 }
 
+/// The Kiro Social credential refresh endpoint for an auth region.
+pub fn social_refresh_endpoint(region: &str) -> String {
+    format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken")
+}
+
 /// The AWS service host of a runtime region: CodeWhisperer in `us-east-1`,
 /// the `q.*` host everywhere else (what kiro-cli's shell talks to).
 pub fn runtime_host(region: &str) -> String {
@@ -130,6 +135,16 @@ pub fn kas_static_headers() -> Vec<(&'static str, String)> {
         ("x-amz-target", KAS_TARGET.to_owned()),
         ("x-amzn-codewhisperer-optout", "true".to_owned()),
         ("x-amzn-kiro-client-attribution", "kiro-cli".to_owned()),
+    ]
+}
+
+/// The Kiro IDE identity used by Social credential refreshes. This endpoint
+/// does not use a KAS target, but it still checks the public client profile.
+pub fn social_static_headers() -> Vec<(&'static str, String)> {
+    let user_agent = "aws-sdk-js/1.0.0 KiroIDE-1.0.116".to_owned();
+    vec![
+        ("user-agent", user_agent.clone()),
+        ("x-amz-user-agent", user_agent),
     ]
 }
 
