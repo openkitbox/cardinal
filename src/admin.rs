@@ -2,6 +2,7 @@
 //!
 //! Endpoints:
 //! - `GET/POST /api/providers`, `GET/PATCH/DELETE /api/providers/:id` — provider = protocol + endpoint (+ auth scheme), no credential
+//! - `POST /api/providers/kiro` `{name, base_url}` — atomic Kiro provider find-or-create by runtime endpoint
 //! - `DELETE /api/providers/:id/if-empty` — atomically delete a provider only when it has no keys
 //! - `GET/POST /api/providers/:id/keys`, `PATCH/DELETE /api/providers/:id/keys/:key_id` — every credential is a named key
 //!   (a Kiro key carries `auth_kind: "kiro_oidc"` + `oauth` instead of `api_key`; PATCH replaces that bundle only on an existing Kiro key)
@@ -223,6 +224,12 @@ struct ProviderBody {
     spec: ProviderSpecBody,
 }
 
+#[derive(Deserialize)]
+struct KiroProviderBody {
+    name: String,
+    base_url: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -252,6 +259,37 @@ async fn create_provider(request: &mut Request, depot: &mut Depot, response: &mu
             let _ = state(depot).route_cache.refresh(pool).await;
             response.status_code(StatusCode::CREATED);
             json_response(response, &json!({"id": id}));
+        }
+        Err(error) => bad_request(response, error),
+    }
+}
+
+#[handler]
+async fn find_or_create_kiro_provider(
+    request: &mut Request,
+    depot: &mut Depot,
+    response: &mut Response,
+) {
+    let Ok(body) = request.parse_json::<KiroProviderBody>().await else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid Kiro provider body");
+        return;
+    };
+    if !validate_base_url(depot, &body.name, &body.base_url, response) {
+        return;
+    }
+    let pool = state_pool(depot);
+    match store::find_or_create_kiro_provider(pool, &body.name, &body.base_url).await {
+        Ok((id, created)) => {
+            if let Err(error) = state(depot).route_cache.refresh(pool).await {
+                tracing::warn!(%error, "route cache refresh after Kiro provider find-or-create failed");
+            }
+            response.status_code(if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            });
+            json_response(response, &json!({"id": id, "created": created}));
         }
         Err(error) => bad_request(response, error),
     }
@@ -1059,6 +1097,7 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
                 .get(list_providers)
                 .post(create_provider),
         )
+        .push(Router::with_path("providers/kiro").post(find_or_create_kiro_provider))
         .push(
             Router::with_path("providers/{id}")
                 .get(get_provider)

@@ -144,6 +144,106 @@ pub async fn find_or_create_provider(
     Ok(row.id)
 }
 
+/// Remove insignificant trailing slashes from a Kiro runtime endpoint before
+/// using it as the provider identity. The stored endpoint for a new row is the
+/// normalized value; an existing row is never rewritten.
+fn normalize_kiro_base_url(base_url: &str) -> String {
+    base_url.trim_end_matches('/').to_owned()
+}
+
+fn validate_kiro_provider_input(name: &str, base_url: &str) -> anyhow::Result<String> {
+    validate_provider_name(name)?;
+    anyhow::ensure!(!name.trim().is_empty(), "provider name must not be empty");
+    let normalized_base_url = normalize_kiro_base_url(base_url);
+    let url = reqwest::Url::parse(&normalized_base_url)
+        .map_err(|_| anyhow::anyhow!("Kiro base_url must be a valid URL"))?;
+    let Some(host) = url.host_str() else {
+        anyhow::bail!("Kiro base_url must include a host");
+    };
+    let Some(region) = host
+        .strip_prefix("runtime.")
+        .and_then(|host| host.strip_suffix(".kiro.dev"))
+    else {
+        anyhow::bail!("Kiro base_url must be a runtime.<region>.kiro.dev endpoint");
+    };
+    anyhow::ensure!(
+        crate::kiro::valid_region(region)
+            && crate::kiro::kas_endpoint_matches(&format!("{normalized_base_url}/"), region,),
+        "Kiro base_url must be an HTTPS runtime endpoint for a valid AWS region"
+    );
+    Ok(normalized_base_url)
+}
+
+/// Atomic Kiro-only provider identity by protocol, auth scheme, and runtime
+/// endpoint. The advisory lock closes the find-then-create race without
+/// changing generic provider name semantics.
+pub async fn find_or_create_kiro_provider(
+    pool: &PgPool,
+    name: &str,
+    base_url: &str,
+) -> anyhow::Result<(i64, bool)> {
+    let normalized_base_url = validate_kiro_provider_input(name, base_url)?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&normalized_base_url)
+        .execute(&mut *tx)
+        .await?;
+
+    let existing: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM gateway_providers
+         WHERE protocol = 'kiro' AND auth_scheme = 'bearer'
+           AND rtrim(base_url, '/') = $1
+         ORDER BY id
+         LIMIT 1",
+    )
+    .bind(&normalized_base_url)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((id,)) = existing {
+        tx.commit().await?;
+        return Ok((id, false));
+    }
+
+    let inserted: Option<(i64,)> = sqlx::query_as(
+        "INSERT INTO gateway_providers (name, protocol, base_url, auth_scheme, enabled)
+         VALUES ($1, 'kiro', $2, 'bearer', true)
+         ON CONFLICT (name) DO NOTHING
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(&normalized_base_url)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((id,)) = inserted {
+        tx.commit().await?;
+        return Ok((id, true));
+    }
+
+    let existing_name: Option<ProviderRow> = sqlx::query_as(
+        "SELECT id, name, protocol, base_url, auth_scheme, enabled
+         FROM gateway_providers WHERE name = $1",
+    )
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(existing_name) = existing_name else {
+        anyhow::bail!(
+            "provider {} vanished between insert conflict and re-select",
+            name
+        );
+    };
+    anyhow::ensure!(
+        existing_name.protocol == "kiro"
+            && existing_name.auth_scheme == "bearer"
+            && normalize_kiro_base_url(&existing_name.base_url) == normalized_base_url,
+        "provider '{}' already exists with a different protocol, auth scheme, or endpoint",
+        name
+    );
+    let id = existing_name.id;
+    tx.commit().await?;
+    Ok((id, false))
+}
+
 /// Replace a provider's endpoint config. Errors when the id does not exist.
 pub async fn update_provider(
     pool: &PgPool,

@@ -22,10 +22,10 @@
 //!   frame. It carries no upstream credential: [`Self::reveal_key`] is the only
 //!   credential-serving call, and the key's model snapshot rides along in the
 //!   bootstrap's credential-free key shape.
-//! - [`Self::find_or_create_provider`] emulates the facade's
+//! - [`Self::find_or_create_provider`] emulates the general provider facade's
 //!   find-or-create client-side (create, then on failure fall back to a
-//!   name lookup with the base_url-mismatch guard) — there is no dedicated
-//!   HTTP endpoint for it.
+//!   name lookup with the base_url-mismatch guard). Kiro imports use the
+//!   dedicated [`Self::find_or_create_kiro_provider`] endpoint instead.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -449,6 +449,24 @@ impl GatewayHttpClient {
     pub async fn create_provider(&self, input: &ProviderInput<'_>) -> Result<i64, ClientError> {
         let body = provider_body(input);
         created_id(self.post("/api/providers").json(&body)).await
+    }
+
+    /// Find or create a Kiro provider by its endpoint identity. The gateway
+    /// owns matching and returns whether this call created the provider.
+    pub async fn find_or_create_kiro_provider(
+        &self,
+        name: &str,
+        base_url: &str,
+    ) -> Result<(i64, bool), ClientError> {
+        #[derive(serde::Deserialize)]
+        struct KiroProviderResponse {
+            id: i64,
+            created: bool,
+        }
+        let body = serde_json::json!({ "name": name, "base_url": base_url });
+        let response: KiroProviderResponse =
+            json(self.post("/api/providers/kiro").json(&body)).await?;
+        Ok((response.id, response.created))
     }
 
     /// Find a provider by name, creating it when absent — client-side

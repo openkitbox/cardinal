@@ -34,9 +34,9 @@ pub use price::{
 };
 pub use provider::{
     EmptyProviderDeleteOutcome, ProviderDeleteOutcome, ProviderInput, ProviderRow,
-    default_auth_scheme, delete_provider, delete_provider_if_empty, find_or_create_provider,
-    get_provider, get_provider_by_name, insert_provider, list_providers, list_providers_by_ids,
-    seed_from_config, set_provider_enabled, update_provider,
+    default_auth_scheme, delete_provider, delete_provider_if_empty, find_or_create_kiro_provider,
+    find_or_create_provider, get_provider, get_provider_by_name, insert_provider, list_providers,
+    list_providers_by_ids, seed_from_config, set_provider_enabled, update_provider,
 };
 pub use quota::{
     QuotaHistoryPoint, list_quota_history, list_quota_snapshots, list_quota_snapshots_by_keys,
