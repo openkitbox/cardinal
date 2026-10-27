@@ -55,18 +55,26 @@ pub const MATRIX_DIALECTS: [ProtocolId; 4] = [
 /// Parse result: the IR plus structured notes on concepts that did not survive.
 pub type Parsed<T> = Result<(T, Vec<&'static str>), crate::protocol::ProtocolError>;
 
+/// The `response_to_ir` shape: body plus the served model's declared metadata.
+pub type ResponseToIr = fn(
+    &[u8],
+    Option<u64>,
+    Option<f64>,
+    Option<&str>,
+) -> Result<ir::IrResponse, crate::protocol::ProtocolError>;
+
 /// Protocol-neutral dialect surface used by the relay pipeline. Only dialects
 /// whose adapters have shipped return a value.
 ///
-/// `response_to_ir` takes the served model's declared context window, which the
-/// Kiro dialect uses to derive prompt tokens from its `contextUsagePercentage`;
-/// every other dialect ignores it.
+/// `response_to_ir` takes the served model's declared context window, rate
+/// multiplier and requested id, which the Kiro dialect uses to estimate prompt
+/// tokens and derive its GPT-5.6 cache-read split; every other dialect ignores
+/// them.
 pub struct Dialect {
     pub to_ir: fn(&serde_json::Value, u64) -> Parsed<ir::IrRequest>,
     pub from_ir: fn(&ir::IrRequest, &str) -> Parsed<serde_json::Value>,
     pub emit_response_json: fn(&ir::IrResponse) -> Result<Vec<u8>, crate::protocol::ProtocolError>,
-    pub response_to_ir:
-        fn(&[u8], Option<u64>) -> Result<ir::IrResponse, crate::protocol::ProtocolError>,
+    pub response_to_ir: ResponseToIr,
     /// The dialect derives token usage from context percentages instead of
     /// vendor-reported counts (Kiro: KAS reports credits and a context
     /// percentage, never token counts). The relay keeps such an estimate for

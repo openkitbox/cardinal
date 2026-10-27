@@ -523,6 +523,8 @@ pub fn from_ir(
 pub fn response_to_ir(
     raw: &[u8],
     _context_window: Option<u64>,
+    _rate_multiplier: Option<f64>,
+    _model: Option<&str>,
 ) -> Result<super::ir::IrResponse, ProtocolError> {
     let body: Value = serde_json::from_slice(raw).map_err(|_| ProtocolError::UpstreamError)?;
     let mut content = Vec::new();

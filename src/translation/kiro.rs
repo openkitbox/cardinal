@@ -312,8 +312,12 @@ fn family_fallback(family: &Family) -> Option<&'static str> {
 
 /// The GPT-5.6 discriminating tokens (reference `mapModel`): `sol`, `terra`,
 /// `luna`, and the `codex` alias for the flagship. A bare `gpt-5.6` names no
-/// variant and is refused.
-fn gpt_model(lower: &str) -> Option<&'static str> {
+/// variant and is refused. `lower` must already be trimmed and lowercased.
+///
+/// The canonical id is also the id the vendor's model catalogue
+/// (`ListAvailableModels`) lists, so the relay's metadata lookup resolves a
+/// configured alias to the same snapshot entry through this one mapping.
+pub(crate) fn gpt_model(lower: &str) -> Option<&'static str> {
     if lower.contains("sol") {
         return Some("gpt-5.6-sol");
     }
@@ -1528,8 +1532,15 @@ fn dedup_notes(notes: Vec<&'static str>) -> Vec<&'static str> {
 pub fn response_to_ir(
     raw: &[u8],
     context_window: Option<u64>,
+    rate_multiplier: Option<f64>,
+    model: Option<&str>,
 ) -> Result<IrResponse, ProtocolError> {
-    let decoder = crate::protocol::kiro::aggregate(raw, context_window)?;
+    let decoder = crate::protocol::kiro::aggregate(
+        raw,
+        context_window,
+        rate_multiplier,
+        model.map(str::to_owned),
+    )?;
     if decoder.failed() {
         return Err(ProtocolError::InvalidUpstreamResponse);
     }

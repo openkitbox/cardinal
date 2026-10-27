@@ -30,9 +30,12 @@ const ERROR_SNIPPET: usize = 200;
 /// The struct is also the wire shape of a key's persisted model-list snapshot
 /// (`gateway_provider_keys.models`), so it round-trips through serde; the
 /// defaults keep older/partial payloads decodable.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProbeModel {
     pub id: String,
+    /// Kiro's model pricing multiplier. Other providers leave this absent.
+    #[serde(default, deserialize_with = "deserialize_rate_multiplier")]
+    pub rate_multiplier: Option<f64>,
     /// Context window in tokens (`context_length` or `context_window`).
     #[serde(default)]
     pub context: Option<u64>,
@@ -50,6 +53,20 @@ pub struct ProbeModel {
     /// level outside the closed vocabulary.
     #[serde(default)]
     pub default_effort: Option<String>,
+}
+
+/// Read a vendor rate multiplier tolerantly. The field is optional metadata, so
+/// a malformed, non-positive, or non-finite value degrades to `None` instead of
+/// rejecting the whole model list or a persisted snapshot that carries it.
+fn deserialize_rate_multiplier<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0))
 }
 
 /// Fetch the models a key can list at a provider endpoint.
@@ -376,6 +393,7 @@ fn parse_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
             };
             Some(ProbeModel {
                 id,
+                rate_multiplier: None,
                 context,
                 max_output,
                 input_modalities,
@@ -471,6 +489,8 @@ fn parse_kiro_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
         token_limits: Option<TokenLimits>,
         #[serde(default)]
         supported_input_types: Vec<String>,
+        #[serde(default, deserialize_with = "deserialize_rate_multiplier")]
+        rate_multiplier: Option<f64>,
     }
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -496,6 +516,7 @@ fn parse_kiro_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
             let limits = entry.token_limits;
             Some(ProbeModel {
                 id,
+                rate_multiplier: entry.rate_multiplier,
                 context: limits
                     .as_ref()
                     .and_then(|limits| limits.max_input_tokens)

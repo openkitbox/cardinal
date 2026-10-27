@@ -31,11 +31,12 @@
 //!   chars / 4)` across accumulated text, reasoning and every tool call's
 //!   arguments. These are estimates, not vendor-reported token counts. A
 //!   missing window or percentage omits usage entirely rather than fabricating
-//!   zeros. `meteringEvent` credits remain diagnostics only and never enter
-//!   [`UsageCounts`]: KAS bills credits, but cardinal's ledger prices tokens
-//!   against the models.dev/manual price table for every provider and never
-//!   converts credits into money. Kiro does not produce `StreamEvent::Usage`,
-//!   so these estimates never enter client-visible frames.
+//!   zeros. `meteringEvent` credits are not themselves converted to USD: on a
+//!   recognized GPT-5.6 variant with `unit == "credit"` they license
+//!   [`derive_cache_read_tokens`], which fills `cached_input_tokens`; that
+//!   derived split is then consumed by the normal token × price ledger and can
+//!   change the estimated cost. Kiro does not produce `StreamEvent::Usage`, so
+//!   these estimates never enter client-visible frames.
 //! * **`metadataEvent` is the only normal-end evidence.** Its `stopReason` is
 //!   never trusted (real tool-calling responses report `END_TURN`); the
 //!   terminal state is inferred — tools present ⇒ `tool_calls`, a tool whose
@@ -161,17 +162,79 @@ pub struct ToolCall {
     pub complete: bool,
 }
 
-/// Raw `meteringEvent` evidence, kept for diagnostics only.
+/// Raw `meteringEvent` evidence, kept as diagnostics and cache-derivation input.
 ///
-/// KAS bills credits, not tokens: these values are never converted into token
-/// counts. The [`StreamDecoder::usage`] estimate comes from the context
-/// percentage and accumulated content instead. Fields stay optional so nothing
-/// is invented for an absent or wrongly-typed field.
+/// KAS bills credits, not total tokens: [`StreamDecoder::usage`] still estimates
+/// the token counts from the context percentage and accumulated content. A
+/// credit reading additionally licenses the `cached_input_tokens` split for a
+/// supported GPT variant; it never replaces the total token estimate. Fields
+/// stay optional so nothing is invented for absent or wrongly-typed data.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Metering {
     pub usage: Option<f64>,
     pub unit: Option<String>,
     pub unit_plural: Option<String>,
+}
+
+const GPT_K_IN: f64 = 1.6584e-5;
+const GPT_K_OUT: f64 = 1.1048e-4;
+const GPT_CACHE_READ_RATIO: f64 = 0.1;
+
+/// Derive GPT-5.6 cache-read tokens from KAS credit metering.
+///
+/// The recognized model writing gates the derivation; the candidate snapshot's
+/// `rate_multiplier` supplies the account-specific pricing multiplier.
+pub fn derive_cache_read_tokens(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    credits: f64,
+    rate_multiplier: Option<f64>,
+) -> Option<u64> {
+    let _ = gpt_multiplier(model)?;
+    let multiplier = match rate_multiplier {
+        Some(value) if value.is_finite() && value > 0.0 => value,
+        _ => return None,
+    };
+    if !credits.is_finite() || credits < 0.0 {
+        return None;
+    }
+    let prompt_tokens = input_tokens.saturating_sub(output_tokens);
+    // KAS bills one prompt above this size at double rate as a whole — the
+    // cached span included — so the tier scales the multiplier, not a subtotal.
+    let long_context_multiplier = if prompt_tokens > 272_000 { 2.0 } else { 1.0 };
+    let raw = (GPT_K_IN * prompt_tokens as f64 + GPT_K_OUT * output_tokens as f64
+        - credits / (multiplier * long_context_multiplier))
+        / ((1.0 - GPT_CACHE_READ_RATIO) * GPT_K_IN);
+    if !raw.is_finite() {
+        return None;
+    }
+    let rounded = raw.round();
+    if !rounded.is_finite() {
+        return None;
+    }
+    Some(rounded.max(0.0).min(prompt_tokens as f64) as u64)
+}
+
+fn gpt_multiplier(model: &str) -> Option<f64> {
+    let lower = model.trim().to_ascii_lowercase();
+    // The reference recognizes any `gpt` writing carrying a variant token, so a
+    // configured alias, a provider prefix, or a `-thinking` suffix still names
+    // its variant; `codex` is the flagship (sol) alias.
+    if !lower.contains("gpt") {
+        return None;
+    }
+    if lower.contains("sol") {
+        Some(4.4)
+    } else if lower.contains("terra") {
+        Some(2.2)
+    } else if lower.contains("luna") {
+        Some(0.6)
+    } else if lower.contains("codex") {
+        Some(4.4)
+    } else {
+        None
+    }
 }
 
 /// The KAS response state machine: one instance per logical response.
@@ -181,6 +244,9 @@ pub struct Metering {
 /// the same events.
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
+    /// The model this attempt requested. KAS events carry no model identity,
+    /// so the relay supplies it; it selects the GPT-5.6 cache-read variant.
+    model: Option<String>,
     text: String,
     reasoning: String,
     /// Native reasoning signature. Kept as internal evidence only: no
@@ -205,15 +271,25 @@ pub struct StreamDecoder {
     /// into prompt tokens. `None` when the snapshot carries no window, and
     /// `None` means "no input estimate" — never zero.
     context_window: Option<u64>,
+    /// Kiro's model rate multiplier (`ListAvailableModels.rateMultiplier`).
+    /// It gates the GPT-5.6 cache-read split only; it is never part of the
+    /// total token accounting.
+    rate_multiplier: Option<f64>,
     /// Set by the first undecodable/invalid frame; every later frame is
     /// refused, so content is never spliced across a known-broken span.
     failed: bool,
 }
 
 impl StreamDecoder {
-    pub fn new(context_window: Option<u64>) -> Self {
+    pub fn new(
+        context_window: Option<u64>,
+        rate_multiplier: Option<f64>,
+        model: Option<String>,
+    ) -> Self {
         Self {
             context_window,
+            rate_multiplier,
+            model,
             ..Self::default()
         }
     }
@@ -321,6 +397,7 @@ impl StreamDecoder {
                     usage = ?metering.usage,
                     unit = ?metering.unit,
                     unit_plural = ?metering.unit_plural,
+                    rate_multiplier = ?self.rate_multiplier,
                     "KAS metering (credits, never token usage)"
                 );
                 self.metering = Some(metering);
@@ -475,9 +552,22 @@ impl StreamDecoder {
                 .map(|call| call.arguments.chars().count())
                 .sum::<usize>();
         let output_tokens = (total_chars / 4) as u64;
+        let cached_input_tokens = self.metering.as_ref().and_then(|metering| {
+            if metering.unit.as_deref() != Some("credit") {
+                return None;
+            }
+            derive_cache_read_tokens(
+                self.model.as_deref()?,
+                input_tokens,
+                output_tokens,
+                metering.usage?,
+                self.rate_multiplier,
+            )
+        });
         Some(UsageCounts {
             input_tokens,
             output_tokens,
+            cached_input_tokens,
             ..Default::default()
         })
     }
@@ -569,7 +659,12 @@ fn diagnostic_str(payload: &serde_json::Map<String, Value>, field: &str) -> Opti
 ///
 /// A partial frame at the end of the body is [`AwsError::Truncated`], never a
 /// silent clean end, so callers can never observe half a response.
-pub fn aggregate(body: &[u8], context_window: Option<u64>) -> Result<StreamDecoder, ProtocolError> {
+pub fn aggregate(
+    body: &[u8],
+    context_window: Option<u64>,
+    rate_multiplier: Option<f64>,
+    model: Option<String>,
+) -> Result<StreamDecoder, ProtocolError> {
     let mut framer = Framer::new();
     let messages = framer
         .push(body)
@@ -577,7 +672,7 @@ pub fn aggregate(body: &[u8], context_window: Option<u64>) -> Result<StreamDecod
     framer
         .finish()
         .map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
-    let mut decoder = StreamDecoder::new(context_window);
+    let mut decoder = StreamDecoder::new(context_window, rate_multiplier, model);
     for message in &messages {
         decoder.observe(message)?;
     }
@@ -596,8 +691,10 @@ pub fn aggregate(body: &[u8], context_window: Option<u64>) -> Result<StreamDecod
 pub fn parse_json(
     body: &[u8],
     context_window: Option<u64>,
+    rate_multiplier: Option<f64>,
+    model: Option<String>,
 ) -> Result<ObservedResponse, ProtocolError> {
-    let decoder = aggregate(body, context_window)?;
+    let decoder = aggregate(body, context_window, rate_multiplier, model)?;
     Ok(ObservedResponse {
         usage: decoder.usage(),
         terminal: decoder.finish(),

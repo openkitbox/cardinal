@@ -399,13 +399,15 @@ pub fn prepare(
 
 /// Observe a complete non-streaming response for the given protocol.
 ///
-/// `context_window` is the served model's declared context window, used by the
-/// Kiro kernel to derive prompt tokens from its `contextUsagePercentage`; every
-/// other protocol ignores it.
+/// `context_window`, `rate_multiplier` and `model` are the served model's
+/// declared metadata, used by the Kiro kernel to estimate prompt tokens and
+/// derive a GPT-5.6 cache-read split; every other protocol ignores them.
 pub fn parse_json(
     protocol: ProtocolId,
     body: &[u8],
     context_window: Option<u64>,
+    rate_multiplier: Option<f64>,
+    model: Option<String>,
 ) -> Result<ObservedResponse, ProtocolError> {
     match protocol {
         ProtocolId::OpenAiChat => openai_chat::parse_json(body),
@@ -413,7 +415,7 @@ pub fn parse_json(
         ProtocolId::AnthropicMessages => anthropic_messages::parse_json(body),
         ProtocolId::Gemini => gemini::parse_json(body),
         ProtocolId::OpenAiEmbeddings => embeddings::parse_json(body),
-        ProtocolId::Kiro => kiro::parse_json(body, context_window),
+        ProtocolId::Kiro => kiro::parse_json(body, context_window, rate_multiplier, model),
     }
 }
 
@@ -433,10 +435,15 @@ pub enum Decoder {
 }
 
 impl Decoder {
-    /// `context_window` is the served model's declared context window, used by
-    /// the Kiro kernel to derive prompt tokens from its `contextUsagePercentage`;
-    /// every other protocol ignores it.
-    pub fn new(protocol: ProtocolId, context_window: Option<u64>) -> Self {
+    /// `context_window`, `rate_multiplier` and `model` are the served model's
+    /// declared metadata, used by the Kiro kernel to estimate prompt tokens and
+    /// derive a GPT-5.6 cache-read split; every other protocol ignores them.
+    pub fn new(
+        protocol: ProtocolId,
+        context_window: Option<u64>,
+        rate_multiplier: Option<f64>,
+        model: Option<String>,
+    ) -> Self {
         match protocol {
             ProtocolId::OpenAiChat => Self::Chat(openai_chat::StreamDecoder::new()),
             ProtocolId::OpenAiResponses => Self::Responses(openai_responses::StreamDecoder::new()),
@@ -445,7 +452,11 @@ impl Decoder {
             }
             ProtocolId::Gemini => Self::Gemini(gemini::StreamDecoder::new()),
             ProtocolId::OpenAiEmbeddings => Self::Unstreamed,
-            ProtocolId::Kiro => Self::Kiro(kiro::StreamDecoder::new(context_window)),
+            ProtocolId::Kiro => Self::Kiro(kiro::StreamDecoder::new(
+                context_window,
+                rate_multiplier,
+                model,
+            )),
         }
     }
 

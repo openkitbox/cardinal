@@ -45,6 +45,9 @@ pub struct Candidate {
     /// i.e. the model's input window). `None` when the snapshot has no such
     /// entry, which the Kiro decoder reads as "no input estimate" — never zero.
     pub context_window: Option<u64>,
+    /// Kiro's upstream model pricing multiplier, carried for decoder context;
+    /// `None` for non-Kiro models and old snapshots.
+    pub rate_multiplier: Option<f64>,
 }
 
 impl Candidate {
@@ -69,17 +72,35 @@ fn serves_model(key: &ProviderKeyRow, upstream_model: &str) -> bool {
     })
 }
 
+/// A snapshot entry is selected by its exact configured id first. An alias, a
+/// provider prefix, or a thinking suffix falls back to the canonical id only
+/// for a recognized GPT variant (the same mapping the KAS body uses); any other
+/// writing stays without metadata, so derived accounting fails closed.
+fn snapshot_entry<'a>(
+    key: &'a ProviderKeyRow,
+    model: &str,
+) -> Option<&'a crate::probe::ProbeModel> {
+    let models = key.models.as_ref()?;
+    if let Some(entry) = models.iter().find(|entry| entry.id == model) {
+        return Some(entry);
+    }
+    let lower = model.trim().to_ascii_lowercase();
+    if !lower.contains("gpt") {
+        return None;
+    }
+    let canonical = crate::translation::kiro::gpt_model(&lower)?;
+    models
+        .iter()
+        .find(|entry| entry.id.eq_ignore_ascii_case(canonical))
+}
+
 /// The candidate model's effort dial from the key's cached model-list
 /// snapshot: canonical levels (ascending) plus the vendor-declared default.
 /// A missing snapshot/model or an empty level list yields `(None, default)`,
 /// meaning dispatch does not clamp (the default may still repair unknown
 /// names).
 fn effort_support(key: &ProviderKeyRow, model: &str) -> (Option<Box<[Effort]>>, Option<Effort>) {
-    let Some(entry) = key
-        .models
-        .as_ref()
-        .and_then(|models| models.iter().find(|entry| entry.id == model))
-    else {
+    let Some(entry) = snapshot_entry(key, model) else {
         return (None, None);
     };
     let mut levels: Vec<Effort> = entry
@@ -104,11 +125,11 @@ fn effort_support(key: &ProviderKeyRow, model: &str) -> (Option<Box<[Effort]>>, 
 /// The candidate model's declared context window from the key's cached
 /// model-list snapshot. A missing snapshot or entry yields `None`.
 fn model_context(key: &ProviderKeyRow, model: &str) -> Option<u64> {
-    key.models
-        .as_ref()?
-        .iter()
-        .find(|entry| entry.id == model)
-        .and_then(|entry| entry.context)
+    snapshot_entry(key, model).and_then(|entry| entry.context)
+}
+
+fn model_rate_multiplier(key: &ProviderKeyRow, model: &str) -> Option<f64> {
+    snapshot_entry(key, model).and_then(|entry| entry.rate_multiplier)
 }
 
 /// Direct path ("<provider>/<model>"): the provider's enabled keys — which must arrive in global
@@ -124,6 +145,7 @@ pub fn expand_direct(
     for (key, secret) in keys {
         let (supported, default) = effort_support(&key, upstream_model);
         let context_window = model_context(&key, upstream_model);
+        let rate_multiplier = model_rate_multiplier(&key, upstream_model);
         if !key.enabled {
             excluded.push((
                 Candidate {
@@ -136,6 +158,7 @@ pub fn expand_direct(
                     supported_efforts: supported.clone(),
                     default_effort: default,
                     context_window,
+                    rate_multiplier,
                 },
                 SkipReason::Disabled,
             ));
@@ -153,6 +176,7 @@ pub fn expand_direct(
                     supported_efforts: supported.clone(),
                     default_effort: default,
                     context_window,
+                    rate_multiplier,
                 },
                 SkipReason::ModelNotAllowed,
             ));
@@ -168,6 +192,7 @@ pub fn expand_direct(
             supported_efforts: supported,
             default_effort: default,
             context_window,
+            rate_multiplier,
         });
     }
     (candidates, excluded)
@@ -273,5 +298,6 @@ fn make_candidate(
         supported_efforts: supported,
         default_effort: default,
         context_window: model_context(key, model),
+        rate_multiplier: model_rate_multiplier(key, model),
     }
 }
