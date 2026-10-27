@@ -323,6 +323,7 @@ pub async fn upsert_kiro_key_by_label(
     label: &str,
     oauth: &KiroOAuth,
     expected: &KiroUpsertExpectation,
+    max_concurrency: Option<Option<i32>>,
 ) -> Result<(i64, bool), KiroUpsertError> {
     if label.is_empty() {
         return Err(KiroUpsertError::InvalidInput(
@@ -331,6 +332,8 @@ pub async fn upsert_kiro_key_by_label(
     }
     oauth
         .validate()
+        .map_err(|error| KiroUpsertError::InvalidInput(format!("{error:#}")))?;
+    ensure_valid_max_concurrency(max_concurrency.flatten())
         .map_err(|error| KiroUpsertError::InvalidInput(format!("{error:#}")))?;
     let oauth = serde_json::to_value(oauth)
         .map_err(|error| KiroUpsertError::Internal(anyhow::Error::new(error)))?;
@@ -379,12 +382,13 @@ pub async fn upsert_kiro_key_by_label(
                 "INSERT INTO gateway_provider_keys
                     (provider_id, label, api_key, auth_kind, oauth, position, max_concurrency, allowed_models)
                  VALUES ($1, $2, NULL, 'kiro_oidc', $3,
-                    (SELECT COALESCE(MAX(position) + 1, 0) FROM gateway_provider_keys), NULL, NULL)
+                    (SELECT COALESCE(MAX(position) + 1, 0) FROM gateway_provider_keys), $4, NULL)
                  RETURNING id",
             )
             .bind(provider_id)
             .bind(label)
             .bind(oauth)
+            .bind(max_concurrency.flatten())
             .fetch_one(&mut *tx)
             .await
             .map_err(|error| KiroUpsertError::Internal(error.into()))?;
@@ -396,11 +400,16 @@ pub async fn upsert_kiro_key_by_label(
         [(id, auth_kind, current_oauth)] if matches!(expected, KiroUpsertExpectation::Existing { key_id, oauth: expected_oauth } if *key_id == *id && auth_kind == "kiro_oidc" && current_oauth.as_ref().and_then(|value| serde_json::from_value::<KiroOAuth>(value.clone()).ok()).as_ref() == Some(expected_oauth)) =>
         {
             sqlx::query(
-                "UPDATE gateway_provider_keys SET oauth = $3 WHERE id = $1 AND provider_id = $2",
+                "UPDATE gateway_provider_keys SET
+                    oauth = $3,
+                    max_concurrency = CASE WHEN $4 THEN $5 ELSE max_concurrency END
+                 WHERE id = $1 AND provider_id = $2",
             )
             .bind(id)
             .bind(provider_id)
             .bind(oauth)
+            .bind(max_concurrency.is_some())
+            .bind(max_concurrency.flatten())
             .execute(&mut *tx)
             .await
             .map_err(|error| KiroUpsertError::Internal(error.into()))?;

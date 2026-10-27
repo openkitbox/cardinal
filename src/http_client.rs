@@ -616,13 +616,25 @@ impl GatewayHttpClient {
         provider_id: i64,
         label: &str,
         oauth: &KiroOAuth,
+        max_concurrency: Option<Option<i32>>,
     ) -> Result<(i64, bool), ClientError> {
         #[derive(serde::Deserialize)]
         struct Upserted {
             id: i64,
             created: bool,
         }
-        let body = serde_json::json!({ "label": label, "oauth": oauth });
+        #[derive(serde::Serialize)]
+        struct KiroUpsert<'a> {
+            label: &'a str,
+            oauth: &'a KiroOAuth,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_concurrency: Option<Option<i32>>,
+        }
+        let body = KiroUpsert {
+            label,
+            oauth,
+            max_concurrency,
+        };
         let result: Upserted = json(
             self.post(&format!("/api/providers/{provider_id}/kiro-key"))
                 .json(&body),

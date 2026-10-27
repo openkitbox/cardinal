@@ -256,7 +256,7 @@ async fn create_provider(request: &mut Request, depot: &mut Depot, response: &mu
     }
     match store::insert_provider(pool, &body.spec.input()).await {
         Ok(id) => {
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             response.status_code(StatusCode::CREATED);
             json_response(response, &json!({"id": id}));
         }
@@ -281,7 +281,7 @@ async fn find_or_create_kiro_provider(
     let pool = state_pool(depot);
     match store::find_or_create_kiro_provider(pool, &body.name, &body.base_url).await {
         Ok((id, created)) => {
-            if let Err(error) = state(depot).route_cache.refresh(pool).await {
+            if let Err(error) = admin(depot).refresh_route_cache().await {
                 tracing::warn!(%error, "route cache refresh after Kiro provider find-or-create failed");
             }
             response.status_code(if created {
@@ -328,7 +328,7 @@ async fn update_provider(request: &mut Request, depot: &mut Depot, response: &mu
     }
     match store::update_provider(pool, id, &body.spec.input()).await {
         Ok(true) => {
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
         Ok(false) => not_found(response, "provider"),
@@ -347,7 +347,7 @@ async fn delete_provider(request: &mut Request, depot: &mut Depot, response: &mu
     match store::delete_provider(pool, id).await {
         Ok(store::ProviderDeleteOutcome::Deleted { kiro_key_ids }) => {
             state(depot).kiro_tokens.remove_provider(&kiro_key_ids);
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
         Ok(store::ProviderDeleteOutcome::Missing) => not_found(response, "provider"),
@@ -369,7 +369,7 @@ async fn delete_provider_if_empty(
     let pool = state_pool(depot);
     match store::delete_provider_if_empty(pool, id).await {
         Ok(store::EmptyProviderDeleteOutcome::Deleted) => {
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
         Ok(store::EmptyProviderDeleteOutcome::HasKeys) => {
@@ -457,7 +457,7 @@ async fn put_route(request: &mut Request, depot: &mut Depot, response: &mut Resp
     .await
     {
         Ok(()) => {
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
         Err(error) => bad_request(response, error),
@@ -470,7 +470,7 @@ async fn delete_route(request: &mut Request, depot: &mut Depot, response: &mut R
     let alias = request.param::<String>("alias").unwrap_or_default();
     match store::delete_route(pool, &alias).await {
         Ok(true) => {
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
         Ok(false) => not_found(response, "route"),
@@ -1191,6 +1191,9 @@ struct KeyBody {
 struct KiroKeyBody {
     label: String,
     oauth: KiroOAuth,
+    /// Absent preserves an existing cap; null clears it; a positive number sets it.
+    #[serde(default, deserialize_with = "tri_state")]
+    max_concurrency: Option<Option<i32>>,
 }
 
 /// Raw Kiro import body. `credentials` stays a JSON value until the pure
@@ -1202,6 +1205,9 @@ struct KiroImportBody {
     #[serde(default)]
     account: usize,
     credentials: serde_json::Value,
+    /// Absent preserves an existing cap; null clears it; a positive number sets it.
+    #[serde(default, deserialize_with = "tri_state")]
+    max_concurrency: Option<Option<i32>>,
 }
 
 #[derive(Deserialize)]
@@ -1331,7 +1337,7 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
                     .adopt_persisted(pool, provider_id, id, oauth)
                     .await;
             }
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             response.status_code(StatusCode::CREATED);
             json_response(response, &json!({"id": id}));
         }
@@ -1363,7 +1369,7 @@ async fn import_kiro_key(request: &mut Request, depot: &mut Depot, response: &mu
         }
     };
     match admin(depot)
-        .upsert_kiro_key(provider_id, &body.label, oauth)
+        .upsert_kiro_key(provider_id, &body.label, oauth, body.max_concurrency)
         .await
     {
         Ok((id, created)) => {
@@ -1406,7 +1412,7 @@ async fn upsert_kiro_key(request: &mut Request, depot: &mut Depot, response: &mu
         return;
     };
     match admin(depot)
-        .upsert_kiro_key(provider_id, &body.label, body.oauth)
+        .upsert_kiro_key(provider_id, &body.label, body.oauth, body.max_concurrency)
         .await
     {
         Ok((id, created)) => {
@@ -1484,7 +1490,7 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
                     .adopt_persisted(pool, provider_id, key_id, oauth)
                     .await;
             }
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
         Ok(false) => not_found(response, "key"),
@@ -1504,7 +1510,7 @@ async fn reorder_keys(request: &mut Request, depot: &mut Depot, response: &mut R
     };
     match store::reorder_keys(pool, &body.ids).await {
         Ok(()) => {
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
         Err(error) => bad_request(response, error),
@@ -1526,7 +1532,7 @@ async fn delete_key(request: &mut Request, depot: &mut Depot, response: &mut Res
             if is_kiro {
                 state(depot).kiro_tokens.remove(key_id);
             }
-            let _ = state(depot).route_cache.refresh(pool).await;
+            let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
         Ok(None) => {

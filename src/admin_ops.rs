@@ -424,6 +424,19 @@ impl Admin {
         self
     }
 
+    /// Refresh the route cache and publish its complete concurrency-cap view. Existing
+    /// inflight work is never cancelled; the dispatcher applies the new cap
+    /// only to future assignments.
+    pub(crate) async fn refresh_route_cache(&self) -> anyhow::Result<()> {
+        let Some(dispatcher) = &self.dispatcher else {
+            self.route_cache.refresh(&self.pool).await?;
+            return Ok(());
+        };
+        self.route_cache
+            .refresh_and_sync(&self.pool, dispatcher)
+            .await
+    }
+
     /// Assemble the admin UI's bootstrap document (see [`Bootstrap`]): every
     /// parameterless read the status pages render from, in one pass.
     ///
@@ -665,7 +678,7 @@ impl Admin {
         // The route cache is the only read path for /v1/models; refresh it so a
         // successful persist is visible immediately. A refresh failure degrades
         // to a warn — the next admin write retries it.
-        if let Err(error) = self.route_cache.refresh(&self.pool).await {
+        if let Err(error) = self.refresh_route_cache().await {
             tracing::warn!(key_id, error = %format!("{error:#}"), "route cache refresh after model snapshot failed");
         }
         Ok(models)
@@ -707,7 +720,7 @@ impl Admin {
         // The route cache is the only read path for /v1/models; refresh it so a
         // successful persist is visible immediately. A refresh failure degrades
         // to a warn — the next admin write retries it.
-        if updated && let Err(error) = self.route_cache.refresh(&self.pool).await {
+        if updated && let Err(error) = self.refresh_route_cache().await {
             tracing::warn!(key_id, error = %format!("{error:#}"), "route cache refresh after model snapshot failed");
         }
         Ok(updated)
@@ -732,6 +745,7 @@ impl Admin {
         provider_id: i64,
         label: &str,
         oauth: KiroOAuth,
+        max_concurrency: Option<Option<i32>>,
     ) -> anyhow::Result<(i64, bool)> {
         if label.is_empty() {
             return Err(
@@ -741,6 +755,14 @@ impl Admin {
         oauth
             .validate()
             .map_err(|error| store::KiroUpsertError::InvalidInput(format!("{error:#}")))?;
+        if let Some(limit) = max_concurrency.flatten()
+            && limit <= 0
+        {
+            return Err(store::KiroUpsertError::InvalidInput(
+                "max_concurrency must be positive".to_owned(),
+            )
+            .into());
+        }
         // Both regions become URL hosts (the OIDC token endpoint and the
         // control plane), so the grammar guard dispatch shares applies before
         // any request is built — an unusable region is caller error, not a
@@ -787,6 +809,7 @@ impl Admin {
             label,
             &candidate_oauth,
             &expectation,
+            max_concurrency,
         )
         .await?;
         // The catalogue answer also becomes the key's model snapshot. That is a
@@ -799,7 +822,7 @@ impl Admin {
         tokens
             .adopt_persisted(&self.pool, provider_id, key_id, candidate_oauth)
             .await;
-        if let Err(error) = self.route_cache.refresh(&self.pool).await {
+        if let Err(error) = self.refresh_route_cache().await {
             tracing::warn!(key_id, error = %format!("{error:#}"), "route cache refresh after Kiro key upsert failed");
         }
         match models_saved {

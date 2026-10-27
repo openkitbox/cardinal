@@ -2,6 +2,7 @@
 //! Seeded from PG at startup, refreshed after any admin write.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::protocol::ProtocolId;
@@ -12,6 +13,8 @@ use crate::store::{
 #[derive(Clone)]
 pub struct RouteCache {
     inner: Arc<RwLock<RouteCacheInner>>,
+    generation: Arc<AtomicU64>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct RouteCacheInner {
@@ -34,6 +37,8 @@ impl RouteCache {
                 routes_by_alias: HashMap::new(),
                 all_routes: Vec::new(),
             })),
+            generation: Arc::new(AtomicU64::new(0)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -44,6 +49,42 @@ impl RouteCache {
 
     /// Full reload after admin mutations (create/update/delete provider/key/route).
     pub async fn refresh(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        let inner = Self::load_inner(pool).await?;
+        self.replace_inner(inner);
+        Ok(())
+    }
+
+    /// Reload a complete snapshot and publish its cap table to the dispatcher.
+    /// The dispatcher activates it immediately, retries queued requests, and
+    /// preserves existing inflight work when a cap decreases.
+    pub async fn refresh_and_sync(
+        &self,
+        pool: &sqlx::PgPool,
+        dispatcher: &tokio::sync::mpsc::UnboundedSender<crate::relay::dispatcher::DispatchEvent>,
+    ) -> anyhow::Result<()> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        let inner = Self::load_inner(pool).await?;
+        let generation = self.generation() + 1;
+        let caps = Self::concurrency_caps_for(&inner);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        if dispatcher
+            .send(crate::relay::dispatcher::DispatchEvent::SyncKeyCaps {
+                caps,
+                generation,
+                reply,
+            })
+            .is_err()
+        {
+            tracing::warn!("dispatcher unavailable while syncing route concurrency caps");
+        } else if response.await.is_err() {
+            tracing::warn!("dispatcher stopped while syncing route concurrency caps");
+        }
+        self.replace_inner(inner);
+        Ok(())
+    }
+
+    async fn load_inner(pool: &sqlx::PgPool) -> anyhow::Result<RouteCacheInner> {
         let providers = crate::store::list_providers(pool).await?;
         let keys = crate::store::list_all_keys(pool).await?;
         let routes = crate::store::list_routes(pool).await?;
@@ -70,17 +111,23 @@ impl RouteCache {
             routes_by_alias.insert(r.alias.clone(), r.clone());
         }
 
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| anyhow::anyhow!("route cache lock poisoned: {e}"))?;
-        inner.providers_by_name = providers_by_name;
-        inner.providers_by_id = providers_by_id;
-        inner.keys_by_id = keys_by_id;
-        inner.keys_by_provider = keys_by_provider;
-        inner.routes_by_alias = routes_by_alias;
-        inner.all_routes = routes;
-        Ok(())
+        Ok(RouteCacheInner {
+            providers_by_name,
+            providers_by_id,
+            keys_by_id,
+            keys_by_provider,
+            routes_by_alias,
+            all_routes: routes,
+        })
+    }
+
+    fn replace_inner(&self, new_inner: RouteCacheInner) {
+        let Ok(mut inner) = self.inner.write() else {
+            tracing::warn!("route cache lock poisoned while replacing snapshot");
+            return;
+        };
+        *inner = new_inner;
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     // Sync read methods used by resolve():
@@ -233,6 +280,75 @@ impl RouteCache {
                 .then(a.key_id.cmp(&b.key_id))
         });
         rows
+    }
+
+    pub fn all_key_caps(&self) -> Vec<(i64, Option<i32>)> {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        inner
+            .keys_by_id
+            .values()
+            .map(|key| (key.id, key.max_concurrency))
+            .collect()
+    }
+
+    /// Complete cap view for the dispatcher. Uncapped route entries are
+    /// included as `None` so clearing an entry cap cannot leave an old slot
+    /// cap behind.
+    pub fn all_concurrency_caps(&self) -> Vec<(crate::relay::SlotKey, Option<usize>)> {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        Self::concurrency_caps_for(&inner)
+    }
+
+    fn concurrency_caps_for(
+        inner: &RouteCacheInner,
+    ) -> Vec<(crate::relay::SlotKey, Option<usize>)> {
+        let mut caps = Vec::new();
+        for key in inner.keys_by_id.values() {
+            let Some(provider) = inner.providers_by_id.get(&key.provider_id) else {
+                continue;
+            };
+            if !key.enabled || !provider.enabled {
+                continue;
+            }
+            caps.push((
+                crate::relay::SlotKey::Key(key.id as u64),
+                key.max_concurrency.map(|cap| cap as usize),
+            ));
+        }
+        for route in &inner.all_routes {
+            for entry in &route.entries {
+                let Some(key) = inner.keys_by_id.get(&entry.key_id) else {
+                    continue;
+                };
+                let Some(provider) = inner.providers_by_id.get(&key.provider_id) else {
+                    continue;
+                };
+                if !key.enabled || !provider.enabled {
+                    continue;
+                }
+                caps.push((
+                    crate::relay::dispatcher::entry_slot_key(
+                        &route.alias,
+                        entry.key_id as u64,
+                        &entry.model,
+                    ),
+                    entry
+                        .max_concurrency
+                        .and_then(|cap| usize::try_from(cap).ok()),
+                ));
+            }
+        }
+        caps
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub fn all_key_models(&self) -> Vec<KeyModels> {

@@ -236,7 +236,7 @@ async fn relay_dispatch(
                 header::CACHE_CONTROL,
                 header::HeaderValue::from_static("no-cache"),
             );
-            response.stream(tokio_stream::wrappers::ReceiverStream::new(frames));
+            response.stream(frames);
             // Return immediately after installing the stream: salvo only hands the
             // Response to hyper once the handler future completes, so awaiting
             // `finalize` here would buffer the whole stream and deadlock the pump

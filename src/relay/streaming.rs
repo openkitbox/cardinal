@@ -17,6 +17,39 @@ use crate::upstream::transport::{self, StreamReader};
 use super::dispatcher::SlotGuard;
 use super::{PAYLOAD_TARGET, truncate_payload};
 
+/// Client-facing stream that owns the account-level slot until the response
+/// body is fully consumed or dropped by the HTTP server.
+pub struct StreamFrames {
+    frames: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+    slot: Option<SlotGuard>,
+}
+
+impl StreamFrames {
+    pub fn new(
+        frames: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+        slot: Option<SlotGuard>,
+    ) -> Self {
+        Self { frames, slot }
+    }
+}
+
+impl futures::Stream for StreamFrames {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.frames.poll_recv(cx) {
+            std::task::Poll::Ready(None) => {
+                self.slot.take();
+                std::task::Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
 /// Relay result: non-streaming JSON or streaming SSE.
 pub(super) enum RelayOutcome {
     /// Non-streaming: JSON bytes to return plus observation.
@@ -358,15 +391,12 @@ pub(super) struct PumpSide {
 /// Start the streaming relay pump: a background task turns upstream frames
 /// into client SSE byte chunks pushed via `tx`; when the stream ends it sends
 /// the usage to `usage_tx`. `commit_tx` carries the one-shot hold verdict the
-/// dispatcher waits on before locking the attempt in; `permit_rx` is the
-/// dispatcher's permit handoff — a committed attempt's permits ride it and
-/// are released when this task ends.
+/// dispatcher waits on before locking the attempt in.
 pub(super) fn spawn_stream_pump(
     mut reader: Box<StreamReader>,
     pump: StreamPump,
     usage_tx: tokio::sync::oneshot::Sender<StreamOutcome>,
     commit_tx: tokio::sync::oneshot::Sender<HoldSignal>,
-    permit_rx: tokio::sync::oneshot::Receiver<SlotGuard>,
     side: PumpSide,
 ) -> tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
@@ -375,10 +405,6 @@ pub(super) fn spawn_stream_pump(
             drive_stream(&mut reader, pump, &tx, commit_tx, side).await;
         drop(reader); // release the upstream response
         drop(tx); // close the client stream
-        // A committed attempt's permits sit in this channel and are released only
-        // now — the stream has ended. An aborted attempt never sent them (the
-        // dispatcher kept ownership through the failure path).
-        drop(permit_rx);
         let _ = usage_tx.send(StreamOutcome {
             usage,
             ttft_ms,

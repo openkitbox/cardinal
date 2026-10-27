@@ -25,6 +25,12 @@ pub enum DispatchEvent {
     QueryInflight {
         reply: oneshot::Sender<HashMap<u64, usize>>,
     },
+    /// Replace the current cap for every known key and route entry, and update queued requests.
+    SyncKeyCaps {
+        caps: Vec<(SlotKey, Option<usize>)>,
+        generation: u64,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// Namespaced key for the slot-state map. Prevents collision between raw
@@ -35,6 +41,17 @@ pub enum SlotKey {
     Key(u64),
     /// Route-entry-level concurrency slot.
     Entry(u64),
+}
+
+/// Stable identity for one route entry's concurrency slot.
+pub fn entry_slot_key(route_id: &str, key_id: u64, model: &str) -> SlotKey {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    route_id.hash(&mut hasher);
+    key_id.hash(&mut hasher);
+    model.hash(&mut hasher);
+    SlotKey::Entry(hasher.finish())
 }
 
 /// A request for the dispatcher to assign a candidate.
@@ -49,6 +66,9 @@ pub struct DispatchRequest {
     pub order: Vec<usize>,
     /// Per-candidate concurrency caps (key_cap, entry_cap), pre-computed.
     pub caps: Vec<CandidateCaps>,
+    /// Route/key cap snapshot generation used to prevent stale requests from
+    /// replacing a newer dispatcher cap.
+    pub cap_generation: u64,
     /// Reply channel: Some(Assignment) = assigned, None = timed out.
     pub reply: oneshot::Sender<Option<Assignment>>,
 }
@@ -168,35 +188,51 @@ pub async fn run(
 ) {
     let mut slots: HashMap<SlotKey, SlotState> = HashMap::new();
     let mut pending: VecDeque<PendingRequest> = VecDeque::new();
-
+    let mut cap_generation = 0;
+    // Once a route snapshot is synchronized, this is the sole authority for
+    // initializing a slot. Request-local caps are only a bootstrap fallback
+    // before the first snapshot reaches the dispatcher. This matters during
+    // failover: the reacquire request may still carry the caps captured for
+    // candidate A, while candidate B is a previously unseen slot.
+    let mut authoritative_caps: Option<HashMap<SlotKey, Option<usize>>> = None;
     while let Some(event) = rx.recv().await {
         match event {
-            DispatchEvent::Request(mut req) => match try_assign(&mut req, &mut slots) {
-                Some((index, decision)) => {
-                    let key_slot = req.slot_keys[index].0;
-                    let slot = make_slot_guard(&req, index, &release_tx);
-                    let _ = req.reply.send(Some(Assignment {
-                        index,
-                        slot,
-                        decision,
-                    }));
-                    publish_slot(&sink, &slots, key_slot);
+            DispatchEvent::Request(mut req) => {
+                match try_assign(&mut req, &mut slots, authoritative_caps.as_ref()) {
+                    Some((index, decision)) => {
+                        let key_slot = req.slot_keys[index].0;
+                        let slot = make_slot_guard(&req, index, &release_tx);
+                        let _ = req.reply.send(Some(Assignment {
+                            index,
+                            slot,
+                            decision,
+                        }));
+                        publish_slot(&sink, &slots, key_slot);
+                    }
+                    None if !has_possible_candidate(&req, authoritative_caps.as_ref()) => {
+                        let _ = req.reply.send(None);
+                    }
+                    None => pending.push_back(PendingRequest { request: req }),
                 }
-                None => {
-                    pending.push_back(PendingRequest { request: req });
-                }
-            },
+            }
             DispatchEvent::Release { key } => {
                 if let Some(state) = slots.get_mut(&key) {
                     state.inflight = state.inflight.saturating_sub(1);
                 }
                 publish_slot(&sink, &slots, key);
                 // Try to assign pending requests
-                drain_pending(&mut pending, &mut slots, &release_tx, &sink);
+                drain_pending(
+                    &mut pending,
+                    &mut slots,
+                    authoritative_caps.as_ref(),
+                    &release_tx,
+                    &sink,
+                );
             }
             DispatchEvent::Timeout { request_id } => {
-                if let Some(pos) = pending.iter().position(|p| p.request.id == request_id) {
-                    let req = pending.remove(pos).expect("position valid");
+                if let Some(pos) = pending.iter().position(|p| p.request.id == request_id)
+                    && let Some(req) = pending.remove(pos)
+                {
                     let _ = req.request.reply.send(None);
                 }
             }
@@ -209,6 +245,39 @@ pub async fn run(
                     })
                     .collect();
                 let _ = reply.send(counts);
+            }
+            DispatchEvent::SyncKeyCaps {
+                caps,
+                generation,
+                reply,
+            } => {
+                if generation < cap_generation {
+                    let _ = reply.send(());
+                    continue;
+                }
+                cap_generation = generation;
+                let current: std::collections::HashMap<SlotKey, Option<usize>> =
+                    caps.iter().copied().collect();
+                authoritative_caps = Some(current);
+                if let Some(authoritative_caps) = authoritative_caps.as_ref() {
+                    let mut changed_keys = Vec::new();
+                    for (key, state) in &mut slots {
+                        state.cap = authoritative_caps.get(key).copied().unwrap_or(Some(0));
+                        changed_keys.push(*key);
+                    }
+                    for key in changed_keys {
+                        publish_slot(&sink, &slots, key);
+                    }
+                    update_pending_caps(&mut pending, cap_generation, &slots, authoritative_caps);
+                }
+                let _ = reply.send(());
+                drain_pending(
+                    &mut pending,
+                    &mut slots,
+                    authoritative_caps.as_ref(),
+                    &release_tx,
+                    &sink,
+                );
             }
         }
     }
@@ -236,6 +305,7 @@ fn make_slot_guard(
 fn try_assign(
     req: &mut DispatchRequest,
     slots: &mut HashMap<SlotKey, SlotState>,
+    authoritative_caps: Option<&HashMap<SlotKey, Option<usize>>>,
 ) -> Option<(usize, DispatchDecision)> {
     // Build the full state vector, indexed by candidate index (not order
     // position) so consumers can look up states directly by candidate.
@@ -248,7 +318,7 @@ fn try_assign(
             states[index] = CandidateState::Rested;
             continue;
         }
-        if let Some(result) = try_one(req, index, slots, &mut states) {
+        if let Some(result) = try_one(req, index, slots, authoritative_caps, &mut states) {
             return Some(result);
         }
     }
@@ -259,7 +329,7 @@ fn try_assign(
         if !caps.rested {
             continue; // already tried in pass 1
         }
-        if let Some(result) = try_one(req, index, slots, &mut states) {
+        if let Some(result) = try_one(req, index, slots, authoritative_caps, &mut states) {
             return Some(result);
         }
     }
@@ -274,17 +344,19 @@ fn try_one(
     req: &DispatchRequest,
     index: usize,
     slots: &mut HashMap<SlotKey, SlotState>,
+    authoritative_caps: Option<&HashMap<SlotKey, Option<usize>>>,
     states: &mut [CandidateState],
 ) -> Option<(usize, DispatchDecision)> {
     let caps = &req.caps[index];
     let (key_slot_key, entry_slot_key) = req.slot_keys[index];
+    let key_cap = slot_cap(key_slot_key, caps.key_cap, authoritative_caps);
 
     // Check key-level cap
-    let key_state = slots.entry(key_slot_key).or_insert_with(|| SlotState {
+    let key_state = slots.entry(key_slot_key).or_insert(SlotState {
         inflight: 0,
-        cap: caps.key_cap,
+        cap: key_cap,
     });
-
+    key_state.cap = key_cap;
     if let Some(cap) = key_state.cap
         && key_state.inflight >= cap
     {
@@ -293,12 +365,16 @@ fn try_one(
     }
 
     // Check entry-level cap (if this candidate is from a route entry)
-    if let (Some(entry_cap), Some(entry_key)) = (caps.entry_cap, entry_slot_key) {
-        let entry_state = slots.entry(entry_key).or_insert_with(|| SlotState {
+    if let Some(entry_key) = entry_slot_key {
+        let entry_cap = slot_cap(entry_key, caps.entry_cap, authoritative_caps);
+        let entry_state = slots.entry(entry_key).or_insert(SlotState {
             inflight: 0,
-            cap: Some(entry_cap),
+            cap: entry_cap,
         });
-        if entry_state.inflight >= entry_cap {
+        entry_state.cap = entry_cap;
+        if let Some(cap) = entry_state.cap
+            && entry_state.inflight >= cap
+        {
             states[index] = CandidateState::Full;
             return None;
         }
@@ -307,11 +383,11 @@ fn try_one(
     // Both caps available: assign!
 
     // Increment inflight counts
-    let key_state = slots.get_mut(&key_slot_key).expect("key slot exists");
+    let key_state = slots.get_mut(&key_slot_key)?;
     key_state.inflight += 1;
 
     if let Some(entry_key) = entry_slot_key {
-        let entry_state = slots.get_mut(&entry_key).expect("entry slot exists");
+        let entry_state = slots.get_mut(&entry_key)?;
         entry_state.inflight += 1;
     }
 
@@ -325,23 +401,69 @@ fn try_one(
     Some((index, decision))
 }
 
+fn slot_cap(
+    key: SlotKey,
+    request_cap: Option<usize>,
+    authoritative_caps: Option<&HashMap<SlotKey, Option<usize>>>,
+) -> Option<usize> {
+    authoritative_caps
+        .map(|caps| caps.get(&key).copied().unwrap_or(Some(0)))
+        .unwrap_or(request_cap)
+}
+
+fn update_pending_caps(
+    pending: &mut VecDeque<PendingRequest>,
+    generation: u64,
+    slots: &HashMap<SlotKey, SlotState>,
+    authoritative_caps: &HashMap<SlotKey, Option<usize>>,
+) {
+    for pending in pending {
+        if pending.request.cap_generation > generation {
+            continue;
+        }
+        for (index, (key, entry)) in pending.request.slot_keys.iter().enumerate() {
+            pending.request.caps[index].key_cap = authoritative_caps
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| slots.get(key).map_or(Some(0), |state| state.cap));
+            pending.request.caps[index].entry_cap = entry.map_or(None, |entry| {
+                authoritative_caps
+                    .get(&entry)
+                    .copied()
+                    .unwrap_or_else(|| slots.get(&entry).map_or(Some(0), |state| state.cap))
+            });
+        }
+        pending.request.cap_generation = generation;
+    }
+}
+
 /// Try to assign pending requests after a slot release.
 /// Processes in FIFO order; stops at the first request that can't be assigned
 /// (preserves FIFO fairness — no skipping ahead).
 fn drain_pending(
     pending: &mut VecDeque<PendingRequest>,
     slots: &mut HashMap<SlotKey, SlotState>,
+    authoritative_caps: Option<&HashMap<SlotKey, Option<usize>>>,
     release_tx: &mpsc::UnboundedSender<DispatchEvent>,
     sink: &ActivitySink,
 ) {
-    while let Some(pending_req) = pending.pop_front() {
+    let mut remaining = pending.len();
+    while remaining > 0 {
+        remaining -= 1;
+        let Some(pending_req) = pending.pop_front() else {
+            break;
+        };
         let mut req = pending_req.request;
         // The relay may have already timed out waiting and dropped its receiver;
         // skip silently rather than handing a slot to nobody.
         if req.reply.is_closed() {
             continue;
         }
-        match try_assign(&mut req, slots) {
+        if !has_possible_candidate(&req, authoritative_caps) {
+            let _ = req.reply.send(None);
+            continue;
+        }
+        match try_assign(&mut req, slots, authoritative_caps) {
             Some((index, decision)) => {
                 let key_slot = req.slot_keys[index].0;
                 let slot = make_slot_guard(&req, index, release_tx);
@@ -353,12 +475,28 @@ fn drain_pending(
                 publish_slot(sink, slots, key_slot);
             }
             None => {
-                // Can't assign this one — push it back to the front and stop.
+                // A still-valid request is temporarily full: preserve FIFO and
+                // wait for its release. Permanently invalid requests were
+                // removed by `has_possible_candidate` above.
                 pending.push_front(PendingRequest { request: req });
                 break;
             }
         }
     }
+}
+
+fn has_possible_candidate(
+    req: &DispatchRequest,
+    authoritative_caps: Option<&HashMap<SlotKey, Option<usize>>>,
+) -> bool {
+    req.order.iter().any(|&index| {
+        let caps = req.caps[index];
+        let key_cap = slot_cap(req.slot_keys[index].0, caps.key_cap, authoritative_caps);
+        let entry_cap = req.slot_keys[index]
+            .1
+            .map(|key| slot_cap(key, caps.entry_cap, authoritative_caps));
+        key_cap != Some(0) && entry_cap != Some(Some(0))
+    })
 }
 
 /// Announce a key-level slot's occupancy (absolute, after the change) to the

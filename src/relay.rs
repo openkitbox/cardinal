@@ -62,7 +62,7 @@ use dialects::{
     join_split_tool_call_turns_pending, opencode_headers, vendor_thinking_off_fields,
 };
 use streaming::{
-    AttemptSuccess, HoldSignal, PumpSide, RelayOutcome, StreamPump, spawn_stream_pump,
+    AttemptSuccess, HoldSignal, PumpSide, RelayOutcome, StreamFrames, StreamPump, spawn_stream_pump,
 };
 
 /// Full context of one client request.
@@ -1368,7 +1368,7 @@ pub enum DispatchOutcome {
     /// Streaming success: client-protocol SSE frame stream plus a completion signal for post-processing (usage accounting and persistence run in a background task).
     Stream {
         status: u16,
-        frames: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+        frames: StreamFrames,
         finalize: tokio::sync::oneshot::Receiver<()>,
     },
     /// Request-level failure (no route / no enabled key / all attempts failed): carries the status and message the client should get, plus a Retry-After hint (seconds) when waiting is the documented remedy (gateway-side saturation).
@@ -1400,6 +1400,76 @@ fn call_budget(protocol: ProtocolId, limits: &transport::Limits) -> std::time::D
     match protocol {
         ProtocolId::OpenAiEmbeddings => EMBEDDINGS_BUDGET.min(limits.total),
         _ => limits.total,
+    }
+}
+
+/// Acquire a slot for the remaining failover candidates. The returned index is
+/// absolute in the original candidate vector, and the guard belongs to exactly
+/// that candidate.
+struct DispatchTimeoutGuard {
+    dispatcher: tokio::sync::mpsc::UnboundedSender<dispatcher::DispatchEvent>,
+    request_id: u64,
+    armed: bool,
+}
+
+impl DispatchTimeoutGuard {
+    fn new(
+        dispatcher: tokio::sync::mpsc::UnboundedSender<dispatcher::DispatchEvent>,
+        request_id: u64,
+    ) -> Self {
+        Self {
+            dispatcher,
+            request_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DispatchTimeoutGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.dispatcher.send(dispatcher::DispatchEvent::Timeout {
+                request_id: self.request_id,
+            });
+        }
+    }
+}
+
+async fn acquire_remaining_candidate_slot(
+    dispatcher: tokio::sync::mpsc::UnboundedSender<dispatcher::DispatchEvent>,
+    queue_timeout: std::time::Duration,
+    start_index: usize,
+    slot_keys: &[(SlotKey, Option<SlotKey>)],
+    caps: &[CandidateCaps],
+    cap_generation: u64,
+) -> Result<Option<(usize, SlotGuard)>, ()> {
+    if start_index >= slot_keys.len() {
+        return Ok(None);
+    }
+    let request_id = next_request_id();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    dispatcher
+        .send(DispatchEvent::Request(DispatchRequest {
+            id: request_id,
+            slot_keys: slot_keys[start_index..].to_vec(),
+            order: (0..slot_keys.len() - start_index).collect(),
+            caps: caps[start_index..].to_vec(),
+            cap_generation,
+            reply: reply_tx,
+        }))
+        .map_err(|_| ())?;
+    let mut timeout_guard = DispatchTimeoutGuard::new(dispatcher, request_id);
+    match tokio::time::timeout(queue_timeout, reply_rx).await {
+        Ok(Ok(Some(assignment))) => {
+            timeout_guard.disarm();
+            Ok(Some((start_index + assignment.index, assignment.slot)))
+        }
+        Ok(Ok(None)) | Err(_) => Ok(None),
+        Ok(Err(_)) => Err(()),
     }
 }
 
@@ -1690,6 +1760,7 @@ pub async fn dispatch_at(
     // The last busy-gate verdict's queue wait (None once any real attempt
     // fails): the Retry-After for the terminal verdict when busy is the end.
     let mut retry_after_hint: Option<u64> = None;
+    let mut terminal_concurrency_busy = false;
 
     // restLast: a resting candidate is not skipped but deferred behind the ready
     // ones — a lone resting candidate is still tried, and its fresh error is what
@@ -1760,7 +1831,7 @@ pub async fn dispatch_at(
     // captured before the partition/Smart reorder would misalign with the
     // positions below (a rest flag from stored order would land on a
     // different candidate).
-    let caps: Vec<CandidateCaps> = candidates
+    let candidate_caps: Vec<CandidateCaps> = candidates
         .iter()
         .map(|c| CandidateCaps {
             key_cap: c.key.max_concurrency.map(|n| n as usize),
@@ -1783,16 +1854,10 @@ pub async fn dispatch_at(
         .iter()
         .map(|c| {
             let key_slot = SlotKey::Key(c.key.id as u64);
-            let entry_slot = c.entry_cap.map(|_| {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                c.key.id.hash(&mut hasher);
-                c.upstream_model.hash(&mut hasher);
-                if let Some(alias) = &c.route_alias {
-                    alias.hash(&mut hasher);
-                }
-                SlotKey::Entry(hasher.finish())
-            });
+            let entry_slot = c
+                .route_alias
+                .as_deref()
+                .map(|alias| dispatcher::entry_slot_key(alias, c.key.id as u64, &c.upstream_model));
             (key_slot, entry_slot)
         })
         .collect();
@@ -1808,9 +1873,10 @@ pub async fn dispatch_at(
     // Submit the dispatch request.
     let dispatch_req = DispatchRequest {
         id: request_num,
-        slot_keys,
+        slot_keys: slot_keys.clone(),
         order,
-        caps,
+        caps: candidate_caps.clone(),
+        cap_generation: route_cache.generation(),
         reply: reply_tx,
     };
 
@@ -1826,16 +1892,15 @@ pub async fn dispatch_at(
         };
     }
 
+    let mut timeout_guard = DispatchTimeoutGuard::new(dispatcher.clone(), request_num);
+
     // Wait for assignment with timeout.
     let assignment = match tokio::time::timeout(queue_timeout, reply_rx).await {
-        Ok(Ok(Some(assignment))) => assignment,
+        Ok(Ok(Some(assignment))) => {
+            timeout_guard.disarm();
+            assignment
+        }
         Ok(Ok(None)) | Err(_) => {
-            // All candidates busy: either the dispatcher answered None (its own
-            // Timeout event raced us) or our wait timed out — tell the dispatcher
-            // to drop the pending entry so the queue doesn't leak.
-            let _ = dispatcher.send(DispatchEvent::Timeout {
-                request_id: request_num,
-            });
             retry_after_hint = Some(queue_timeout.as_secs());
             return DispatchOutcome::Failed {
                 status: 429,
@@ -1870,7 +1935,41 @@ pub async fn dispatch_at(
     });
     trace_ring.push(trace);
 
-    'candidates: for (index, candidate) in candidates.iter().enumerate().skip(start_index) {
+    let mut index = start_index;
+    'candidates: loop {
+        if slot.is_none() {
+            match acquire_remaining_candidate_slot(
+                dispatcher.clone(),
+                queue_timeout,
+                index,
+                &slot_keys,
+                &candidate_caps,
+                route_cache.generation(),
+            )
+            .await
+            {
+                Ok(Some((assigned_index, candidate_slot))) => {
+                    debug_assert!(assigned_index >= index);
+                    index = assigned_index;
+                    slot = Some(candidate_slot);
+                }
+                Ok(None) => {
+                    terminal_concurrency_busy = true;
+                    retry_after_hint = Some(queue_timeout.as_secs());
+                    break;
+                }
+                Err(()) => {
+                    return DispatchOutcome::Failed {
+                        status: 500,
+                        message: "dispatcher unavailable".into(),
+                        retry_after_secs: None,
+                    };
+                }
+            }
+        }
+        let Some(candidate) = candidates.get(index) else {
+            break;
+        };
         let is_last = index + 1 == candidates.len();
         let provider = &candidate.provider;
         let target_model = candidate.upstream_model.as_str();
@@ -1902,6 +2001,7 @@ pub async fn dispatch_at(
                 );
             }
             drop(slot.take()); // Release the slot before failing over.
+            index += 1;
             continue 'candidates;
         };
         // Gemini bakes the upstream model into the URL; substitute the pattern's
@@ -2071,7 +2171,6 @@ pub async fn dispatch_at(
                 }) => {
                     let (usage_tx, usage_rx) = tokio::sync::oneshot::channel();
                     let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
-                    let (permit_tx, permit_rx) = tokio::sync::oneshot::channel();
                     // Response-body accumulator, one per streaming attempt (an
                     // aborted attempt's buffer is dropped unread with the outcome).
                     let captured = capture.as_ref().map(|_| CapturedBody::new());
@@ -2080,7 +2179,6 @@ pub async fn dispatch_at(
                         pump,
                         usage_tx,
                         commit_tx,
-                        permit_rx,
                         PumpSide {
                             payload_log: request.payload_log,
                             captured,
@@ -2090,17 +2188,11 @@ pub async fn dispatch_at(
                         },
                     );
                     match commit_rx.await {
-                        Ok(HoldSignal::Committed) => {
-                            // Locked in: the pump guards the slot for the stream's life.
-                            if let Some(slot) = slot.take() {
-                                let _ = permit_tx.send(slot);
-                            }
-                            Ok(AttemptSuccess::Stream {
-                                status,
-                                frames,
-                                usage_rx,
-                            })
-                        }
+                        Ok(HoldSignal::Committed) => Ok(AttemptSuccess::Stream {
+                            status,
+                            frames,
+                            usage_rx,
+                        }),
                         // A dropped verdict channel means the pump panicked: nothing
                         // reached the client either way, so it reads as an abort.
                         Ok(HoldSignal::Aborted) | Err(_) => {
@@ -2249,11 +2341,12 @@ pub async fn dispatch_at(
                     });
                     return DispatchOutcome::Stream {
                         status,
-                        frames,
+                        frames: StreamFrames::new(frames, slot.take()),
                         finalize: finalize_rx,
                     };
                 }
                 Err(error) => {
+                    terminal_concurrency_busy = false;
                     retry_after_hint = None;
                     let attempt = AttemptLog::from_error(
                         capability.protocol,
@@ -2379,6 +2472,7 @@ pub async fn dispatch_at(
                             "attempt failed without blaming the key, failing over: {}",
                             error.message()
                         );
+                        index += 1;
                         continue 'candidates;
                     }
                     // An `Other` failure bumps the key's consecutive-failure counter once
@@ -2391,6 +2485,7 @@ pub async fn dispatch_at(
                     };
                     let Some(rest_target) = failure.rest_target(consecutive, chrono::Utc::now())
                     else {
+                        index += 1;
                         continue 'candidates;
                     };
                     let (duration, rest_model) = match rest_target {
@@ -2410,6 +2505,7 @@ pub async fn dispatch_at(
                         "attempt failed, failing over: {} (resting until {until})",
                         error.message()
                     );
+                    index += 1;
                     continue 'candidates;
                 }
             }
@@ -2420,15 +2516,23 @@ pub async fn dispatch_at(
     // leave attempts empty — the push is then a no-op and no Persisted fires,
     // same as the old per-request guard. The outcome fields are lifted first
     // so the push can take ownership (no clone of the attempt rows).
-    let outcome = attempts.last().map(|last| {
-        (
-            last.status,
-            last.error
-                .clone()
-                .unwrap_or_else(|| "upstream failed".into()),
+    let outcome = if terminal_concurrency_busy {
+        Some((
+            429,
+            format!("all candidates busy after {queue_timeout:?}"),
             retry_after_hint,
-        )
-    });
+        ))
+    } else {
+        attempts.last().map(|last| {
+            (
+                last.status,
+                last.error
+                    .clone()
+                    .unwrap_or_else(|| "upstream failed".into()),
+                retry_after_hint,
+            )
+        })
+    };
     ledger.push(attempts);
     match outcome {
         Some((status, message, retry_after_secs)) => {
