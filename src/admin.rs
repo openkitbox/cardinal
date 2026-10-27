@@ -114,7 +114,7 @@ async fn admin_auth(
     ctrl.skip_rest();
 }
 
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }

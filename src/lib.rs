@@ -39,6 +39,7 @@ pub mod standalone;
 pub mod store;
 pub mod translation;
 pub mod upstream;
+pub mod user_usage;
 
 /// This crate's schema migrator (`migrations/`). Composition roots run it
 /// once at startup via `crate::db::Db::migrate("gateway", gateway::migrator())`.

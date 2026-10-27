@@ -748,6 +748,7 @@ pub fn router(
                 .push(Router::with_path("models").get(list_gemini_models))
                 .push(Router::with_path("models/{**call}").post(gemini_generate)),
         )
-        .push(crate::admin::router(admin_key, admin_remote))
+        .push(crate::admin::router(Arc::clone(&admin_key), admin_remote))
+        .push(crate::user_usage::router(admin_key))
         .hoop(affix_state::inject(state))
 }
