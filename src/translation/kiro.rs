@@ -283,7 +283,7 @@ fn kas_model(model: &str) -> Option<&'static str> {
     let id = if let Some(family) = FAMILIES.iter().find(|family| lower.contains(family.name)) {
         map_family(&lower, family)
     } else if lower.contains("gpt") {
-        gpt_model(&lower)
+        crate::kiro::gpt_model(&lower)
     } else {
         None
     }?;
@@ -308,29 +308,6 @@ fn map_family(lower: &str, family: &Family) -> Option<&'static str> {
 
 fn family_fallback(family: &Family) -> Option<&'static str> {
     family.versions.last().map(|(_, id)| *id)
-}
-
-/// The GPT-5.6 discriminating tokens (reference `mapModel`): `sol`, `terra`,
-/// `luna`, and the `codex` alias for the flagship. A bare `gpt-5.6` names no
-/// variant and is refused. `lower` must already be trimmed and lowercased.
-///
-/// The canonical id is also the id the vendor's model catalogue
-/// (`ListAvailableModels`) lists, so the relay's metadata lookup resolves a
-/// configured alias to the same snapshot entry through this one mapping.
-pub(crate) fn gpt_model(lower: &str) -> Option<&'static str> {
-    if lower.contains("sol") {
-        return Some("gpt-5.6-sol");
-    }
-    if lower.contains("terra") {
-        return Some("gpt-5.6-terra");
-    }
-    if lower.contains("luna") {
-        return Some("gpt-5.6-luna");
-    }
-    if lower.contains("codex") {
-        return Some("gpt-5.6-sol");
-    }
-    None
 }
 
 /// The version code next to a family name: after the name first
@@ -1533,7 +1510,7 @@ pub fn response_to_ir(
     raw: &[u8],
     context_window: Option<u64>,
 ) -> Result<IrResponse, ProtocolError> {
-    let decoder = crate::protocol::kiro::aggregate(raw, context_window)?;
+    let mut decoder = crate::protocol::kiro::aggregate(raw, context_window)?;
     if decoder.failed() {
         return Err(ProtocolError::InvalidUpstreamResponse);
     }
@@ -1567,14 +1544,17 @@ pub fn response_to_ir(
         }
         crate::protocol::Terminal::Cancelled => return Err(ProtocolError::InvalidUpstreamResponse),
     };
+    // `usage` estimates output tokens from the accumulated text, so it must be
+    // read before the text is moved out below.
+    let usage = decoder.usage();
+    let reasoning = decoder.take_reasoning();
+    let text = decoder.take_text();
     let mut content = Vec::new();
-    if !decoder.reasoning().is_empty() {
-        content.push(IrPart::Thinking {
-            text: decoder.reasoning().to_owned(),
-        });
+    if !reasoning.is_empty() {
+        content.push(IrPart::Thinking { text: reasoning });
     }
-    if !decoder.text().is_empty() {
-        content.push(IrPart::Text(decoder.text().to_owned()));
+    if !text.is_empty() {
+        content.push(IrPart::Text(text));
     }
     for call in decoder.tool_calls() {
         // An incomplete call's arguments are not known to be valid JSON and
@@ -1628,7 +1608,7 @@ pub fn response_to_ir(
         model: String::new(),
         content,
         stop,
-        usage: decoder.usage(),
+        usage,
     })
 }
 

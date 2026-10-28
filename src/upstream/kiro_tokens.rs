@@ -15,7 +15,7 @@
 //!   one freshness rule (`expires_at > now + 600`).
 //! * **One refresh per key.** Each key owns an async mutex; a waiter rechecks
 //!   freshness under the lock and skips the refresh another caller performed.
-//!   The same lock de-duplicates the 401 path ([`KiroTokens::recover_invalidated`]):
+//!   The same lock de-duplicates the 401 path ([`KiroTokens::recover_invalidated_for_endpoint`]):
 //!   N concurrent requests that all presented the same stale bearer trigger
 //!   exactly one `CreateToken`.
 //! * **Disk is authoritative only while memory is persisted.** The route cache
@@ -44,7 +44,7 @@
 //!   and an unchanged row stays permanently invalidated. Memory is only replaced
 //!   by a successful exchange or by the fresh stored bearer, so a failed recovery
 //!   never rolls back a newer in-memory bundle.
-//! * **The 401 path rereads the row.** [`KiroTokens::recover_invalidated`]
+//! * **The 401 path rereads the row.** [`KiroTokens::recover_invalidated_for_endpoint`]
 //!   rereads the credential under the key's lock before refreshing: a stored
 //!   bearer different from the rejected one and still fresh is returned as is
 //!   (the external rotation case), and a changed-but-stale bundle becomes the
@@ -241,7 +241,7 @@ pub struct KiroCallContext {
     bearer: SecretString,
     pub profile_arn: Option<String>,
     /// The credential's AWS region for its runtime host (`runtime.{region}.kiro.dev`).
-    /// Non-secret: the relay reasserts the endpoint against it after resolving a
+    /// Non-secret: the manager reasserts the endpoint against it after resolving a
     /// credential, so a route-cache bundle that lags behind a region move cannot
     /// validate the wrong host before the bearer is sent.
     pub api_region: String,
@@ -647,11 +647,55 @@ impl KiroTokens {
         }
     }
 
+    /// [`Self::access_token`] for a bearer that will be sent to `endpoint`.
+    ///
+    /// The bearer may only travel to the credential's own
+    /// `runtime.{api_region}.kiro.dev` origin, never to an operator-editable
+    /// `base_url`. The route-cache bundle is checked BEFORE any credential
+    /// resolution (no bearer, no refresh request, no database read happens for a
+    /// contradicting endpoint), and the resolved bundle is checked again because
+    /// the cached copy can lag a region move. Fails closed.
+    pub async fn access_token_for_endpoint(
+        &self,
+        pool: &PgPool,
+        key: &ProviderKeyRow,
+        endpoint: &str,
+    ) -> Result<KiroCallContext, KiroTokenError> {
+        let oauth = key
+            .oauth
+            .as_ref()
+            .ok_or(KiroTokenError::MissingCredential)?;
+        ensure_endpoint(key, endpoint, &oauth.api_region, EndpointStage::Precheck)?;
+        let call = self.access_token(pool, key).await?;
+        ensure_endpoint(key, endpoint, &call.api_region, EndpointStage::Resolved)?;
+        Ok(call)
+    }
+
+    /// The 401 recovery (`recover_invalidated`) for a bearer that will be resent to
+    /// `endpoint`: the refreshed bundle may have moved to another API region, so
+    /// it is reasserted against the endpoint before the new bearer is returned.
+    pub async fn recover_invalidated_for_endpoint(
+        &self,
+        pool: &PgPool,
+        key: &ProviderKeyRow,
+        endpoint: &str,
+        old_bearer: &str,
+    ) -> Result<KiroCallContext, KiroTokenError> {
+        let recovered = self.recover_invalidated(pool, key, old_bearer).await?;
+        ensure_endpoint(
+            key,
+            endpoint,
+            &recovered.api_region,
+            EndpointStage::Recovered,
+        )?;
+        Ok(recovered)
+    }
+
     /// The bearer was rejected by the runtime service: rotate once. Concurrent
     /// callers that all presented the same stale bearer de-duplicate here — the
     /// first rotates under the lock, the rest observe a different current bearer
     /// and reuse it.
-    pub async fn recover_invalidated(
+    async fn recover_invalidated(
         &self,
         pool: &PgPool,
         key: &ProviderKeyRow,
@@ -1087,6 +1131,49 @@ impl KiroTokens {
     fn token_url(&self, auth_region: &str) -> String {
         format!("https://oidc.{auth_region}.amazonaws.com/token")
     }
+}
+
+/// Where in the credential lifecycle the endpoint pin is being asserted; only
+/// selects the log line.
+#[derive(Clone, Copy)]
+enum EndpointStage {
+    /// The route cache's bundle, before any credential resolution.
+    Precheck,
+    /// The bundle `access_token` resolved.
+    Resolved,
+    /// The bundle a 401 recovery produced.
+    Recovered,
+}
+
+/// The one runtime-host pin: `endpoint` must be exactly this credential's
+/// `runtime.{api_region}.kiro.dev` origin, or the bearer must not be sent.
+fn ensure_endpoint(
+    key: &ProviderKeyRow,
+    endpoint: &str,
+    api_region: &str,
+    stage: EndpointStage,
+) -> Result<(), KiroTokenError> {
+    if crate::kiro::kas_endpoint_matches(endpoint, api_region) {
+        return Ok(());
+    }
+    match stage {
+        EndpointStage::Precheck => tracing::warn!(
+            provider_id = key.provider_id,
+            key_id = key.id,
+            "Kiro runtime endpoint contradicts the credential's API region; refusing to send the bearer"
+        ),
+        EndpointStage::Resolved => tracing::warn!(
+            provider_id = key.provider_id,
+            key_id = key.id,
+            "Kiro credential's API region contradicts the runtime endpoint after token resolution; refusing to send the bearer"
+        ),
+        EndpointStage::Recovered => tracing::warn!(
+            provider_id = key.provider_id,
+            key_id = key.id,
+            "recovered Kiro credential's API region no longer matches the runtime endpoint; refusing to resend the bearer"
+        ),
+    }
+    Err(KiroTokenError::EndpointMismatch)
 }
 
 fn call_context(oauth: &KiroOAuth) -> KiroCallContext {

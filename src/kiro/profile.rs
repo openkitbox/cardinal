@@ -104,28 +104,6 @@ pub fn retry_headers(
     headers
 }
 
-/// Rewrite the retry triple **in place** on an already-prepared header list.
-///
-/// The transport appends a caller's header list after the prepared one, so a
-/// retry that merely appended a second `amz-sdk-request` / `x-kiro-attempt`
-/// would put two contradictory values on the wire. This finds the existing
-/// entries (same names, same positions) and replaces their values, reusing the
-/// invocation id: the retry is the same logical call, one attempt later.
-pub fn replace_retry_headers(
-    headers: &mut Vec<(&'static str, String)>,
-    invocation: &str,
-    attempt: u32,
-    max: u32,
-    now: DateTime<Utc>,
-) {
-    for (name, value) in retry_headers(invocation, attempt, max, true, now) {
-        match headers.iter_mut().find(|(existing, _)| *existing == name) {
-            Some(slot) => slot.1 = value,
-            None => headers.push((name, value)),
-        }
-    }
-}
-
 /// The static KAS headers (everything except the retry triple and the
 /// credential, which the relay injects from the resolved key).
 pub fn kas_static_headers() -> Vec<(&'static str, String)> {

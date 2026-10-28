@@ -67,9 +67,10 @@
 //!   response observes the whole body by construction.
 //! * **The streaming decoder accumulates the full text and reasoning.** The
 //!   same [`StreamDecoder`] backs the streamed and buffered paths (one state
-//!   machine, no drift), so a streamed response keeps a second copy of every
-//!   text/reasoning delta in memory although only deltas are forwarded. That is
-//!   one copy per response, never a per-chunk allocation.
+//!   machine, no drift), so a streamed response keeps one full copy of the
+//!   text/reasoning in memory although only deltas are forwarded, and each
+//!   delta event costs one small allocation. The buffered path moves the
+//!   accumulated text into the IR rather than copying it again.
 
 use super::awseventstream::{Framer, Message};
 use super::usage::UsageCounts;
@@ -510,6 +511,19 @@ impl StreamDecoder {
 
     pub fn reasoning(&self) -> &str {
         &self.reasoning
+    }
+
+    /// Move the accumulated text out, leaving the decoder's copy empty. Call
+    /// it after every read that depends on the text ([`Self::usage`] counts
+    /// its characters, [`Self::content_seen`] its emptiness).
+    pub fn take_text(&mut self) -> String {
+        std::mem::take(&mut self.text)
+    }
+
+    /// Move the accumulated reasoning out; same ordering caveat as
+    /// [`Self::take_text`].
+    pub fn take_reasoning(&mut self) -> String {
+        std::mem::take(&mut self.reasoning)
     }
 
     pub fn reasoning_signature(&self) -> Option<&str> {

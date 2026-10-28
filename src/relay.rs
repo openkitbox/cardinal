@@ -413,45 +413,13 @@ async fn send_attempt(
     // moved the account identity is reflected before the body is prepared.
     let mut kiro_call: Option<KiroCallContext> = match (protocol, kiro) {
         (ProtocolId::Kiro, Some(deps)) => {
-            // Pin the destination BEFORE resolving a credential: a bearer must
-            // only ever travel to the credential's own runtime host, never to
-            // an operator-editable `base_url`. Fail closed on a mismatch.
-            let api_region = deps
-                .key
-                .oauth
-                .as_ref()
-                .map(|oauth| oauth.api_region.as_str())
-                .ok_or(failover::AttemptError::KiroTokenError(
-                    kiro_tokens::KiroTokenError::MissingCredential,
-                ))?;
-            if !crate::kiro::kas_endpoint_matches(&capability.endpoint, api_region) {
-                tracing::warn!(
-                    provider_id = deps.key.provider_id,
-                    key_id = deps.key.id,
-                    "Kiro runtime endpoint contradicts the credential's API region; refusing to send the bearer"
-                );
-                return Err(failover::AttemptError::KiroTokenError(
-                    kiro_tokens::KiroTokenError::EndpointMismatch,
-                ));
-            }
+            // The manager pins the destination to the credential's own runtime
+            // host before and after resolving it; fail closed on a mismatch.
             let call = deps
                 .tokens
-                .access_token(deps.pool, deps.key)
+                .access_token_for_endpoint(deps.pool, deps.key, &capability.endpoint)
                 .await
                 .map_err(failover::AttemptError::KiroTokenError)?;
-            // Reassert against the RESOLVED bundle: the pre-check read the
-            // route cache's copy, which can lag a region move. The bearer must
-            // only ever travel to its own credential's runtime host.
-            if !crate::kiro::kas_endpoint_matches(&capability.endpoint, &call.api_region) {
-                tracing::warn!(
-                    provider_id = deps.key.provider_id,
-                    key_id = deps.key.id,
-                    "Kiro credential's API region contradicts the runtime endpoint after token resolution; refusing to send the bearer"
-                );
-                return Err(failover::AttemptError::KiroTokenError(
-                    kiro_tokens::KiroTokenError::EndpointMismatch,
-                ));
-            }
             Some(call)
         }
         (ProtocolId::Kiro, None) => {
@@ -611,58 +579,37 @@ async fn send_attempt(
             .await
             .unwrap_or_default();
         // Kiro: the runtime's own invalidation signal licenses exactly one
-        // refresh-and-resend of this SAME invocation (same URL, same body,
-        // attempt advanced in place). Any other 401/403 — or a second rejection
+        // refresh-and-resend of this SAME invocation (same invocation id, the
+        // wire re-prepared with the refreshed identity, attempt advanced).
+        // Any other 401/403 — or a second rejection
         // after the refresh — falls through to the ordinary failure path.
         if !kiro_retried
             && kiro_tokens::bearer_token_invalid(status, &body)
             && let (Some(deps), Some(call)) = (kiro, &kiro_call)
         {
             kiro_retried = true;
-            let old_bearer = call.bearer().to_owned();
-            let old_profile_arn = call.profile_arn.clone();
             // Concurrent requests that presented the same stale bearer
             // de-duplicate in the manager: one CreateToken, everyone reuses.
             let recovered = deps
                 .tokens
-                .recover_invalidated(deps.pool, deps.key, &old_bearer)
+                .recover_invalidated_for_endpoint(
+                    deps.pool,
+                    deps.key,
+                    &capability.endpoint,
+                    call.bearer(),
+                )
                 .await
                 .map_err(failover::AttemptError::KiroTokenError)?;
-            // The refreshed bundle may have moved to another API region (an
-            // operator rotation): reassert before resending this bearer.
-            if !crate::kiro::kas_endpoint_matches(&capability.endpoint, &recovered.api_region) {
-                tracing::warn!(
-                    provider_id = deps.key.provider_id,
-                    key_id = deps.key.id,
-                    "recovered Kiro credential's API region no longer matches the runtime endpoint; refusing to resend the bearer"
-                );
-                return Err(failover::AttemptError::KiroTokenError(
-                    kiro_tokens::KiroTokenError::EndpointMismatch,
-                ));
-            }
-            if recovered.profile_arn != old_profile_arn
-                && let Some(profile_arn) = recovered.profile_arn.as_deref()
-            {
-                // Cold path: the account identity moved, so the already-built
-                // KAS body must name the new profile or the call is rejected.
-                set_profile_arn(&mut prepared, profile_arn);
-            }
             kiro_profile_arn = recovered.profile_arn.clone();
             headers = vec![("authorization", format!("Bearer {}", recovered.bearer()))];
             kiro_call = Some(recovered);
-            // Same logical call, one attempt later: REPLACE the retry headers in
-            // place. The transport appends a caller's header list, so appending
-            // a second triple would send duplicate, contradictory values.
-            if let Some(call) = &kas_call {
-                let attempt = call.next_attempt();
-                crate::kiro::profile::replace_retry_headers(
-                    &mut prepared.headers,
-                    call.invocation(),
-                    attempt,
-                    crate::kiro::profile::KIRO_MAX_ATTEMPTS,
-                    chrono::Utc::now(),
-                );
-            }
+            // Cold path, at most once per attempt: rebuild the wire through the
+            // one preparation path. The refresh may have moved the account
+            // identity (`profileArn`), and `prepare` advances the shared
+            // `KasCall` itself, so the retry headers are replaced wholesale —
+            // same invocation id, one attempt later — with no second writer.
+            prepared = prepare(&skip, kiro_profile_arn.as_deref())
+                .map_err(failover::AttemptError::Protocol)?;
             tracing::warn!(
                 key_id = deps.key.id,
                 status,
@@ -720,33 +667,6 @@ async fn send_attempt(
                 None => failover::AttemptError::Transport(transport::TransportError::InvalidBody),
             },
         );
-    }
-}
-
-/// Point an already-prepared KAS body at a rotated account identity.
-///
-/// One cold-path parse/re-render, taken at most once per attempt: the body was
-/// built from the bundle the token manager knew before the 401, and a refresh
-/// that returned a new `profileArn` invalidates that copy. A body that cannot
-/// be parsed is left untouched (the resend then fails upstream like any other
-/// malformed request, which is the honest outcome).
-fn set_profile_arn(prepared: &mut protocol::Prepared, profile_arn: &str) {
-    let Ok(mut body) = serde_json::from_slice::<Value>(&prepared.body) else {
-        return;
-    };
-    let Some(object) = body.as_object_mut() else {
-        return;
-    };
-    if object.get("profileArn").and_then(Value::as_str) == Some(profile_arn) {
-        return;
-    }
-    object.insert(
-        "profileArn".to_owned(),
-        Value::String(profile_arn.to_owned()),
-    );
-    match serde_json::to_vec(&body) {
-        Ok(rendered) => prepared.body = bytes::Bytes::from(rendered),
-        Err(_) => tracing::warn!("Kiro profileArn update could not re-render the prepared body"),
     }
 }
 

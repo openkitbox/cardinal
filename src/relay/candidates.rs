@@ -85,7 +85,7 @@ fn snapshot_entry<'a>(
     if !lower.contains("gpt") {
         return None;
     }
-    let canonical = crate::translation::kiro::gpt_model(&lower)?;
+    let canonical = crate::kiro::gpt_model(&lower)?;
     models
         .iter()
         .find(|entry| entry.id.eq_ignore_ascii_case(canonical))
