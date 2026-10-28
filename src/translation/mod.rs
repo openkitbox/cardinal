@@ -55,21 +55,15 @@ pub const MATRIX_DIALECTS: [ProtocolId; 4] = [
 /// Parse result: the IR plus structured notes on concepts that did not survive.
 pub type Parsed<T> = Result<(T, Vec<&'static str>), crate::protocol::ProtocolError>;
 
-/// The `response_to_ir` shape: body plus the served model's declared metadata.
-pub type ResponseToIr = fn(
-    &[u8],
-    Option<u64>,
-    Option<f64>,
-    Option<&str>,
-) -> Result<ir::IrResponse, crate::protocol::ProtocolError>;
+/// The `response_to_ir` shape: body plus the served model's declared context window.
+pub type ResponseToIr =
+    fn(&[u8], Option<u64>) -> Result<ir::IrResponse, crate::protocol::ProtocolError>;
 
 /// Protocol-neutral dialect surface used by the relay pipeline. Only dialects
 /// whose adapters have shipped return a value.
 ///
-/// `response_to_ir` takes the served model's declared context window, rate
-/// multiplier and requested id, which the Kiro dialect uses to estimate prompt
-/// tokens and derive its GPT-5.6 cache-read split; every other dialect ignores
-/// them.
+/// `response_to_ir` takes the served model's declared context window, which the
+/// Kiro dialect uses to estimate prompt tokens; every other dialect ignores it.
 pub struct Dialect {
     pub to_ir: fn(&serde_json::Value, u64) -> Parsed<ir::IrRequest>,
     pub from_ir: fn(&ir::IrRequest, &str) -> Parsed<serde_json::Value>,

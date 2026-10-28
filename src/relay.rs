@@ -355,8 +355,6 @@ struct AttemptContext<'a> {
     /// The candidate model's declared context window. `None` = unknown, so the
     /// response decoder must omit usage rather than invent it.
     context_window: Option<u64>,
-    /// Kiro's model pricing multiplier, carried into decoder construction only.
-    rate_multiplier: Option<f64>,
     /// 路由层固定 effort 档位;`None` = 直连或 legacy 路由(快照 clamp)。
     route_efforts: Option<&'a [Effort]>,
     /// 当前候选 (provider, model family) 的 effort 方言。
@@ -392,9 +390,8 @@ async fn send_attempt(
         fixups,
         supported_efforts,
         default_effort,
-        // Only the response decoders read the window/multiplier; the request path never needs them.
+        // Only the response decoders read the window; the request path never needs it.
         context_window: _,
-        rate_multiplier: _,
         route_efforts,
         dial,
         kiro,
@@ -770,12 +767,7 @@ async fn attempt_stream(
 
     let pump = if request.protocol == protocol {
         StreamPump::PassThrough {
-            decoder: protocol::Decoder::new(
-                protocol,
-                ctx.context_window,
-                ctx.rate_multiplier,
-                Some(target_model.to_owned()),
-            ),
+            decoder: protocol::Decoder::new(protocol, ctx.context_window),
         }
     } else {
         // Translation: synthesize frames in the client protocol.
@@ -788,8 +780,6 @@ async fn attempt_stream(
             upstream: protocol,
             translator,
             context_window: ctx.context_window,
-            rate_multiplier: ctx.rate_multiplier,
-            model: target_model.to_owned(),
         }
     };
     Ok(RelayOutcome::Stream {
@@ -816,27 +806,16 @@ async fn attempt_json(
 
     let observed = if request.protocol == protocol {
         // Passthrough: observe per the target protocol.
-        protocol::parse_json(
-            protocol,
-            &body,
-            ctx.context_window,
-            ctx.rate_multiplier,
-            Some(target_model.to_owned()),
-        )
-        .map_err(failover::AttemptError::Protocol)?
+        protocol::parse_json(protocol, &body, ctx.context_window)
+            .map_err(failover::AttemptError::Protocol)?
     } else {
         // Translation: upstream response → IR → source-protocol shape.
         let upstream_dialect =
             translation::dialect(protocol).map_err(failover::AttemptError::Protocol)?;
         let source_dialect =
             translation::dialect(request.protocol).map_err(failover::AttemptError::Protocol)?;
-        let mut ir = (upstream_dialect.response_to_ir)(
-            &body,
-            ctx.context_window,
-            ctx.rate_multiplier,
-            Some(target_model),
-        )
-        .map_err(failover::AttemptError::Protocol)?;
+        let mut ir = (upstream_dialect.response_to_ir)(&body, ctx.context_window)
+            .map_err(failover::AttemptError::Protocol)?;
         // A dialect that derives token usage from a context percentage (Kiro)
         // hands the estimate to the ledger and NOT to the client body: every
         // other upstream's `usage` is a count the vendor actually reported.
@@ -2128,7 +2107,6 @@ pub async fn dispatch_at(
                         supported_efforts: candidate.supported_efforts.as_deref(),
                         default_effort: candidate.default_effort,
                         context_window: candidate.context_window,
-                        rate_multiplier: candidate.rate_multiplier,
                         route_efforts: efforts.as_deref(),
                         dial: capabilities::effort_dial(&provider.name, target_model),
                         // Only a Kiro candidate touches token state or PG.

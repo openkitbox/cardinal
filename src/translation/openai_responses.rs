@@ -519,8 +519,6 @@ pub fn from_ir(
 pub fn response_to_ir(
     _raw: &[u8],
     _context_window: Option<u64>,
-    _rate_multiplier: Option<f64>,
-    _model: Option<&str>,
 ) -> Result<IrResponse, ProtocolError> {
     Err(ProtocolError::UnsupportedApi)
 }

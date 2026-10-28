@@ -97,10 +97,6 @@ pub(super) enum StreamPump {
         /// The served model's declared context window, handed to the upstream
         /// decoder (Kiro derives prompt tokens from it).
         context_window: Option<u64>,
-        /// Kiro's model multiplier, carried into the decoder without affecting
-        /// token accounting.
-        rate_multiplier: Option<f64>,
-        model: String,
     },
 }
 
@@ -617,11 +613,8 @@ async fn drive_stream(
             upstream,
             mut translator,
             context_window,
-            rate_multiplier,
-            model,
         } => {
-            let mut upstream =
-                protocol::Decoder::new(upstream, context_window, rate_multiplier, Some(model));
+            let mut upstream = protocol::Decoder::new(upstream, context_window);
             let mut done = false;
             while !done {
                 if hold.is_some() && tx.is_closed() {

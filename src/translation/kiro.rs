@@ -1532,15 +1532,8 @@ fn dedup_notes(notes: Vec<&'static str>) -> Vec<&'static str> {
 pub fn response_to_ir(
     raw: &[u8],
     context_window: Option<u64>,
-    rate_multiplier: Option<f64>,
-    model: Option<&str>,
 ) -> Result<IrResponse, ProtocolError> {
-    let decoder = crate::protocol::kiro::aggregate(
-        raw,
-        context_window,
-        rate_multiplier,
-        model.map(str::to_owned),
-    )?;
+    let decoder = crate::protocol::kiro::aggregate(raw, context_window)?;
     if decoder.failed() {
         return Err(ProtocolError::InvalidUpstreamResponse);
     }
