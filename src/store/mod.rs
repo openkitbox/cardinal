@@ -16,8 +16,8 @@ mod route;
 mod usage;
 
 pub use gateway_key::{
-    GatewayKeyInfo, GatewayKeyRow, create_gateway_key, gateway_key_info, list_gateway_keys,
-    seed_gateway_key, set_gateway_key_enabled, touch_gateway_key,
+    GatewayKeyInfo, GatewayKeyRow, create_gateway_key, gateway_key_info, is_label_taken,
+    list_gateway_keys, seed_gateway_key, set_gateway_key_enabled,
 };
 pub use key::{
     ActiveWindow, AvailabilityRule, EnabledKeyModels, KeyModels, KeyPatch, KiroUpsertError,

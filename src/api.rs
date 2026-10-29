@@ -688,12 +688,6 @@ async fn gateway_auth(
         // Registered key: the caller is its label (chosen by the owner) —
         // never the raw key value.
         depot.insert(CALLER_KEY, info.label.clone());
-        // Fire-and-forget: update last_used_at.
-        let pool = pool.clone();
-        let id = info.id;
-        tokio::spawn(async move {
-            crate::store::touch_gateway_key(&pool, id).await;
-        });
         return;
     }
     // Loopback without a proxy's forwarding headers is this computer itself:

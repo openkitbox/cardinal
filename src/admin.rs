@@ -716,6 +716,10 @@ async fn create_gateway_key(request: &mut Request, depot: &mut Depot, response: 
     let created_by = depot.get_typed::<String>().ok().map(|s| s.as_str());
     match store::create_gateway_key(pool, body.label.trim(), created_by).await {
         Ok(key) => json_response(response, &json!({ "key": key })),
+        Err(error) if store::is_label_taken(&error) => {
+            response.status_code(StatusCode::CONFLICT);
+            json_response(response, &json!({ "error": "label already in use" }));
+        }
         Err(error) => internal(response, error),
     }
 }

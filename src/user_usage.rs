@@ -148,7 +148,6 @@ async fn user_auth(
         return;
     };
     depot.insert(CALLER_KEY, label);
-    tokio::spawn(async move { store::touch_gateway_key(&pool, info.id).await });
 }
 
 #[derive(Deserialize)]

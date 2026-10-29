@@ -10,10 +10,18 @@ pub struct GatewayKeyInfo {
 
 /// Startup seeding: idempotently record the configured gateway auth key.
 pub async fn seed_gateway_key(pool: &PgPool, gateway_key: &str) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO gateway_keys (key_plaintext, label) VALUES ($1, 'default') ON CONFLICT (key_plaintext) DO NOTHING")
-        .bind(gateway_key)
-        .execute(pool)
-        .await?;
+    // Labels are unique: if 'default' already belongs to another key (the
+    // configured key was rotated), the new one gets a derived label instead
+    // of failing startup.
+    sqlx::query(
+        "INSERT INTO gateway_keys (key_plaintext, label)
+         SELECT $1, CASE WHEN EXISTS (SELECT 1 FROM gateway_keys WHERE label = 'default')
+                         THEN 'default-' || substr(md5($1), 1, 8) ELSE 'default' END
+         ON CONFLICT (key_plaintext) DO NOTHING",
+    )
+    .bind(gateway_key)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -28,14 +36,6 @@ pub async fn gateway_key_info(pool: &PgPool, key: &str) -> anyhow::Result<Option
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(id, label, enabled)| GatewayKeyInfo { id, label, enabled }))
-}
-
-/// Touch `last_used_at` for a successfully authenticated key (fire-and-forget).
-pub async fn touch_gateway_key(pool: &PgPool, id: i64) {
-    let _ = sqlx::query("UPDATE gateway_keys SET last_used_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await;
 }
 
 /// Gateway key row for admin listing.
@@ -67,7 +67,10 @@ pub async fn list_gateway_keys(pool: &PgPool) -> anyhow::Result<Vec<GatewayKeyRo
             Option<chrono::DateTime<chrono::Utc>>,
         ),
     >(
-        "SELECT id, key_plaintext, label, enabled, created_at, created_by, last_used_at, disabled_at FROM gateway_keys ORDER BY created_at DESC",
+        "SELECT k.id, k.key_plaintext, k.label, k.enabled, k.created_at, k.created_by,
+                (SELECT max(r.ts) FROM gateway_requests r WHERE r.caller_key = k.label),
+                k.disabled_at
+         FROM gateway_keys k ORDER BY k.created_at DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -109,6 +112,14 @@ pub async fn create_gateway_key(
         .execute(pool)
         .await?;
     Ok(key)
+}
+
+/// True when `create_gateway_key` failed because the label is already taken.
+pub fn is_label_taken(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<sqlx::Error>()
+        .and_then(sqlx::Error::as_database_error)
+        .is_some_and(|db| db.constraint() == Some("gateway_keys_label_unique"))
 }
 
 /// Enable or disable a gateway key by its id.
