@@ -204,10 +204,17 @@ impl Core {
 /// tick), so concurrent probes can never build up, and the prober touches no
 /// request-path lock: relay dispatch reads snapshots from the database.
 /// `cancel` ends the loop between ticks at shutdown, before the pool closes.
+///
+/// A round that produced readings announces
+/// [`crate::activity::ActivitySink::quota_refreshed`] (the same signal the
+/// request-driven [`admin_ops::Admin::quotas`] sends), so connected GUIs
+/// re-read the freshly persisted snapshots instead of waiting for a manual
+/// refresh or a tab switch.
 async fn quota_prober(
     pool: sqlx::PgPool,
     smart_cache: relay::SmartCache,
     kiro_tokens: Arc<crate::upstream::KiroTokens>,
+    activity: crate::activity::ActivitySink,
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(QUOTA_PROBE_INTERVAL);
@@ -218,7 +225,10 @@ async fn quota_prober(
     loop {
         tokio::select! {
           _ = ticker.tick() => {
-            admin_ops::probe_all_quotas(&pool, Some(&smart_cache), Some(&kiro_tokens)).await;
+            let rows = admin_ops::probe_all_quotas(&pool, Some(&smart_cache), Some(&kiro_tokens)).await;
+            if !rows.is_empty() {
+                activity.quota_refreshed();
+            }
           }
           // Shutdown: stop between rounds (a round in flight finishes; the pool
           // stays open until this task's owner proceeds past the cancel).
@@ -324,6 +334,7 @@ impl Gateway {
             core.pool.clone(),
             core.smart_cache.clone(),
             Arc::clone(&core.kiro_tokens),
+            core.activity.clone(),
             core.prober_cancel.clone(),
         ));
         *core.prober_join.lock().expect("prober_join poisoned") = Some(prober_handle);
