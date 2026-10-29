@@ -95,8 +95,26 @@ impl RestCache {
         Ok(())
     }
 
+    /// Whether the key's whole-key rest or its `model` rest is cached. The map
+    /// is tiny and the scan allocates nothing. A poisoned lock answers `true`
+    /// so the caller falls through to the authoritative PG delete.
+    fn rests(&self, key_id: i64, model: &str) -> bool {
+        self.inner.read().map_or(true, |inner| {
+            inner
+                .keys()
+                .any(|(k, m)| *k == key_id && m.as_deref().is_none_or(|m| m == model))
+        })
+    }
+
     /// Clear a key's whole-key rest + the named model's rest (write-through).
+    ///
+    /// Runs on every successful request, so a key with nothing to clear (the
+    /// normal case) returns without touching PG: the cache is write-through,
+    /// so a row absent from it is absent from PG.
     pub async fn clear_for_model(&self, key_id: i64, model: &str) -> anyhow::Result<()> {
+        if !self.rests(key_id, model) {
+            return Ok(());
+        }
         crate::store::clear_rest_for_model(&self.pool, key_id, model).await?;
         let mut inner = self
             .inner
