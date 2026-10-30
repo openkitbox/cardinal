@@ -10,6 +10,8 @@
 //! - `POST /api/providers/:id/kiro-import` `{label, account?, credentials}` — allow-listed import of a raw `kiro.rs` object or account array
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
 //!   plaintext-serving endpoint; the list shape stays masked)
+//! - `POST /api/key-groups` `{name}` → `{id}`, `PATCH/DELETE /api/key-groups/:id` — account groups (409 on a taken name, 400 on an invalid one,
+//!   404 on an unknown id); membership is set per key through the key PATCH's `group_ids` (absent = untouched, array = full replace)
 //! - `PUT /api/keys/order` `{ids: [..]}` — assign global positions sequentially in array order (one transaction)
 //! - `POST /api/keys/validate` `{name, protocol, base_url, auth_scheme?, enabled?, api_key}` — probe a not-yet-saved credential
 //! - `GET/PUT /api/keys/:id/models` — a key's model list: GET re-probes the provider, PUT persists a list as the snapshot
@@ -1123,6 +1125,12 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
         )
         .push(Router::with_path("providers/{id}/keys/{key_id}/reveal").get(reveal_key))
         .push(Router::with_path("keys/order").put(reorder_keys))
+        .push(Router::with_path("key-groups").post(create_key_group))
+        .push(
+            Router::with_path("key-groups/{id}")
+                .patch(rename_key_group)
+                .delete(delete_key_group),
+        )
         .push(Router::with_path("rests").get(list_rests))
         .push(Router::with_path("rests/keys/{key_id}").delete(clear_rest_by_key))
         .push(Router::with_path("rests/providers/{provider_id}").delete(clear_rests_by_provider))
@@ -1233,6 +1241,10 @@ struct PatchKeyBody {
     /// a static key: a credential-kind conversion is not a patch.
     #[serde(default)]
     oauth: Option<KiroOAuth>,
+    /// Group memberships: absent/null = untouched, array = the complete new
+    /// set (`[]` leaves every group).
+    #[serde(default)]
+    group_ids: Option<Vec<i64>>,
 }
 
 /// Presence-capturing deserializer for a tri-state field: serde only calls
@@ -1481,6 +1493,7 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
             max_concurrency: body.max_concurrency,
             allowed_models: body.allowed_models,
             oauth: body.oauth.as_ref(),
+            group_ids: body.group_ids.as_deref(),
         },
     )
     .await
@@ -1499,6 +1512,78 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
         }
         Ok(false) => not_found(response, "key"),
         Err(error) => bad_request(response, error),
+    }
+}
+
+#[derive(Deserialize)]
+struct KeyGroupBody {
+    name: String,
+}
+
+/// Map a group write failure: a bad name is the caller's, a taken name a
+/// conflict; storage detail stays in the log.
+fn key_group_error(response: &mut Response, error: store::KeyGroupError) {
+    match error {
+        store::KeyGroupError::InvalidName(_) => {
+            response.status_code(StatusCode::BAD_REQUEST);
+            let _ = response.body(error.to_string());
+        }
+        store::KeyGroupError::NameTaken(_) => {
+            response.status_code(StatusCode::CONFLICT);
+            let _ = response.body(error.to_string());
+        }
+        store::KeyGroupError::Other(error) => internal(response, error.into()),
+    }
+}
+
+/// `POST /api/key-groups` `{name}` → `{id}`. Groups are display-side only and
+/// never enter the route cache, so no cache refresh follows a group write.
+#[handler]
+async fn create_key_group(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Ok(body) = request.parse_json::<KeyGroupBody>().await else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid key group body");
+        return;
+    };
+    match store::create_key_group(state_pool(depot), &body.name).await {
+        Ok(id) => json_response(response, &json!({"id": id})),
+        Err(error) => key_group_error(response, error),
+    }
+}
+
+/// `PATCH /api/key-groups/{id}` `{name}`: rename.
+#[handler]
+async fn rename_key_group(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid id");
+        return;
+    };
+    let Ok(body) = request.parse_json::<KeyGroupBody>().await else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid key group body");
+        return;
+    };
+    match store::rename_key_group(state_pool(depot), id, &body.name).await {
+        Ok(true) => json_response(response, &json!({"ok": true})),
+        Ok(false) => not_found(response, "key group"),
+        Err(error) => key_group_error(response, error),
+    }
+}
+
+/// `DELETE /api/key-groups/{id}`: drops the group and its memberships; the
+/// keys stay.
+#[handler]
+async fn delete_key_group(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid id");
+        return;
+    };
+    match store::delete_key_group(state_pool(depot), id).await {
+        Ok(true) => json_response(response, &json!({"ok": true})),
+        Ok(false) => not_found(response, "key group"),
+        Err(error) => internal(response, error),
     }
 }
 

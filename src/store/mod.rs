@@ -7,6 +7,7 @@
 
 mod gateway_key;
 mod key;
+mod key_group;
 mod price;
 mod provider;
 mod quota;
@@ -27,6 +28,10 @@ pub use key::{
     list_enabled_key_models, list_keys_by_ids, list_limited_keys, list_provider_keys,
     list_quota_reset_anchors, patch_provider_key, reorder_keys, replace_kiro_oauth,
     update_key_models, update_key_models_for_oauth, update_provider_key, upsert_kiro_key_by_label,
+};
+pub use key_group::{
+    KeyGroupError, KeyGroupView, create_key_group, delete_key_group, list_key_groups,
+    rename_key_group,
 };
 pub use price::{
     ModelPrice, ModelSuccessRow, PriceTier, get_price, last_model_success,

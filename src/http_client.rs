@@ -113,6 +113,25 @@ fn build_client(timeout: Option<Duration>) -> reqwest::Client {
   })
 }
 
+/// A partial key update for [`GatewayHttpClient::update_key`], serialized as
+/// the PATCH body. `None` leaves a field out (the server keeps it); the
+/// nested options are three-state: `Some(None)` sends `null` (clear the cap /
+/// the whitelist). `group_ids` replaces the key's group memberships as a
+/// whole (`Some(&[])` leaves every group).
+#[derive(Default, serde::Serialize)]
+pub struct KeyUpdate<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<Option<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Option<Vec<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_ids: Option<&'a [i64]>,
+}
+
 /// HTTP client of the gateway's loopback admin API. Cheap to clone (the
 /// reqwest clients are shared).
 #[derive(Clone)]
@@ -643,40 +662,45 @@ impl GatewayHttpClient {
         Ok((result.id, result.created))
     }
 
-    /// Patch a key's label/enabled/concurrency cap/whitelist. `max_concurrency`
-    /// is three-state (outer None = untouched, inner None = clear); so is
-    /// `allowed_models`.
+    /// Patch a key. Every unset field is left out of the body, so the server
+    /// leaves it untouched; see [`KeyUpdate`].
     pub async fn update_key(
         &self,
         provider_id: i64,
         key_id: i64,
-        label: Option<&str>,
-        enabled: Option<bool>,
-        max_concurrency: Option<Option<i32>>,
-        allowed_models: Option<Option<Vec<String>>>,
+        update: &KeyUpdate<'_>,
     ) -> Result<(), ClientError> {
-        // skip_serializing_if preserves the server's absent/null/value tri-state.
-        #[derive(serde::Serialize)]
-        struct PatchKey<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            label: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            enabled: Option<bool>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            max_concurrency: Option<Option<i32>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            allowed_models: Option<Option<Vec<String>>>,
-        }
-        let body = PatchKey {
-            label,
-            enabled,
-            max_concurrency,
-            allowed_models,
-        };
         ok(self
             .patch(&format!("/api/providers/{provider_id}/keys/{key_id}"))
-            .json(&body))
+            .json(update))
         .await
+    }
+
+    // ---------- account groups ----------
+
+    /// Create an account group; returns its id. Errors (409) when the name is
+    /// taken, (400) when it is empty or longer than 32 characters.
+    pub async fn create_key_group(&self, name: &str) -> Result<i64, ClientError> {
+        created_id(
+            self.post("/api/key-groups")
+                .json(&serde_json::json!({ "name": name })),
+        )
+        .await
+    }
+
+    /// Rename an account group. Errors (404) when it does not exist, (409)
+    /// when the name is taken.
+    pub async fn rename_key_group(&self, id: i64, name: &str) -> Result<(), ClientError> {
+        ok(self
+            .patch(&format!("/api/key-groups/{id}"))
+            .json(&serde_json::json!({ "name": name })))
+        .await
+    }
+
+    /// Delete an account group; its keys stay. Errors (404) when it does not
+    /// exist.
+    pub async fn delete_key_group(&self, id: i64) -> Result<(), ClientError> {
+        ok(self.delete(&format!("/api/key-groups/{id}"))).await
     }
 
     /// Delete a key. Errors (404) when the key does not exist.

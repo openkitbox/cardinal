@@ -595,6 +595,9 @@ pub struct KeyPatch<'a> {
     pub allowed_models: Option<Option<Vec<String>>>,
     /// Replacement OAuth bundle; only accepted on an existing `kiro_oidc` row.
     pub oauth: Option<&'a KiroOAuth>,
+    /// Group memberships: `None` = untouched, `Some` = replace the key's
+    /// groups with exactly this set (`Some(&[])` = leave every group).
+    pub group_ids: Option<&'a [i64]>,
 }
 
 /// Partial update (PATCH semantics) that may also rotate the credential:
@@ -699,6 +702,11 @@ pub async fn patch_provider_key(
             None => Ok(false),
         };
     }
+    if let Some(group_ids) = patch.group_ids {
+        // An unknown group id fails the foreign key; `?` drops `tx`, which
+        // rolls the whole patch back.
+        super::key_group::replace_key_groups(&mut tx, key_id, group_ids).await?;
+    }
     tx.commit().await?;
     Ok(true)
 }
@@ -725,6 +733,7 @@ pub async fn update_provider_key(
             max_concurrency,
             allowed_models,
             oauth: None,
+            group_ids: None,
         },
     )
     .await

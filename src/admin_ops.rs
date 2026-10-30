@@ -105,6 +105,9 @@ pub struct Bootstrap {
     pub gateway_keys: Vec<store::GatewayKeyRow>,
     /// Latest successful request time per (key, model).
     pub model_success: Vec<store::ModelSuccessRow>,
+    /// Account groups with their member key ids (the only place membership
+    /// lives; `keys` carries none), in id order.
+    pub key_groups: Vec<store::KeyGroupView>,
 }
 
 /// The probed key row does not exist. The admin HTTP surface maps this to
@@ -465,6 +468,7 @@ impl Admin {
             quota_history: store::list_quota_history(&self.pool).await?,
             gateway_keys: store::list_gateway_keys(&self.pool).await?,
             model_success: store::last_model_success(&self.pool).await?,
+            key_groups: store::list_key_groups(&self.pool).await?,
         })
     }
 
