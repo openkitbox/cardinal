@@ -578,6 +578,14 @@ impl Decoder {
         }
     }
 
+    /// Whether this protocol reports its usage AFTER the terminal event, so a
+    /// client close that wants the usage must wait for the tail (KAS sends
+    /// `contextUsageEvent` after `metadataEvent`). Every other protocol carries
+    /// usage inside or before its terminal event.
+    pub fn usage_follows_terminal(&self) -> bool {
+        matches!(self, Self::Kiro(_))
+    }
+
     /// Whether the wire stream carried any closing signal (see the per-kernel
     /// `wire_terminal_seen`); post-commit synthesis gate.
     pub fn wire_terminal_seen(&self) -> bool {
@@ -702,4 +710,27 @@ pub struct ObservedResponse {
     pub terminal: Terminal,
     /// Model id echoed by the upstream, kept for evidence only.
     pub upstream_model: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Decoder, ProtocolId};
+
+    #[test]
+    fn only_kiro_reports_usage_after_the_terminal_event() {
+        assert!(Decoder::new(ProtocolId::Kiro, None).usage_follows_terminal());
+        for protocol in [
+            ProtocolId::OpenAiChat,
+            ProtocolId::OpenAiResponses,
+            ProtocolId::AnthropicMessages,
+            ProtocolId::Gemini,
+            ProtocolId::OpenAiEmbeddings,
+        ] {
+            assert!(
+                !Decoder::new(protocol, None).usage_follows_terminal(),
+                "{} must not wait for a usage tail",
+                protocol.as_str()
+            );
+        }
+    }
 }

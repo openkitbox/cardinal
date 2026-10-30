@@ -614,10 +614,11 @@ async fn drive_stream(
             mut translator,
             context_window,
         } => {
-            // KAS reports its usage after the terminal event, so the client
-            // close must wait for the tail; every other upstream forwards first.
-            let tail_before_finish = upstream == ProtocolId::Kiro;
             let mut upstream = protocol::Decoder::new(upstream, context_window);
+            // A protocol that reports its usage after the terminal event (KAS)
+            // makes the client close wait for the tail; every other upstream
+            // forwards first.
+            let tail_before_finish = upstream.usage_follows_terminal();
             let mut done = false;
             while !done {
                 if hold.is_some() && tx.is_closed() {
