@@ -69,12 +69,6 @@ pub struct Dialect {
     pub from_ir: fn(&ir::IrRequest, &str) -> Parsed<serde_json::Value>,
     pub emit_response_json: fn(&ir::IrResponse) -> Result<Vec<u8>, crate::protocol::ProtocolError>,
     pub response_to_ir: ResponseToIr,
-    /// The dialect derives token usage from context percentages instead of
-    /// vendor-reported counts (Kiro: KAS reports credits and a context
-    /// percentage, never token counts). The relay keeps such an estimate for
-    /// the ledger only — a derived number must not reach the client, where
-    /// every other upstream puts what the vendor actually reported.
-    pub estimates_usage: bool,
 }
 
 pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
@@ -84,14 +78,12 @@ pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
             from_ir: openai_chat::from_ir,
             emit_response_json: openai_chat::emit_response_json,
             response_to_ir: openai_chat::response_to_ir,
-            estimates_usage: false,
         }),
         ProtocolId::AnthropicMessages => Some(Dialect {
             to_ir: anthropic_messages::to_ir,
             from_ir: anthropic_messages::from_ir,
             emit_response_json: anthropic_messages::emit_response_json,
             response_to_ir: anthropic_messages::response_to_ir,
-            estimates_usage: false,
         }),
         // Client-side half only: to_ir/emit_response_json are live, while
         // from_ir/response_to_ir refuse — nothing translates *into* Responses.
@@ -100,7 +92,6 @@ pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
             from_ir: openai_responses::from_ir,
             emit_response_json: openai_responses::emit_response_json,
             response_to_ir: openai_responses::response_to_ir,
-            estimates_usage: false,
         }),
         // Gemini is passthrough-only: it takes part in no IR translation in
         // either direction (the OPENED matrix is untouched by design).
@@ -115,7 +106,6 @@ pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
             from_ir: kiro::from_ir,
             emit_response_json: kiro::emit_response_json,
             response_to_ir: kiro::response_to_ir,
-            estimates_usage: true,
         }),
     }
 }

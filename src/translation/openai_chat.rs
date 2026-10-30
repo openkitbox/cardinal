@@ -574,9 +574,9 @@ pub fn response_to_ir(
 
 /// Rebuild a Chat response body from the parsed IR response.
 ///
-/// A source that reported no token usage (`usage: None`, e.g. Kiro) yields a
-/// body without a `usage` object at all: three fabricated zeroes would be read
-/// as a free request and mis-bill it.
+/// A response with `usage: None` yields a body without a `usage` object at
+/// all: three fabricated zeroes would be read as a free request and mis-bill
+/// it. (Kiro carries an estimate whenever KAS reported a context percentage.)
 pub fn emit_response_json(response: &super::ir::IrResponse) -> Result<Vec<u8>, ProtocolError> {
     let mut content: Option<String> = None;
     let mut calls: Vec<Value> = Vec::new();
@@ -786,4 +786,38 @@ pub(super) fn parse_args(arguments: Option<&Value>) -> Value {
         return value;
     }
     serde_json::json!({"input": raw})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::usage::UsageCounts;
+    use crate::translation::ir::{IrResponse, IrStop};
+
+    fn body(usage: Option<UsageCounts>) -> Value {
+        let response = IrResponse {
+            model: "m".to_owned(),
+            content: Vec::new(),
+            stop: IrStop::Stop,
+            usage,
+        };
+        serde_json::from_slice(&emit_response_json(&response).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn response_body_carries_the_ir_usage() {
+        let body = body(Some(UsageCounts {
+            input_tokens: 1200,
+            output_tokens: 3,
+            ..Default::default()
+        }));
+        assert_eq!(body["usage"]["prompt_tokens"], 1200);
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+        assert_eq!(body["usage"]["total_tokens"], 1203);
+    }
+
+    #[test]
+    fn response_body_omits_usage_when_the_ir_has_none() {
+        assert!(body(None).get("usage").is_none());
+    }
 }

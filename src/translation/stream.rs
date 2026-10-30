@@ -691,11 +691,12 @@ impl StreamTranslator {
                 } else {
                     serde_json::json!(finish_reason)
                 };
-                // Usage is evidence, not a shape to fill: only an upstream
-                // Usage event licenses a usage object. Kiro reports no token
-                // usage, so its translated Chat close must omit the field
-                // entirely — `{"completion_tokens":0}` reads as a measured
-                // free request and mis-bills it.
+                // Usage is evidence, not a shape to fill: only a Usage event
+                // licenses a usage object. Kiro's estimate is licensed by the
+                // pump injecting it ahead of `Finish` (`usage_before_finish`);
+                // with no estimate the field is still omitted entirely —
+                // `{"completion_tokens":0}` reads as a measured free request
+                // and mis-bills it.
                 let usage_seen = usage.is_some() || input_tokens.is_some();
                 out.push(chat_chunk(
                     &self.model,
@@ -979,5 +980,162 @@ fn stop_chat_name(reason: &str) -> &'static str {
         "tool_calls" | "tool_use" | "function_call" => "tool_calls",
         "max_tokens_truncated" => "",
         _ => "stop",
+    }
+}
+
+/// Places `usage` immediately before the first `Finish` of a batch.
+///
+/// A Kiro (KAS) upstream reports its usage estimate only after the terminal
+/// event, so the translator would close the client stream (finish chunk and
+/// `[DONE]`) before any `Usage` exists. Moving the estimate in front of the
+/// `Finish` lets the close frame carry it. See
+/// `2026-10-30-kiro-stream-usage-to-client.md` in the plans directory.
+///
+/// Unchanged when `usage` is `None`, when the batch already holds a `Usage`,
+/// or when it holds no `Finish`.
+pub(crate) fn usage_before_finish(
+    mut events: Vec<StreamEvent>,
+    usage: Option<UsageCounts>,
+) -> Vec<StreamEvent> {
+    let Some(usage) = usage else {
+        return events;
+    };
+    if events.iter().any(|e| matches!(e, StreamEvent::Usage(_))) {
+        return events;
+    }
+    if let Some(at) = events
+        .iter()
+        .position(|e| matches!(e, StreamEvent::Finish { .. }))
+    {
+        events.insert(at, StreamEvent::Usage(usage));
+    }
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(input: u64, output: u64) -> UsageCounts {
+        UsageCounts {
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        }
+    }
+
+    fn text(s: &str) -> StreamEvent {
+        StreamEvent::TextDelta(s.to_owned())
+    }
+
+    fn finish() -> StreamEvent {
+        StreamEvent::Finish {
+            reason: "stop".to_owned(),
+        }
+    }
+
+    #[test]
+    fn no_usage_leaves_events_unchanged() {
+        let events = vec![text("hi"), finish()];
+        assert_eq!(usage_before_finish(events.clone(), None), events);
+    }
+
+    #[test]
+    fn existing_usage_is_never_duplicated() {
+        let events = vec![text("hi"), StreamEvent::Usage(usage(5, 6)), finish()];
+        assert_eq!(
+            usage_before_finish(events.clone(), Some(usage(1200, 3))),
+            events
+        );
+    }
+
+    #[test]
+    fn usage_lands_immediately_before_finish() {
+        let out = usage_before_finish(vec![text("hi"), finish()], Some(usage(1200, 3)));
+        assert_eq!(
+            out,
+            vec![text("hi"), StreamEvent::Usage(usage(1200, 3)), finish()]
+        );
+    }
+
+    #[test]
+    fn usage_lands_before_the_first_of_two_finishes() {
+        let out = usage_before_finish(
+            vec![text("a"), text("b"), finish(), finish()],
+            Some(usage(7, 8)),
+        );
+        assert_eq!(
+            out,
+            vec![
+                text("a"),
+                text("b"),
+                StreamEvent::Usage(usage(7, 8)),
+                finish(),
+                finish()
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_without_finish_is_unchanged() {
+        let events = vec![text("hi")];
+        assert_eq!(
+            usage_before_finish(events.clone(), Some(usage(1, 2))),
+            events
+        );
+    }
+
+    fn json_frames(frames: &[RawFrame]) -> Vec<Value> {
+        frames
+            .iter()
+            .filter(|f| f.data.as_ref() != b"[DONE]")
+            .map(|f| serde_json::from_slice(&f.data).expect("frame is JSON"))
+            .collect()
+    }
+
+    fn chat_frames(events: Vec<StreamEvent>) -> Vec<RawFrame> {
+        let mut t = StreamTranslator::new(ProtocolId::OpenAiChat, "m", "req").unwrap();
+        t.translate(events).unwrap()
+    }
+
+    #[test]
+    fn chat_finish_chunk_carries_usage_when_placed_before_finish() {
+        let frames = chat_frames(usage_before_finish(
+            vec![text("hi"), finish()],
+            Some(usage(1200, 3)),
+        ));
+        assert_eq!(frames.last().unwrap().data.as_ref(), b"[DONE]");
+        let chunks = json_frames(&frames);
+        let finish_chunk = chunks.last().unwrap();
+        assert_eq!(finish_chunk["choices"][0]["finish_reason"], "stop");
+        assert_eq!(finish_chunk["usage"]["prompt_tokens"], 1200);
+        assert_eq!(finish_chunk["usage"]["completion_tokens"], 3);
+    }
+
+    #[test]
+    fn chat_finish_chunk_has_no_usage_key_without_evidence() {
+        let frames = chat_frames(vec![text("hi"), finish()]);
+        assert_eq!(frames.last().unwrap().data.as_ref(), b"[DONE]");
+        let chunks = json_frames(&frames);
+        let finish_chunk = chunks.last().unwrap();
+        assert_eq!(finish_chunk["choices"][0]["finish_reason"], "stop");
+        assert!(finish_chunk.get("usage").is_none(), "{finish_chunk}");
+    }
+
+    #[test]
+    fn anthropic_message_delta_carries_output_tokens() {
+        let mut t = StreamTranslator::new(ProtocolId::AnthropicMessages, "m", "req").unwrap();
+        let frames = t
+            .translate(usage_before_finish(
+                vec![text("hi"), finish()],
+                Some(usage(1200, 3)),
+            ))
+            .unwrap();
+        let delta = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("message_delta"))
+            .expect("message_delta frame");
+        let body: Value = serde_json::from_slice(&delta.data).unwrap();
+        assert_eq!(body["usage"]["output_tokens"], 3);
     }
 }

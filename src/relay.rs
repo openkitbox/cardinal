@@ -736,14 +736,6 @@ async fn attempt_json(
             translation::dialect(request.protocol).map_err(failover::AttemptError::Protocol)?;
         let mut ir = (upstream_dialect.response_to_ir)(&body, ctx.context_window)
             .map_err(failover::AttemptError::Protocol)?;
-        // A dialect that derives token usage from a context percentage (Kiro)
-        // hands the estimate to the ledger and NOT to the client body: every
-        // other upstream's `usage` is a count the vendor actually reported.
-        let estimated_usage = if upstream_dialect.estimates_usage {
-            ir.usage.take()
-        } else {
-            None
-        };
         // Kiro reports no model identity. The client body must still carry a
         // sensible model, so fill an empty one with the model this attempt
         // actually requested (never an invented id). The ledger keeps the
@@ -767,8 +759,9 @@ async fn attempt_json(
             body: bytes,
             observed: protocol::ObservedResponse {
                 // A translated upstream that reported no token usage stays
-                // unknown; the ledger must not record fabricated zeroes.
-                usage: estimated_usage.or(ir.usage),
+                // unknown; the ledger must not record fabricated zeroes. The
+                // same value is already in the client body (Kiro: an estimate).
+                usage: ir.usage,
                 terminal,
                 upstream_model: reported_model.then_some(ir.model),
             },

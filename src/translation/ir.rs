@@ -349,7 +349,8 @@ pub enum IrStop {
 /// dialect.
 ///
 /// `usage` is optional because not every upstream reports token usage: KAS
-/// reports credits/context percentages only. `None` means "unknown", and every
+/// reports credits/context percentages only, so its value is an estimate (and
+/// `None` when the percentage is missing). `None` means "unknown", and every
 /// emitter must then omit its usage field rather than fabricate three zeroes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IrResponse {

@@ -26,15 +26,20 @@
 //!   The reference's `LegacyThinkingDecoder` and `tool-call-text` detector
 //!   rewrite assistant text the model never described as reasoning/tools; this
 //!   kernel only reports what the upstream's own events said.
-//! * **Estimated token accounting is ledger-only.** Input is `floor(advertised
+//! * **Estimated token accounting.** Input is `floor(advertised
 //!   context window × contextUsagePercentage / 100)`; output is `floor(total
 //!   chars / 4)` across accumulated text, reasoning and every tool call's
 //!   arguments. These are estimates, not vendor-reported token counts. A
 //!   missing window or percentage omits usage entirely rather than fabricating
 //!   zeros. `meteringEvent` credits are tracing evidence only: they are never
-//!   converted to USD or to a cached-token split. Kiro does not produce
-//!   `StreamEvent::Usage`, so these estimates never enter client-visible
-//!   frames.
+//!   converted to USD or to a cached-token split. The decoder itself emits no
+//!   `StreamEvent::Usage`; the relay hands the estimate to the ledger AND to
+//!   the client. Streamed: the pump drains the tail, then places the estimate
+//!   before the finish event. Buffered: it is written into the body `usage`.
+//!   The Chat shape writes `cached_tokens` and reasoning tokens as 0.
+//!   Deviation (2026-10-30): estimates are client-visible so context-aware
+//!   clients (ox) can drive compaction; billing consumers must not treat them
+//!   as vendor counts.
 //! * **`metadataEvent` is the only normal-end evidence.** Its `stopReason` is
 //!   never trusted (real tool-calling responses report `END_TURN`); the
 //!   terminal state is inferred — tools present ⇒ `tool_calls`, a tool whose
@@ -61,10 +66,11 @@
 //!   visible thinking. Not hidden yet: the IR has no opaque-reasoning concept.
 //! * **Post-`metadataEvent` frames are drained after the terminal.** KAS sends
 //!   `contextUsageEvent`/`meteringEvent` after `metadataEvent`; the relay's
-//!   translated pump keeps reading for a bounded window after the `Finish`
-//!   event and observes — never forwards — those frames. That read is what
-//!   gives the ledger its usage estimate on streamed responses; a buffered
-//!   response observes the whole body by construction.
+//!   translated pump reads that tail (bounded window) as soon as the `Finish`
+//!   event arrives, before closing the client stream. The frames themselves
+//!   are never forwarded; the usage estimate they yield goes to the ledger and
+//!   is placed before the finish event for the client. A buffered response
+//!   observes the whole body by construction.
 //! * **The streaming decoder accumulates the full text and reasoning.** The
 //!   same [`StreamDecoder`] backs the streamed and buffered paths (one state
 //!   machine, no drift), so a streamed response keeps one full copy of the
@@ -460,6 +466,7 @@ impl StreamDecoder {
     /// uses a chars/4 heuristic over text, reasoning and tool arguments. A
     /// missing window or percentage yields `None`, never zero-filled counts;
     /// non-finite and negative percentages are rejected as corrupt evidence.
+    /// The relay forwards this estimate to the ledger and the client alike.
     pub fn usage(&self) -> Option<UsageCounts> {
         let context_window = self.context_window?;
         let percentage = self.context_usage_percentage?;
@@ -601,8 +608,9 @@ pub fn aggregate(body: &[u8], context_window: Option<u64>) -> Result<StreamDecod
 ///
 /// `usage` estimates input tokens from `context_window` and the KAS context
 /// percentage, and output tokens from accumulated content with a chars/4
-/// heuristic. Missing input evidence omits usage rather than recording zeros;
-/// the estimates are ledger-only and never appear on the client wire.
+/// heuristic. Missing input evidence omits usage rather than recording zeros.
+/// The estimates also reach the client body (not vendor-reported counts), with
+/// `cached_tokens` and reasoning tokens written as 0 by the Chat shape.
 /// `context_window` is the served model's declared input window; the decoder
 /// combines it with the context percentage for the input estimate rather than
 /// inventing one from a bare percentage.

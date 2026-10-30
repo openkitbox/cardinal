@@ -231,8 +231,8 @@ async fn read_frame(
 /// never forwarding them.
 ///
 /// The terminal event is not the end of the wire: KAS reports its context
-/// usage and billing after `metadataEvent`, and the ledger's usage estimate
-/// comes from those frames. Every failure here is diagnostics only — the
+/// usage and billing after `metadataEvent`, and the usage estimate (ledger and,
+/// for Kiro, the client's finish chunk) comes from those frames. Every failure here is diagnostics only — the
 /// response already completed, so a broken, truncated or silent tail must
 /// not mark the stream interrupted or synthesize an error frame. Bounded by
 /// `TAIL_DRAIN` so a lingering upstream only costs that much.
@@ -614,6 +614,9 @@ async fn drive_stream(
             mut translator,
             context_window,
         } => {
+            // KAS reports its usage after the terminal event, so the client
+            // close must wait for the tail; every other upstream forwards first.
+            let tail_before_finish = upstream == ProtocolId::Kiro;
             let mut upstream = protocol::Decoder::new(upstream, context_window);
             let mut done = false;
             while !done {
@@ -681,14 +684,22 @@ async fn drive_stream(
                         if events.is_empty() {
                             continue;
                         }
+                        let terminal_at_eof = events
+                            .iter()
+                            .any(|event| matches!(event, protocol::StreamEvent::Finish { .. }));
+                        let mut tail_drained = false;
+                        let events = if tail_before_finish && terminal_at_eof {
+                            drain_tail(reader, &mut upstream).await;
+                            tail_drained = true;
+                            translation::stream::usage_before_finish(events, upstream.usage())
+                        } else {
+                            events
+                        };
                         for event in &events {
                             if let protocol::StreamEvent::Usage(counts) = event {
                                 usage = Some(counts.clone());
                             }
                         }
-                        let terminal_at_eof = events
-                            .iter()
-                            .any(|event| matches!(event, protocol::StreamEvent::Finish { .. }));
                         let content = events.iter().any(|event| {
                             matches!(
                                 event,
@@ -740,7 +751,9 @@ async fn drive_stream(
                             }
                         }
                         if terminal_at_eof {
-                            drain_tail(reader, &mut upstream).await;
+                            if !tail_drained {
+                                drain_tail(reader, &mut upstream).await;
+                            }
                             done = true;
                         }
                     }
