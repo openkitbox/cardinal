@@ -1,10 +1,10 @@
+use super::Balance;
 use super::KeyQuota;
 
 /// DeepSeek balance (`/user/balance`):
 /// `{"balance_infos":[{"currency":"CNY","total_balance":"12.34"}]}` — the
-/// first entry, with the currency folded to its symbol; the amount is
-/// normalized to two decimals (an unparseable amount is no reading, not
-/// "¥abc").
+/// first entry, with the currency folded to its symbol (an unparseable
+/// amount is no reading, not "¥abc").
 pub(super) fn parse_deepseek_balance(body: &str) -> Option<KeyQuota> {
     #[derive(serde::Deserialize)]
     struct Response {
@@ -23,10 +23,18 @@ pub(super) fn parse_deepseek_balance(body: &str) -> Option<KeyQuota> {
         "USD" => "$",
         _ => return None,
     };
-    let amount: f64 = first.total_balance.trim().parse().ok()?;
+    let amount: f64 = first
+        .total_balance
+        .trim()
+        .parse()
+        .ok()
+        .filter(|amount: &f64| amount.is_finite())?;
     Some(KeyQuota {
         windows: Vec::new(),
-        balance: Some(format!("{symbol}{amount:.2}")),
+        balance: Some(Balance {
+            amount,
+            symbol: symbol.to_string(),
+        }),
         details: Vec::new(),
     })
 }

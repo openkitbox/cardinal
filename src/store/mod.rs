@@ -5,6 +5,7 @@
 //! cooldown identity is (key, model) with NULL meaning the whole key, and routes are named key
 //! subsets exposed as client model ids.
 
+mod balance_history;
 mod gateway_key;
 mod key;
 mod key_group;
@@ -16,6 +17,7 @@ mod rest;
 mod route;
 mod usage;
 
+pub use balance_history::{BalanceHistoryPoint, balance_history_record, list_balance_history};
 pub use gateway_key::{
     GatewayKeyInfo, GatewayKeyRow, create_gateway_key, gateway_key_info, is_label_taken,
     list_gateway_keys, seed_gateway_key, set_gateway_key_enabled,

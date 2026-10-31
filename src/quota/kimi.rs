@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 
+use super::Balance;
 use super::KeyQuota;
 use super::QuotaWindow;
 
@@ -15,10 +16,19 @@ pub(super) fn parse_kimi_balance(body: &str) -> Option<KeyQuota> {
         available_balance: String,
     }
     let response: Response = serde_json::from_str(body).ok()?;
-    let amount: f64 = response.data?.available_balance.trim().parse().ok()?;
+    let amount: f64 = response
+        .data?
+        .available_balance
+        .trim()
+        .parse()
+        .ok()
+        .filter(|amount: &f64| amount.is_finite())?;
     Some(KeyQuota {
         windows: Vec::new(),
-        balance: Some(format!("¥{amount:.2}")),
+        balance: Some(Balance {
+            amount,
+            symbol: "¥".to_string(),
+        }),
         details: Vec::new(),
     })
 }

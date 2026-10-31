@@ -102,6 +102,11 @@ pub struct Bootstrap {
     /// renders the current point alone.
     #[serde(default)]
     pub quota_history: Vec<store::QuotaHistoryPoint>,
+    /// The current balance segment of every prepaid key (segment-opening row
+    /// plus downsampled change rows), for the cards' balance charts. Older
+    /// gateways omit the field; the GUI then renders the current reading alone.
+    #[serde(default)]
+    pub balance_history: Vec<store::BalanceHistoryPoint>,
     pub gateway_keys: Vec<store::GatewayKeyRow>,
     /// Latest successful request time per (key, model).
     pub model_success: Vec<store::ModelSuccessRow>,
@@ -310,17 +315,21 @@ pub async fn probe_all_quotas(
                         quota::fetch_quota(&provider_name, &base_url, api_key).await
                     }
                 };
+                // The vendor read's own instant, taken before any DB work: the
+                // balance history orders readings by it, so a probe that
+                // finishes late cannot overwrite a newer one.
+                let probed_at = chrono::Utc::now();
                 if let (Some(day), Some(quota)) = (anchor, quota.as_mut()) {
-                    quota::apply_monthly_anchor(quota, day, chrono::Utc::now());
+                    quota::apply_monthly_anchor(quota, day, probed_at);
                 }
-                (key_id, quota)
+                (key_id, probed_at, quota)
             });
         }
     }
     let mut quotas = Vec::new();
     while let Some(joined) = tasks.join_next().await {
         match joined {
-            Ok((key_id, Some(quota))) => {
+            Ok((key_id, probed_at, Some(quota))) => {
                 // Persist the snapshot for the GUI's instant first paint; a store
                 // failure must not lose the reading itself (quota is decorative).
                 if let Err(error) = store::quota_snapshot_upsert(pool, key_id, &quota).await {
@@ -332,9 +341,17 @@ pub async fn probe_all_quotas(
                 if let Err(error) = store::quota_history_insert(pool, key_id, &quota).await {
                     tracing::warn!(key_id, error = %format!("{error:#}"), "quota history insert failed");
                 }
+                // The balance chart's series: written only when the amount
+                // changed. A failure never loses the reading itself.
+                if let Some(balance) = &quota.balance
+                    && let Err(error) =
+                        store::balance_history_record(pool, key_id, balance, probed_at).await
+                {
+                    tracing::warn!(key_id, error = %format!("{error:#}"), "balance history record failed");
+                }
                 quotas.push(KeyQuotaRow { key_id, quota });
             }
-            Ok((key_id, None)) => tracing::debug!(key_id, "quota probe: no reading"),
+            Ok((key_id, _, None)) => tracing::debug!(key_id, "quota probe: no reading"),
             Err(error) => tracing::warn!(%error, "quota probe task panicked"),
         }
     }
@@ -466,6 +483,7 @@ impl Admin {
             rests: store::list_rests(&self.pool).await?,
             quota_snapshots: self.quota_snapshots().await,
             quota_history: store::list_quota_history(&self.pool).await?,
+            balance_history: store::list_balance_history(&self.pool).await?,
             gateway_keys: store::list_gateway_keys(&self.pool).await?,
             model_success: store::last_model_success(&self.pool).await?,
             key_groups: store::list_key_groups(&self.pool).await?,

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 
 /// One quota window of a vendor plan (e.g. a 5-hour token window or the
@@ -28,6 +30,20 @@ pub struct QuotaWindow {
     pub total: Option<String>,
 }
 
+/// A prepaid account balance: numeric amount plus its currency symbol.
+/// The numeric amount feeds balance history; `Display` is the card text.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Balance {
+    pub amount: f64,
+    pub symbol: String,
+}
+
+impl fmt::Display for Balance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{:.2}", self.symbol, self.amount)
+    }
+}
+
 /// What one key's vendor account reports: plan quota windows and/or a prepaid
 /// balance. Either side may be empty when the vendor exposes neither.
 ///
@@ -38,9 +54,9 @@ pub struct QuotaWindow {
 pub struct KeyQuota {
     #[serde(default)]
     pub windows: Vec<QuotaWindow>,
-    /// Display-ready balance ("¥12.34").
+    /// Prepaid balance as reported by the vendor (renders as "¥12.34").
     #[serde(default)]
-    pub balance: Option<String>,
+    pub balance: Option<Balance>,
     /// Display-ready info lines beyond meters and balance (plan name, expiry,
     /// today's / lifetime usage), rendered verbatim in vendor order. Only
     /// the sub2api relay source fills them today.

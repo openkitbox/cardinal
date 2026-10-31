@@ -19,6 +19,7 @@
 //! invalid base_url, or a failed/unparseable probe all yield `None` — never
 //! an error. Failures are logged (warn) and the card simply shows no meter.
 
+mod balance;
 mod commandcode;
 mod deepseek;
 mod endpoint;
@@ -30,7 +31,10 @@ mod monthly_anchor;
 mod opencode;
 mod sub2api;
 
+pub use balance::BalanceStep;
+pub use balance::classify;
 pub use endpoint::fetch_quota;
+pub use key_quota::Balance;
 pub use key_quota::KeyQuota;
 pub use key_quota::QuotaWindow;
 pub use kiro::fetch_kiro_quota;

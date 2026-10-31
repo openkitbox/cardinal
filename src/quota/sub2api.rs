@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 
+use super::Balance;
 use super::KeyQuota;
 use super::QuotaWindow;
 
@@ -152,7 +153,15 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
             windows.extend(window(name, used, limit, resets_at, Some(period_minutes)));
         }
     }
-    let balance = response.balance.map(money);
+    let balance = response.balance.map(|amount| Balance {
+        amount,
+        symbol: match unit {
+            "USD" => "$".to_string(),
+            "CNY" => "¥".to_string(),
+            // No symbol known: the ISO code itself, spaced ("EUR 9.96").
+            other => format!("{other} "),
+        },
+    });
     let now = Utc::now();
     let mut details = Vec::new();
     // Plan line: name, a non-active status, and the expiry with days left.

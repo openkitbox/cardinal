@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 
+use super::Balance;
 use super::KeyQuota;
 use super::QuotaWindow;
 
@@ -100,21 +101,23 @@ pub(super) fn parse_commandcode_quota(body: &str) -> Option<KeyQuota> {
             implied_monthly = Some(cap * fraction);
         }
     }
-    let mut balance = None::<String>;
+    let mut balance = None::<Balance>;
     // The month's credits: a progress-bar window when a full allowance is known
     // — from the vendor's plan table (a reply that names its plan) or derived
     // from the rate windows — else a bare balance. The reply itself never sends
     // the full allowance.
     if let Some(credits) = response.credits {
-        let left = [
+        let pools = [
             credits.monthly.as_ref(),
             credits.purchased.as_ref(),
             credits.free.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|value| number(value).unwrap_or(0.))
-        .sum::<f64>();
+        ];
+        let reported = pools.iter().any(Option::is_some);
+        let left = pools
+            .into_iter()
+            .flatten()
+            .map(|value| number(value).unwrap_or(0.))
+            .sum::<f64>();
         let cap = commandcode_plan_cap(credits.plan_id.as_deref()).or(implied_monthly);
         match cap {
             Some(cap) if cap > 0. && left > 0. => windows.push(QuotaWindow {
@@ -124,11 +127,15 @@ pub(super) fn parse_commandcode_quota(body: &str) -> Option<KeyQuota> {
                 period_minutes: Some(30 * 1440),
                 total: Some(format!("${cap:.2}")),
             }),
-            _ => {
-                if left > 0. {
-                    balance = Some(format!("${left:.2}"));
-                }
+            // A depleted pool is a real reading too: record it as $0 so the
+            // balance history sees the spend-down, not a missing probe.
+            _ if reported => {
+                balance = Some(Balance {
+                    amount: left.max(0.),
+                    symbol: "$".to_string(),
+                });
             }
+            _ => {}
         }
     }
     if windows.is_empty() && balance.is_none() {
