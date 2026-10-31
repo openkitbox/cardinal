@@ -16,21 +16,26 @@ pub struct QuotaHistoryPoint {
 
 // ---------- quota snapshots (decorative GUI card cache, one row per key) ----------
 
-/// Persist one key's probed quota reading, refreshing the probe timestamp.
+/// Persist one key's quota reading taken from the vendor at `probed_at`.
 /// Called by the admin probe fan-out after each successful read; the GUI
-/// renders these snapshots instantly on load before re-probing.
+/// renders these snapshots instantly on load before re-probing. A reading
+/// older than the stored one (a concurrent probe that finished late) is
+/// dropped, so the snapshot never regresses behind the balance history.
 pub async fn quota_snapshot_upsert(
     pool: &PgPool,
     key_id: i64,
     quota: &KeyQuota,
+    probed_at: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<()> {
     let payload = serde_json::to_value(quota)?;
     sqlx::query(
-    "INSERT INTO gateway_key_quota_snapshots (key_id, payload, probed_at) VALUES ($1, $2, now())
-         ON CONFLICT (key_id) DO UPDATE SET payload = EXCLUDED.payload, probed_at = now()",
-  )
-  .bind(key_id)
-  .bind(payload)
+        "INSERT INTO gateway_key_quota_snapshots (key_id, payload, probed_at) VALUES ($1, $2, $3)
+         ON CONFLICT (key_id) DO UPDATE SET payload = EXCLUDED.payload, probed_at = EXCLUDED.probed_at
+         WHERE gateway_key_quota_snapshots.probed_at < EXCLUDED.probed_at",
+    )
+    .bind(key_id)
+    .bind(payload)
+    .bind(probed_at)
   .execute(pool)
   .await?;
     Ok(())

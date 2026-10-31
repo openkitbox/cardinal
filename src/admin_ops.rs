@@ -332,7 +332,9 @@ pub async fn probe_all_quotas(
             Ok((key_id, probed_at, Some(quota))) => {
                 // Persist the snapshot for the GUI's instant first paint; a store
                 // failure must not lose the reading itself (quota is decorative).
-                if let Err(error) = store::quota_snapshot_upsert(pool, key_id, &quota).await {
+                if let Err(error) =
+                    store::quota_snapshot_upsert(pool, key_id, &quota, probed_at).await
+                {
                     tracing::warn!(key_id, error = %format!("{error:#}"), "quota snapshot upsert failed");
                 }
                 // The trend chart's series: one row per window per probe. A
