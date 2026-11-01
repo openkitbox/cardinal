@@ -535,7 +535,7 @@ impl Admin {
         &self,
         since: chrono::DateTime<chrono::Utc>,
         until: chrono::DateTime<chrono::Utc>,
-        caller: Option<store::CallerFilter<'_>>,
+        caller: Option<store::CallerFilter>,
     ) -> anyhow::Result<store::UsageWindow> {
         store::usage_window(
             &self.pool,
@@ -556,7 +556,7 @@ impl Admin {
         until: chrono::DateTime<chrono::Utc>,
         split: store::TrendSplit,
         local_offset: chrono::Duration,
-        caller: Option<store::CallerFilter<'_>>,
+        caller: Option<store::CallerFilter>,
     ) -> anyhow::Result<Vec<store::TrendRow>> {
         let since = since.clamp(until - chrono::Duration::days(370), until);
         store::usage_trend(&self.pool, since, until, split, local_offset, caller).await

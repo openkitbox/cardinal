@@ -166,6 +166,18 @@ pub struct RequestRow {
     /// The serving account's label (LEFT JOIN on provider_key_id; None when the
     /// request had no key — e.g. a pre-candidate failure — or the key is gone).
     pub key_label: Option<String>,
+    /// The user owning the caller's gateway key (0013; None = in-process call
+    /// or an unattributed historical row).
+    pub user_id: Option<i64>,
+    /// That user's login (LEFT JOIN on user_id; None when `user_id` is None).
+    pub login: Option<String>,
+    /// The caller's gateway key id (0013; None as for `user_id`).
+    pub gateway_key_id: Option<i64>,
+    /// Amount debited for this attempt, micro-USD (0014; None = not charged).
+    pub charged_microus: Option<i64>,
+    /// The caller's effective rate at request time, basis points (0014; None
+    /// = in-process call or a row predating billing).
+    pub rate_bp: Option<i64>,
 }
 
 /// The most recent requests, newest first. `before_id` paginates: only rows
@@ -179,9 +191,10 @@ pub async fn list_recent_requests(
     let rows = sqlx::query_as::<_, RequestRow>(
     "SELECT r.id, r.ts, r.protocol, r.client_protocol, r.effort, r.alias, r.provider_id, r.provider_key_id, r.model, r.served_model, r.status,
             r.input_tokens, r.output_tokens, r.cached_input_tokens, r.cache_creation_input_tokens, r.total_ms, r.ttft_ms, r.cost_usd::float8, r.error, r.caller_key, r.agent,
-            r.request_id, k.label AS key_label
+            r.request_id, k.label AS key_label, r.user_id, u.login, r.gateway_key_id, r.charged_microus, r.rate_bp
          FROM gateway_requests r
          LEFT JOIN gateway_provider_keys k ON k.id = r.provider_key_id
+         LEFT JOIN users u ON u.id = r.user_id
          WHERE ($1::bigint IS NULL OR r.id < $1)
          ORDER BY r.id DESC LIMIT $2",
   )

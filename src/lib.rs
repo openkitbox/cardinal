@@ -28,6 +28,7 @@ pub mod config;
 pub mod db;
 pub mod gateway;
 pub mod http_client;
+pub mod key_terms;
 pub mod kiro;
 pub mod metering;
 pub mod models;
@@ -40,7 +41,9 @@ pub mod relay;
 pub mod standalone;
 pub mod store;
 pub mod translation;
+pub mod tri_state;
 pub mod upstream;
+pub mod user_keys;
 pub mod user_usage;
 
 /// This crate's schema migrator (`migrations/`). Composition roots run it

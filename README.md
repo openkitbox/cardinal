@@ -97,9 +97,12 @@ with socket handoff, which is not implemented.
 | `GET /api/activity` | SSE activity stream |
 | `GET/POST /api/users`, `GET/PATCH /api/users/{id}` | Billing users |
 | `POST /api/users/{id}/topup`, `POST /api/users/{id}/adjust` | Balance changes (USD) |
-| `GET /api/users/{id}/entries`, `GET /api/users/{id}/reconcile` | Billing ledger and balance check |
+| `GET /api/users/{id}/entries`, `GET /api/users/{id}/reconcile` | Billing ledger and balance check (also each key's spend against its charges) |
 | `GET/POST /api/user-groups`, `PATCH /api/user-groups/{id}` | User groups (rate multiplier, route whitelist) |
+| `GET/POST /api/gateway-keys`, `PATCH /api/gateway-keys/{id}` | Gateway keys: label (unique per user), owner, expiry, cumulative USD quota, enabled |
 | `GET /user/me`, `GET /user/me/entries` | Self-service balance, keys and ledger (gateway key auth) |
+| `GET/POST /user/keys`, `PATCH /user/keys/{id}` | Self-service keys: list (full key), create `{label, expires_at?, quota_usd?}`, edit `{label?, enabled?, expires_at?, quota_usd?}` (null clears expiry/quota); at most 20 keys per user, disabled included (409); another user's key is 404; no delete |
+| `GET /user/usage/window`, `GET /user/usage/trend` | Self-service usage; trend `split` = `route` (default), `model` or `client` (`provider`/`user` → 400) |
 
 Admin endpoints under `/api` require `Authorization: Bearer <admin key>`;
 `/v1` and `/user` endpoints require a gateway key.

@@ -11,9 +11,9 @@
 //! call sites read unchanged.
 //!
 //! Error contract: transport failures and non-2xx answers both surface as
-//! [`ClientError`], carrying the HTTP status plus the handler's body text
-//! (the handlers write the anyhow chain into the body, so the GUI's error
-//! cards show the same messages the in-process facade produced).
+//! [`ClientError`], carrying the HTTP status plus the handler's message:
+//! the `error` field of a `{"error": …}` body, else the body text verbatim
+//! (handlers use both spellings).
 //!
 //! Wire-shape notes (deviations 12–13 of the spec):
 //! - [`Self::bootstrap`] returns the whole page-bootstrap document (providers,
@@ -40,8 +40,9 @@ use crate::kiro::KiroOAuth;
 use crate::probe::ProbeModel;
 use crate::relay::DispatchTrace;
 use crate::store::{
-    GatewayKeyRow, ModelSuccessRow, ProviderInput, ProviderRow, RequestRow, RestRow, RouteEntry,
-    RouteRow, RouteStrategy, TrendRow, TrendSplit, UsageWindow,
+    EntryRow, GatewayKeyRow, GroupRow, ModelSuccessRow, ProviderInput, ProviderRow, Reconciliation,
+    RequestRow, RestRow, RouteEntry, RouteRow, RouteStrategy, TrendRow, TrendSplit, UsageWindow,
+    UserRow,
 };
 
 /// What the GUI shows when the gateway is not running (spec §8 decision 1).
@@ -68,8 +69,9 @@ pub enum ClientError {
     /// The request never got a usable response (connection refused, timeout).
     #[error("request failed: {0}")]
     Transport(#[from] reqwest::Error),
-    /// The gateway answered with a non-success status; the body carries the
-    /// handler's error text (the anyhow chain, verbatim).
+    /// The gateway answered with a non-success status; `body` is the
+    /// handler's message (the `error` field of a JSON error body, else the
+    /// body text).
     #[error("HTTP {status}: {body}")]
     Http {
         status: reqwest::StatusCode,
@@ -135,6 +137,134 @@ pub struct KeyUpdate<'a> {
     pub archived: Option<bool>,
 }
 
+/// Which callers the usage endpoints aggregate over. One variant per
+/// request, so the mutually exclusive `caller`, `key_id` and `user_id` query
+/// parameters can never be sent together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageScope {
+    /// Every caller.
+    #[default]
+    All,
+    /// Unidentified 本机 rows (`caller=null`).
+    Local,
+    /// One gateway key, by id (labels are only unique per user).
+    Key(i64),
+    /// Every key one user owns.
+    User(i64),
+}
+
+impl UsageScope {
+    fn caller(self) -> Option<&'static str> {
+        match self {
+            UsageScope::Local => Some("null"),
+            UsageScope::All | UsageScope::Key(_) | UsageScope::User(_) => None,
+        }
+    }
+
+    fn key_id(self) -> Option<i64> {
+        match self {
+            UsageScope::Key(key_id) => Some(key_id),
+            UsageScope::All | UsageScope::Local | UsageScope::User(_) => None,
+        }
+    }
+
+    fn user_id(self) -> Option<i64> {
+        match self {
+            UsageScope::User(user_id) => Some(user_id),
+            UsageScope::All | UsageScope::Local | UsageScope::Key(_) => None,
+        }
+    }
+}
+
+/// `POST /api/users` body. `rate_bp` `None` = the group rate applies;
+/// `max_concurrent` `None` = the server default.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct UserCreate<'a> {
+    pub login: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<&'a str>,
+    pub group_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_bp: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<i32>,
+}
+
+/// `PATCH /api/users/{id}` body: `None` leaves a field untouched.
+/// `rate_bp` is three-state: `Some(None)` clears the override back to the
+/// group rate.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct UserUpdate<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_bp: Option<Option<i64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<i32>,
+}
+
+/// `POST /api/user-groups` body. `rate_bp` `None` = 1.0×; `route_aliases`
+/// `None` = every route visible, a slice = the whitelist.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct UserGroupCreate<'a> {
+    pub name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_bp: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_aliases: Option<&'a [String]>,
+}
+
+/// `PATCH /api/user-groups/{id}` body: `None` leaves a field untouched.
+/// `route_aliases` is three-state: `Some(None)` makes every route visible.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct UserGroupUpdate<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_bp: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_aliases: Option<Option<&'a [String]>>,
+}
+
+/// Gateway key PATCH body, shared by `PATCH /api/gateway-keys/{id}` and
+/// `PATCH /user/keys/{id}`: `None` leaves a field untouched. `expires_at`
+/// and `quota_usd` are three-state: `Some(None)` clears them (never expires
+/// / unlimited). `quota_usd` is a decimal USD string, parsed server-side.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct GatewayKeyUpdate<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Option<DateTime<Utc>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_usd: Option<Option<&'a str>>,
+}
+
+/// The answer of `POST /api/users/{id}/topup` and `/adjust`: the written
+/// ledger entry and the user's new balance.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Credited {
+    pub entry: EntryRow,
+    pub balance_microus: i64,
+    /// `balance_microus` as a decimal USD string.
+    pub balance_usd: String,
+}
+
+/// The answer of `GET /api/users/{id}/reconcile`: the stored balances next
+/// to the ledger sums, and whether every pair agrees.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReconcileReport {
+    #[serde(flatten)]
+    pub report: Reconciliation,
+    pub consistent: bool,
+}
+
 /// HTTP client of the gateway's loopback admin API. Cheap to clone (the
 /// reqwest clients are shared).
 #[derive(Clone)]
@@ -158,16 +288,10 @@ impl GatewayHttpClient {
     /// `host:port` (same as `[gateway].listen`, `http://` is prepended) or a
     /// full URL (`https://gateway.example.com:8787`), used as-is.
     pub fn new(listen: &str, admin_key: &str) -> Self {
-        let trimmed = listen.trim_end_matches('/');
-        let base = if trimmed.contains("://") {
-            trimmed.to_string()
-        } else {
-            format!("http://{trimmed}")
-        };
         Self {
             http: build_client(Some(REQUEST_TIMEOUT)),
             stream: build_client(None),
-            base,
+            base: base_url(listen),
             admin_key: Arc::from(admin_key),
         }
     }
@@ -181,16 +305,7 @@ impl GatewayHttpClient {
     /// `GET /health` — no auth (the route sits outside the `/api` hoops).
     /// `Ok(())` when any 2xx answers.
     pub async fn health(&self) -> Result<(), ClientError> {
-        let response = self
-            .http
-            .get(format!("{}/health", self.base))
-            .send()
-            .await?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(http_error(response).await)
-        }
+        ok(self.http.get(format!("{}/health", self.base))).await
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -262,25 +377,30 @@ impl GatewayHttpClient {
     }
 
     /// Whole-window usage aggregates for the KPI cards over `[since, until)`;
-    /// `caller` restricts to one caller identity (None = all, Some("null") =
-    /// unidentified 本机 rows, anything else = a caller label).
+    /// `scope` restricts the callers counted.
     pub async fn usage_window(
         &self,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
-        caller: Option<&str>,
+        scope: UsageScope,
     ) -> Result<UsageWindow, ClientError> {
         #[derive(serde::Serialize)]
         struct WindowParams {
             since: String,
             until: String,
             #[serde(skip_serializing_if = "Option::is_none")]
-            caller: Option<String>,
+            caller: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            key_id: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            user_id: Option<i64>,
         }
         let params = WindowParams {
             since: rfc3339(since),
             until: rfc3339(until),
-            caller: caller.map(str::to_string),
+            caller: scope.caller(),
+            key_id: scope.key_id(),
+            user_id: scope.user_id(),
         };
         json(self.get("/api/usage/window").query(&params)).await
     }
@@ -288,15 +408,14 @@ impl GatewayHttpClient {
     /// Usage aggregated by bucket × category for the trend chart. `split` is
     /// one of `route`, `model`, `provider`, `client`, or `user`;
     /// `local_offset` shifts bucket labels to the caller's wall clock;
-    /// `caller` restricts to one caller identity (same spelling as
-    /// [`Self::usage_window`]).
+    /// `scope` restricts the callers counted.
     pub async fn usage_trend(
         &self,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
         split: TrendSplit,
         local_offset: chrono::Duration,
-        caller: Option<&str>,
+        scope: UsageScope,
     ) -> Result<Vec<TrendRow>, ClientError> {
         #[derive(serde::Serialize)]
         struct TrendParams {
@@ -305,14 +424,20 @@ impl GatewayHttpClient {
             split: TrendSplit,
             offset_seconds: i64,
             #[serde(skip_serializing_if = "Option::is_none")]
-            caller: Option<String>,
+            caller: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            key_id: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            user_id: Option<i64>,
         }
         let params = TrendParams {
             since: rfc3339(since),
             until: rfc3339(until),
             split,
             offset_seconds: local_offset.num_seconds(),
-            caller: caller.map(str::to_string),
+            caller: scope.caller(),
+            key_id: scope.key_id(),
+            user_id: scope.user_id(),
         };
         items(self.get("/api/usage/trend").query(&params)).await
     }
@@ -583,28 +708,169 @@ impl GatewayHttpClient {
 
     // ---------- gateway key management ----------
 
-    /// List all gateway keys.
-    pub async fn gateway_keys(&self) -> Result<Vec<GatewayKeyRow>, ClientError> {
-        let response: GatewayKeysResponse = json(self.get("/api/gateway-keys")).await?;
-        Ok(response.items)
+    /// Gateway keys with plaintext and owner: every key, or only those of
+    /// `user_id`.
+    pub async fn gateway_keys(
+        &self,
+        user_id: Option<i64>,
+    ) -> Result<Vec<GatewayKeyRow>, ClientError> {
+        #[derive(serde::Serialize)]
+        struct Params {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            user_id: Option<i64>,
+        }
+        items(self.get("/api/gateway-keys").query(&Params { user_id })).await
     }
 
-    /// Create a new gateway key; returns the plaintext key (shown once).
-    pub async fn create_gateway_key(&self, label: &str) -> Result<String, ClientError> {
-        let response: GatewayKeyCreateResponse = json(
-            self.post("/api/gateway-keys")
-                .json(&serde_json::json!({ "label": label })),
-        )
-        .await?;
+    /// Create a gateway key and return its plaintext. `user_id` `None` = the
+    /// built-in `owner` user; `expires_at` `None` = never expires;
+    /// `quota_usd` (decimal USD string) `None` = unlimited. A taken label
+    /// answers 409.
+    pub async fn create_gateway_key(
+        &self,
+        user_id: Option<i64>,
+        label: &str,
+        expires_at: Option<DateTime<Utc>>,
+        quota_usd: Option<&str>,
+    ) -> Result<String, ClientError> {
+        #[derive(serde::Serialize)]
+        struct KeyCreateBody<'a> {
+            label: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            user_id: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            expires_at: Option<DateTime<Utc>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            quota_usd: Option<&'a str>,
+        }
+        let body = KeyCreateBody {
+            label,
+            user_id,
+            expires_at,
+            quota_usd,
+        };
+        let response: GatewayKeyCreateResponse =
+            json(self.post("/api/gateway-keys").json(&body)).await?;
         Ok(response.key)
+    }
+
+    /// Partial update of a gateway key's label, enabled flag, expiry and
+    /// quota. Errors (404) when the id does not exist.
+    pub async fn patch_gateway_key(
+        &self,
+        id: i64,
+        patch: &GatewayKeyUpdate<'_>,
+    ) -> Result<(), ClientError> {
+        ok(self.patch(&format!("/api/gateway-keys/{id}")).json(patch)).await
     }
 
     /// Enable or disable a gateway key by its id. Errors (404) when not found.
     pub async fn set_gateway_key_enabled(&self, id: i64, enabled: bool) -> Result<(), ClientError> {
-        ok(self
-            .patch(&format!("/api/gateway-keys/{id}"))
-            .json(&serde_json::json!({ "enabled": enabled })))
-        .await
+        let patch = GatewayKeyUpdate {
+            enabled: Some(enabled),
+            ..GatewayKeyUpdate::default()
+        };
+        self.patch_gateway_key(id, &patch).await
+    }
+
+    // ---------- users, groups and credit ----------
+
+    /// Every user with group name, rates and balance.
+    pub async fn users(&self) -> Result<Vec<UserRow>, ClientError> {
+        items(self.get("/api/users")).await
+    }
+
+    /// One user. Errors (404) when the id does not exist.
+    pub async fn user(&self, id: i64) -> Result<UserRow, ClientError> {
+        json(self.get(&format!("/api/users/{id}"))).await
+    }
+
+    /// Create a user (balance 0) and return its row. A taken login answers
+    /// 409, an unknown group 404.
+    pub async fn create_user(&self, user: &UserCreate<'_>) -> Result<UserRow, ClientError> {
+        json(self.post("/api/users").json(user)).await
+    }
+
+    /// Partial update of a user; returns the updated row.
+    pub async fn patch_user(
+        &self,
+        id: i64,
+        patch: &UserUpdate<'_>,
+    ) -> Result<UserRow, ClientError> {
+        json(self.patch(&format!("/api/users/{id}")).json(patch)).await
+    }
+
+    /// Every user group with its member count.
+    pub async fn user_groups(&self) -> Result<Vec<GroupRow>, ClientError> {
+        items(self.get("/api/user-groups")).await
+    }
+
+    /// Create a user group and return its row. A taken name answers 409.
+    pub async fn create_user_group(
+        &self,
+        group: &UserGroupCreate<'_>,
+    ) -> Result<GroupRow, ClientError> {
+        json(self.post("/api/user-groups").json(group)).await
+    }
+
+    /// Partial update of a user group; returns the updated row.
+    pub async fn patch_user_group(
+        &self,
+        id: i64,
+        patch: &UserGroupUpdate<'_>,
+    ) -> Result<GroupRow, ClientError> {
+        json(self.patch(&format!("/api/user-groups/{id}")).json(patch)).await
+    }
+
+    /// Add money to a user's balance. `amount_usd` is a positive decimal
+    /// USD string, parsed server-side.
+    pub async fn topup(
+        &self,
+        id: i64,
+        amount_usd: &str,
+        note: Option<&str>,
+    ) -> Result<Credited, ClientError> {
+        let body = CreditBody { amount_usd, note };
+        json(self.post(&format!("/api/users/{id}/topup")).json(&body)).await
+    }
+
+    /// Correct a user's balance in either direction. `amount_usd` is a
+    /// signed decimal USD string; the server requires a non-empty `note`.
+    pub async fn adjust(
+        &self,
+        id: i64,
+        amount_usd: &str,
+        note: &str,
+    ) -> Result<Credited, ClientError> {
+        let body = CreditBody {
+            amount_usd,
+            note: Some(note),
+        };
+        json(self.post(&format!("/api/users/{id}/adjust")).json(&body)).await
+    }
+
+    /// One page of a user's ledger, newest first: entries older than
+    /// `before_id`, at most `limit` (`None` = the server default).
+    pub async fn user_entries(
+        &self,
+        id: i64,
+        before_id: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Vec<EntryRow>, ClientError> {
+        #[derive(serde::Serialize)]
+        struct EntriesParams {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            before_id: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            limit: Option<i64>,
+        }
+        let params = EntriesParams { before_id, limit };
+        items(self.get(&format!("/api/users/{id}/entries")).query(&params)).await
+    }
+
+    /// Check a user's stored balance and key spends against the ledger.
+    pub async fn reconcile(&self, id: i64) -> Result<ReconcileReport, ClientError> {
+        json(self.get(&format!("/api/users/{id}/reconcile"))).await
     }
 
     /// Add a named key to a provider; returns the new key id.
@@ -1068,6 +1334,17 @@ impl Reseed {
 
 // ---------- response plumbing ----------
 
+/// A base URL from either `host:port` (`http://` is prepended) or a full
+/// URL (used as-is); a trailing `/` is dropped.
+fn base_url(listen: &str) -> String {
+    let trimmed = listen.trim_end_matches('/');
+    if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
 /// RFC3339 with the `Z` spelling — human-diffable in logs; reqwest's query
 /// serializer percent-encodes whatever it gets, so the `+00:00` pitfall the
 /// handler tests document cannot bite here.
@@ -1075,17 +1352,18 @@ fn rfc3339(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// Body of `POST /api/users/{id}/topup` and `/adjust`.
+#[derive(serde::Serialize)]
+struct CreditBody<'a> {
+    amount_usd: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'a str>,
+}
+
 /// The `{ "items": [...] }` envelope most list endpoints answer with.
 #[derive(serde::Deserialize)]
 struct Items<T> {
     items: Vec<T>,
-}
-
-/// `GET /api/gateway-keys` response (same envelope as Items, but typed for
-/// the client method's return).
-#[derive(serde::Deserialize)]
-struct GatewayKeysResponse {
-    items: Vec<GatewayKeyRow>,
 }
 
 /// `POST /api/gateway-keys` response: the plaintext key, shown once.
@@ -1139,11 +1417,28 @@ async fn created_id(request: reqwest::RequestBuilder) -> Result<i64, ClientError
     Ok(json::<Created>(request).await?.id)
 }
 
-/// A non-success response into the typed error (status + body text).
+/// A non-success response into the typed error: the status plus the
+/// handler's message ([`error_message`]).
 async fn http_error(response: reqwest::Response) -> ClientError {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    ClientError::Http { status, body }
+    ClientError::Http {
+        status,
+        body: error_message(body),
+    }
+}
+
+/// The message of an error body: the `error` string of a `{"error": …}`
+/// JSON object, else the body text unchanged (plain-text handlers).
+fn error_message(body: String) -> String {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        error: String,
+    }
+    match serde_json::from_str::<ErrorBody>(&body) {
+        Ok(parsed) => parsed.error,
+        Err(_) => body,
+    }
 }
 
 /// reqwest's decode failure into the wire-drift variant: surface the serde

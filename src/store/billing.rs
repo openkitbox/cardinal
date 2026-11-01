@@ -1,6 +1,7 @@
 //! Billing ledger persistence: settle per-request charges into
 //! `billing_entries` and keep `users.balance_microus` equal to the sum of a
-//! user's entries.
+//! user's entries, and `gateway_keys.spent_microus` equal to the negated sum
+//! of the key's charge entries.
 //!
 //! Pure data layer: amounts arrive already computed (`crate::billing` owns
 //! the rules); this module only guarantees atomicity and idempotency. A
@@ -17,7 +18,7 @@ use sqlx::PgPool;
 macro_rules! entry_columns {
     () => {
         "id, user_id, kind, amount_microus, balance_after_microus, request_id, \
-         cost_microus, rate_bp, note, operator, created_at"
+         cost_microus, rate_bp, gateway_key_id, note, operator, created_at"
     };
 }
 
@@ -34,6 +35,9 @@ pub struct Charge {
     /// The caller's effective rate at request time, basis points (`None`
     /// when the row did not record one; stored as NULL).
     pub rate_bp: Option<i64>,
+    /// The gateway key the request used (`None` when the row did not record
+    /// one); its `spent_microus` grows with the charge.
+    pub gateway_key_id: Option<i64>,
 }
 
 /// What one [`settle_charges`] call did.
@@ -60,18 +64,32 @@ pub struct Overflowed {
     pub request_id: String,
 }
 
-/// A user's stored balance next to the sum of their ledger entries; the two
-/// must be equal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A user's stored balance next to the sum of their ledger entries, and the
+/// same check for each of their keys; each pair must be equal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reconciliation {
     pub balance_microus: i64,
+    pub entries_sum_microus: i64,
+    /// One row per key the user owns, by key id.
+    pub keys: Vec<KeyReconciliation>,
+}
+
+/// A key's stored spend next to the negated sum of its charge entries.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, sqlx::FromRow,
+)]
+pub struct KeyReconciliation {
+    pub key_id: i64,
+    pub spent_microus: i64,
     pub entries_sum_microus: i64,
 }
 
 /// Settle `charges` in one transaction: lock the affected users in id order
 /// (a fixed order, so concurrent settlers cannot deadlock), insert one
 /// `charge` entry per new request id in input order, and write each changed
-/// balance back. Either the whole batch lands or nothing does. Charges of
+/// balance back, then add each key's newly inserted charges to its
+/// `spent_microus` (one update per key, in key id order). Duplicates add
+/// nothing. Either the whole batch lands or nothing does. Charges of
 /// missing users, and charges whose arithmetic would overflow, are skipped
 /// and reported instead of failing the batch.
 pub async fn settle_charges(
@@ -98,6 +116,8 @@ pub async fn settle_charges(
         .into_iter()
         .map(|(id, balance)| (id, (balance, false)))
         .collect();
+    // key id -> micro-USD newly charged through it in this batch
+    let mut key_spend: HashMap<i64, i64> = HashMap::new();
 
     for charge in charges {
         let Some((balance, changed)) = balances.get_mut(&charge.user_id) else {
@@ -120,8 +140,9 @@ pub async fn settle_charges(
         };
         let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO billing_entries
-                 (user_id, kind, amount_microus, balance_after_microus, request_id, cost_microus, rate_bp)
-             VALUES ($1, 'charge', $2, $3, $4, $5, $6)
+                 (user_id, kind, amount_microus, balance_after_microus, request_id, cost_microus,
+                  rate_bp, gateway_key_id)
+             VALUES ($1, 'charge', $2, $3, $4, $5, $6, $7)
              ON CONFLICT (request_id) WHERE kind = 'charge' DO NOTHING
              RETURNING id",
         )
@@ -131,11 +152,16 @@ pub async fn settle_charges(
         .bind(&charge.request_id)
         .bind(charge.cost_microus)
         .bind(charge.rate_bp)
+        .bind(charge.gateway_key_id)
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_some() {
             *balance = after;
             *changed = true;
+            if let Some(key_id) = charge.gateway_key_id {
+                let spent = key_spend.entry(key_id).or_default();
+                *spent = spent.saturating_add(charge.amount_microus);
+            }
             report.settled += 1;
         } else {
             report.duplicates += 1;
@@ -152,12 +178,22 @@ pub async fn settle_charges(
             .execute(&mut *tx)
             .await?;
     }
+    let mut key_ids: Vec<(i64, i64)> = key_spend.into_iter().collect();
+    key_ids.sort_unstable();
+    for (key_id, amount) in key_ids {
+        sqlx::query("UPDATE gateway_keys SET spent_microus = spent_microus + $2 WHERE id = $1")
+            .bind(key_id)
+            .bind(amount)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(report)
 }
 
-/// A user's stored balance and the sum of their ledger entries, or `None`
-/// when the user does not exist.
+/// A user's stored balance and the sum of their ledger entries, plus each
+/// owned key's stored spend and the negated sum of its charge entries, or
+/// `None` when the user does not exist.
 pub async fn reconcile_user(
     pool: &PgPool,
     user_id: i64,
@@ -171,12 +207,28 @@ pub async fn reconcile_user(
     .bind(user_id)
     .fetch_optional(pool)
     .await?;
-    Ok(
-        row.map(|(balance_microus, entries_sum_microus)| Reconciliation {
-            balance_microus,
-            entries_sum_microus,
-        }),
+    let Some((balance_microus, entries_sum_microus)) = row else {
+        return Ok(None);
+    };
+    let keys = sqlx::query_as::<_, KeyReconciliation>(
+        "SELECT k.id AS key_id, k.spent_microus,
+                COALESCE(s.charged, 0)::bigint AS entries_sum_microus
+           FROM gateway_keys k
+           LEFT JOIN (SELECT e.gateway_key_id, -SUM(e.amount_microus) AS charged
+                        FROM billing_entries e
+                       WHERE e.user_id = $1 AND e.kind = 'charge'
+                       GROUP BY e.gateway_key_id) s ON s.gateway_key_id = k.id
+          WHERE k.user_id = $1
+          ORDER BY k.id",
     )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(Reconciliation {
+        balance_microus,
+        entries_sum_microus,
+        keys,
+    }))
 }
 
 /// A manual balance change made by an operator.
@@ -200,7 +252,7 @@ impl CreditKind {
 }
 
 /// One ledger entry as stored.
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct EntryRow {
     pub id: i64,
     pub user_id: i64,
@@ -211,6 +263,8 @@ pub struct EntryRow {
     pub request_id: Option<String>,
     pub cost_microus: Option<i64>,
     pub rate_bp: Option<i64>,
+    /// The key a charge was made through; `None` on other kinds.
+    pub gateway_key_id: Option<i64>,
     pub note: String,
     pub operator: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,

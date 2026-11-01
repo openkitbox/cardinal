@@ -1595,7 +1595,7 @@ pub async fn dispatch_at(
     {
         return DispatchOutcome::Failed {
             status: deny.status(),
-            message: deny.message().into(),
+            message: deny.message(&principal.key_label),
             retry_after_secs: None,
         };
     }

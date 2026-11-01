@@ -6,7 +6,8 @@
 //!
 //! Each flush writes two things with different guarantees:
 //!
-//! - **Charges** (`billing_entries` + `users.balance_microus`): every billed
+//! - **Charges** (`billing_entries` + `users.balance_microus` +
+//!   `gateway_keys.spent_microus`): every billed
 //!   row (a user, a request id and a positive `charged_microus`) becomes a
 //!   [`Charge`], settled first, in chunks of at most [`SETTLE_CHUNK`]
 //!   charges, one transaction per chunk ([`crate::store::settle_charges`]).
@@ -296,6 +297,7 @@ fn charge_of(row: &AttemptLog) -> Option<Charge> {
         amount_microus,
         cost_microus: row.cost_usd.and_then(crate::billing::cost_microus),
         rate_bp: row.rate_bp,
+        gateway_key_id: row.gateway_key_id,
     })
 }
 

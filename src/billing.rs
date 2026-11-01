@@ -5,7 +5,9 @@
 //! Units: money is integer micro-USD (`i64`, 1 USD = 1_000_000); rate
 //! multipliers are integer basis points (`i64`, 10_000 = 1.0×). Admin-entered
 //! amounts are decimal USD strings converted exactly by [`parse_usd`] (never
-//! through a float) and rendered back by [`format_usd`].
+//! through a float) and rendered back by [`format_usd`]; rate multipliers
+//! typed as decimals (`"1.25"`) go through [`parse_rate`] / [`format_rate`]
+//! the same way.
 //!
 //! Rounding: the provider cost (USD float from `ModelPrice::cost_split`) is
 //! *rounded* to micro-USD so float noise such as `3.0000000000000004e-6`
@@ -35,6 +37,8 @@ const MICROUS_PER_USD: f64 = 1_000_000.0;
 const MICROUS_PER_USD_INT: i64 = 1_000_000;
 /// Decimal places of a USD amount in micro-USD.
 const USD_SCALE_DIGITS: usize = 6;
+/// Decimal places of a rate multiplier in basis points.
+const RATE_SCALE_DIGITS: usize = 4;
 
 /// Largest rate multiplier an operator may set on a user or group:
 /// 1_000_000 bp = 100×. Far beyond any real price, and it keeps
@@ -69,24 +73,60 @@ pub fn parse_usd(text: &str) -> Option<i64> {
         Some(rest) => (true, rest),
         None => (false, text),
     };
-    let (whole, fraction) = match unsigned.split_once('.') {
-        Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
-        Some(_) => return None,
-        None => (unsigned, ""),
-    };
-    if whole.is_empty() || fraction.len() > USD_SCALE_DIGITS {
-        return None;
-    }
-    let mut micro = digits_value(whole)?.checked_mul(MICROUS_PER_USD_INT)?;
-    if !fraction.is_empty() {
-        let scale = 10_i64.checked_pow(u32::try_from(USD_SCALE_DIGITS - fraction.len()).ok()?)?;
-        micro = micro.checked_add(digits_value(fraction)?.checked_mul(scale)?)?;
-    }
+    let micro = parse_fixed(unsigned, USD_SCALE_DIGITS)?;
     if negative {
         micro.checked_neg()
     } else {
         Some(micro)
     }
+}
+
+/// Parse a decimal rate multiplier (`"1.25"` = 1.25×) into basis points
+/// (12_500) exactly, without going through a float. Surrounding whitespace
+/// is ignored (the input is a text field). Accepts at most four fractional
+/// digits and values in `0..=100` (`MAX_RATE_BP`); a sign, an exponent, a
+/// `×` suffix, a bare `.` edge (`"1."`, `".5"`) or any other text is `None`.
+#[must_use]
+pub fn parse_rate(text: &str) -> Option<i64> {
+    parse_fixed(text.trim(), RATE_SCALE_DIGITS).filter(|rate_bp| *rate_bp <= MAX_RATE_BP)
+}
+
+/// Render basis points as a multiplier with trailing fractional zeros
+/// trimmed: 12_500 → `"1.25×"`, 10_000 → `"1×"`, 0 → `"0×"`.
+#[must_use]
+pub fn format_rate(rate_bp: i64) -> String {
+    let sign = if rate_bp < 0 { "-" } else { "" };
+    let magnitude = rate_bp.unsigned_abs();
+    let per_unit = UNIT_BP.unsigned_abs();
+    let whole = u128::from(magnitude) / per_unit;
+    let fraction = u128::from(magnitude) % per_unit;
+    if fraction == 0 {
+        return format!("{sign}{whole}×");
+    }
+    let digits = format!("{fraction:0width$}", width = RATE_SCALE_DIGITS);
+    format!("{sign}{whole}.{}×", digits.trim_end_matches('0'))
+}
+
+/// Value of an unsigned decimal with at most `scale_digits` fractional
+/// digits, scaled by `10^scale_digits` (`"1.25"`, 4 → 12_500). Both the whole
+/// and (when a `.` is present) the fractional part must be non-empty runs
+/// of ASCII digits; overflow is `None`.
+fn parse_fixed(text: &str, scale_digits: usize) -> Option<i64> {
+    let (whole, fraction) = match text.split_once('.') {
+        Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
+        Some(_) => return None,
+        None => (text, ""),
+    };
+    if whole.is_empty() || fraction.len() > scale_digits {
+        return None;
+    }
+    let unit = 10_i64.checked_pow(u32::try_from(scale_digits).ok()?)?;
+    let mut value = digits_value(whole)?.checked_mul(unit)?;
+    if !fraction.is_empty() {
+        let scale = 10_i64.checked_pow(u32::try_from(scale_digits - fraction.len()).ok()?)?;
+        value = value.checked_add(digits_value(fraction)?.checked_mul(scale)?)?;
+    }
+    Some(value)
 }
 
 /// Value of a non-empty run of ASCII digits, `None` on any other byte or on
@@ -210,6 +250,8 @@ pub fn certainty(usage_observed: bool, upstream: ProtocolId) -> UsageCertainty {
 pub enum Deny {
     InsufficientBalance,
     RouteNotAllowed,
+    /// The key has spent its cumulative quota.
+    KeyQuotaExhausted,
 }
 
 impl Deny {
@@ -217,17 +259,21 @@ impl Deny {
     #[must_use]
     pub fn status(self) -> u16 {
         match self {
-            Deny::InsufficientBalance => 402,
+            Deny::InsufficientBalance | Deny::KeyQuotaExhausted => 402,
             Deny::RouteNotAllowed => 403,
         }
     }
 
-    /// Client-facing error message.
+    /// Client-facing error message. `key_label` names the caller's key; the
+    /// key itself never appears.
     #[must_use]
-    pub fn message(self) -> &'static str {
+    pub fn message(self, key_label: &str) -> String {
         match self {
-            Deny::InsufficientBalance => "insufficient balance; top up to continue",
-            Deny::RouteNotAllowed => "this model is not available on your plan",
+            Deny::InsufficientBalance => "insufficient balance; top up to continue".to_owned(),
+            Deny::RouteNotAllowed => "this model is not available on your plan".to_owned(),
+            Deny::KeyQuotaExhausted => {
+                format!("the API key '{key_label}' has used up its quota")
+            }
         }
     }
 }
@@ -235,16 +281,23 @@ impl Deny {
 /// Decide whether `principal` may spend on `model` (the client-requested
 /// route alias or `provider/model` direct string).
 ///
-/// The route whitelist is checked before the balance: "this model is not
-/// available" is the more accurate answer than "top up" for a model the
-/// plan can never use. A whitelist matches exactly, so direct
-/// `provider/model` strings are refused unless listed. Free users (rate 0)
-/// skip the balance check.
+/// Order: route whitelist, key quota, balance — each earlier answer is the
+/// more accurate one ("not available" beats "top up" for a model the plan
+/// can never use; topping up does not lift a key's quota). A whitelist
+/// matches exactly, so direct `provider/model` strings are refused unless
+/// listed. The key quota applies whatever the rate; free users (rate 0)
+/// skip only the balance check.
 pub fn admit(principal: &Principal, model: &str) -> Result<(), Deny> {
     if let Some(aliases) = &principal.route_aliases
         && !aliases.iter().any(|alias| alias == model)
     {
         return Err(Deny::RouteNotAllowed);
+    }
+    if principal
+        .key_quota_microus
+        .is_some_and(|quota| principal.key_spent_microus >= quota)
+    {
+        return Err(Deny::KeyQuotaExhausted);
     }
     if rate_bp(principal) > 0 && principal.balance_microus <= 0 {
         return Err(Deny::InsufficientBalance);

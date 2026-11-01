@@ -1,4 +1,4 @@
-//! Read-only self-service API for ordinary gateway-key users (`/user/*`).
+//! Self-service API for ordinary gateway-key users (`/user/*`).
 //!
 //! This surface is separate from the admin router. It authenticates one
 //! gateway key that is enabled, unexpired and owned by an enabled user, and
@@ -10,7 +10,10 @@
 //! - `GET /user/me` — profile, group, effective rate, balance, the user's
 //!   keys (full plaintext, so the client can copy them again) and 30-day usage
 //! - `GET /user/me/entries?before_id&limit` — the user's ledger, newest first
-//! - `GET /user/usage/window`, `GET /user/usage/trend` — usage aggregates
+//! - `GET /user/usage/window`, `GET /user/usage/trend` — usage aggregates;
+//!   the trend `split` is `route` (default), `model` or `client` — `provider`
+//!   and `user` are refused with 400 (users never see upstream providers)
+//! - `/user/keys` — self-service key management, see [`crate::user_keys`]
 
 use std::sync::Arc;
 
@@ -63,15 +66,20 @@ fn is_admin_key(token: &str, admin_key: &AdminKey) -> bool {
     )
 }
 
-fn scope_override_requested(caller: bool, label: bool) -> bool {
-    caller || label
+/// Query parameters that pick a scope on the admin usage endpoints. The user
+/// endpoints are always scoped to the authenticated user, so any of them is
+/// refused rather than silently ignored.
+const SCOPE_PARAMS: [&str; 4] = ["caller", "label", "key_id", "user_id"];
+
+fn scope_override_requested(present: impl Fn(&str) -> bool) -> bool {
+    SCOPE_PARAMS.iter().any(|name| present(name))
 }
 
-fn state(depot: &Depot) -> Result<&Arc<AppState>, ()> {
+pub(crate) fn state(depot: &Depot) -> Result<&Arc<AppState>, ()> {
     depot.get_typed::<Arc<AppState>>().map_err(|_| ())
 }
 
-fn json_response<T: serde::Serialize>(response: &mut Response, value: &T) {
+pub(crate) fn json_response<T: serde::Serialize>(response: &mut Response, value: &T) {
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("application/json"),
@@ -79,7 +87,7 @@ fn json_response<T: serde::Serialize>(response: &mut Response, value: &T) {
     let _ = response.body(serde_json::to_vec(value).unwrap_or_default());
 }
 
-fn internal(response: &mut Response, error: anyhow::Error) {
+pub(crate) fn internal(response: &mut Response, error: anyhow::Error) {
     tracing::error!("user usage api: {error:#}");
     response.status_code(StatusCode::INTERNAL_SERVER_ERROR);
     let _ = response.body("internal error");
@@ -162,6 +170,41 @@ struct EntriesQuery {
 /// Window of the usage summary in `GET /user/me`.
 const ME_USAGE_DAYS: i64 = 30;
 
+/// The `GET /user/me` body: the caller's own account.
+#[derive(serde::Serialize)]
+struct MeView {
+    user: MeUser,
+    group: MeGroup,
+    /// The effective rate: the user override, else the group rate.
+    rate_bp: i64,
+    balance_microus: i64,
+    /// `balance_microus` as a decimal USD string.
+    balance_usd: String,
+    /// Every key the user owns, full plaintext included.
+    keys: Vec<store::GatewayKeyRow>,
+    /// Usage over the last [`ME_USAGE_DAYS`] days, all of the user's keys.
+    usage_30d: store::UsageWindow,
+}
+
+/// The profile part of [`MeView`].
+#[derive(serde::Serialize)]
+struct MeUser {
+    id: i64,
+    login: String,
+    display_name: String,
+    enabled: bool,
+    max_concurrent: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The group part of [`MeView`]; `rate_bp` is the group's own rate.
+#[derive(serde::Serialize)]
+struct MeGroup {
+    id: i64,
+    name: String,
+    rate_bp: i64,
+}
+
 #[derive(Deserialize)]
 struct WindowQuery {
     #[serde(default)]
@@ -186,6 +229,20 @@ struct TrendQuery {
     offset_seconds: Option<i64>,
 }
 
+/// The trend split a user may ask for: route (the default), model or
+/// client. Provider would expose upstream accounts and user is meaningless
+/// within one user's scope, so both are refused.
+fn user_split(split: Option<store::TrendSplit>) -> Result<store::TrendSplit, &'static str> {
+    use store::TrendSplit;
+    match split {
+        None => Ok(TrendSplit::Route),
+        Some(split @ (TrendSplit::Route | TrendSplit::Model | TrendSplit::Client)) => Ok(split),
+        Some(TrendSplit::Provider | TrendSplit::User) => {
+            Err("split must be route, model or client")
+        }
+    }
+}
+
 fn resolve_window(
     since: Option<chrono::DateTime<chrono::Utc>>,
     until: Option<chrono::DateTime<chrono::Utc>>,
@@ -201,11 +258,8 @@ fn resolve_window(
     )
 }
 
-fn client_scope(request: &Request, depot: &Depot) -> Result<CallerFilter<'static>, StatusCode> {
-    if scope_override_requested(
-        request.queries().get("caller").is_some(),
-        request.queries().get("label").is_some(),
-    ) {
+fn client_scope(request: &Request, depot: &Depot) -> Result<CallerFilter, StatusCode> {
+    if scope_override_requested(|name| request.queries().get(name).is_some()) {
         return Err(StatusCode::BAD_REQUEST);
     }
     depot
@@ -229,7 +283,8 @@ async fn usage_window(request: &mut Request, depot: &mut Depot, response: &mut R
         Ok(caller) => caller,
         Err(status) => {
             response.status_code(status);
-            let _ = response.body("caller and label filters are not accepted");
+            let _ =
+                response.body("scope parameters (caller, label, key_id, user_id) are not accepted");
             return;
         }
     };
@@ -265,12 +320,21 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
         let _ = response.body("offset_seconds must be within ±14 hours");
         return;
     }
+    let split = match user_split(query.split) {
+        Ok(split) => split,
+        Err(message) => {
+            response.status_code(StatusCode::BAD_REQUEST);
+            let _ = response.body(message);
+            return;
+        }
+    };
     let (since, until) = resolve_window(query.since, query.until, query.days);
     let caller = match client_scope(request, depot) {
         Ok(caller) => caller,
         Err(status) => {
             response.status_code(status);
-            let _ = response.body("caller and label filters are not accepted");
+            let _ =
+                response.body("scope parameters (caller, label, key_id, user_id) are not accepted");
             return;
         }
     };
@@ -286,7 +350,7 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
         pool,
         since,
         until,
-        query.split.unwrap_or(store::TrendSplit::Route),
+        split,
         chrono::Duration::seconds(offset_seconds),
         Some(caller),
     )
@@ -298,7 +362,7 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
 }
 
 /// The authenticated user's id; `None` only if the auth hoop did not run.
-fn scoped_user(depot: &Depot) -> Option<i64> {
+pub(crate) fn scoped_user(depot: &Depot) -> Option<i64> {
     depot.get_typed::<UserScope>().ok().map(|scope| scope.0)
 }
 
@@ -338,29 +402,27 @@ async fn me(depot: &mut Depot, response: &mut Response) {
         }
     };
     let rate_bp = crate::billing::effective_rate_bp(user.rate_bp, user.group_rate_bp);
-    json_response(
-        response,
-        &json!({
-            "user": {
-                "id": user.id,
-                "login": user.login,
-                "display_name": user.display_name,
-                "enabled": user.enabled,
-                "max_concurrent": user.max_concurrent,
-                "created_at": user.created_at,
-            },
-            "group": {
-                "id": user.group_id,
-                "name": user.group_name,
-                "rate_bp": user.group_rate_bp,
-            },
-            "rate_bp": rate_bp,
-            "balance_microus": user.balance_microus,
-            "balance_usd": crate::billing::format_usd(user.balance_microus),
-            "keys": keys,
-            "usage_30d": usage,
-        }),
-    );
+    let view = MeView {
+        user: MeUser {
+            id: user.id,
+            login: user.login,
+            display_name: user.display_name,
+            enabled: user.enabled,
+            max_concurrent: user.max_concurrent,
+            created_at: user.created_at,
+        },
+        group: MeGroup {
+            id: user.group_id,
+            name: user.group_name,
+            rate_bp: user.group_rate_bp,
+        },
+        rate_bp,
+        balance_microus: user.balance_microus,
+        balance_usd: crate::billing::format_usd(user.balance_microus),
+        keys,
+        usage_30d: usage,
+    };
+    json_response(response, &view);
 }
 
 /// `GET /user/me/entries?before_id&limit`: the caller's ledger, newest first.
@@ -383,9 +445,9 @@ async fn me_entries(request: &mut Request, depot: &mut Depot, response: &mut Res
     }
 }
 
-/// `/user/*` sub-router: the caller's account and ledger plus the two
-/// usage endpoints, all read-only. Management, request-log, and streaming
-/// routes are intentionally absent.
+/// `/user/*` sub-router: the caller's account and ledger, the two usage
+/// endpoints and the caller's own keys ([`crate::user_keys`]). Admin
+/// management, request-log, and streaming routes are intentionally absent.
 pub fn router(admin_key: Arc<AdminKey>) -> Router {
     Router::with_path("user")
         .hoop(salvo::affix_state::inject(admin_key))
@@ -400,6 +462,7 @@ pub fn router(admin_key: Arc<AdminKey>) -> Router {
                 .push(Router::with_path("window").get(usage_window))
                 .push(Router::with_path("trend").get(usage_trend)),
         )
+        .push(crate::user_keys::router())
 }
 
 #[cfg(test)]
@@ -413,6 +476,8 @@ mod tests {
             key_label: "alice".to_owned(),
             key_enabled,
             key_expires_at: None,
+            key_quota_microus: None,
+            key_spent_microus: 0,
             user_id,
             login: "alice".to_owned(),
             user_enabled,
@@ -448,11 +513,14 @@ mod tests {
     }
 
     #[test]
-    fn caller_and_label_query_parameters_cannot_override_scope() {
-        assert!(!scope_override_requested(false, false));
-        assert!(scope_override_requested(true, false));
-        assert!(scope_override_requested(false, true));
-        assert!(scope_override_requested(true, true));
+    fn scope_query_parameters_cannot_override_scope() {
+        assert!(!scope_override_requested(|name| name == "days"));
+        for param in SCOPE_PARAMS {
+            assert!(
+                scope_override_requested(|name| name == param),
+                "{param} must be refused"
+            );
+        }
     }
 
     #[test]

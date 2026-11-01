@@ -23,10 +23,12 @@
 //!   400 when the body is malformed or a referenced key does not exist). PUT is a full
 //!   replace: a strategy-preserving client MUST send it back, or the save resets to `ordered`
 //! - `GET /api/rests`, `DELETE /api/rests/keys/:key_id`, `DELETE /api/rests/providers/:provider_id` — cooldowns, identity = key
-//! - `GET /api/usage?days=N` (aggregated by day × alias; `caller` restricts to one caller identity, `caller=null` = unidentified)
-//! - `GET /api/usage/trend?since&until&split&offset_seconds` (bucket × category aggregates for the trend chart; `split` = `route`|`model`|`provider`|`client`|`user`; `caller` as above)
-//! - `GET /api/usage/window?since&until` (whole-window aggregate behind the KPI cards; `caller` as above)
-//! - `GET /api/requests?limit=N` (recent requests)
+//! - `GET /api/usage?days=N` (aggregated by day × alias; `key_id` restricts to one gateway key, `caller=null` = unidentified,
+//!   `user_id` = every key one user owns; more than one of them is 400, any other `caller` value is 400)
+//! - `GET /api/usage/trend?since&until&split&offset_seconds` (bucket × category aggregates for the trend chart; `split` =
+//!   `route`|`model`|`provider`|`client`|`user` (`user` = the owning user's login); `caller`/`key_id`/`user_id` as above)
+//! - `GET /api/usage/window?since&until` (whole-window aggregate behind the KPI cards; `caller`/`key_id`/`user_id` as above)
+//! - `GET /api/requests?limit=N` (recent requests, with `user_id`, `login`, `gateway_key_id`, `charged_microus`, `rate_bp`)
 //! - `GET /api/requests/:id/bodies` (captured request/response bodies from the hourly payload files)
 //! - `GET /api/chat-models` (the chat picker's model list: route aliases + probed direct entries)
 //! - `GET /api/concurrency` (per-key live occupancy for concurrency-capped keys)
@@ -39,7 +41,12 @@
 //! - `POST /api/users/:id/topup` `{amount_usd, note?, operator?}` (> 0), `POST /api/users/:id/adjust` `{amount_usd, note,
 //!   operator?}` (≠ 0) — one ledger entry plus the balance change in one transaction; `operator` defaults to `admin`
 //! - `GET /api/users/:id/entries?before_id&limit` (ledger, newest first), `GET /api/users/:id/reconcile`
-//! - `GET/POST /api/gateway-keys` (`?user_id=` filters the list; POST `user_id` defaults to `owner`), `PATCH /api/gateway-keys/:id`
+//!   (balance vs ledger sum, plus `keys: [{key_id, spent_microus, entries_sum_microus}]`; `consistent` covers both)
+//! - `GET/POST /api/gateway-keys` (`?user_id=` filters the list; POST `{label, user_id?, expires_at?, quota_usd?}`,
+//!   `user_id` defaults to `owner`), `PATCH /api/gateway-keys/:id` `{label?, enabled?, expires_at?, quota_usd?}`
+//!   (`expires_at` RFC 3339 in the future, `quota_usd` a non-negative decimal USD string = cumulative cap that never
+//!   resets; on PATCH both are three-state: absent = untouched, null = clear). Labels are unique per user (409);
+//!   a key whose spend reached its quota is refused with 402
 //! - `GET /api/traces`, `GET /api/traces/:request_id` — recent routing traces from the dispatch trace ring
 //!   (newest first, capped at the ring's capacity; transient — nothing is persisted)
 
@@ -53,6 +60,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::agent;
+use crate::key_terms;
 use crate::kiro::{KeyCredential, KiroOAuth, resolve_key_credential};
 use crate::store::{self, ProviderInput, RouteEntry, RouteStrategy};
 
@@ -410,7 +418,7 @@ struct RouteBody {
     note: Option<String>,
     /// Three-state: absent = keep the stored list, null = clear back to legacy
     /// derivation, array = set the list.
-    #[serde(default, deserialize_with = "tri_state")]
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
     efforts: Option<Option<Vec<String>>>,
 }
 
@@ -498,6 +506,10 @@ struct UsageQuery {
     days: i32,
     #[serde(default)]
     caller: Option<String>,
+    #[serde(default)]
+    key_id: Option<i64>,
+    #[serde(default)]
+    user_id: Option<i64>,
 }
 
 fn default_days() -> i32 {
@@ -508,12 +520,25 @@ fn default_days() -> i32 {
 #[handler]
 async fn usage(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let pool = state_pool(depot);
-    let query = request.parse_queries::<UsageQuery>().unwrap_or(UsageQuery {
-        days: default_days(),
-        caller: None,
-    });
+    // A malformed query is refused rather than defaulted: falling back would
+    // silently drop a `user_id`/`key_id`/`caller` filter and widen the result.
+    let query = match request.parse_queries::<UsageQuery>() {
+        Ok(query) => query,
+        Err(_) => {
+            response.status_code(StatusCode::BAD_REQUEST);
+            let _ = response.body("invalid usage query (days, caller, key_id, user_id)");
+            return;
+        }
+    };
     let days = query.days.clamp(1, 365);
-    let caller = caller_filter(query.caller.as_deref());
+    let caller = match usage_scope(query.caller.as_deref(), query.key_id, query.user_id) {
+        Ok(caller) => caller,
+        Err(message) => {
+            response.status_code(StatusCode::BAD_REQUEST);
+            let _ = response.body(message);
+            return;
+        }
+    };
     match store::usage_by_day(pool, days, caller).await {
         Ok(rows) => json_response(response, &json!({ "days": days, "items": rows })),
         Err(error) => internal(response, error),
@@ -544,8 +569,8 @@ fn resolve_window(
 /// Query form of `GET /api/usage/trend`. `split` is the category dimension
 /// (route|model|provider|client|user, default route); `offset_seconds` shifts
 /// bucket labels to the caller's wall clock (the GUI passes its local offset);
-/// `caller` restricts to one caller identity (`null` = unidentified 本机
-/// rows, anything else = a gateway key label).
+/// `caller=null` restricts to unidentified 本机 rows, `key_id` to one gateway
+/// key, `user_id` to one user's keys (mutually exclusive, see [`usage_scope`]).
 /// Window bounds resolve via [`resolve_window`].
 #[derive(Deserialize)]
 struct TrendQuery {
@@ -561,6 +586,10 @@ struct TrendQuery {
     offset_seconds: Option<i64>,
     #[serde(default)]
     caller: Option<String>,
+    #[serde(default)]
+    key_id: Option<i64>,
+    #[serde(default)]
+    user_id: Option<i64>,
 }
 
 /// Usage aggregated by bucket × category for the trend chart; mirrors
@@ -592,28 +621,44 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
         return;
     }
     let offset = chrono::Duration::seconds(offset_seconds);
-    let caller = caller_filter(query.caller.as_deref());
+    let caller = match usage_scope(query.caller.as_deref(), query.key_id, query.user_id) {
+        Ok(caller) => caller,
+        Err(message) => {
+            response.status_code(StatusCode::BAD_REQUEST);
+            let _ = response.body(message);
+            return;
+        }
+    };
     match admin.usage_trend(since, until, split, offset, caller).await {
         Ok(rows) => json_response(response, &json!({ "items": rows })),
         Err(error) => internal(response, error),
     }
 }
 
-/// The `caller` query parameter's store form: the reserved value `null`
-/// selects unidentified callers, any other value is a gateway key label.
-fn caller_filter(caller: Option<&str>) -> Option<store::CallerFilter<'_>> {
-    caller.map(|value| {
-        if value == "null" {
-            store::CallerFilter::Null
-        } else {
-            store::CallerFilter::Label(value)
-        }
-    })
+/// The store filter of the usage endpoints' scope query parameters:
+/// `caller=null` selects unidentified callers (no other `caller` value is
+/// accepted: labels are only unique per user, so a label cannot name a key);
+/// `key_id` one gateway key; `user_id` every key that user owns. They name
+/// different scopes, so more than one is refused rather than one silently
+/// winning.
+fn usage_scope(
+    caller: Option<&str>,
+    key_id: Option<i64>,
+    user_id: Option<i64>,
+) -> Result<Option<store::CallerFilter>, &'static str> {
+    match (caller, key_id, user_id) {
+        (None, None, None) => Ok(None),
+        (Some("null"), None, None) => Ok(Some(store::CallerFilter::Null)),
+        (Some(_), None, None) => Err("caller only accepts null; select a key with key_id"),
+        (None, Some(key_id), None) => Ok(Some(store::CallerFilter::Key(key_id))),
+        (None, None, Some(user_id)) => Ok(Some(store::CallerFilter::User(user_id))),
+        _ => Err("caller, key_id and user_id are mutually exclusive"),
+    }
 }
 
 /// Query form of `GET /api/usage/window` — window bounds plus the optional
-/// `caller` restriction (same spelling as [`TrendQuery`]), resolved via
-/// [`resolve_window`].
+/// `caller`/`key_id`/`user_id` restriction (same spelling as [`TrendQuery`]), resolved
+/// via [`resolve_window`].
 #[derive(Deserialize)]
 struct WindowQuery {
     #[serde(default)]
@@ -624,6 +669,10 @@ struct WindowQuery {
     days: Option<i32>,
     #[serde(default)]
     caller: Option<String>,
+    #[serde(default)]
+    key_id: Option<i64>,
+    #[serde(default)]
+    user_id: Option<i64>,
 }
 
 /// Whole-window usage aggregates behind the KPI cards; mirrors
@@ -640,7 +689,14 @@ async fn usage_window(request: &mut Request, depot: &mut Depot, response: &mut R
         }
     };
     let (since, until) = resolve_window(query.since, query.until, query.days);
-    let caller = caller_filter(query.caller.as_deref());
+    let caller = match usage_scope(query.caller.as_deref(), query.key_id, query.user_id) {
+        Ok(caller) => caller,
+        Err(message) => {
+            response.status_code(StatusCode::BAD_REQUEST);
+            let _ = response.body(message);
+            return;
+        }
+    };
     match admin.usage_window(since, until, caller).await {
         Ok(window) => json_response(response, &window),
         Err(error) => internal(response, error),
@@ -696,6 +752,12 @@ struct GatewayKeyCreateBody {
     label: String,
     /// Owning user; defaults to the built-in `owner` user when absent.
     user_id: Option<i64>,
+    /// RFC 3339; absent/null = never expires.
+    #[serde(default)]
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Cumulative cap as a decimal USD string; absent/null = unlimited.
+    #[serde(default)]
+    quota_usd: Option<String>,
 }
 
 /// `POST /api/gateway-keys`: create a new gateway key and return its
@@ -712,11 +774,19 @@ async fn create_gateway_key(request: &mut Request, depot: &mut Depot, response: 
             return;
         }
     };
-    if body.label.trim().is_empty() {
-        response.status_code(StatusCode::BAD_REQUEST);
-        json_response(response, &json!({ "error": "label is required" }));
-        return;
-    }
+    let terms = key_terms::create(
+        &body.label,
+        body.expires_at,
+        body.quota_usd.as_deref(),
+        chrono::Utc::now(),
+    );
+    let (label, terms) = match terms {
+        Ok(valid) => valid,
+        Err(message) => {
+            json_error(response, StatusCode::BAD_REQUEST, message);
+            return;
+        }
+    };
     // created_by: the admin caller's identity if available (from CALLER_KEY depot).
     let created_by = depot.get_typed::<String>().ok().map(|s| s.as_str());
     let user_id = match body.user_id {
@@ -729,7 +799,7 @@ async fn create_gateway_key(request: &mut Request, depot: &mut Depot, response: 
             }
         },
     };
-    match store::create_gateway_key(pool, user_id, body.label.trim(), created_by).await {
+    match store::create_gateway_key(pool, user_id, label, terms, created_by).await {
         Ok(key) => json_response(response, &json!({ "key": key })),
         Err(error) if store::is_label_taken(&error) => {
             response.status_code(StatusCode::CONFLICT);
@@ -758,12 +828,8 @@ async fn list_gateway_keys(request: &mut Request, depot: &mut Depot, response: &
     }
 }
 
-#[derive(Deserialize)]
-struct GatewayKeyPatchBody {
-    enabled: bool,
-}
-
-/// `PATCH /api/gateway-keys/{id}`: enable or disable a gateway key.
+/// `PATCH /api/gateway-keys/{id}`: partial update of label, enabled,
+/// expiry and quota.
 #[handler]
 async fn patch_gateway_key(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let pool = state_pool(depot);
@@ -772,7 +838,7 @@ async fn patch_gateway_key(request: &mut Request, depot: &mut Depot, response: &
         json_response(response, &json!({ "error": "missing id" }));
         return;
     };
-    let body: GatewayKeyPatchBody = match request.parse_json().await {
+    let body: key_terms::PatchBody = match request.parse_json().await {
         Ok(body) => body,
         Err(_) => {
             response.status_code(StatusCode::BAD_REQUEST);
@@ -780,11 +846,21 @@ async fn patch_gateway_key(request: &mut Request, depot: &mut Depot, response: &
             return;
         }
     };
-    match store::set_gateway_key_enabled(pool, id, body.enabled).await {
+    let patch = match key_terms::patch(&body, chrono::Utc::now()) {
+        Ok(patch) => patch,
+        Err(message) => {
+            json_error(response, StatusCode::BAD_REQUEST, message);
+            return;
+        }
+    };
+    match store::update_gateway_key(pool, id, None, patch).await {
         Ok(true) => json_response(response, &json!({ "ok": true })),
         Ok(false) => {
             response.status_code(StatusCode::NOT_FOUND);
             json_response(response, &json!({ "error": "key not found" }));
+        }
+        Err(error) if store::is_label_taken(&error) => {
+            json_error(response, StatusCode::CONFLICT, "label already in use");
         }
         Err(error) => internal(response, error),
     }
@@ -1127,7 +1203,7 @@ struct UserPatchBody {
     group_id: Option<i64>,
     /// Three-state: absent = untouched, null = clear the override (use the
     /// group rate), number = set the override.
-    #[serde(default, deserialize_with = "tri_state")]
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
     rate_bp: Option<Option<i64>>,
     #[serde(default)]
     max_concurrent: Option<i32>,
@@ -1152,7 +1228,7 @@ struct GroupPatchBody {
     rate_bp: Option<i64>,
     /// Three-state: absent = untouched, null = every route visible, array =
     /// whitelist.
-    #[serde(default, deserialize_with = "tri_state")]
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
     route_aliases: Option<Option<Vec<String>>>,
 }
 
@@ -1473,7 +1549,8 @@ async fn list_user_entries(request: &mut Request, depot: &mut Depot, response: &
     }
 }
 
-/// `GET /api/users/{id}/reconcile`: stored balance against the ledger sum.
+/// `GET /api/users/{id}/reconcile`: stored balance against the ledger sum,
+/// and each owned key's stored spend against the sum of its charges.
 #[handler]
 async fn reconcile_user(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let pool = state_pool(depot);
@@ -1487,7 +1564,9 @@ async fn reconcile_user(request: &mut Request, depot: &mut Depot, response: &mut
             &json!({
                 "balance_microus": report.balance_microus,
                 "entries_sum_microus": report.entries_sum_microus,
-                "consistent": report.balance_microus == report.entries_sum_microus,
+                "consistent": report.balance_microus == report.entries_sum_microus
+                    && report.keys.iter().all(|key| key.spent_microus == key.entries_sum_microus),
+                "keys": report.keys,
             }),
         ),
         Ok(None) => json_error(response, StatusCode::NOT_FOUND, "user not found"),
@@ -1659,7 +1738,7 @@ struct KiroKeyBody {
     label: String,
     oauth: KiroOAuth,
     /// Absent preserves an existing cap; null clears it; a positive number sets it.
-    #[serde(default, deserialize_with = "tri_state")]
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
     max_concurrency: Option<Option<i32>>,
     /// Groups to add the key to (append only); absent/null = untouched.
     #[serde(default)]
@@ -1676,7 +1755,7 @@ struct KiroImportBody {
     account: usize,
     credentials: serde_json::Value,
     /// Absent preserves an existing cap; null clears it; a positive number sets it.
-    #[serde(default, deserialize_with = "tri_state")]
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
     max_concurrency: Option<Option<i32>>,
     /// Groups to add the key to (append only); absent/null = untouched.
     #[serde(default)]
@@ -1692,11 +1771,11 @@ struct PatchKeyBody {
     /// Three-state: absent = untouched, null = clear to unlimited, number = set.
     /// (A plain Option<Option<i32>> cannot tell null from absent — serde maps
     /// both to the outer None — so presence must be captured explicitly.)
-    #[serde(default, deserialize_with = "tri_state")]
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
     max_concurrency: Option<Option<i32>>,
     /// Three-state: absent = untouched, null/[] = clear to unrestricted,
     /// array = set the whitelist.
-    #[serde(default, deserialize_with = "tri_state")]
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
     allowed_models: Option<Option<Vec<String>>>,
     /// Replacement OAuth bundle for an EXISTING Kiro OIDC key. Not accepted on
     /// a static key: a credential-kind conversion is not a patch.
@@ -1710,17 +1789,6 @@ struct PatchKeyBody {
     /// first archive time), false = unarchive.
     #[serde(default)]
     archived: Option<bool>,
-}
-
-/// Presence-capturing deserializer for a tri-state field: serde only calls
-/// this when the field is present, so wrapping in Some marks "explicitly
-/// supplied" (null → Some(None)); absence falls back to the field default.
-fn tri_state<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 /// `PUT /api/keys/order` body: positions are assigned sequentially in array order (0, 1, 2, …).

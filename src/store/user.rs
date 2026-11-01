@@ -20,6 +20,11 @@ pub struct Principal {
     pub key_label: String,
     pub key_enabled: bool,
     pub key_expires_at: Option<DateTime<Utc>>,
+    /// The key's cumulative spending cap, micro-USD; `None` = unlimited.
+    pub key_quota_microus: Option<i64>,
+    /// Micro-USD charged through the key so far (lags settlement by up to
+    /// one ledger flush).
+    pub key_spent_microus: i64,
     pub user_id: i64,
     pub login: String,
     pub user_enabled: bool,
@@ -39,7 +44,8 @@ pub struct Principal {
 pub async fn authenticate_principal(pool: &PgPool, key: &str) -> anyhow::Result<Option<Principal>> {
     let principal = sqlx::query_as::<_, Principal>(
         "SELECT k.id AS key_id, k.label AS key_label, k.enabled AS key_enabled,
-                k.expires_at AS key_expires_at, u.id AS user_id, u.login,
+                k.expires_at AS key_expires_at, k.quota_microus AS key_quota_microus,
+                k.spent_microus AS key_spent_microus, u.id AS user_id, u.login,
                 u.enabled AS user_enabled, g.id AS group_id, g.rate_bp AS group_rate_bp,
                 u.rate_bp AS user_rate_bp, u.balance_microus, u.max_concurrent,
                 g.route_aliases
@@ -67,7 +73,7 @@ pub async fn owner_user_id(pool: &PgPool) -> anyhow::Result<i64> {
 /// One user for the admin and self-service views: the row joined with its
 /// group's name and rate. `rate_bp` is the user override (`None` = the group
 /// rate applies); `crate::billing::effective_rate_bp` combines the two.
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct UserRow {
     pub id: i64,
     pub login: String,
@@ -87,7 +93,7 @@ pub struct UserRow {
 /// route is visible; an array is the whitelist. The built-in `internal`
 /// group (rate 0, owner of the built-in `owner` user) is an ordinary row:
 /// changing its rate or whitelist changes what in-house callers pay and see.
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct GroupRow {
     pub id: i64,
     pub name: String,

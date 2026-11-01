@@ -8,38 +8,32 @@ use sqlx::PgPool;
 
 /// Caller filter shared by the usage reads. `None` (no filter) = every
 /// caller; `Null` = only unidentified rows (caller_key IS NULL: in-process
-/// calls and history from before loopback access was closed); `Label` = one
-/// gateway key label (the admin `caller` query parameter); `User` = every
-/// key one user owns (the user self-service scope, by `user_id`).
+/// calls and history from before loopback access was closed); `Key` = one
+/// gateway key, by id (labels are only unique per user, so a label cannot
+/// name a key); `User` = every key one user owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallerFilter<'a> {
+pub enum CallerFilter {
     Null,
-    Label(&'a str),
+    Key(i64),
     User(i64),
 }
 
 /// SQL bind values of an optional [`CallerFilter`]: the kind (`NULL` = no
-/// filter), the label (text) and the user id (bigint). Kept as three typed
-/// binds so no parameter is reused across text and bigint comparisons.
-struct CallerBinds<'a> {
+/// filter) and the id it compares against (a key id or a user id).
+struct CallerBinds {
     kind: Option<&'static str>,
-    label: Option<&'a str>,
-    user_id: Option<i64>,
+    id: Option<i64>,
 }
 
-impl<'a> From<Option<CallerFilter<'a>>> for CallerBinds<'a> {
-    fn from(caller: Option<CallerFilter<'a>>) -> Self {
-        let (kind, label, user_id) = match caller {
-            None => (None, None, None),
-            Some(CallerFilter::Null) => (Some("null"), None, None),
-            Some(CallerFilter::Label(label)) => (Some("label"), Some(label), None),
-            Some(CallerFilter::User(user_id)) => (Some("user"), None, Some(user_id)),
+impl From<Option<CallerFilter>> for CallerBinds {
+    fn from(caller: Option<CallerFilter>) -> Self {
+        let (kind, id) = match caller {
+            None => (None, None),
+            Some(CallerFilter::Null) => (Some("null"), None),
+            Some(CallerFilter::Key(key_id)) => (Some("key"), Some(key_id)),
+            Some(CallerFilter::User(user_id)) => (Some("user"), Some(user_id)),
         };
-        Self {
-            kind,
-            label,
-            user_id,
-        }
+        Self { kind, id }
     }
 }
 
@@ -60,7 +54,7 @@ pub struct UsageRow {
 pub async fn usage_by_day(
     pool: &PgPool,
     days: i32,
-    caller: Option<CallerFilter<'_>>,
+    caller: Option<CallerFilter>,
 ) -> anyhow::Result<Vec<UsageRow>> {
     let binds = CallerBinds::from(caller);
     let rows = sqlx::query_as::<_, UsageRow>(
@@ -74,15 +68,14 @@ pub async fn usage_by_day(
          WHERE ts > now() - make_interval(days => $1)
            AND ($2::text IS NULL
                 OR ($2 = 'null' AND caller_key IS NULL)
-                OR ($2 = 'label' AND caller_key = $3)
-                OR ($2 = 'user' AND user_id = $4))
+                OR ($2 = 'key' AND gateway_key_id = $3)
+                OR ($2 = 'user' AND user_id = $3))
          GROUP BY day, alias
          ORDER BY day DESC, alias",
     )
     .bind(days)
     .bind(binds.kind)
-    .bind(binds.label)
-    .bind(binds.user_id)
+    .bind(binds.id)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -102,13 +95,14 @@ pub enum TrendSplit {
     Model,
     /// Provider name (joined from `gateway_providers`).
     Provider,
-    /// Client identity: the UA's name (`agent`) wins, the gateway key's label
-    /// falls back. Rows with neither group as NULL (the GUI renders them as
-    /// 本机).
+    /// Client identity: the UA's name (`agent`) wins, the gateway key falls
+    /// back as `login/label` (labels are only unique per user; a one-user
+    /// scope shows the bare label). Rows with neither group as NULL (the GUI
+    /// renders them as 本机).
     Client,
-    /// Caller identity recorded in `caller_key`: the gateway key label;
-    /// in-process calls (and history from before loopback access was closed)
-    /// are NULL. The GUI displays NULL as 本机.
+    /// Billed user: the login of the user owning the caller's gateway key
+    /// (`users.login` joined on `user_id`). In-process calls and historical
+    /// rows with no recorded user are NULL. The GUI displays NULL as 本机.
     User,
 }
 
@@ -128,6 +122,9 @@ pub struct TrendRow {
     /// Attempts that ended in an error (same convention as [`UsageWindow`]).
     pub failed: i64,
     pub cost_usd: Option<f64>,
+    /// Amount debited to users, micro-USD (sum of `charged_microus`; 0 when
+    /// nothing was charged).
+    pub charged_microus: i64,
     /// Output tokens over successful rows — the per-category speed numerator.
     pub timed_output: i64,
     /// Summed wall time of successful rows — the duration card's denominator.
@@ -159,7 +156,7 @@ pub async fn usage_trend(
     until: chrono::DateTime<chrono::Utc>,
     split: TrendSplit,
     local_offset: chrono::Duration,
-    caller: Option<CallerFilter<'_>>,
+    caller: Option<CallerFilter>,
 ) -> anyhow::Result<Vec<TrendRow>> {
     let bucket = if hourly_buckets(since, until) {
         "to_char(date_trunc('hour', r.ts AT TIME ZONE 'UTC' + $3), 'YYYY-MM-DD HH24:00')"
@@ -184,8 +181,19 @@ pub async fn usage_trend(
             "LEFT JOIN gateway_providers p ON p.id = r.provider_id",
             "",
         ),
-        TrendSplit::Client => ("COALESCE(r.agent, r.caller_key)", "", ""),
-        TrendSplit::User => ("r.caller_key", "", ""),
+        // Labels are only unique per user, so the label fallback is
+        // qualified with the owner's login (`alice/default`) unless the scope
+        // is already one user ($4 = 'user'), where the bare label is unique;
+        // historical rows with no recorded user keep the bare label.
+        TrendSplit::Client => (
+            "COALESCE(r.agent,
+                      CASE WHEN $4 IS DISTINCT FROM 'user' THEN u.login || '/' || r.caller_key END,
+                      r.caller_key)",
+            "LEFT JOIN users u ON u.id = r.user_id",
+            "",
+        ),
+        // Logins are unique, so grouping by the login is grouping by user_id.
+        TrendSplit::User => ("u.login", "LEFT JOIN users u ON u.id = r.user_id", ""),
     };
     let sql = format!(
     "SELECT {bucket} AS bucket, {category} AS category,
@@ -195,6 +203,7 @@ pub async fn usage_trend(
             COUNT(*)::bigint AS requests,
             COUNT(*) FILTER (WHERE r.error IS NOT NULL)::bigint AS failed,
             SUM(r.cost_usd)::float8 AS cost_usd,
+            COALESCE(SUM(r.charged_microus), 0)::bigint AS charged_microus,
             COALESCE(SUM(r.output_tokens) FILTER (WHERE r.error IS NULL), 0)::bigint AS timed_output,
             COALESCE(SUM(r.total_ms) FILTER (WHERE r.error IS NULL), 0)::bigint AS timed_ms,
             COALESCE(SUM(GREATEST(r.total_ms - COALESCE(r.ttft_ms, 0), 0)) FILTER (WHERE r.error IS NULL), 0)::bigint AS decode_ms
@@ -202,8 +211,8 @@ pub async fn usage_trend(
          WHERE r.ts >= $1 AND r.ts < $2
            AND ($4::text IS NULL
                 OR ($4 = 'null' AND r.caller_key IS NULL)
-                OR ($4 = 'label' AND r.caller_key = $5)
-                OR ($4 = 'user' AND r.user_id = $6)){filter}
+                OR ($4 = 'key' AND r.gateway_key_id = $5)
+                OR ($4 = 'user' AND r.user_id = $5)){filter}
          GROUP BY 1, 2
          ORDER BY 1"
   );
@@ -216,8 +225,7 @@ pub async fn usage_trend(
         .bind(until)
         .bind(local_offset)
         .bind(binds.kind)
-        .bind(binds.label)
-        .bind(binds.user_id)
+        .bind(binds.id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -237,6 +245,9 @@ pub struct UsageWindow {
     pub failed: i64,
     /// Sum over priced rows; None when no row was priced.
     pub cost_usd: Option<f64>,
+    /// Amount debited to users, micro-USD (sum of `charged_microus`; 0 when
+    /// nothing was charged).
+    pub charged_microus: i64,
     /// Successful rows with usage but no known price (not counted in cost).
     pub unpriced: i64,
     /// Output tokens over successful rows — the speed card's numerator.
@@ -253,7 +264,7 @@ pub async fn usage_window(
     pool: &PgPool,
     since: chrono::DateTime<chrono::Utc>,
     until: chrono::DateTime<chrono::Utc>,
-    caller: Option<CallerFilter<'_>>,
+    caller: Option<CallerFilter>,
 ) -> anyhow::Result<UsageWindow> {
     let binds = CallerBinds::from(caller);
     let window = sqlx::query_as::<_, UsageWindow>(
@@ -263,6 +274,7 @@ pub async fn usage_window(
             COUNT(*)::bigint AS requests,
             COUNT(*) FILTER (WHERE error IS NOT NULL)::bigint AS failed,
             SUM(cost_usd)::float8 AS cost_usd,
+            COALESCE(SUM(charged_microus), 0)::bigint AS charged_microus,
             COUNT(*) FILTER (WHERE error IS NULL AND input_tokens IS NOT NULL AND cost_usd IS NULL)::bigint AS unpriced,
             COALESCE(SUM(output_tokens) FILTER (WHERE error IS NULL), 0)::bigint AS timed_output,
             COALESCE(SUM(total_ms) FILTER (WHERE error IS NULL), 0)::bigint AS timed_ms,
@@ -271,14 +283,13 @@ pub async fn usage_window(
          WHERE ts >= $1 AND ts < $2
            AND ($3::text IS NULL
                 OR ($3 = 'null' AND caller_key IS NULL)
-                OR ($3 = 'label' AND caller_key = $4)
-                OR ($3 = 'user' AND user_id = $5))",
+                OR ($3 = 'key' AND gateway_key_id = $4)
+                OR ($3 = 'user' AND user_id = $4))",
   )
   .bind(since)
   .bind(until)
   .bind(binds.kind)
-  .bind(binds.label)
-  .bind(binds.user_id)
+  .bind(binds.id)
   .fetch_one(pool)
   .await?;
     Ok(window)

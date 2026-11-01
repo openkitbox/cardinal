@@ -21,12 +21,12 @@ mod user;
 
 pub use balance_history::{BalanceHistoryPoint, balance_history_record, list_balance_history};
 pub use billing::{
-    Charge, CreditError, CreditKind, EntryRow, Overflowed, Reconciliation, SettleReport, credit,
-    list_entries, reconcile_user, settle_charges,
+    Charge, CreditError, CreditKind, EntryRow, KeyReconciliation, Overflowed, Reconciliation,
+    SettleReport, credit, list_entries, reconcile_user, settle_charges,
 };
 pub use gateway_key::{
-    GatewayKeyRow, create_gateway_key, is_label_taken, is_unknown_user, list_gateway_keys,
-    seed_gateway_key, set_gateway_key_enabled,
+    GatewayKeyPatch, GatewayKeyRow, KeyTerms, create_gateway_key, create_user_gateway_key,
+    is_label_taken, is_unknown_user, list_gateway_keys, seed_gateway_key, update_gateway_key,
 };
 pub use key::{
     ActiveWindow, AvailabilityRule, EnabledKeyModels, KeyModels, KeyPatch, KiroUpsertError,
