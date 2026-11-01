@@ -217,7 +217,8 @@ pub async fn create_key(
     }
 }
 
-/// Delete a key row (route entries are stripped in the same transaction).
+/// Delete a key row. Route entries reference the provider, so routes are
+/// untouched.
 /// Returns whether the row existed and was deleted.
 pub async fn delete_key(
     pool: &PgPool,

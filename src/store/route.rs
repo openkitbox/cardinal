@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use sqlx::PgPool;
 
 use super::key::{RouteEntry, RouteRow, RouteStrategy};
@@ -50,10 +52,24 @@ pub enum EffortsUpdate {
     Set(Option<Vec<String>>),
 }
 
-/// Validate and write one route: every referenced key must exist (the same
-/// key may appear repeatedly, one entry per model; enabled is irrelevant —
-/// disabled keys are skipped at dispatch). Validation and write share one
-/// transaction so a key deleted mid-flight cannot leave a dangling entry.
+/// The first entry whose (provider, model) pair already appeared earlier in
+/// `entries`, if any. A route may list a provider once per model; a repeat
+/// would expand to the same keys twice.
+#[must_use]
+pub fn duplicate_entry(entries: &[RouteEntry]) -> Option<(i64, &str)> {
+    let mut seen: HashSet<(i64, &str)> = HashSet::new();
+    entries
+        .iter()
+        .map(|entry| (entry.provider_id, entry.model.as_str()))
+        .find(|pair| !seen.insert(*pair))
+}
+
+/// Validate and write one route: every referenced provider must exist and
+/// each (provider, model) pair may appear only once (the same provider may
+/// appear repeatedly, one entry per model; enabled is irrelevant — disabled
+/// providers and keys are skipped at dispatch). Validation and write share
+/// one transaction so a provider deleted mid-flight cannot leave a dangling
+/// entry.
 pub async fn put_route(
     pool: &PgPool,
     alias: &str,
@@ -78,6 +94,11 @@ pub async fn put_route(
         note.as_ref().is_none_or(|note| note.chars().count() <= 200),
         "route {alias} note exceeds 200 characters"
     );
+    if let Some((provider_id, model)) = duplicate_entry(entries) {
+        anyhow::bail!(
+            "route {alias} lists provider {provider_id} with model {model} more than once"
+        );
+    }
     let mut tx = pool.begin().await?;
     for entry in entries {
         anyhow::ensure!(
@@ -102,14 +123,16 @@ pub async fn put_route(
                 .map_err(|error| anyhow::anyhow!("route {alias} entry {}: {error}", entry.model))?;
         }
         let exists: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM gateway_provider_keys WHERE id = $1")
-                .bind(entry.key_id)
+            // FOR SHARE: a concurrent delete_provider (FOR UPDATE) waits for
+            // this transaction instead of deleting the provider mid-write.
+            sqlx::query_as("SELECT id FROM gateway_providers WHERE id = $1 FOR SHARE")
+                .bind(entry.provider_id)
                 .fetch_optional(&mut *tx)
                 .await?;
         anyhow::ensure!(
             exists.is_some(),
-            "route {alias} references a nonexistent key {}",
-            entry.key_id
+            "route {alias} references a nonexistent provider {}",
+            entry.provider_id
         );
     }
     let preserve = matches!(efforts, EffortsUpdate::Preserve);
@@ -158,8 +181,8 @@ fn parse_route(
     note: Option<String>,
     efforts: Option<serde_json::Value>,
 ) -> anyhow::Result<RouteRow> {
-    // Empty entries are a legitimate state: deleting a key cascades it out of
-    // every route, and the emptied route keeps its alias so it can be
+    // Empty entries are a legitimate state: deleting a provider cascades it out
+    // of every route, and the emptied route keeps its alias so it can be
     // re-pointed (it expands to zero candidates → 404 at dispatch).
     let entries: Vec<RouteEntry> = serde_json::from_value(entries)
         .map_err(|e| anyhow::anyhow!("route {alias} has invalid entries JSON: {e}"))?;
@@ -184,4 +207,45 @@ fn parse_route(
         note,
         efforts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(provider_id: i64, model: &str) -> RouteEntry {
+        RouteEntry {
+            provider_id,
+            model: model.to_owned(),
+            label: None,
+            max_concurrency: None,
+            rules: Vec::new(),
+            active_window: None,
+        }
+    }
+
+    #[test]
+    fn distinct_entries_have_no_duplicate() {
+        let entries = [entry(10, "a"), entry(10, "b"), entry(3, "a")];
+        assert_eq!(
+            duplicate_entry(&entries),
+            None,
+            "same provider with different models is allowed"
+        );
+    }
+
+    #[test]
+    fn repeated_provider_and_model_is_reported() {
+        let entries = [entry(10, "a"), entry(3, "b"), entry(10, "a")];
+        assert_eq!(
+            duplicate_entry(&entries),
+            Some((10, "a")),
+            "second (10, a) must be flagged"
+        );
+    }
+
+    #[test]
+    fn empty_entries_have_no_duplicate() {
+        assert_eq!(duplicate_entry(&[]), None, "no entries, no duplicate");
+    }
 }

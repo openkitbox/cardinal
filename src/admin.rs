@@ -18,9 +18,10 @@
 //! - `PUT /api/keys/order` `{ids: [..]}` — assign global positions sequentially in array order (one transaction)
 //! - `POST /api/keys/validate` `{name, protocol, base_url, auth_scheme?, enabled?, api_key}` — probe a not-yet-saved credential
 //! - `GET/PUT /api/keys/:id/models` — a key's model list: GET re-probes the provider, PUT persists a list as the snapshot
-//! - `GET /api/routes`, `GET/PUT/DELETE /api/routes/:alias` — route = named key subset exposed to clients as a model id;
-//!   PUT body `{entries: [{key_id, model}], context_window?, strategy?}` (`strategy` = `ordered`|`smart`|`rotate`, absent = `ordered`;
-//!   400 when the body is malformed or a referenced key does not exist). PUT is a full
+//! - `GET /api/routes`, `GET/PUT/DELETE /api/routes/:alias` — route = named list of (provider, model) entries exposed to clients
+//!   as a model id; each entry expands to the provider's active keys at dispatch;
+//!   PUT body `{entries: [{provider_id, model}], context_window?, strategy?}` (`strategy` = `ordered`|`smart`|`rotate`, absent = `ordered`;
+//!   400 when the body is malformed, a referenced provider does not exist, or a (provider, model) pair repeats). PUT is a full
 //!   replace: a strategy-preserving client MUST send it back, or the save resets to `ordered`
 //! - `GET /api/rests`, `DELETE /api/rests/keys/:key_id`, `DELETE /api/rests/providers/:provider_id` — cooldowns, identity = key
 //! - `GET /api/usage?days=N` (aggregated by day × alias; `key_id` restricts to one gateway key, `caller=null` = unidentified,
@@ -2134,7 +2135,8 @@ async fn delete_key_group(request: &mut Request, depot: &mut Depot, response: &m
 }
 
 /// Global key reorder: `PUT /api/keys/order` `{ids: [..]}` must list every key exactly once →
-/// position = array index, validated and written in one transaction.
+/// position = array index, validated and written in one transaction. Kept for API clients; the
+/// GUI no longer reorders keys, since `position` only breaks ties in a provider's expansion order.
 #[handler]
 async fn reorder_keys(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let pool = state_pool(depot);

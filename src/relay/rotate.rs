@@ -1,7 +1,8 @@
 //! Round-robin cursor for Rotate route ordering.
 //!
-//! Rotate ignores quota entirely: each dispatch starts from the position
-//! after the last one served, cycling through the ready partition. The cursor
+//! Rotate cycles through route ENTRY GROUPS: each dispatch starts from the
+//! entry after the last one served (keys inside an entry are still ranked by
+//! quota — see `route_order`). The cursor
 //! is a per-alias `AtomicUsize` — one `fetch_add` on the request path, no
 //! lock held, no allocation, no deep copy.
 //!
@@ -26,7 +27,7 @@ impl RotateCursors {
     }
 
     /// Advance the cursor for `alias` and return the previous value.
-    /// The caller mods by the current ready count, so membership changes
+    /// The caller mods by the current ready group count, so membership changes
     /// (keys added/removed/rested) can never overflow into a panic.
     pub fn next(&self, alias: &str) -> usize {
         self.inner

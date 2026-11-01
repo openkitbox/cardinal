@@ -13,7 +13,7 @@ pub struct CandidateTrace {
     pub model: String,
     /// Why this candidate was skipped; None = it was tried.
     pub skipped: Option<SkipReason>,
-    /// Smart verdict reason (empty for ordered routes).
+    /// Quota verdict reason (empty when no snapshot data was available).
     pub smart_reason: String,
 }
 

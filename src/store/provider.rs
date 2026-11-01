@@ -308,22 +308,7 @@ pub async fn delete_provider(pool: &PgPool, id: i64) -> anyhow::Result<ProviderD
         .filter(|(_, auth_kind)| auth_kind == "kiro_oidc")
         .map(|(key_id, _)| *key_id)
         .collect();
-    let all_key_ids: Vec<i64> = keys.into_iter().map(|(key_id, _)| key_id).collect();
-    if !all_key_ids.is_empty() {
-        sqlx::query(
-            "UPDATE gateway_routes
-             SET entries = COALESCE(
-                 (SELECT jsonb_agg(entry) FROM jsonb_array_elements(entries) AS entry
-                  WHERE NOT ((entry->>'key_id')::bigint = ANY($1))),
-                 '[]'::jsonb)
-             WHERE EXISTS (
-                 SELECT 1 FROM jsonb_array_elements(entries) AS entry
-                 WHERE (entry->>'key_id')::bigint = ANY($1))",
-        )
-        .bind(&all_key_ids)
-        .execute(&mut *tx)
-        .await?;
-    }
+    strip_route_entries(&mut tx, id).await?;
     sqlx::query("DELETE FROM gateway_providers WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -334,8 +319,49 @@ pub async fn delete_provider(pool: &PgPool, id: i64) -> anyhow::Result<ProviderD
     })
 }
 
+/// Cascade a provider delete into routes. An entry pointing at a deleted
+/// provider is a dangling reference that resolves to zero candidates (a
+/// misleading 404) and makes the next whole-route save fail validation, so
+/// every delete path strips it in its own transaction, keeping the remaining
+/// entries' order. A route left empty keeps its alias so it can be re-pointed
+/// instead of silently vanishing from /v1/models.
+///
+/// Malformed rows fail closed to "left untouched" so they cannot turn every
+/// provider delete into an error: a route whose `entries` is not a JSON array
+/// is skipped, and an element whose `provider_id` is missing or not a JSON
+/// number is kept. The type checks sit in `CASE` because Postgres does not
+/// guarantee `AND`/`OR` evaluation order, and the comparison is done as
+/// `numeric` so a fractional or out-of-range number cannot raise a cast error.
+async fn strip_route_entries(
+    conn: &mut sqlx::PgConnection,
+    provider_id: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE gateway_routes
+         SET entries = COALESCE(
+             (SELECT jsonb_agg(entry ORDER BY ord)
+                FROM jsonb_array_elements(entries) WITH ORDINALITY AS e(entry, ord)
+               WHERE NOT CASE WHEN jsonb_typeof(entry->'provider_id') = 'number'
+                              THEN (entry->>'provider_id')::numeric = $1
+                              ELSE false END),
+             '[]'::jsonb)
+         WHERE CASE WHEN jsonb_typeof(entries) = 'array'
+                    THEN EXISTS (
+                        SELECT 1 FROM jsonb_array_elements(entries) AS x(entry)
+                         WHERE CASE WHEN jsonb_typeof(entry->'provider_id') = 'number'
+                                    THEN (entry->>'provider_id')::numeric = $1
+                                    ELSE false END)
+                    ELSE false END",
+    )
+    .bind(provider_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Delete a provider only while it has no keys. The predicate is part of the
 /// DELETE so a concurrent key insert cannot turn this into an orphaning race.
+/// Route entries referencing the provider are stripped like [`delete_provider`].
 pub async fn delete_provider_if_empty(
     pool: &PgPool,
     id: i64,
@@ -359,6 +385,7 @@ pub async fn delete_provider_if_empty(
         tx.rollback().await?;
         return Ok(EmptyProviderDeleteOutcome::HasKeys);
     }
+    strip_route_entries(&mut tx, id).await?;
     sqlx::query("DELETE FROM gateway_providers WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)

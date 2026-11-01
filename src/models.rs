@@ -3,9 +3,11 @@
 //! model-list snapshots (see [`crate::probe`]).
 //!
 //! Derivation is pure and total: a route whose entries cannot ALL be resolved
-//! against the snapshots (key deleted, snapshot missing, model absent from it)
-//! still lists — it just carries no derived attributes. A declared context
-//! window on the route always wins over derivation.
+//! against the snapshots (snapshot missing, model absent from it) still lists —
+//! it just carries no derived attributes. An entry whose provider has no
+//! servable key contributes nothing instead of voiding the route, exactly as
+//! dispatch skips it. A declared context window on the route always wins over
+//! derivation.
 
 use serde_json::{Value, json};
 
@@ -18,8 +20,8 @@ use crate::store::{KeyModels, RouteRow};
 /// - `context_window` / `context_length` / `max_input_tokens` (the names
 ///   different clients read the window by):
 ///   the route's DECLARED window when set, else the minimum over the member
-///   models' snapshots (only when every entry resolves AND every resolved
-///   model carries a context value);
+///   models' snapshots (only when every resolving entry yields a model AND
+///   every resolved model carries a context value);
 /// - `max_output_tokens`: the minimum over members (same all-members rule);
 /// - `modalities.input`: `["text", …]` — the intersection of all members'
 ///   extra input modalities (a modality is advertised only when every member
@@ -31,9 +33,11 @@ use crate::store::{KeyModels, RouteRow};
 ///   treated as unconstrained, not as a veto), in the first declaring member's
 ///   order, only when non-empty.
 ///
-/// Any entry that fails to resolve (key deleted, snapshot missing, model not
-/// in the snapshot) voids ALL derived fields; a declared context window and a
-/// declared efforts list are still emitted.
+/// A resolving entry contributes its provider's servable keys' models. An
+/// entry whose provider has no servable key contributes nothing (dispatch
+/// skips it too). Any entry that has a provider but fails to resolve (snapshot
+/// missing, model not in the snapshot) voids ALL derived fields; a declared
+/// context window and a declared efforts list are still emitted.
 ///
 /// `chat_capable` = the route serves a chat protocol. A retrieval route
 /// (`openai_embeddings`) is listed — OpenAI's own catalog lists embedding
@@ -149,36 +153,49 @@ pub fn gemini_model_object(route: &RouteRow, keys: &[KeyModels]) -> Value {
     object
 }
 
-/// Every route entry's member model: its key's snapshot must exist and contain
-/// the entry's model id. `None` when any entry fails to resolve. Empty routes
-/// are a real state (key deletion cascades entries out, the emptied route
-/// keeps its alias so it can be re-pointed) and resolve to no attributes.
+/// Every route entry's member models: one per key of the entry's provider,
+/// whose snapshot must exist and contain the entry's model id. An entry whose
+/// provider has no servable key is skipped, not fatal: dispatch skips it too,
+/// so it must not void the surviving entries' attributes. `None` when an
+/// entry with keys fails to resolve, or when no entry contributed a member.
+/// Empty routes are a real state (provider deletion cascades entries out, the
+/// emptied route keeps its alias so it can be re-pointed) and resolve to no
+/// attributes.
 fn resolve_members<'a>(route: &RouteRow, keys: &'a [KeyModels]) -> Option<Vec<&'a ProbeModel>> {
     if route.entries.is_empty() {
         return None;
     }
-    let members: Vec<&'a ProbeModel> = route
-        .entries
-        .iter()
-        // The whitelist gates the same way relay dispatch does: a key that does not
-        // serve the entry's model is not a member at all — skip it (do not poison
-        // the whole route the way an unresolvable entry does).
-        .filter(|entry| {
-            let key = keys.iter().find(|key| key.id == entry.key_id);
-            !key.is_some_and(|key| {
-                key.allowed_models.as_ref().is_some_and(|allowed| {
-                    !allowed.is_empty() && !allowed.iter().any(|model| model == &entry.model)
-                })
-            })
-        })
-        .map(|entry| {
-            let key = keys.iter().find(|key| key.id == entry.key_id)?;
-            key.models
+    let mut members: Vec<&'a ProbeModel> = Vec::new();
+    for entry in &route.entries {
+        let provider_keys: Vec<&KeyModels> = keys
+            .iter()
+            .filter(|key| key.provider_id == entry.provider_id)
+            .collect();
+        if provider_keys.is_empty() {
+            // Dangling provider, or every key of it disabled/archived: the
+            // entry serves nothing, so it contributes no member — same as
+            // dispatch, which skips the entry. The `members.is_empty()` check
+            // below covers the case where NO entry contributes.
+            continue;
+        }
+        for key in provider_keys {
+            // The whitelist gates the same way relay dispatch does: a key that
+            // does not serve the entry's model is not a member at all — skip it
+            // (do not poison the whole route the way an unresolvable key does).
+            let whitelisted_away = key.allowed_models.as_ref().is_some_and(|allowed| {
+                !allowed.is_empty() && !allowed.iter().any(|model| model == &entry.model)
+            });
+            if whitelisted_away {
+                continue;
+            }
+            let member = key
+                .models
                 .as_ref()?
                 .iter()
-                .find(|model| model.id == entry.model)
-        })
-        .collect::<Option<Vec<_>>>()?;
+                .find(|model| model.id == entry.model)?;
+            members.push(member);
+        }
+    }
     // Every member whitelisted away: nothing to derive from (the route still
     // exists and is listed, just without derived attributes).
     if members.is_empty() {
@@ -205,4 +222,91 @@ fn intersection<'a>(lists: impl Iterator<Item = &'a [String]>) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{RouteEntry, RouteStrategy};
+
+    fn entry(provider_id: i64, model: &str) -> RouteEntry {
+        RouteEntry {
+            provider_id,
+            model: model.to_owned(),
+            label: None,
+            max_concurrency: None,
+            rules: Vec::new(),
+            active_window: None,
+        }
+    }
+
+    fn route(entries: Vec<RouteEntry>) -> RouteRow {
+        RouteRow {
+            alias: "r".to_owned(),
+            entries,
+            context_window: None,
+            strategy: RouteStrategy::Ordered,
+            note: None,
+            efforts: None,
+        }
+    }
+
+    fn model(id: &str, context: u64) -> ProbeModel {
+        ProbeModel {
+            id: id.to_owned(),
+            rate_multiplier: None,
+            context: Some(context),
+            max_output: Some(context / 2),
+            input_modalities: Vec::new(),
+            effort_levels: Vec::new(),
+            default_effort: None,
+        }
+    }
+
+    fn key(id: i64, provider_id: i64, model: ProbeModel) -> KeyModels {
+        KeyModels {
+            id,
+            provider_id,
+            models: Some(vec![model]),
+            allowed_models: None,
+        }
+    }
+
+    #[test]
+    fn one_unservable_entry_does_not_void_the_other_entries_attributes() {
+        // Provider 2 has no servable key (every key disabled or archived, or
+        // the provider itself disabled): `list_all_key_models` drops it, so it
+        // never reaches `keys`. Dispatch skips such an entry, so derivation
+        // must skip it too instead of voiding the whole route.
+        let route = route(vec![entry(1, "m"), entry(2, "n")]);
+        let keys = vec![key(1, 1, model("m", 128_000))];
+        let object = route_model_object(&route, &keys, true);
+        assert_eq!(
+            object["context_window"], 128_000,
+            "the resolvable entry still derives the route's window: {object}"
+        );
+        assert_eq!(
+            object["max_output_tokens"], 64_000,
+            "the resolvable entry still derives the route's max output: {object}"
+        );
+        assert_eq!(
+            object["modalities"],
+            serde_json::json!({ "input": ["text", "image"] }),
+            "the route still advertises its modalities: {object}"
+        );
+    }
+
+    #[test]
+    fn a_route_with_no_servable_entry_derives_nothing() {
+        let route = route(vec![entry(1, "m"), entry(2, "n")]);
+        let object = route_model_object(&route, &[], true);
+        assert!(
+            object.get("context_window").is_none(),
+            "no member model, no derived window: {object}"
+        );
+        assert!(
+            object.get("modalities").is_none(),
+            "no member model, no derived modalities: {object}"
+        );
+    }
 }

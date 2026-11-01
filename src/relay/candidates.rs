@@ -2,10 +2,15 @@
 //! upstream model it should serve); failure cooldown policy lives in `failover`.
 //!
 //! Ordering contracts, flattened onto keys:
-//! - the direct path (`provider/model`) tries the provider's active keys in
-//!   their single global (position, id) order — the store's ORDER BY contract;
-//! - a route tries its entries in STORED order (the user arranges them in the
-//!   GUI); key position never reorders a route;
+//! - the direct path (`provider/model`) expands to the provider's active keys
+//!   in their single global (position, id) order — the store's ORDER BY
+//!   contract. That is the EXPANSION order only: the dispatch order is ranked
+//!   by quota in `route_order`, because direct is one Smart entry group;
+//! - a route entry expands to every active key of its provider, in that
+//!   provider's (position, id) order, each candidate tagged with its entry's
+//!   index; `route_order` keeps Ordered entry groups in STORED order (the user
+//!   arranges them in the GUI), rotates them for Rotate, ranks all candidates
+//!   globally for Smart, and always ranks keys inside a group by quota;
 //! - a failure cools at its own granularity (whole key, or one (key, model)
 //!   pair for an unserved model — see `failover`); resting candidates are
 //!   deferred behind ready ones (restLast) instead of being skipped, so a
@@ -33,6 +38,11 @@ pub struct Candidate {
     /// Per-item concurrency cap of the route entry (None = only the key-level
     /// cap applies).
     pub entry_cap: Option<i32>,
+    /// Index of the route entry this candidate expanded from, in stored entry
+    /// order (0 on the direct path, which is a single group). Candidates of
+    /// one entry form one ordering group: the strategy orders groups, quota
+    /// orders the keys inside a group.
+    pub entry_index: usize,
     /// Effort levels the candidate's snapshot says its upstream model accepts,
     /// canonical and ascending. `None` = unconstrained (no snapshot, model
     /// absent from it, or nothing listed).
@@ -125,64 +135,46 @@ fn model_context(key: &ProviderKeyRow, model: &str) -> Option<u64> {
     snapshot_entry(key, model).and_then(|entry| entry.context)
 }
 
-/// Direct path ("<provider>/<model>"): the provider's enabled keys — which must arrive in global
+/// Direct path ("<provider>/<model>"): the provider's active keys — which must arrive in global
 /// (position, id) order (the store's ORDER BY contract), each paired with its resolved secret —
-/// all serving the same upstream model. Returns the candidates plus the excluded ones with their reasons.
+/// all serving the same upstream model as ONE entry group (`entry_index` 0). This is the
+/// expansion order; `route_order` then ranks the group by quota. Returns the candidates plus
+/// the excluded ones with their reasons.
 pub fn expand_direct(
     provider: ProviderRow,
     keys: Vec<(ProviderKeyRow, SecretString)>,
     upstream_model: &str,
 ) -> (Vec<Candidate>, Vec<(Candidate, SkipReason)>) {
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(keys.len());
     let mut excluded = Vec::new();
     for (key, secret) in keys {
+        // `fetch_key_secrets` already drops inactive keys; this stays as the
+        // fail-closed guard for any caller that does not.
+        let skip = if !key.active() {
+            Some(SkipReason::Disabled)
+        } else if !serves_model(&key, upstream_model) {
+            Some(SkipReason::ModelNotAllowed)
+        } else {
+            None
+        };
         let (supported, default) = effort_support(&key, upstream_model);
         let context_window = model_context(&key, upstream_model);
-        if !key.active() {
-            excluded.push((
-                Candidate {
-                    provider: provider.clone(),
-                    key: key.clone(),
-                    secret: secret.clone(),
-                    upstream_model: upstream_model.to_owned(),
-                    route_alias: None,
-                    entry_cap: None,
-                    supported_efforts: supported.clone(),
-                    default_effort: default,
-                    context_window,
-                },
-                SkipReason::Disabled,
-            ));
-            continue;
-        }
-        if !serves_model(&key, upstream_model) {
-            excluded.push((
-                Candidate {
-                    provider: provider.clone(),
-                    key: key.clone(),
-                    secret: secret.clone(),
-                    upstream_model: upstream_model.to_owned(),
-                    route_alias: None,
-                    entry_cap: None,
-                    supported_efforts: supported.clone(),
-                    default_effort: default,
-                    context_window,
-                },
-                SkipReason::ModelNotAllowed,
-            ));
-            continue;
-        }
-        candidates.push(Candidate {
+        let candidate = Candidate {
             provider: provider.clone(),
             key,
             secret,
             upstream_model: upstream_model.to_owned(),
             route_alias: None,
             entry_cap: None,
+            entry_index: 0,
             supported_efforts: supported,
             default_effort: default,
             context_window,
-        });
+        };
+        match skip {
+            Some(reason) => excluded.push((candidate, reason)),
+            None => candidates.push(candidate),
+        }
     }
     (candidates, excluded)
 }
@@ -197,64 +189,56 @@ pub struct Expansion {
     pub excluded: Vec<(Candidate, SkipReason)>,
 }
 
-/// Route path: ONE CANDIDATE PER ENTRY — the same key may appear several times
-/// with different models. Order is the entries' STORED order (the order the
-/// user arranged in the GUI). Disabled or archived keys, keys of disabled providers,
-/// dangling entries, and entries whose availability rules deny `now` are
-/// skipped.
+/// Route path: each entry expands to every key of its provider present in
+/// `keys` (in `keys` order, which must be the provider's (position, id)
+/// order), each candidate tagged with the entry's stored index; the same key
+/// may appear several times with different models. Entries keep their STORED
+/// order (the order the user arranged in the GUI). Keys of a disabled
+/// provider, inactive keys, and keys whose whitelist lacks the entry's model
+/// are excluded with their reason; entries whose availability rules deny
+/// `now` exclude all their keys as window-skipped; dangling entries are
+/// skipped silently.
 pub fn expand_route(
     entries: &[RouteEntry],
     keys: Vec<(ProviderKeyRow, SecretString)>,
     providers: &HashMap<i64, ProviderRow>,
     now: chrono::DateTime<chrono::Local>,
 ) -> Expansion {
-    let keys_by_id: HashMap<i64, (ProviderKeyRow, SecretString)> = keys
-        .into_iter()
-        .map(|(key, secret)| (key.id, (key, secret)))
-        .collect();
     let mut window_skipped = 0;
-    let mut candidates = Vec::with_capacity(entries.len());
+    let mut candidates = Vec::with_capacity(keys.len());
     let mut excluded = Vec::new();
-    for entry in entries {
-        let Some((key, secret)) = keys_by_id.get(&entry.key_id) else {
-            continue;
-        }; // dangling key
-        let Some(provider) = providers.get(&key.provider_id) else {
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let Some(provider) = providers.get(&entry.provider_id) else {
             continue;
         }; // dangling provider
-        if !key.active() {
-            excluded.push((
-                make_candidate(key, secret, provider, &entry.model, entry),
-                SkipReason::Disabled,
-            ));
-            continue;
+        let provider_keys = keys
+            .iter()
+            .filter(|(key, _)| key.provider_id == entry.provider_id);
+        // Judged once per entry: `window_skipped` counts entries, not keys —
+        // one denied entry is one skip however many keys its provider has.
+        let available = entry.is_available(now);
+        let mut entry_window_skipped = false;
+        for (key, secret) in provider_keys {
+            // Inactive keys are already dropped by `fetch_key_secrets`; the
+            // check stays as the fail-closed guard.
+            let skip = if !provider.enabled || !key.active() {
+                Some(SkipReason::Disabled)
+            } else if !serves_model(key, &entry.model) {
+                Some(SkipReason::ModelNotAllowed)
+            } else if !available {
+                entry_window_skipped = true;
+                Some(SkipReason::WindowSkipped)
+            } else {
+                None
+            };
+            let candidate = make_candidate(key, secret, provider, entry, entry_index);
+            match skip {
+                Some(reason) => excluded.push((candidate, reason)),
+                None => candidates.push(candidate),
+            }
         }
-        if !serves_model(key, &entry.model) {
-            excluded.push((
-                make_candidate(key, secret, provider, &entry.model, entry),
-                SkipReason::ModelNotAllowed,
-            ));
-            continue;
-        }
-        if !provider.enabled {
-            excluded.push((
-                make_candidate(key, secret, provider, &entry.model, entry),
-                SkipReason::Disabled,
-            ));
-            continue;
-        }
-        if !entry.is_available(now) {
-            window_skipped += 1;
-            excluded.push((
-                make_candidate(key, secret, provider, &entry.model, entry),
-                SkipReason::WindowSkipped,
-            ));
-            continue;
-        }
-        candidates.push(make_candidate(key, secret, provider, &entry.model, entry));
+        window_skipped += usize::from(entry_window_skipped);
     }
-    // Stored order = dispatch order: the entries arrive in the order the user
-    // arranged them; no re-sorting by key position.
     Expansion {
         candidates,
         window_skipped,
@@ -267,14 +251,17 @@ fn make_candidate(
     key: &ProviderKeyRow,
     secret: &SecretString,
     provider: &ProviderRow,
-    model: &str,
     entry: &RouteEntry,
+    entry_index: usize,
 ) -> Candidate {
+    let model = entry.model.as_str();
     let (supported, default) = effort_support(key, model);
     Candidate {
         key: key.clone(),
-        // A key serving several entries clones its secret per candidate (each
-        // clone is its own zeroizing allocation; route entries are few).
+        // A key serving several entries clones its row and secret per
+        // candidate (each secret clone is its own zeroizing allocation; route
+        // entries and a provider's keys are few, and this runs once per
+        // request at resolve time).
         secret: secret.clone(),
         provider: provider.clone(),
         upstream_model: model.to_owned(),
@@ -284,8 +271,271 @@ fn make_candidate(
         entry_cap: entry
             .max_concurrency
             .and_then(|cap| i32::try_from(cap).ok()),
+        entry_index,
         supported_efforts: supported,
         default_effort: default,
         context_window: model_context(key, model),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+
+    use super::*;
+    use crate::store::{ActiveWindow, AvailabilityRule, RuleEffect};
+
+    fn provider(id: i64, enabled: bool) -> ProviderRow {
+        ProviderRow {
+            id,
+            name: format!("p{id}"),
+            protocol: "openai_chat".to_owned(),
+            base_url: "http://upstream".to_owned(),
+            auth_scheme: "bearer".to_owned(),
+            enabled,
+        }
+    }
+
+    fn key(id: i64, provider_id: i64, allowed: Option<&[&str]>) -> (ProviderKeyRow, SecretString) {
+        (
+            ProviderKeyRow {
+                id,
+                provider_id,
+                label: format!("k{id}"),
+                api_key: Some("secret".to_owned()),
+                enabled: true,
+                position: 0,
+                max_concurrency: None,
+                models: None,
+                allowed_models: allowed
+                    .map(|models| models.iter().map(|model| (*model).to_owned()).collect()),
+                auth_kind: "static".to_owned(),
+                oauth: None,
+                archived_at: None,
+            },
+            SecretString::from("secret".to_owned()),
+        )
+    }
+
+    fn entry(provider_id: i64, model: &str) -> RouteEntry {
+        RouteEntry {
+            provider_id,
+            model: model.to_owned(),
+            label: None,
+            max_concurrency: None,
+            rules: Vec::new(),
+            active_window: None,
+        }
+    }
+
+    fn providers(rows: &[ProviderRow]) -> HashMap<i64, ProviderRow> {
+        rows.iter().map(|row| (row.id, row.clone())).collect()
+    }
+
+    fn now() -> chrono::DateTime<chrono::Local> {
+        chrono::Local
+            .with_ymd_and_hms(2026, 11, 1, 12, 0, 0)
+            .single()
+            .expect("noon on a weekday is an unambiguous local time")
+    }
+
+    fn ids(candidates: &[Candidate]) -> Vec<(i64, usize)> {
+        candidates
+            .iter()
+            .map(|candidate| (candidate.key.id, candidate.entry_index))
+            .collect()
+    }
+
+    #[test]
+    fn expand_route_expands_every_active_key_with_its_entry_index() {
+        let entries = vec![entry(1, "m"), entry(2, "n")];
+        let keys = vec![key(1, 1, None), key(2, 1, None), key(3, 2, None)];
+        let expansion = expand_route(
+            &entries,
+            keys,
+            &providers(&[provider(1, true), provider(2, true)]),
+            now(),
+        );
+        assert_eq!(
+            ids(&expansion.candidates),
+            vec![(1, 0), (2, 0), (3, 1)],
+            "one candidate per active key, keys keep their input order"
+        );
+        assert!(expansion.excluded.is_empty(), "nothing to exclude");
+        assert_eq!(expansion.window_skipped, 0, "no availability window");
+    }
+
+    #[test]
+    fn expand_route_excludes_keys_whose_whitelist_lacks_the_model() {
+        let entries = vec![entry(1, "m")];
+        let keys = vec![
+            key(1, 1, Some(&["other"])),
+            key(2, 1, Some(&["m"])),
+            key(3, 1, None),
+        ];
+        let expansion = expand_route(&entries, keys, &providers(&[provider(1, true)]), now());
+        assert_eq!(
+            ids(&expansion.candidates),
+            vec![(2, 0), (3, 0)],
+            "whitelist and unrestricted keys serve"
+        );
+        assert_eq!(expansion.excluded.len(), 1, "one key is excluded");
+        let (excluded, reason) = &expansion.excluded[0];
+        assert_eq!(excluded.key.id, 1, "the whitelisted-out key");
+        assert!(
+            matches!(reason, SkipReason::ModelNotAllowed),
+            "reason: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn expand_route_marks_every_key_of_a_disabled_provider_disabled() {
+        let entries = vec![entry(1, "m"), entry(2, "n")];
+        let keys = vec![key(1, 1, None), key(2, 1, None), key(3, 2, None)];
+        let expansion = expand_route(
+            &entries,
+            keys,
+            &providers(&[provider(1, false), provider(2, true)]),
+            now(),
+        );
+        assert_eq!(
+            ids(&expansion.candidates),
+            vec![(3, 1)],
+            "only the enabled provider serves"
+        );
+        assert_eq!(
+            expansion.excluded.len(),
+            2,
+            "both keys of the disabled provider"
+        );
+        for (candidate, reason) in &expansion.excluded {
+            assert!(matches!(reason, SkipReason::Disabled), "reason: {reason:?}");
+            assert_eq!(
+                candidate.entry_index, 0,
+                "excluded keys keep their entry index"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_route_counts_a_denied_window_once_per_entry() {
+        // A deny-only rule that matches every moment: 00:00–00:00 is the whole day.
+        let deny = AvailabilityRule {
+            window: ActiveWindow {
+                start: "00:00".to_owned(),
+                end: "00:00".to_owned(),
+                days: None,
+            },
+            effect: RuleEffect::Deny,
+        };
+        let mut denied = entry(1, "m");
+        denied.rules = vec![deny];
+        let entries = vec![denied, entry(2, "n")];
+        let keys = vec![key(1, 1, None), key(2, 1, None), key(3, 2, None)];
+        let expansion = expand_route(
+            &entries,
+            keys,
+            &providers(&[provider(1, true), provider(2, true)]),
+            now(),
+        );
+        assert_eq!(
+            ids(&expansion.candidates),
+            vec![(3, 1)],
+            "the denied entry serves nothing"
+        );
+        assert_eq!(
+            expansion.window_skipped, 1,
+            "one denied entry, however many keys it has"
+        );
+        assert_eq!(
+            expansion.excluded.len(),
+            2,
+            "both keys are reported as window-skipped"
+        );
+        for (_, reason) in &expansion.excluded {
+            assert!(
+                matches!(reason, SkipReason::WindowSkipped),
+                "reason: {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_route_skips_an_entry_whose_provider_is_gone() {
+        let entries = vec![entry(9, "m"), entry(1, "n")];
+        let keys = vec![key(1, 1, None), key(2, 9, None)];
+        let expansion = expand_route(&entries, keys, &providers(&[provider(1, true)]), now());
+        assert_eq!(
+            ids(&expansion.candidates),
+            vec![(1, 1)],
+            "dangling provider is skipped"
+        );
+        assert!(
+            expansion.excluded.is_empty(),
+            "a dangling entry has no candidate to report"
+        );
+        assert_eq!(
+            expansion.window_skipped, 0,
+            "a dangling entry is not a window skip"
+        );
+    }
+
+    #[test]
+    fn expand_direct_uses_a_single_entry_group() {
+        let keys = vec![key(1, 1, None), key(2, 1, Some(&["m"]))];
+        let (candidates, excluded) = expand_direct(provider(1, true), keys, "m");
+        assert_eq!(
+            ids(&candidates),
+            vec![(1, 0), (2, 0)],
+            "direct is one group"
+        );
+        assert!(excluded.is_empty(), "both keys serve the model");
+    }
+
+    #[test]
+    fn expand_route_repeats_a_key_for_each_entry_of_its_provider() {
+        // One provider listed twice, once per model: every key of it appears
+        // once per entry, each copy tagged with its own entry's index.
+        let entries = vec![entry(1, "m"), entry(2, "x"), entry(1, "n")];
+        let keys = vec![key(1, 1, None), key(2, 1, None), key(3, 2, None)];
+        let expansion = expand_route(
+            &entries,
+            keys,
+            &providers(&[provider(1, true), provider(2, true)]),
+            now(),
+        );
+        assert_eq!(
+            ids(&expansion.candidates),
+            vec![(1, 0), (2, 0), (3, 1), (1, 2), (2, 2)],
+            "each entry of the provider gets its own copy of every key"
+        );
+        let models: Vec<&str> = expansion
+            .candidates
+            .iter()
+            .map(|candidate| candidate.upstream_model.as_str())
+            .collect();
+        assert_eq!(
+            models,
+            vec!["m", "m", "x", "n", "n"],
+            "each copy carries its own entry's model"
+        );
+    }
+
+    #[test]
+    fn expand_direct_excludes_a_key_whose_whitelist_lacks_the_model() {
+        let keys = vec![key(1, 1, Some(&["other"])), key(2, 1, None)];
+        let (candidates, excluded) = expand_direct(provider(1, true), keys, "m");
+        assert_eq!(
+            ids(&candidates),
+            vec![(2, 0)],
+            "only the unrestricted key serves"
+        );
+        assert_eq!(excluded.len(), 1, "one key is excluded");
+        let (excluded, reason) = &excluded[0];
+        assert_eq!(excluded.key.id, 1, "the whitelisted-out key");
+        assert!(
+            matches!(reason, SkipReason::ModelNotAllowed),
+            "reason: {reason:?}"
+        );
     }
 }

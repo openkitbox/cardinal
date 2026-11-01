@@ -41,32 +41,22 @@ impl SmartCache {
         }
     }
 
-    /// Clone the current snapshot map for a dispatch's ordering pass.
-    /// One lock acquisition regardless of candidate count.
+    /// Run `read` against the current snapshot map under one read lock — a
+    /// dispatch's ordering pass borrows the map instead of deep-cloning it.
+    /// The lock is a std `RwLock`, so `read` must stay synchronous (it is:
+    /// ordering is pure computation).
     ///
     /// A poisoned lock degrades to an empty map, which the caller treats like
-    /// "no snapshots yet" — smart ordering falls back to stored route order.
-    pub fn snapshots(&self) -> HashMap<i64, KeyQuota> {
+    /// "no snapshots yet" — ordering falls back to stored order.
+    pub fn with_snapshots<Output>(
+        &self,
+        read: impl FnOnce(&HashMap<i64, KeyQuota>) -> Output,
+    ) -> Output {
         match self.inner.read() {
-            Ok(guard) => guard.clone(),
+            Ok(guard) => read(&guard),
             Err(_) => {
                 tracing::warn!("smart cache lock poisoned on read; dispatching without quota data");
-                HashMap::new()
-            }
-        }
-    }
-
-    /// Whether any snapshot has been loaded (drives the degradation path
-    /// without a PG round-trip).
-    ///
-    /// A poisoned lock reports empty, routing the dispatch down the same
-    /// "no snapshots" fallback as an unloaded cache.
-    pub fn is_empty(&self) -> bool {
-        match self.inner.read() {
-            Ok(guard) => guard.is_empty(),
-            Err(_) => {
-                tracing::warn!("smart cache lock poisoned on is_empty; treating as empty");
-                true
+                read(&HashMap::new())
             }
         }
     }
