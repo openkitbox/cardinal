@@ -39,7 +39,9 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 
 use crate::activity::{ActivitySink, EndMetrics, EndStatus};
+use crate::billing;
 use crate::body_log::{BodyLog, CapturedBodies, CapturedBody};
+use crate::metering::UsageCertainty;
 use crate::protocol::{self, ProtocolError, TargetView};
 use crate::store::{self, AttemptLog};
 use crate::translation;
@@ -49,11 +51,13 @@ use crate::upstream::transport::{self, Transport};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Monotonic request ID for dispatcher timeout tracking.
-static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+/// Monotonic, process-local id for dispatcher events (assignment requests
+/// and their timeout tracking). Not the request's idempotency key: it resets
+/// on restart, so the persisted request id is a UUID (see [`dispatch`]).
+static DISPATCH_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 
-fn next_request_id() -> u64 {
-    REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+fn next_dispatch_event_id() -> u64 {
+    DISPATCH_EVENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 use dialects::{
@@ -62,7 +66,8 @@ use dialects::{
     join_split_tool_call_turns_pending, opencode_headers, vendor_thinking_off_fields,
 };
 use streaming::{
-    AttemptSuccess, HoldSignal, PumpSide, RelayOutcome, StreamFrames, StreamPump, spawn_stream_pump,
+    AttemptSuccess, HoldSignal, OnClientGone, PumpSide, RelayOutcome, StreamFrames, StreamPump,
+    spawn_stream_pump,
 };
 
 /// Full context of one client request.
@@ -72,9 +77,10 @@ pub struct RelayRequest {
     pub stream: bool,
     /// Mirror request/response payloads into the log (target `gateway::payload`).
     pub payload_log: bool,
-    /// The caller's identity (the gateway key's label), verified by the HTTP
-    /// auth hoop; None for a local unidentified caller or an in-process call.
-    pub caller_key: Option<String>,
+    /// The caller the HTTP auth hoop verified (gateway key + owning user +
+    /// group). None only for in-process calls that never pass HTTP auth (the
+    /// admin chat facade, test hosts); every `/v1*` request carries one.
+    pub principal: Option<store::Principal>,
     /// Which client the request's User-Agent names; None
     /// when the header is absent or the call is in-process.
     pub agent: Option<String>,
@@ -270,7 +276,7 @@ async fn probe_quota_reset(
 }
 
 /// Attach the captured bodies to the settling dispatch, keyed by its request
-/// id (`req_{n}`): the ledger writer batches inserts, so no DB row id exists
+/// id (`req_<uuid>`): the ledger writer batches inserts, so no DB row id exists
 /// at capture time. Failover writes one row per attempt, and only the settled
 /// request carries bodies (intermediate failures stay uncaptured on purpose).
 fn push_capture(
@@ -1091,8 +1097,12 @@ impl AttemptLog {
             cost_usd,
             error: None,
             caller_key: None,
+            user_id: None,
+            gateway_key_id: None,
             agent: None,
             request_id: None,
+            charged_microus: None,
+            rate_bp: None,
         }
     }
 
@@ -1125,15 +1135,46 @@ impl AttemptLog {
             cost_usd: None,
             error: Some(error.message()),
             caller_key: None,
+            user_id: None,
+            gateway_key_id: None,
             agent: None,
             request_id: None,
+            charged_microus: None,
+            rate_bp: None,
         }
     }
 
-    /// Stamp the caller identity (one per dispatch, shared by every attempt row
-    /// of the request — the constructors leave it empty).
-    fn with_caller(mut self, caller_key: Option<&str>) -> Self {
-        self.caller_key = caller_key.map(str::to_owned);
+    /// Stamp the caller identity — key label, owning user and key id (one per
+    /// dispatch, shared by every attempt row of the request — the
+    /// constructors leave it empty).
+    fn with_caller(mut self, principal: Option<&store::Principal>) -> Self {
+        if let Some(principal) = principal {
+            self.caller_key = Some(principal.key_label.clone());
+            self.user_id = Some(principal.user_id);
+            self.gateway_key_id = Some(principal.key_id);
+            self.rate_bp = Some(billing::rate_bp(principal));
+        }
+        self
+    }
+
+    /// Price a successful attempt: the debit derived from its cost, the
+    /// usage certainty and the caller's rate (stamped by
+    /// [`Self::with_caller`]; None — an in-process call — is never charged).
+    /// A billed caller's success with unknown usage is served free and
+    /// warned about: unknown is never treated as zero.
+    fn with_charge(mut self, certainty: UsageCertainty) -> Self {
+        let Some(rate_bp) = self.rate_bp else {
+            return self;
+        };
+        if rate_bp > 0 && certainty == UsageCertainty::Unknown {
+            tracing::warn!(
+                request_id = self.request_id.as_deref().unwrap_or(""),
+                user_id = self.user_id,
+                model = self.model.as_str(),
+                "billed request succeeded without usage; not charged"
+            );
+        }
+        self.charged_microus = billing::attempt_charge(self.cost_usd, certainty, rate_bp);
         self
     }
 
@@ -1158,7 +1199,7 @@ impl AttemptLog {
         self
     }
 
-    /// Stamp the dispatch request id (the `req_{n}` string the trace ring and
+    /// Stamp the dispatch request id (the `req_<uuid>` string the trace ring and
     /// upstream header share; same one-per-dispatch sharing as
     /// [`Self::with_caller`]).
     fn with_request_id(mut self, request_id: &str) -> Self {
@@ -1200,7 +1241,7 @@ struct AbandonGuard<'a> {
     effort: Option<&'a str>,
     provider_id: i64,
     provider_key_id: i64,
-    caller_key: Option<&'a str>,
+    principal: Option<&'a store::Principal>,
     agent: Option<&'a str>,
     started: std::time::Instant,
     ledger: &'a LedgerWriter,
@@ -1232,7 +1273,7 @@ impl Drop for AbandonGuard<'_> {
             &error,
             self.started,
         )
-        .with_caller(self.caller_key)
+        .with_caller(self.principal)
         .with_agent(self.agent)
         .with_client_protocol(self.client_protocol)
         .with_effort(self.effort)
@@ -1342,7 +1383,7 @@ async fn acquire_remaining_candidate_slot(
     if start_index >= slot_keys.len() {
         return Ok(None);
     }
-    let request_id = next_request_id();
+    let request_id = next_dispatch_event_id();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     dispatcher
         .send(DispatchEvent::Request(DispatchRequest {
@@ -1408,6 +1449,9 @@ pub struct DispatchDeps<'a> {
     /// Batch ledger writer: attempt rows are queued here and flushed to PG by
     /// a background task — the request path never blocks on the INSERT.
     pub ledger: &'a LedgerWriter,
+    /// Cancelled once graceful shutdown has stopped the HTTP surface; each
+    /// stream pump selects on it to settle instead of draining for usage.
+    pub server_stopped: &'a tokio_util::sync::CancellationToken,
 }
 
 /// The Smart verdict reason per READY candidate, position-aligned with the
@@ -1524,6 +1568,7 @@ pub async fn dispatch_at(
         rest_cache,
         price_cache,
         ledger,
+        server_stopped,
     } = deps;
     let body_log = observability.body_log;
     let activity = observability.activity;
@@ -1541,7 +1586,23 @@ pub async fn dispatch_at(
         };
     };
     // One caller identity per request: shared by every attempt row it writes.
-    let caller_key = request.caller_key.as_deref();
+    let principal = request.principal.as_ref();
+    // Admission before any routing work: a refused caller costs no candidate
+    // expansion, slot or ledger row. In-process calls (no principal) are not
+    // subject to billing.
+    if let Some(principal) = principal
+        && let Err(deny) = billing::admit(principal, &model)
+    {
+        return DispatchOutcome::Failed {
+            status: deny.status(),
+            message: deny.message().into(),
+            retry_after_secs: None,
+        };
+    }
+    // The caller's rate multiplier, `Copy` so the streaming accounting task
+    // captures it without holding the principal.
+    let rate_bp = principal.map(billing::rate_bp);
+    let caller_key = principal.map(|principal| principal.key_label.as_str());
     let effort = extract_effort(request.protocol, &request.body);
     let agent = request.agent.as_deref();
     // Serialize the body at most once (payloads on): the tracing line and the
@@ -1578,7 +1639,7 @@ pub async fn dispatch_at(
 
     // Model resolution: direct `provider/model` first, then the route table.
     // `now` (one read per request) is what route active windows are judged against.
-    let (alias, strategy, expanded, excluded, window_skipped, secret_skipped, efforts) =
+    let (alias, strategy, mut expanded, excluded, window_skipped, secret_skipped, efforts) =
         match resolve(route_cache, &model, now) {
             Ok(Resolution::Candidates {
                 alias,
@@ -1626,6 +1687,32 @@ pub async fn dispatch_at(
             secret_skipped,
             "candidates dropped: secrets unreadable in the secret store"
         );
+    }
+    // Fail closed on pricing: a billed caller is only ever served by a
+    // candidate whose model has a price, so every success can be charged.
+    // Free callers and in-process calls keep every candidate. An empty
+    // resolution falls through to the window/no-key answers below.
+    if billing::needs_price(principal) && !expanded.is_empty() {
+        expanded.retain(|candidate| {
+            let priced = price_cache.contains(candidate.provider.id, &candidate.upstream_model);
+            if !priced {
+                // May be new to models.dev: nudge the catalog keeper (6h-throttled).
+                crate::prices::missing(&candidate.upstream_model);
+            }
+            priced
+        });
+        if expanded.is_empty() {
+            tracing::warn!(
+                model = model.as_str(),
+                user_id = principal.map(|principal| principal.user_id),
+                "no priced candidate for a billed caller; refusing"
+            );
+            return DispatchOutcome::Failed {
+                status: 503,
+                message: format!("model {model} is not priced yet; try again later"),
+                retry_after_secs: None,
+            };
+        }
     }
     if expanded.is_empty() {
         // All entries filtered by their time window is a temporary state, not a
@@ -1706,6 +1793,9 @@ pub async fn dispatch_at(
     // Set when at least one candidate was skipped because none of its
     // capabilities can serve the client protocol (shapes the final error).
     let mut unserved = false;
+    // Set when a billed caller's candidate lost its price after admission
+    // (shapes the final error like the admission refusal).
+    let mut unpriced = false;
     // OpenCode session identity: derived from the request body alone, so it is
     // computed at most once per dispatch and reused by every attempt (the
     // sha256 input must stay byte-identical — opencode's session headers depend
@@ -1754,17 +1844,19 @@ pub async fn dispatch_at(
         })
         .collect();
 
-    // One request id per dispatch: the dispatcher's timeout-tracking id, the
-    // trace's request_id, and the upstream header all share it.
-    let request_num = next_request_id();
-    let request_id = format!("req_{request_num}");
+    // One request id per dispatch, shared by the trace, the ledger rows, the
+    // captured bodies and the billing charge. A UUID, not a counter: the
+    // billing idempotency index keys on it, so it must stay unique across
+    // restarts. The dispatcher keeps its own process-local numeric event id.
+    let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+    let dispatch_event_id = next_dispatch_event_id();
 
     // Create a reply channel for this request.
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
     // Submit the dispatch request.
     let dispatch_req = DispatchRequest {
-        id: request_num,
+        id: dispatch_event_id,
         slot_keys: slot_keys.clone(),
         order,
         caps: candidate_caps.clone(),
@@ -1784,7 +1876,7 @@ pub async fn dispatch_at(
         };
     }
 
-    let mut timeout_guard = DispatchTimeoutGuard::new(dispatcher.clone(), request_num);
+    let mut timeout_guard = DispatchTimeoutGuard::new(dispatcher.clone(), dispatch_event_id);
 
     // Wait for assignment with timeout.
     let assignment = match tokio::time::timeout(queue_timeout, reply_rx).await {
@@ -1916,6 +2008,21 @@ pub async fn dispatch_at(
                 // A priceless model may be new to models.dev: nudge the catalog
                 // keeper (6h-throttled, no-op when no keeper runs).
                 crate::prices::missing(target_model);
+                // The admission filter saw a price, but it vanished since (a
+                // catalog reload): a billed caller must never be served
+                // unpriced, so skip this candidate like an unservable one.
+                if billing::needs_price(principal) {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        provider = provider.name.as_str(),
+                        model = target_model,
+                        "price vanished after admission; skipping candidate for a billed caller"
+                    );
+                    unpriced = true;
+                    drop(slot.take()); // Release the slot before failing over.
+                    index += 1;
+                    continue 'candidates;
+                }
                 None
             }
         };
@@ -1970,7 +2077,7 @@ pub async fn dispatch_at(
                 protocol: protocol.as_str(),
                 client_protocol: Some(request.protocol.as_str()),
                 effort: effort.as_deref(),
-                caller: request.caller_key.as_deref(),
+                caller: caller_key,
                 agent: request.agent.as_deref(),
                 // The Smart verdict computed at dispatch-prep time, read by POSITION in
                 // the dispatch order (empty for ordered routes and the resting tail —
@@ -1999,7 +2106,7 @@ pub async fn dispatch_at(
                     effort: effort.as_deref(),
                     provider_id: provider.id,
                     provider_key_id: key_id,
-                    caller_key,
+                    principal,
                     agent,
                     started,
                     ledger,
@@ -2062,6 +2169,9 @@ pub async fn dispatch_at(
                 }) => {
                     let (usage_tx, usage_rx) = tokio::sync::oneshot::channel();
                     let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+                    // The slot moves into the pump only on commit: until then a
+                    // failed attempt still holds it here for failover.
+                    let (slot_tx, slot_rx) = tokio::sync::oneshot::channel();
                     // Response-body accumulator, one per streaming attempt (an
                     // aborted attempt's buffer is dropped unread with the outcome).
                     let captured = capture.as_ref().map(|_| CapturedBody::new());
@@ -2070,20 +2180,39 @@ pub async fn dispatch_at(
                         pump,
                         usage_tx,
                         commit_tx,
+                        slot_rx,
                         PumpSide {
                             payload_log: request.payload_log,
                             captured,
                             activity: Some((activity.clone(), seq)),
                             started,
                             request_id: request_id.clone(),
+                            // A billed caller is charged for what the upstream
+                            // generated, even past a client hang-up.
+                            on_client_gone: if billing::needs_price(principal) {
+                                OnClientGone::DrainUsage
+                            } else {
+                                OnClientGone::Stop
+                            },
+                            server_stopped: server_stopped.clone(),
                         },
                     );
                     match commit_rx.await {
-                        Ok(HoldSignal::Committed) => Ok(AttemptSuccess::Stream {
-                            status,
-                            frames,
-                            usage_rx,
-                        }),
+                        Ok(HoldSignal::Committed) => {
+                            // Locked in: the pump now owns the slot and releases it
+                            // when the upstream read ends, not when the client's
+                            // response body is dropped. A failed send (the pump
+                            // task already died) returns the guard, which drops
+                            // here and releases the slot.
+                            if let Some(guard) = slot.take() {
+                                let _ = slot_tx.send(guard);
+                            }
+                            Ok(AttemptSuccess::Stream {
+                                status,
+                                frames,
+                                usage_rx,
+                            })
+                        }
                         // A dropped verdict channel means the pump panicked: nothing
                         // reached the client either way, so it reads as an abort.
                         Ok(HoldSignal::Aborted) | Err(_) => {
@@ -2119,11 +2248,15 @@ pub async fn dispatch_at(
                         price.as_ref(),
                         started,
                     )
-                    .with_caller(caller_key)
+                    .with_caller(principal)
                     .with_agent(agent)
                     .with_client_protocol(request.protocol)
                     .with_effort(effort.as_deref())
-                    .with_request_id(&request_id);
+                    .with_request_id(&request_id)
+                    .with_charge(billing::certainty(
+                        observed.usage.is_some(),
+                        capability.protocol,
+                    ));
                     let metrics = attempt.end_metrics();
                     attempts.push(attempt);
                     // Success resets the failure counter and clears this model's rest
@@ -2162,12 +2295,15 @@ pub async fn dispatch_at(
                     let model = model.clone();
                     let served_model = candidate.upstream_model.clone();
                     let caller_key = caller_key.map(str::to_owned);
+                    let user_id = principal.map(|principal| principal.user_id);
+                    let gateway_key_id = principal.map(|principal| principal.key_id);
                     let agent = agent.map(str::to_owned);
                     let client_protocol = request.protocol;
                     let activity = activity.clone();
                     let stream_request_id = request_id.clone();
                     let mut attempts = std::mem::take(&mut attempts);
-                    tokio::spawn(async move {
+                    let settlement_ledger = ledger.clone();
+                    settlement_ledger.spawn_settlement(async move {
                         let outcome = usage_rx.await.ok();
                         let ttft_ms = outcome.as_ref().and_then(|outcome| outcome.ttft_ms);
                         let usage = outcome.as_ref().and_then(|outcome| outcome.usage);
@@ -2209,9 +2345,14 @@ pub async fn dispatch_at(
                             cost_usd,
                             error: interrupted,
                             caller_key,
+                            user_id,
+                            gateway_key_id,
                             agent,
                             request_id: Some(stream_request_id),
-                        };
+                            charged_microus: None,
+                            rate_bp,
+                        }
+                        .with_charge(billing::certainty(usage.is_some(), attempt_protocol));
                         let metrics = attempt.end_metrics();
                         attempts.push(attempt);
                         // Success resets the failure counter and clears this model's rest
@@ -2232,7 +2373,7 @@ pub async fn dispatch_at(
                     });
                     return DispatchOutcome::Stream {
                         status,
-                        frames: StreamFrames::new(frames, slot.take()),
+                        frames: StreamFrames::new(frames),
                         finalize: finalize_rx,
                     };
                 }
@@ -2248,7 +2389,7 @@ pub async fn dispatch_at(
                         &error,
                         started,
                     )
-                    .with_caller(caller_key)
+                    .with_caller(principal)
                     .with_agent(agent)
                     .with_client_protocol(request.protocol)
                     .with_effort(effort.as_deref())
@@ -2441,6 +2582,11 @@ pub async fn dispatch_at(
         // No attempt ran and at least one candidate was skipped for capability
         // reasons: nobody can serve this protocol (e.g. a responses client with
         // only chat-capable candidates — responses has no translation path).
+        None if unpriced => DispatchOutcome::Failed {
+            status: 503,
+            message: format!("model {model} is not priced yet; try again later"),
+            retry_after_secs: None,
+        },
         None if unserved => DispatchOutcome::Failed {
             status: 501,
             message: format!("no candidate can serve the {} protocol", protocol.as_str()),

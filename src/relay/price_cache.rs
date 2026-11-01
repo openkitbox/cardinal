@@ -40,6 +40,19 @@ impl PriceCacheInner {
                 .insert(model, price);
         }
     }
+
+    /// Provider-scoped row first, then the global fallback (provider_id = 0).
+    /// Aggregator routes serve vendor-prefixed ids (`deepseek/deepseek-v4.1-flash`)
+    /// the price table doesn't carry; a global miss retries the bare id —
+    /// the same one-path-head strip the catalog import normalizes with
+    /// (`crate::prices::bare`).
+    fn find(&self, provider_id: i64, model: &str) -> Option<&ModelPrice> {
+        self.scoped
+            .get(&provider_id)
+            .and_then(|m| m.get(model))
+            .or_else(|| self.global.get(model))
+            .or_else(|| self.global.get(crate::prices::bare(model)))
+    }
 }
 
 impl PriceCache {
@@ -101,18 +114,16 @@ impl PriceCache {
 
     pub fn get(&self, provider_id: i64, model: &str) -> Option<ModelPrice> {
         let inner = self.inner.read().ok()?;
-        // Provider-scoped row first, then the global fallback (provider_id = 0).
-        // Aggregator routes serve vendor-prefixed ids (`deepseek/deepseek-v4.1-flash`)
-        // the price table doesn't carry; a global miss retries the bare id —
-        // the same one-path-head strip the catalog import normalizes with
-        // (`crate::prices::bare`).
-        inner
-            .scoped
-            .get(&provider_id)
-            .and_then(|m| m.get(model))
-            .or_else(|| inner.global.get(model))
-            .or_else(|| inner.global.get(crate::prices::bare(model)))
-            .cloned()
+        inner.find(provider_id, model).cloned()
+    }
+
+    /// Whether a price exists for `(provider_id, model)` — the same lookup as
+    /// [`Self::get`] without cloning the price (admission filters candidates
+    /// on this before any of them is tried).
+    pub fn contains(&self, provider_id: i64, model: &str) -> bool {
+        self.inner
+            .read()
+            .is_ok_and(|inner| inner.find(provider_id, model).is_some())
     }
 
     /// Upsert a catalog price (write-through: PG first, then cache).

@@ -3,7 +3,7 @@ use sqlx::PgPool;
 
 /// The ledger time and dispatch request id of one request row — the anchor
 /// for locating its captured bodies in the hourly payload files
-/// (`body_log::BodyLog::get_near` keys captures by `req_{n}`, not row id:
+/// (`body_log::BodyLog::get_near` keys captures by `req_<uuid>`, not row id:
 /// the ledger writer batches inserts, so the row id is unknown at capture
 /// time).
 pub async fn request_row_anchor(
@@ -52,16 +52,29 @@ pub struct AttemptLog {
     pub ttft_ms: Option<i64>,
     pub cost_usd: Option<f64>,
     pub error: Option<String>,
-    /// The caller's identity (the gateway key's label); NULL for a local
-    /// unidentified caller or an in-process direct call.
+    /// The caller's identity (the gateway key's label, kept for display and
+    /// grouping); NULL for an in-process direct call.
     pub caller_key: Option<String>,
+    /// The user owning the caller's gateway key (0013); NULL for an
+    /// in-process direct call. Usage scoping and billing key on this.
+    pub user_id: Option<i64>,
+    /// The caller's gateway key id (0013); NULL for an in-process direct call.
+    pub gateway_key_id: Option<i64>,
     /// Which client the request's User-Agent named; NULL
     /// when the request carried no User-Agent or was in-process.
     pub agent: Option<String>,
-    /// The dispatch request id (`req_{n}`) — correlates the ledger row with
+    /// The dispatch request id (`req_<uuid>`) — correlates the ledger row with
     /// its routing trace (the trace ring and the upstream header share it).
     /// NULL for attempts constructed before a request id exists.
     pub request_id: Option<String>,
+    /// Amount to debit for this attempt, micro-USD (0014). Set only on a
+    /// successful attempt of a caller with known or estimated usage; None =
+    /// not charged (failed attempt, unknown usage, unpriced model or an
+    /// in-process call). Estimated usage is derivable from `protocol = kiro`.
+    pub charged_microus: Option<i64>,
+    /// The caller's effective rate multiplier in basis points at request
+    /// time (0014); None for an in-process direct call.
+    pub rate_bp: Option<i64>,
 }
 
 /// Persist attempt rows to `gateway_requests`, returning the inserted row ids
@@ -76,8 +89,10 @@ pub async fn insert_request_logs(pool: &PgPool, attempts: &[AttemptLog]) -> Vec<
         let result = sqlx::query_scalar::<_, i64>(
       "INSERT INTO gateway_requests (protocol, client_protocol, effort, alias, provider_id, provider_key_id, model,
              served_model, status, input_tokens, output_tokens, cached_input_tokens,
-             cache_creation_input_tokens, total_ms, ttft_ms, cost_usd, error, caller_key, agent, request_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+             cache_creation_input_tokens, total_ms, ttft_ms, cost_usd, error, caller_key, agent, request_id,
+             user_id, gateway_key_id, charged_microus, rate_bp)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+             $21, $22, $23, $24)
              RETURNING id",
     )
     .bind(attempt.protocol.as_str())
@@ -100,6 +115,10 @@ pub async fn insert_request_logs(pool: &PgPool, attempts: &[AttemptLog]) -> Vec<
     .bind(&attempt.caller_key)
     .bind(&attempt.agent)
     .bind(&attempt.request_id)
+    .bind(attempt.user_id)
+    .bind(attempt.gateway_key_id)
+    .bind(attempt.charged_microus)
+    .bind(attempt.rate_bp)
     .fetch_one(pool)
     .await;
         match result {
@@ -135,12 +154,13 @@ pub struct RequestRow {
     pub ttft_ms: Option<i64>,
     pub cost_usd: Option<f64>,
     pub error: Option<String>,
-    /// Who called (the gateway key label; None = loopback/in-process caller).
+    /// Who called (the gateway key label; None = in-process caller or a row
+    /// from before loopback access was closed).
     pub caller_key: Option<String>,
     /// Which client the request's User-Agent named (None = no User-Agent or an
     /// in-process call; rows predating 0014).
     pub agent: Option<String>,
-    /// The dispatch request id (`req_{n}`), correlating the row with its
+    /// The dispatch request id (`req_<uuid>`), correlating the row with its
     /// routing trace (0021; None for earlier rows).
     pub request_id: Option<String>,
     /// The serving account's label (LEFT JOIN on provider_key_id; None when the

@@ -4,6 +4,7 @@
 //! - `protocol`: protocol kernels (validate/prepare/observe), the bounded SSE
 //!   framer and usage evidence — pure data transformations producing `Prepared` DTOs;
 //! - `metering`: usage certainty classification, a leaf module;
+//! - `billing`: pure decision layer for rates, charges, usage certainty and admission;
 //! - `translation`: hub-and-spoke IR translation, a pure-function layer;
 //! - `upstream`: connection layer (DNS target policy + bounded HTTP client), consuming `Prepared`;
 //! - `relay`: orchestration layer (route/direct model resolution, key failover), composing the layers above;
@@ -20,6 +21,7 @@ pub mod admin;
 pub mod admin_ops;
 pub mod agent;
 pub mod api;
+pub mod billing;
 pub mod body_log;
 pub mod client;
 pub mod config;

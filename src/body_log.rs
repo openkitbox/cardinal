@@ -39,7 +39,7 @@ pub struct CapturedBodies {
     pub captured_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// One NDJSON line: the dispatch request id (`req_{n}`) plus the captured
+/// One NDJSON line: the dispatch request id (`req_<uuid>`) plus the captured
 /// bodies (flattened, so the admin response stays a bare [`CapturedBodies`]).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CapturedRow {
@@ -88,7 +88,7 @@ impl BodyLog {
     }
 
     /// Append one request's bodies, keyed by its dispatch request id
-    /// (`req_{n}` — the ledger writer batches inserts, so the row id is not
+    /// (`req_<uuid>` — the ledger writer batches inserts, so the row id is not
     /// known at capture time; the request id is the correlation key). The
     /// record lands in the hour of `bodies.captured_at`; a capture spanning an
     /// hour boundary still lands whole in its starting hour.

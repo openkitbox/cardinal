@@ -53,6 +53,30 @@ cargo build --release
 curl -H "Authorization: Bearer your-admin-key" http://127.0.0.1:8787/api/info
 ```
 
+## Deployment
+
+On SIGTERM or Ctrl-C the gateway stops accepting new connections, waits up to
+120s for in-flight requests (including long SSE streams) to finish, waits up to
+20s more for finished streams to record their usage and charges, flushes and
+settles the buffered ledger rows, then exits. Streams still open after 120s are
+cut.
+
+systemd's default stop timeout (90s) is shorter than that, so the unit must
+raise it, or systemd will SIGKILL the process before the final ledger flush and
+unsettled charges are lost:
+
+```ini
+[Service]
+ExecStart=/opt/cardinal/cardinal-gateway
+KillSignal=SIGTERM
+TimeoutStopSec=150
+Restart=always
+```
+
+A single instance still has a gap of a few seconds during a restart when new
+connections are refused. Zero-downtime restarts would need several instances
+with socket handoff, which is not implemented.
+
 ## API Overview
 
 | Endpoint | Description |
@@ -71,8 +95,14 @@ curl -H "Authorization: Bearer your-admin-key" http://127.0.0.1:8787/api/info
 | `GET /api/requests` | Query request ledger |
 | `GET /api/quotas` | Provider quota snapshots |
 | `GET /api/activity` | SSE activity stream |
+| `GET/POST /api/users`, `GET/PATCH /api/users/{id}` | Billing users |
+| `POST /api/users/{id}/topup`, `POST /api/users/{id}/adjust` | Balance changes (USD) |
+| `GET /api/users/{id}/entries`, `GET /api/users/{id}/reconcile` | Billing ledger and balance check |
+| `GET/POST /api/user-groups`, `PATCH /api/user-groups/{id}` | User groups (rate multiplier, route whitelist) |
+| `GET /user/me`, `GET /user/me/entries` | Self-service balance, keys and ledger (gateway key auth) |
 
-All admin endpoints require `Authorization: Bearer <key>`.
+Admin endpoints under `/api` require `Authorization: Bearer <admin key>`;
+`/v1` and `/user` endpoints require a gateway key.
 
 ## Architecture
 

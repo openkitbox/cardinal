@@ -490,7 +490,7 @@ impl Admin {
             quota_snapshots: self.quota_snapshots().await,
             quota_history: store::list_quota_history(&self.pool).await?,
             balance_history: store::list_balance_history(&self.pool).await?,
-            gateway_keys: store::list_gateway_keys(&self.pool).await?,
+            gateway_keys: store::list_gateway_keys(&self.pool, None).await?,
             model_success: store::last_model_success(&self.pool).await?,
             key_groups: store::list_key_groups(&self.pool).await?,
         })
@@ -535,7 +535,7 @@ impl Admin {
         &self,
         since: chrono::DateTime<chrono::Utc>,
         until: chrono::DateTime<chrono::Utc>,
-        caller: Option<(store::CallerFilter, &str)>,
+        caller: Option<store::CallerFilter<'_>>,
     ) -> anyhow::Result<store::UsageWindow> {
         store::usage_window(
             &self.pool,
@@ -556,7 +556,7 @@ impl Admin {
         until: chrono::DateTime<chrono::Utc>,
         split: store::TrendSplit,
         local_offset: chrono::Duration,
-        caller: Option<(store::CallerFilter, &str)>,
+        caller: Option<store::CallerFilter<'_>>,
     ) -> anyhow::Result<Vec<store::TrendRow>> {
         let since = since.clamp(until - chrono::Duration::days(370), until);
         store::usage_trend(&self.pool, since, until, split, local_offset, caller).await

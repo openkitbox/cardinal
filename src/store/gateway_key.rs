@@ -1,41 +1,22 @@
 use sqlx::PgPool;
 
-/// Gateway key record: id + label + enabled state for auth decisions.
-#[derive(Debug, Clone)]
-pub struct GatewayKeyInfo {
-    pub id: i64,
-    pub label: String,
-    pub enabled: bool,
-}
-
-/// Startup seeding: idempotently record the configured gateway auth key.
+/// Startup seeding: idempotently record the configured gateway auth key,
+/// owned by the built-in `owner` user.
 pub async fn seed_gateway_key(pool: &PgPool, gateway_key: &str) -> anyhow::Result<()> {
     // Labels are unique: if 'default' already belongs to another key (the
     // configured key was rotated), the new one gets a derived label instead
     // of failing startup.
     sqlx::query(
-        "INSERT INTO gateway_keys (key_plaintext, label)
+        "INSERT INTO gateway_keys (key_plaintext, label, user_id)
          SELECT $1, CASE WHEN EXISTS (SELECT 1 FROM gateway_keys WHERE label = 'default')
-                         THEN 'default-' || substr(md5($1), 1, 8) ELSE 'default' END
+                         THEN 'default-' || substr(md5($1), 1, 8) ELSE 'default' END,
+                (SELECT id FROM users WHERE login = 'owner')
          ON CONFLICT (key_plaintext) DO NOTHING",
     )
     .bind(gateway_key)
     .execute(pool)
     .await?;
     Ok(())
-}
-
-/// Authenticate one caller key candidate: plaintext against `gateway_keys`.
-/// Returns Some(GatewayKeyInfo) on a match, None if key not found.
-/// The caller checks `enabled` — a disabled key is NOT an auth success.
-pub async fn gateway_key_info(pool: &PgPool, key: &str) -> anyhow::Result<Option<GatewayKeyInfo>> {
-    let row = sqlx::query_as::<_, (i64, String, bool)>(
-        "SELECT id, label, enabled FROM gateway_keys WHERE key_plaintext = $1",
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(id, label, enabled)| GatewayKeyInfo { id, label, enabled }))
 }
 
 /// Gateway key row for admin listing.
@@ -46,14 +27,20 @@ pub struct GatewayKeyRow {
     pub key: String,
     pub label: String,
     pub enabled: bool,
+    /// Owning user and that user's login.
+    pub user_id: i64,
+    pub login: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub created_by: Option<String>,
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
     pub disabled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// List all gateway keys for admin UI.
-pub async fn list_gateway_keys(pool: &PgPool) -> anyhow::Result<Vec<GatewayKeyRow>> {
+/// List gateway keys, newest first: every key, or only those `user_id` owns.
+pub async fn list_gateway_keys(
+    pool: &PgPool,
+    user_id: Option<i64>,
+) -> anyhow::Result<Vec<GatewayKeyRow>> {
     let rows = sqlx::query_as::<
         _,
         (
@@ -61,28 +48,47 @@ pub async fn list_gateway_keys(pool: &PgPool) -> anyhow::Result<Vec<GatewayKeyRo
             String,
             String,
             bool,
+            i64,
+            String,
             chrono::DateTime<chrono::Utc>,
             Option<String>,
             Option<chrono::DateTime<chrono::Utc>>,
             Option<chrono::DateTime<chrono::Utc>>,
         ),
     >(
-        "SELECT k.id, k.key_plaintext, k.label, k.enabled, k.created_at, k.created_by,
-                (SELECT max(r.ts) FROM gateway_requests r WHERE r.caller_key = k.label),
+        "SELECT k.id, k.key_plaintext, k.label, k.enabled, k.user_id, u.login,
+                k.created_at, k.created_by,
+                (SELECT max(r.ts) FROM gateway_requests r WHERE r.gateway_key_id = k.id),
                 k.disabled_at
-         FROM gateway_keys k ORDER BY k.created_at DESC",
+         FROM gateway_keys k JOIN users u ON u.id = k.user_id
+         WHERE $1::bigint IS NULL OR k.user_id = $1
+         ORDER BY k.created_at DESC",
     )
+    .bind(user_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
         .map(
-            |(id, key, label, enabled, created_at, created_by, last_used_at, disabled_at)| {
+            |(
+                id,
+                key,
+                label,
+                enabled,
+                user_id,
+                login,
+                created_at,
+                created_by,
+                last_used_at,
+                disabled_at,
+            )| {
                 GatewayKeyRow {
                     id,
                     key,
                     label,
                     enabled,
+                    user_id,
+                    login,
                     created_at,
                     created_by,
                     last_used_at,
@@ -93,9 +99,10 @@ pub async fn list_gateway_keys(pool: &PgPool) -> anyhow::Result<Vec<GatewayKeyRo
         .collect())
 }
 
-/// Create a new gateway key. Returns the plaintext key.
+/// Create a new gateway key owned by `user_id`. Returns the plaintext key.
 pub async fn create_gateway_key(
     pool: &PgPool,
+    user_id: i64,
     label: &str,
     created_by: Option<&str>,
 ) -> anyhow::Result<String> {
@@ -105,12 +112,16 @@ pub async fn create_gateway_key(
         's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
     ];
     let key = format!("sk-{}", nanoid::nanoid!(50, &ALPHABET));
-    sqlx::query("INSERT INTO gateway_keys (key_plaintext, label, created_by) VALUES ($1, $2, $3)")
-        .bind(&key)
-        .bind(label)
-        .bind(created_by)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO gateway_keys (key_plaintext, label, created_by, user_id)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(&key)
+    .bind(label)
+    .bind(created_by)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
     Ok(key)
 }
 
@@ -120,6 +131,15 @@ pub fn is_label_taken(error: &anyhow::Error) -> bool {
         .downcast_ref::<sqlx::Error>()
         .and_then(sqlx::Error::as_database_error)
         .is_some_and(|db| db.constraint() == Some("gateway_keys_label_unique"))
+}
+
+/// True when `create_gateway_key` failed because `user_id` names no user
+/// (the only foreign key on `gateway_keys`).
+pub fn is_unknown_user(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<sqlx::Error>()
+        .and_then(sqlx::Error::as_database_error)
+        .is_some_and(|db| db.is_foreign_key_violation())
 }
 
 /// Enable or disable a gateway key by its id.

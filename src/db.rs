@@ -73,8 +73,9 @@ impl Db {
     }
 }
 
-/// SHA-256 hex digest (gateway key hashing: stored keys are digests, never
-/// plaintext).
+/// SHA-256 hex digest. Used to compare secrets in constant length (admin key
+/// checks) and to derive stable opaque ids; gateway keys themselves are stored
+/// in plaintext so they stay viewable and copyable.
 pub fn sha256_hex(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

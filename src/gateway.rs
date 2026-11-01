@@ -28,8 +28,20 @@ use crate::relay::dispatcher;
 use crate::upstream::transport;
 use crate::{admin, admin_ops, api, config, store};
 
-/// Maximum wait for in-flight requests during graceful shutdown (long SSE streams may linger; forced stop after timeout).
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum wait for in-flight requests during graceful shutdown; streams still
+/// open after it are cut. Production p99 request duration is about 60s, so a
+/// restart lets nearly every in-flight stream finish (and be charged). The
+/// systemd unit's `TimeoutStopSec` must exceed this plus
+/// [`ACCOUNTING_DRAIN_TIMEOUT`] plus the final ledger flush (see README
+/// "Deployment").
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Maximum wait, after the HTTP server stopped, for streaming settlement
+/// tasks still turning their pump's usage into ledger rows and charges.
+/// [`SHUTDOWN_TIMEOUT`] (120s) + this (20s) + the final ledger flush must
+/// stay under the systemd unit's `TimeoutStopSec=150` (README
+/// "Deployment"), or systemd kills the process mid-flush.
+const ACCOUNTING_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Cadence of the background vendor-quota prober. The Smart route strategy
 /// ranks a route's candidates by their stored quota snapshots, read by relay
@@ -63,6 +75,11 @@ struct Core {
     /// quota prober) — cancelled by [`Gateway::shutdown`] before the pool
     /// closes so no daemon round ever races pool teardown.
     prober_cancel: CancellationToken,
+    /// Cancelled by [`Gateway::shutdown`] once the HTTP server has stopped
+    /// (every connection closed or the [`SHUTDOWN_TIMEOUT`] grace cut the
+    /// rest). Stream pumps still draining an upstream for usage then settle
+    /// at once, so their rows land inside [`ACCOUNTING_DRAIN_TIMEOUT`].
+    server_stopped: CancellationToken,
     /// The quota prober's join handle, awaited in [`Gateway::shutdown`] after
     /// cancellation so an in-flight probe round finishes before the pool closes.
     prober_join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -180,6 +197,7 @@ impl Core {
             writer_handle,
             activity,
             prober_cancel: CancellationToken::new(),
+            server_stopped: CancellationToken::new(),
             prober_join: std::sync::Mutex::new(None),
             smart_cache,
             rotate_cursors: relay::RotateCursors::new(),
@@ -365,6 +383,7 @@ impl Gateway {
             price_cache: core.price_cache.clone(),
             kiro_tokens: core.kiro_tokens.clone(),
             ledger: core.ledger.clone(),
+            server_stopped: core.server_stopped.clone(),
             payload_log: core.payload_log,
         });
 
@@ -387,11 +406,19 @@ impl Gateway {
     /// Graceful shutdown: the HTTP surface stops accepting new connections and waits for in-flight requests
     /// (at most [`SHUTDOWN_TIMEOUT`]), then the ledger writer flushes its buffered rows, then the database pool closes.
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        tracing::info!(
+            timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+            "graceful shutdown: refusing new connections, draining in-flight requests"
+        );
         self.server.handle.stop_graceful(SHUTDOWN_TIMEOUT);
         self.server
             .join
             .await
             .map_err(|error| anyhow::anyhow!("server task join failed: {error}"))?;
+        // The grace is over and the server cut whatever was still open: a
+        // billed pump draining its upstream for usage must settle now, with
+        // the usage it has, or it would outlive the settlement drain below.
+        self.core.server_stopped.cancel();
         // Stop the quota prober and wait for any in-flight round to finish
         // before the pool closes — no probe round ever races pool teardown.
         self.core.prober_cancel.cancel();
@@ -404,6 +431,12 @@ impl Gateway {
         if let Some(handle) = prober {
             let _ = handle.await;
         }
+        // Streams the server already let go may still be settling: wait for
+        // their accounting tasks so their rows and charges are queued.
+        self.core
+            .ledger
+            .drain_settlements(ACCOUNTING_DRAIN_TIMEOUT)
+            .await;
         // In-flight requests have settled (their rows are queued); flush before
         // the pool closes — the final batch still needs a live connection.
         self.core.writer_handle.flush_and_shutdown().await;

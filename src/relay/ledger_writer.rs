@@ -4,6 +4,24 @@
 //! request path (a settled request no longer waits on the INSERT round-trip),
 //! and a burst of concurrent requests amortizes into fewer, larger inserts.
 //!
+//! Each flush writes two things with different guarantees:
+//!
+//! - **Charges** (`billing_entries` + `users.balance_microus`): every billed
+//!   row (a user, a request id and a positive `charged_microus`) becomes a
+//!   [`Charge`], settled first, in chunks of at most [`SETTLE_CHUNK`]
+//!   charges, one transaction per chunk ([`crate::store::settle_charges`]).
+//!   Committed chunks leave the pending queue; a failed chunk and every
+//!   chunk after it stay queued, in order, for the next flush to retry (the
+//!   timer flushes even with no new rows). The request-id unique index makes
+//!   a retry of an already-committed charge a no-op, so retries never
+//!   double-debit. The queue is capped at [`MAX_PENDING_CHARGES`]: beyond
+//!   that the oldest charges are dropped and logged (lost revenue, never an
+//!   overcharge). Charges whose user no longer exists, or whose arithmetic
+//!   would overflow, are dropped with an error.
+//! - **Statistics rows** (`gateway_requests`): written best-effort, row by
+//!   row, and cleared after the attempt whether or not every insert landed —
+//!   the store logs failures, and keeping the rows would re-insert them.
+//!
 //! Ordering: one mpsc producer order per push, and the buffer preserves push
 //! order, so a request's attempts land in PG in the same order the old
 //! per-request insert produced (id order == time order is preserved within a
@@ -11,16 +29,21 @@
 //!
 //! Shutdown: [`LedgerWriterHandle::flush_and_shutdown`] signals the flush
 //! task to drain the channel and write a final batch before exiting, so a
-//! graceful exit loses no ledger rows. An ungraceful kill (SIGKILL, panic
-//! abort) loses at most one flush interval of buffered rows — the same class
-//! of loss the old design accepted for the streaming post-processing task.
+//! graceful exit loses no ledger rows while PG is reachable; charges the
+//! final settlement cannot write are reported as lost. An ungraceful kill
+//! (SIGKILL, panic abort) loses at most one flush interval of buffered rows
+//! and charges (plus any pending retries) — the charges are under-collected,
+//! never double-collected. Balances therefore lag by up to one flush window,
+//! so a user can end slightly negative; that is accepted.
 
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
 
 use crate::store::AttemptLog;
+use crate::store::Charge;
 
 /// Default flush cadence for the production writer.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -28,12 +51,34 @@ pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// Default early-flush trigger for the production writer.
 pub const DEFAULT_BATCH_SIZE: usize = 100;
 
+/// Most unsettled charges kept for retry while PG is unreachable; beyond
+/// this the oldest are dropped so memory stays bounded.
+pub const MAX_PENDING_CHARGES: usize = 100_000;
+
+/// Most charges settled in one transaction, so a large retry backlog never
+/// holds one long transaction (and its user row locks) open.
+const SETTLE_CHUNK: usize = 1000;
+
+/// Which flush is running: a periodic one has a next flush to retry
+/// failures; the final one (graceful shutdown or teardown) does not, so its
+/// failures are lost and logged at `error!`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlushKind {
+    Periodic,
+    Final,
+}
+
 /// Buffers attempt logs and flushes them to PG in batches. Cheap to clone
 /// (an unbounded channel sender); the write path is non-blocking — requests
 /// push their attempt rows and move on.
 #[derive(Clone)]
 pub struct LedgerWriter {
     tx: mpsc::UnboundedSender<Vec<AttemptLog>>,
+    /// Detached accounting tasks that will still [`Self::push`] (a committed
+    /// stream's settlement waits for the pump to end). Shutdown waits on them
+    /// before the final flush, so a stream that finishes during the drain is
+    /// still charged.
+    settlements: TaskTracker,
 }
 
 impl LedgerWriter {
@@ -58,7 +103,10 @@ impl LedgerWriter {
             batch_size,
         ));
         (
-            Self { tx },
+            Self {
+                tx,
+                settlements: TaskTracker::new(),
+            },
             LedgerWriterHandle {
                 shutdown_tx,
                 done: Some(done),
@@ -76,6 +124,33 @@ impl LedgerWriter {
         }
         if self.tx.send(attempts).is_err() {
             tracing::warn!("ledger writer already shut down; attempt rows dropped");
+        }
+    }
+
+    /// Spawn a detached accounting task that ends in a [`Self::push`]; the
+    /// shutdown drain ([`Self::drain_settlements`]) waits for it.
+    pub fn spawn_settlement<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.settlements.spawn(task);
+    }
+
+    /// Wait at most `timeout` for every tracked accounting task to finish.
+    /// Call during shutdown after the HTTP server has stopped and before
+    /// [`LedgerWriterHandle::flush_and_shutdown`]; tasks still running at the
+    /// deadline lose their rows and charges (logged).
+    pub async fn drain_settlements(&self, timeout: Duration) {
+        self.settlements.close();
+        if tokio::time::timeout(timeout, self.settlements.wait())
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                remaining = self.settlements.len(),
+                timeout_secs = timeout.as_secs(),
+                "accounting drain timed out; unfinished streams lose their ledger rows and charges"
+            );
         }
     }
 }
@@ -131,6 +206,8 @@ async fn flush_loop(
     batch_size: usize,
 ) {
     let mut buffer: Vec<AttemptLog> = Vec::new();
+    // Charges whose settlement failed, retried on every later flush.
+    let mut pending: Vec<Charge> = Vec::new();
     let mut interval = tokio::time::interval(flush_interval);
     // Delay, not the default Burst: a flush that runs past the interval must
     // wait a full interval rather than firing back-to-back flushes.
@@ -144,59 +221,155 @@ async fn flush_loop(
             while let Ok(batch) = rx.try_recv() {
               buffer.extend(batch);
             }
-            flush(&pool, &activity, &mut buffer, true).await;
+            flush(&pool, &activity, &mut buffer, &mut pending, FlushKind::Final).await;
             break;
           }
           batch = rx.recv() => {
             let Some(batch) = batch else {
               // All LedgerWriter clones dropped (process teardown without a
               // shutdown call): flush what we have and exit.
-              flush(&pool, &activity, &mut buffer, true).await;
+              flush(&pool, &activity, &mut buffer, &mut pending, FlushKind::Final).await;
               break;
             };
             buffer.extend(batch);
             if buffer.len() >= batch_size {
-              flush(&pool, &activity, &mut buffer, false).await;
+              flush(&pool, &activity, &mut buffer, &mut pending, FlushKind::Periodic).await;
             }
           }
           _ = interval.tick() => {
-            flush(&pool, &activity, &mut buffer, false).await;
+            flush(&pool, &activity, &mut buffer, &mut pending, FlushKind::Periodic).await;
           }
         }
     }
 }
 
-/// Write the buffered rows as one batch and notify activity listeners (the
-/// `Persisted` event moved here from the request path: it now fires per
-/// flush, not per request). Buffer is cleared even on partial failure — the
-/// rows are already logged by the store, and keeping them would re-insert.
-/// `is_shutdown`: the final flush during graceful shutdown logs failures at
-/// `error!` level — the operator believes the exit was clean.
+/// Settle the batch's charges (with any pending retries), then write the
+/// buffered statistics rows, and notify activity listeners (the `Persisted`
+/// event fires per flush, not per request). The statistics buffer is cleared
+/// even on partial failure — the rows are already logged by the store, and
+/// keeping them would re-insert. Unsettled charges stay in `pending`.
+/// A [`FlushKind::Final`] flush logs failures at `error!` level — the
+/// operator believes the exit was clean.
 async fn flush(
     pool: &sqlx::PgPool,
     activity: &crate::activity::ActivitySink,
     buffer: &mut Vec<AttemptLog>,
-    is_shutdown: bool,
+    pending: &mut Vec<Charge>,
+    kind: FlushKind,
 ) {
-    if buffer.is_empty() {
+    if buffer.is_empty() && pending.is_empty() {
         return;
     }
-    let ids = crate::store::insert_request_logs(pool, buffer).await;
-    if ids.len() != buffer.len() {
-        if is_shutdown {
-            tracing::error!(
-                expected = buffer.len(),
-                inserted = ids.len(),
-                "ledger shutdown flush: rows lost — PG unreachable during final flush"
-            );
-        } else {
-            tracing::warn!(
-                expected = buffer.len(),
-                inserted = ids.len(),
-                "ledger batch flush: some rows failed to insert"
-            );
+    pending.extend(buffer.iter().filter_map(charge_of));
+    settle(pool, pending, kind).await;
+    if !buffer.is_empty() {
+        let ids = crate::store::insert_request_logs(pool, buffer).await;
+        if ids.len() != buffer.len() {
+            if kind == FlushKind::Final {
+                tracing::error!(
+                    expected = buffer.len(),
+                    inserted = ids.len(),
+                    "ledger shutdown flush: rows lost — PG unreachable during final flush"
+                );
+            } else {
+                tracing::warn!(
+                    expected = buffer.len(),
+                    inserted = ids.len(),
+                    "ledger batch flush: some rows failed to insert"
+                );
+            }
+        }
+        buffer.clear();
+    }
+    activity.persisted();
+}
+
+/// The charge a ledger row carries: a billed user, a request id and a
+/// positive amount. A zero charge (free user) writes no billing entry.
+fn charge_of(row: &AttemptLog) -> Option<Charge> {
+    let user_id = row.user_id?;
+    let request_id = row.request_id.as_ref()?;
+    let amount_microus = row.charged_microus.filter(|amount| *amount > 0)?;
+    Some(Charge {
+        user_id,
+        request_id: request_id.clone(),
+        amount_microus,
+        cost_microus: row.cost_usd.and_then(crate::billing::cost_microus),
+        rate_bp: row.rate_bp,
+    })
+}
+
+/// Settle `pending` chunk by chunk, oldest first, one transaction per
+/// chunk. Committed chunks (including their definitive skips: unknown users,
+/// overflows) leave the queue; the first failure stops the pass and keeps
+/// that chunk and everything after it, in order, for the next flush, trimmed
+/// to [`MAX_PENDING_CHARGES`] by dropping the oldest. A
+/// [`FlushKind::Final`] flush has no next flush, so a failure loses what
+/// is left.
+async fn settle(pool: &sqlx::PgPool, pending: &mut Vec<Charge>, kind: FlushKind) {
+    let mut committed = 0;
+    let mut failure: Option<sqlx::Error> = None;
+    for chunk in pending.chunks(SETTLE_CHUNK) {
+        match crate::store::settle_charges(pool, chunk).await {
+            Ok(report) => {
+                log_report(&report);
+                committed += chunk.len();
+            }
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
         }
     }
-    buffer.clear();
-    activity.persisted();
+    pending.drain(..committed);
+    let Some(error) = failure else {
+        return;
+    };
+    match kind {
+        FlushKind::Final => {
+            tracing::error!(
+                lost = pending.len(),
+                "billing shutdown settlement failed: {error}; charges lost (under-collected)"
+            );
+            pending.clear();
+        }
+        FlushKind::Periodic => {
+            tracing::error!(
+                pending = pending.len(),
+                "billing settlement failed: {error}; charges kept for retry"
+            );
+            if pending.len() > MAX_PENDING_CHARGES {
+                let excess = pending.len() - MAX_PENDING_CHARGES;
+                pending.drain(..excess);
+                tracing::error!(
+                    dropped = excess,
+                    "billing retry queue full: oldest charges dropped (under-collected)"
+                );
+            }
+        }
+    }
+}
+
+/// Log the definitive skips of one committed settlement chunk.
+fn log_report(report: &crate::store::SettleReport) {
+    if !report.unknown_users.is_empty() {
+        tracing::error!(
+            user_ids = ?report.unknown_users,
+            charges = report.unknown_charges,
+            "billing settlement: charges dropped — their users no longer exist"
+        );
+    }
+    for skipped in &report.overflowed {
+        tracing::error!(
+            request_id = skipped.request_id.as_str(),
+            user_id = skipped.user_id,
+            "billing settlement: charge dropped — the amount overflows the balance"
+        );
+    }
+    if report.duplicates > 0 {
+        tracing::warn!(
+            duplicates = report.duplicates,
+            "billing settlement: request ids already charged; skipped"
+        );
+    }
 }

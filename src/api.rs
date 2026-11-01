@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::protocol::ProtocolId;
 use crate::relay::{self, RelayRequest};
-use crate::store::GatewayKeyInfo;
+use crate::store::Principal;
 use crate::upstream::transport;
 
 /// Shared in-process state.
@@ -47,6 +47,9 @@ pub struct AppState {
     pub kiro_tokens: Arc<crate::upstream::KiroTokens>,
     /// Batch ledger writer: relay dispatch queues attempt rows here.
     pub ledger: relay::LedgerWriter,
+    /// Cancelled once graceful shutdown has stopped the HTTP surface (shared
+    /// with relay dispatch; stream pumps settle on it).
+    pub server_stopped: tokio_util::sync::CancellationToken,
     /// `[gateway].payloads`: relay mirrors request/response bodies into the log.
     pub payload_log: bool,
 }
@@ -177,16 +180,17 @@ async fn relay_dispatch(
     body: Value,
     agent: Option<String>,
 ) {
+    // The principal the gateway_auth hoop verified, moved out of the depot
+    // (nothing after this handler reads it). Always present on the /v1 and
+    // /v1beta routes, which every request reaches through that hoop.
+    let principal = depot.remove_typed::<Principal>().ok();
     let state = depot.get_typed::<Arc<AppState>>().expect("state");
-    // The caller identity the gateway_auth hoop verified (absent for a local
-    // unidentified caller — the ledger row then records caller_key NULL).
-    let caller_key = depot.get::<String>(CALLER_KEY).ok().cloned();
     let request = RelayRequest {
         protocol,
         stream: stream_of(&body),
         body,
         payload_log: state.payload_log,
-        caller_key,
+        principal,
         agent,
     };
 
@@ -208,6 +212,7 @@ async fn relay_dispatch(
         rest_cache: &state.rest_cache,
         price_cache: &state.price_cache,
         ledger: &state.ledger,
+        server_stopped: &state.server_stopped,
     };
     match relay::dispatch(&deps, &observability, request).await {
         relay::DispatchOutcome::Json { status, body } => {
@@ -483,13 +488,9 @@ async fn list_gemini_models(depot: &mut Depot, response: &mut Response) {
 //
 // Gateway auth is an HTTP-surface concern: it reads salvo request headers and
 // short-circuits the request, so it lives here, not in the relay layer. The
-// caller-key model: multi-source credential extraction, loopback
-// leniency, and refusal messages that tell a missing key apart from a wrong
-// one — adapted to our hash-at-rest storage (SHA-256 lookup).
-
-/// The depot key under which the hoop stores the caller's identity (the
-/// gateway key's label) for the relay handler.
-const CALLER_KEY: &str = "caller_key";
+// caller-key model: multi-source credential extraction, one plaintext lookup
+// per candidate (gateway_keys ⋈ users ⋈ user_groups), and refusal messages
+// that tell a missing key apart from a wrong, disabled or expired one.
 
 /// Headers a proxy or tunnel on this machine adds to a request it passes on:
 /// cloudflared (Cf-Connecting-IP, and X-Forwarded-For beside it), ngrok,
@@ -592,11 +593,6 @@ pub(crate) fn is_local(request: &Request) -> bool {
         })
 }
 
-/// Authenticate one candidate key: plaintext against gateway_keys.
-async fn authenticate(pool: &sqlx::PgPool, key: &str) -> anyhow::Result<Option<GatewayKeyInfo>> {
-    crate::store::gateway_key_info(pool, key).await
-}
-
 /// Why a caller was turned away: no credential
 /// came, or the one that came is no gateway key — named by its last four
 /// characters, and only when long enough that naming it doesn't give most of
@@ -624,20 +620,51 @@ fn refused_key(key: Option<&str>) -> String {
     }
 }
 
-/// Caller-key verification: every credential
-/// candidate is tried against gateway_keys and the FIRST match wins (a stale
-/// Authorization beside a correct x-api-key still gets in).
+/// Why a matched key still may not call: the key is disabled, its owning
+/// user is disabled, or the key has expired at `now`. `None` = admitted.
+/// Messages name the key by its label, never by its value. Shared with the
+/// user usage surface (`user_usage`), which admits the same keys.
+pub(crate) fn refusal(principal: &Principal, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    if !principal.key_enabled {
+        return Some(format!("the API key '{}' is disabled", principal.key_label));
+    }
+    if !principal.user_enabled {
+        return Some("the account owning this API key is disabled".to_owned());
+    }
+    if principal
+        .key_expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Some(format!("the API key '{}' has expired", principal.key_label));
+    }
+    None
+}
+
+/// Turn the request away with 401 and log why (the access Logger already
+/// logs the request line).
+fn refuse(request: &Request, response: &mut Response, ctrl: &mut FlowCtrl, reason: String) {
+    tracing::info!(
+        "refused {} {} from {}: {reason}",
+        request.method(),
+        request.uri().path(),
+        request.remote_addr()
+    );
+    response.status_code(StatusCode::UNAUTHORIZED);
+    let _ = response.body(reason);
+    ctrl.skip_rest();
+}
+
+/// Caller-key verification: every credential candidate is tried against
+/// gateway_keys and the FIRST match wins (a stale Authorization beside a
+/// correct x-api-key still gets in). The match resolves to a [`Principal`]
+/// (key + owning user + group) injected into the depot for the relay
+/// handler; identity comes only from the key's owner.
 ///
-/// Caller identity ("the client a request came from is the one its token
-/// names"): a key whose VALUE carries the `cardinal-` prefix
-/// self-names its client (`cardinal-cherry` → the request is cherry's) — a
-/// name is presentation, not access, so it attaches wherever the request is
-/// allowed: a registered key passes and self-names when its value has the
-/// prefix (else falls back to its stored label); an unregistered loopback
-/// request passes and may self-name the same way; a remote or proxied one
-/// gets a 401 regardless of what it calls itself — naming never opens a
-/// door. A DB failure is not an auth failure: 503, so monitoring can tell
-/// the two apart.
+/// Every request needs a gateway key: there is no loopback or self-naming
+/// fallback, so an unmatched or absent key is a 401 wherever it comes from.
+/// A matched key is still refused (401) when it or its user is disabled or
+/// the key has expired ([`refusal`]). A DB failure is not an auth failure:
+/// 503, so monitoring can tell the two apart.
 #[handler]
 async fn gateway_auth(
     request: &mut Request,
@@ -648,15 +675,14 @@ async fn gateway_auth(
     let state = depot.get_typed::<Arc<AppState>>().expect("state");
     let pool = state.pool.clone();
     let candidates = caller_keys(request);
-    let mut info: Option<GatewayKeyInfo> = None;
+    let mut principal: Option<Principal> = None;
     for candidate in &candidates {
-        match authenticate(&pool, candidate).await {
-            Ok(found) => {
-                info = found;
-                if info.is_some() {
-                    break;
-                }
+        match crate::store::authenticate_principal(&pool, candidate).await {
+            Ok(Some(found)) => {
+                principal = Some(found);
+                break;
             }
+            Ok(None) => {}
             Err(error) => {
                 tracing::warn!("gateway key lookup failed: {error}");
                 response.status_code(StatusCode::SERVICE_UNAVAILABLE);
@@ -666,57 +692,16 @@ async fn gateway_auth(
             }
         }
     }
-
-    // User-Agent agent — read for the caller-identity fallback below; the
-    // ledger/feed `agent` column is filled separately at dispatch time.
-    let agent = caller_agent(request);
-
-    if let Some(info) = info {
-        if !info.enabled {
-            let reason = format!("the API key '{}' is disabled", info.label);
-            tracing::info!(
-                "refused {} {} from {}: {reason}",
-                request.method(),
-                request.uri().path(),
-                request.remote_addr()
-            );
-            response.status_code(StatusCode::UNAUTHORIZED);
-            let _ = response.body(reason);
-            ctrl.skip_rest();
-            return;
-        }
-        // Registered key: the caller is its label (chosen by the owner) —
-        // never the raw key value.
-        depot.insert(CALLER_KEY, info.label.clone());
+    let Some(principal) = principal else {
+        let reason = refused_key(candidates.first().map(String::as_str));
+        refuse(request, response, ctrl, reason);
+        return;
+    };
+    if let Some(reason) = refusal(&principal, chrono::Utc::now()) {
+        refuse(request, response, ctrl, reason);
         return;
     }
-    // Loopback without a proxy's forwarding headers is this computer itself:
-    // let it through — carrying its self-asserted name when the key value
-    // offered one (`cardinal-alma` → `alma`), else the client name, else
-    // without identity (normal operation, not logged).
-    if is_local(request) {
-        let named = candidates
-            .iter()
-            .find_map(|candidate| candidate.strip_prefix("cardinal-"))
-            .filter(|rest| !rest.is_empty());
-        if let Some(name) = named {
-            depot.insert(CALLER_KEY, name.to_string());
-        } else if let Some(agent) = agent {
-            depot.insert(CALLER_KEY, agent);
-        }
-        return;
-    }
-    let reason = refused_key(candidates.first().map(String::as_str));
-    // The access Logger already logs the request line; this adds WHY it was refused.
-    tracing::info!(
-        "refused {} {} from {}: {reason}",
-        request.method(),
-        request.uri().path(),
-        request.remote_addr()
-    );
-    response.status_code(StatusCode::UNAUTHORIZED);
-    let _ = response.body(reason);
-    ctrl.skip_rest();
+    depot.insert_typed(principal);
 }
 
 pub fn router(

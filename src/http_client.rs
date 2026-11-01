@@ -400,7 +400,7 @@ impl GatewayHttpClient {
         items(self.get("/api/traces")).await
     }
 
-    /// One routing trace by its dispatch request id (`req_{n}`), `None` when
+    /// One routing trace by its dispatch request id (`req_<uuid>`), `None` when
     /// the ring never held it or evicted it (404).
     pub async fn trace(&self, request_id: &str) -> Result<Option<DispatchTrace>, ClientError> {
         let response = self

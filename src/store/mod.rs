@@ -6,6 +6,7 @@
 //! subsets exposed as client model ids.
 
 mod balance_history;
+mod billing;
 mod gateway_key;
 mod key;
 mod key_group;
@@ -16,11 +17,16 @@ mod request;
 mod rest;
 mod route;
 mod usage;
+mod user;
 
 pub use balance_history::{BalanceHistoryPoint, balance_history_record, list_balance_history};
+pub use billing::{
+    Charge, CreditError, CreditKind, EntryRow, Overflowed, Reconciliation, SettleReport, credit,
+    list_entries, reconcile_user, settle_charges,
+};
 pub use gateway_key::{
-    GatewayKeyInfo, GatewayKeyRow, create_gateway_key, gateway_key_info, is_label_taken,
-    list_gateway_keys, seed_gateway_key, set_gateway_key_enabled,
+    GatewayKeyRow, create_gateway_key, is_label_taken, is_unknown_user, list_gateway_keys,
+    seed_gateway_key, set_gateway_key_enabled,
 };
 pub use key::{
     ActiveWindow, AvailabilityRule, EnabledKeyModels, KeyModels, KeyPatch, KiroUpsertError,
@@ -60,4 +66,9 @@ pub use route::{EffortsUpdate, delete_route, get_route, list_routes, put_route};
 pub use usage::{
     CallerFilter, TrendRow, TrendSplit, UsageRow, UsageWindow, hourly_buckets, usage_by_day,
     usage_trend, usage_window,
+};
+pub use user::{
+    GroupPatch, GroupRow, NewUser, Principal, UserPatch, UserRow, authenticate_principal,
+    create_group, create_user, get_group, get_user, is_conflict, is_unknown_group, list_groups,
+    list_users, owner_user_id, patch_group, patch_user,
 };

@@ -33,6 +33,13 @@
 //! - `GET /api/quotas` (LIVE per-key vendor quota probing — outbound side effect) / `GET /api/quota-snapshots` (the stored readings)
 //! - `GET /api/bootstrap` — every parameterless read the status pages render from, as one document (also the activity stream's connect frame)
 //! - `GET /api/activity` (SSE live attempt feed: ActivityEvent frames + keep-alive)
+//! - `GET/POST /api/users`, `GET/PATCH /api/users/:id` — billed users (POST requires `group_id`; PATCH `rate_bp`
+//!   absent = untouched, null = use the group rate; the balance is never patchable)
+//! - `GET/POST /api/user-groups`, `PATCH /api/user-groups/:id` — pricing groups (`route_aliases` null = every route)
+//! - `POST /api/users/:id/topup` `{amount_usd, note?, operator?}` (> 0), `POST /api/users/:id/adjust` `{amount_usd, note,
+//!   operator?}` (≠ 0) — one ledger entry plus the balance change in one transaction; `operator` defaults to `admin`
+//! - `GET /api/users/:id/entries?before_id&limit` (ledger, newest first), `GET /api/users/:id/reconcile`
+//! - `GET/POST /api/gateway-keys` (`?user_id=` filters the list; POST `user_id` defaults to `owner`), `PATCH /api/gateway-keys/:id`
 //! - `GET /api/traces`, `GET /api/traces/:request_id` — recent routing traces from the dispatch trace ring
 //!   (newest first, capped at the ring's capacity; transient — nothing is persisted)
 
@@ -506,8 +513,8 @@ async fn usage(request: &mut Request, depot: &mut Depot, response: &mut Response
         caller: None,
     });
     let days = query.days.clamp(1, 365);
-    let caller = caller_filter(query.caller);
-    match store::usage_by_day(pool, days, caller_ref(&caller)).await {
+    let caller = caller_filter(query.caller.as_deref());
+    match store::usage_by_day(pool, days, caller).await {
         Ok(rows) => json_response(response, &json!({ "days": days, "items": rows })),
         Err(error) => internal(response, error),
     }
@@ -538,7 +545,7 @@ fn resolve_window(
 /// (route|model|provider|client|user, default route); `offset_seconds` shifts
 /// bucket labels to the caller's wall clock (the GUI passes its local offset);
 /// `caller` restricts to one caller identity (`null` = unidentified 本机
-/// rows, anything else = a gateway key label / self-named caller).
+/// rows, anything else = a gateway key label).
 /// Window bounds resolve via [`resolve_window`].
 #[derive(Deserialize)]
 struct TrendQuery {
@@ -585,33 +592,23 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
         return;
     }
     let offset = chrono::Duration::seconds(offset_seconds);
-    let caller = caller_filter(query.caller);
-    match admin
-        .usage_trend(since, until, split, offset, caller_ref(&caller))
-        .await
-    {
+    let caller = caller_filter(query.caller.as_deref());
+    match admin.usage_trend(since, until, split, offset, caller).await {
         Ok(rows) => json_response(response, &json!({ "items": rows })),
         Err(error) => internal(response, error),
     }
 }
 
 /// The `caller` query parameter's store form: the reserved value `null`
-/// selects unidentified callers, any other value is a caller identity label.
-fn caller_filter(caller: Option<String>) -> Option<(store::CallerFilter, String)> {
+/// selects unidentified callers, any other value is a gateway key label.
+fn caller_filter(caller: Option<&str>) -> Option<store::CallerFilter<'_>> {
     caller.map(|value| {
         if value == "null" {
-            (store::CallerFilter::Null, String::new())
+            store::CallerFilter::Null
         } else {
-            (store::CallerFilter::Label, value)
+            store::CallerFilter::Label(value)
         }
     })
-}
-
-/// Borrowed form of a [`caller_filter`] result, for store calls taking `&str`.
-fn caller_ref(
-    filter: &Option<(store::CallerFilter, String)>,
-) -> Option<(store::CallerFilter, &str)> {
-    filter.as_ref().map(|(kind, label)| (*kind, label.as_str()))
 }
 
 /// Query form of `GET /api/usage/window` — window bounds plus the optional
@@ -643,8 +640,8 @@ async fn usage_window(request: &mut Request, depot: &mut Depot, response: &mut R
         }
     };
     let (since, until) = resolve_window(query.since, query.until, query.days);
-    let caller = caller_filter(query.caller);
-    match admin.usage_window(since, until, caller_ref(&caller)).await {
+    let caller = caller_filter(query.caller.as_deref());
+    match admin.usage_window(since, until, caller).await {
         Ok(window) => json_response(response, &window),
         Err(error) => internal(response, error),
     }
@@ -697,10 +694,13 @@ async fn model_success(depot: &mut Depot, response: &mut Response) {
 #[derive(Deserialize)]
 struct GatewayKeyCreateBody {
     label: String,
+    /// Owning user; defaults to the built-in `owner` user when absent.
+    user_id: Option<i64>,
 }
 
-/// `POST /api/gateway-keys`: create a new gateway key. Returns the plaintext
-/// key exactly once — it is stored as its SHA-256 hash and cannot be retrieved.
+/// `POST /api/gateway-keys`: create a new gateway key and return its
+/// plaintext. Keys are stored in plaintext, so `GET /api/gateway-keys` can
+/// show and copy them again later.
 #[handler]
 async fn create_gateway_key(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let pool = state_pool(depot);
@@ -719,21 +719,40 @@ async fn create_gateway_key(request: &mut Request, depot: &mut Depot, response: 
     }
     // created_by: the admin caller's identity if available (from CALLER_KEY depot).
     let created_by = depot.get_typed::<String>().ok().map(|s| s.as_str());
-    match store::create_gateway_key(pool, body.label.trim(), created_by).await {
+    let user_id = match body.user_id {
+        Some(user_id) => user_id,
+        None => match store::owner_user_id(pool).await {
+            Ok(user_id) => user_id,
+            Err(error) => {
+                internal(response, error);
+                return;
+            }
+        },
+    };
+    match store::create_gateway_key(pool, user_id, body.label.trim(), created_by).await {
         Ok(key) => json_response(response, &json!({ "key": key })),
         Err(error) if store::is_label_taken(&error) => {
             response.status_code(StatusCode::CONFLICT);
             json_response(response, &json!({ "error": "label already in use" }));
         }
+        Err(error) if store::is_unknown_user(&error) => {
+            response.status_code(StatusCode::NOT_FOUND);
+            json_response(response, &json!({ "error": "user not found" }));
+        }
         Err(error) => internal(response, error),
     }
 }
 
-/// `GET /api/gateway-keys`: list all gateway keys (hash truncated for display).
+/// `GET /api/gateway-keys[?user_id=N]`: gateway keys with their plaintext
+/// and owner; every key, or only those of one user.
 #[handler]
-async fn list_gateway_keys(depot: &mut Depot, response: &mut Response) {
+async fn list_gateway_keys(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let pool = state_pool(depot);
-    match store::list_gateway_keys(pool).await {
+    let Ok(query) = request.parse_queries::<GatewayKeysQuery>() else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid query (user_id)");
+        return;
+    };
+    match store::list_gateway_keys(pool, query.user_id).await {
         Ok(rows) => json_response(response, &json!({ "items": rows })),
         Err(error) => internal(response, error),
     }
@@ -774,7 +793,7 @@ async fn patch_gateway_key(request: &mut Request, depot: &mut Depot, response: &
 /// `GET /api/requests/{id}/bodies`: the captured request/response bodies of
 /// one row from the hourly payload files, or 404 when the row was never
 /// captured (payloads off) or predates the files still on disk. Captures are
-/// keyed by the dispatch request id (`req_{n}` — the ledger writer batches
+/// keyed by the dispatch request id (`req_<uuid>` — the ledger writer batches
 /// inserts, so the row id is unknown at capture time); rows persisted before
 /// the batch writer shipped (or by older builds) have no request id and can
 /// no longer be matched — the 404 then covers them.
@@ -1049,13 +1068,430 @@ async fn list_traces(depot: &mut Depot, response: &mut Response) {
 }
 
 /// `GET /api/traces/{request_id}`: one trace by its dispatch request id
-/// (`req_{n}`), 404 when the ring never held it or evicted it.
+/// (`req_<uuid>`), 404 when the ring never held it or evicted it.
 #[handler]
 async fn get_trace(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let request_id = request.param::<String>("request_id").unwrap_or_default();
     match trace_ring(depot).get(&request_id) {
         Some(trace) => json_response(response, &trace),
         None => not_found(response, "trace"),
+    }
+}
+
+// ---------- users, user groups and balances ----------
+
+/// Write `{"error": message}` with `status`.
+fn json_error(response: &mut Response, status: StatusCode, message: &str) {
+    response.status_code(status);
+    json_response(response, &json!({ "error": message }));
+}
+
+/// A rate multiplier or concurrency cap the schema CHECKs would refuse, or
+/// a rate above [`crate::billing::MAX_RATE_BP`]; answered as 400 instead of
+/// a 500 from the constraint.
+fn invalid_limits(rate_bp: Option<i64>, max_concurrent: Option<i32>) -> Option<&'static str> {
+    if rate_bp.is_some_and(|rate| rate < 0) {
+        return Some("rate_bp must not be negative");
+    }
+    if rate_bp.is_some_and(|rate| rate > crate::billing::MAX_RATE_BP) {
+        return Some("rate_bp must not exceed 1000000 (100x)");
+    }
+    if max_concurrent.is_some_and(|cap| cap <= 0) {
+        return Some("max_concurrent must be positive");
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct UserCreateBody {
+    login: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    /// Required: a user is always placed in a group explicitly.
+    #[serde(default)]
+    group_id: Option<i64>,
+    /// User rate override; absent/null = the group rate applies.
+    #[serde(default)]
+    rate_bp: Option<i64>,
+    #[serde(default)]
+    max_concurrent: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct UserPatchBody {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    group_id: Option<i64>,
+    /// Three-state: absent = untouched, null = clear the override (use the
+    /// group rate), number = set the override.
+    #[serde(default, deserialize_with = "tri_state")]
+    rate_bp: Option<Option<i64>>,
+    #[serde(default)]
+    max_concurrent: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct GroupCreateBody {
+    name: String,
+    /// Absent = 10_000 (1.0×).
+    #[serde(default)]
+    rate_bp: Option<i64>,
+    /// Absent/null = every route visible; array = whitelist.
+    #[serde(default)]
+    route_aliases: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct GroupPatchBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    rate_bp: Option<i64>,
+    /// Three-state: absent = untouched, null = every route visible, array =
+    /// whitelist.
+    #[serde(default, deserialize_with = "tri_state")]
+    route_aliases: Option<Option<Vec<String>>>,
+}
+
+#[derive(Deserialize)]
+struct CreditBody {
+    /// Decimal USD string, e.g. `"10"` or `"-0.5"` (see `billing::parse_usd`).
+    amount_usd: String,
+    #[serde(default)]
+    note: Option<String>,
+    /// Who made the change; the admin key carries no identity, so it
+    /// defaults to `"admin"`.
+    #[serde(default)]
+    operator: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EntriesQuery {
+    #[serde(default)]
+    before_id: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct GatewayKeysQuery {
+    #[serde(default)]
+    user_id: Option<i64>,
+}
+
+/// Group rate when a create body names none: 1.0×.
+const DEFAULT_GROUP_RATE_BP: i64 = 10_000;
+
+/// Respond with the user row of `id` (200), 404 when it is gone.
+async fn respond_user(pool: &sqlx::PgPool, id: i64, response: &mut Response) {
+    match store::get_user(pool, id).await {
+        Ok(Some(user)) => json_response(response, &user),
+        Ok(None) => json_error(response, StatusCode::NOT_FOUND, "user not found"),
+        Err(error) => internal(response, error),
+    }
+}
+
+/// Respond with the group row of `id` (200), 404 when it is gone.
+async fn respond_group(pool: &sqlx::PgPool, id: i64, response: &mut Response) {
+    match store::get_group(pool, id).await {
+        Ok(Some(group)) => json_response(response, &group),
+        Ok(None) => json_error(response, StatusCode::NOT_FOUND, "group not found"),
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `GET /api/users`: every user with group name, rates and balance.
+#[handler]
+async fn list_users(depot: &mut Depot, response: &mut Response) {
+    let pool = state_pool(depot);
+    match store::list_users(pool).await {
+        Ok(rows) => json_response(response, &json!({ "items": rows })),
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `POST /api/users`: create a user (balance 0) and return its row.
+#[handler]
+async fn create_user(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let pool = state_pool(depot);
+    let Ok(body) = request.parse_json::<UserCreateBody>().await else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid JSON body");
+        return;
+    };
+    let login = body.login.trim();
+    if login.is_empty() {
+        json_error(response, StatusCode::BAD_REQUEST, "login is required");
+        return;
+    }
+    let Some(group_id) = body.group_id else {
+        json_error(response, StatusCode::BAD_REQUEST, "group_id is required");
+        return;
+    };
+    if let Some(message) = invalid_limits(body.rate_bp, body.max_concurrent) {
+        json_error(response, StatusCode::BAD_REQUEST, message);
+        return;
+    }
+    let user = store::NewUser {
+        login,
+        display_name: body.display_name.as_deref().map_or("", str::trim),
+        group_id,
+        rate_bp: body.rate_bp,
+        max_concurrent: body.max_concurrent,
+    };
+    match store::create_user(pool, user).await {
+        Ok(id) => respond_user(pool, id, response).await,
+        Err(error) if store::is_conflict(&error) => {
+            json_error(response, StatusCode::CONFLICT, "login already in use");
+        }
+        Err(error) if store::is_unknown_group(&error) => {
+            json_error(response, StatusCode::NOT_FOUND, "group not found");
+        }
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `GET /api/users/{id}`.
+#[handler]
+async fn get_user(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let pool = state_pool(depot);
+    let Some(id) = request.param::<i64>("id") else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid user id");
+        return;
+    };
+    respond_user(pool, id, response).await;
+}
+
+/// `PATCH /api/users/{id}`: profile, group, rate override and cap. The
+/// balance is not patchable; it moves only through topup/adjust.
+#[handler]
+async fn patch_user(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let pool = state_pool(depot);
+    let Some(id) = request.param::<i64>("id") else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid user id");
+        return;
+    };
+    let Ok(body) = request.parse_json::<UserPatchBody>().await else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid JSON body");
+        return;
+    };
+    if let Some(message) = invalid_limits(body.rate_bp.flatten(), body.max_concurrent) {
+        json_error(response, StatusCode::BAD_REQUEST, message);
+        return;
+    }
+    let patch = store::UserPatch {
+        display_name: body.display_name.as_deref().map(str::trim),
+        enabled: body.enabled,
+        group_id: body.group_id,
+        rate_bp: body.rate_bp,
+        max_concurrent: body.max_concurrent,
+    };
+    match store::patch_user(pool, id, patch).await {
+        Ok(true) => respond_user(pool, id, response).await,
+        Ok(false) => json_error(response, StatusCode::NOT_FOUND, "user not found"),
+        Err(error) if store::is_unknown_group(&error) => {
+            json_error(response, StatusCode::NOT_FOUND, "group not found");
+        }
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `GET /api/user-groups`: every group with its member count.
+#[handler]
+async fn list_user_groups(depot: &mut Depot, response: &mut Response) {
+    let pool = state_pool(depot);
+    match store::list_groups(pool).await {
+        Ok(rows) => json_response(response, &json!({ "items": rows })),
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `POST /api/user-groups`: create a group and return its row.
+#[handler]
+async fn create_user_group(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let pool = state_pool(depot);
+    let Ok(body) = request.parse_json::<GroupCreateBody>().await else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid JSON body");
+        return;
+    };
+    let name = body.name.trim();
+    if name.is_empty() {
+        json_error(response, StatusCode::BAD_REQUEST, "name is required");
+        return;
+    }
+    let rate_bp = body.rate_bp.unwrap_or(DEFAULT_GROUP_RATE_BP);
+    if let Some(message) = invalid_limits(Some(rate_bp), None) {
+        json_error(response, StatusCode::BAD_REQUEST, message);
+        return;
+    }
+    match store::create_group(pool, name, rate_bp, body.route_aliases.as_deref()).await {
+        Ok(id) => respond_group(pool, id, response).await,
+        Err(error) if store::is_conflict(&error) => {
+            json_error(response, StatusCode::CONFLICT, "group name already in use");
+        }
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `PATCH /api/user-groups/{id}`: name, rate and route whitelist.
+#[handler]
+async fn patch_user_group(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let pool = state_pool(depot);
+    let Some(id) = request.param::<i64>("id") else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid group id");
+        return;
+    };
+    let Ok(body) = request.parse_json::<GroupPatchBody>().await else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid JSON body");
+        return;
+    };
+    let name = body.name.as_deref().map(str::trim);
+    if name.is_some_and(str::is_empty) {
+        json_error(response, StatusCode::BAD_REQUEST, "name must not be empty");
+        return;
+    }
+    if let Some(message) = invalid_limits(body.rate_bp, None) {
+        json_error(response, StatusCode::BAD_REQUEST, message);
+        return;
+    }
+    let patch = store::GroupPatch {
+        name,
+        rate_bp: body.rate_bp,
+        route_aliases: body.route_aliases.as_ref().map(Option::as_deref),
+    };
+    match store::patch_group(pool, id, patch).await {
+        Ok(true) => respond_group(pool, id, response).await,
+        Ok(false) => json_error(response, StatusCode::NOT_FOUND, "group not found"),
+        Err(error) if store::is_conflict(&error) => {
+            json_error(response, StatusCode::CONFLICT, "group name already in use");
+        }
+        Err(error) => internal(response, error),
+    }
+}
+
+/// Shared body of topup/adjust: validate, write the entry with the balance
+/// change, and answer with the entry and the new balance.
+async fn credit_user(
+    request: &mut Request,
+    depot: &Depot,
+    response: &mut Response,
+    kind: store::CreditKind,
+) {
+    let pool = state_pool(depot);
+    let Some(id) = request.param::<i64>("id") else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid user id");
+        return;
+    };
+    let Ok(body) = request.parse_json::<CreditBody>().await else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid JSON body");
+        return;
+    };
+    let note = body.note.as_deref().map_or("", str::trim);
+    let amount = match crate::billing::credit_amount(kind, &body.amount_usd, note) {
+        Ok(amount) => amount,
+        Err(message) => {
+            json_error(response, StatusCode::BAD_REQUEST, message);
+            return;
+        }
+    };
+    let operator = body
+        .operator
+        .as_deref()
+        .map(str::trim)
+        .filter(|operator| !operator.is_empty())
+        .unwrap_or("admin");
+    match store::credit(pool, id, kind, amount, note, operator).await {
+        Ok(Some(entry)) => {
+            let balance = entry.balance_after_microus;
+            json_response(
+                response,
+                &json!({
+                    "entry": entry,
+                    "balance_microus": balance,
+                    "balance_usd": crate::billing::format_usd(balance),
+                }),
+            );
+        }
+        Ok(None) => json_error(response, StatusCode::NOT_FOUND, "user not found"),
+        Err(store::CreditError::Overflow) => {
+            json_error(
+                response,
+                StatusCode::BAD_REQUEST,
+                "the new balance would overflow",
+            );
+        }
+        Err(store::CreditError::Database(error)) => internal(response, error.into()),
+    }
+}
+
+/// `POST /api/users/{id}/topup` `{amount_usd, note?, operator?}`.
+#[handler]
+async fn topup_user(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    credit_user(request, depot, response, store::CreditKind::Topup).await;
+}
+
+/// `POST /api/users/{id}/adjust` `{amount_usd, note, operator?}`.
+#[handler]
+async fn adjust_user(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    credit_user(request, depot, response, store::CreditKind::Adjust).await;
+}
+
+/// `GET /api/users/{id}/entries?before_id&limit`: the user's ledger,
+/// newest first.
+#[handler]
+async fn list_user_entries(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let pool = state_pool(depot);
+    let Some(id) = request.param::<i64>("id") else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid user id");
+        return;
+    };
+    let Ok(query) = request.parse_queries::<EntriesQuery>() else {
+        json_error(
+            response,
+            StatusCode::BAD_REQUEST,
+            "invalid query (before_id, limit)",
+        );
+        return;
+    };
+    match store::get_user(pool, id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            json_error(response, StatusCode::NOT_FOUND, "user not found");
+            return;
+        }
+        Err(error) => {
+            internal(response, error);
+            return;
+        }
+    }
+    let limit = crate::billing::entry_page_limit(query.limit);
+    match store::list_entries(pool, id, query.before_id, limit).await {
+        Ok(rows) => json_response(response, &json!({ "items": rows })),
+        Err(error) => internal(response, error.into()),
+    }
+}
+
+/// `GET /api/users/{id}/reconcile`: stored balance against the ledger sum.
+#[handler]
+async fn reconcile_user(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let pool = state_pool(depot);
+    let Some(id) = request.param::<i64>("id") else {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid user id");
+        return;
+    };
+    match store::reconcile_user(pool, id).await {
+        Ok(Some(report)) => json_response(
+            response,
+            &json!({
+                "balance_microus": report.balance_microus,
+                "entries_sum_microus": report.entries_sum_microus,
+                "consistent": report.balance_microus == report.entries_sum_microus,
+            }),
+        ),
+        Ok(None) => json_error(response, StatusCode::NOT_FOUND, "user not found"),
+        Err(error) => internal(response, error.into()),
     }
 }
 
@@ -1156,6 +1592,22 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
                 .post(create_gateway_key),
         )
         .push(Router::with_path("gateway-keys/{id}").patch(patch_gateway_key))
+        .push(Router::with_path("users").get(list_users).post(create_user))
+        .push(
+            Router::with_path("users/{id}")
+                .get(get_user)
+                .patch(patch_user),
+        )
+        .push(Router::with_path("users/{id}/topup").post(topup_user))
+        .push(Router::with_path("users/{id}/adjust").post(adjust_user))
+        .push(Router::with_path("users/{id}/entries").get(list_user_entries))
+        .push(Router::with_path("users/{id}/reconcile").get(reconcile_user))
+        .push(
+            Router::with_path("user-groups")
+                .get(list_user_groups)
+                .post(create_user_group),
+        )
+        .push(Router::with_path("user-groups/{id}").patch(patch_user_group))
         .push(Router::with_path("keys/validate").post(validate_key))
         .push(
             Router::with_path("keys/{id}/models")

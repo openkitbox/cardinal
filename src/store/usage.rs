@@ -6,24 +6,39 @@ use sqlx::PgPool;
 // in-process admin facade (`admin_ops.rs`). The SQL lives here exactly once;
 // the HTTP layer only maps rows onto its wire shapes.
 
-/// Caller filter shared by the usage admin reads (`caller` query parameter).
-/// `None` = every caller; `Null` = only unidentified callers (caller_key IS
-/// NULL, the 本机/in-process rows); `Label` = one gateway key label or a
-/// self-named `cardinal-x` caller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CallerFilter {
+/// Caller filter shared by the usage reads. `None` (no filter) = every
+/// caller; `Null` = only unidentified rows (caller_key IS NULL: in-process
+/// calls and history from before loopback access was closed); `Label` = one
+/// gateway key label (the admin `caller` query parameter); `User` = every
+/// key one user owns (the user self-service scope, by `user_id`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallerFilter<'a> {
     Null,
-    Label,
+    Label(&'a str),
+    User(i64),
 }
 
-impl CallerFilter {
-    /// Wire spelling of the filter kind (the `caller` query parameter's kind
-    /// half); `as_str` keeps the SQL bind in lockstep with serde's names.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Null => "null",
-            Self::Label => "label",
+/// SQL bind values of an optional [`CallerFilter`]: the kind (`NULL` = no
+/// filter), the label (text) and the user id (bigint). Kept as three typed
+/// binds so no parameter is reused across text and bigint comparisons.
+struct CallerBinds<'a> {
+    kind: Option<&'static str>,
+    label: Option<&'a str>,
+    user_id: Option<i64>,
+}
+
+impl<'a> From<Option<CallerFilter<'a>>> for CallerBinds<'a> {
+    fn from(caller: Option<CallerFilter<'a>>) -> Self {
+        let (kind, label, user_id) = match caller {
+            None => (None, None, None),
+            Some(CallerFilter::Null) => (Some("null"), None, None),
+            Some(CallerFilter::Label(label)) => (Some("label"), Some(label), None),
+            Some(CallerFilter::User(user_id)) => (Some("user"), None, Some(user_id)),
+        };
+        Self {
+            kind,
+            label,
+            user_id,
         }
     }
 }
@@ -45,8 +60,9 @@ pub struct UsageRow {
 pub async fn usage_by_day(
     pool: &PgPool,
     days: i32,
-    caller: Option<(CallerFilter, &str)>,
+    caller: Option<CallerFilter<'_>>,
 ) -> anyhow::Result<Vec<UsageRow>> {
+    let binds = CallerBinds::from(caller);
     let rows = sqlx::query_as::<_, UsageRow>(
         "SELECT to_char((ts AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, alias,
             COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
@@ -58,13 +74,15 @@ pub async fn usage_by_day(
          WHERE ts > now() - make_interval(days => $1)
            AND ($2::text IS NULL
                 OR ($2 = 'null' AND caller_key IS NULL)
-                OR ($2 = 'label' AND caller_key = $3))
+                OR ($2 = 'label' AND caller_key = $3)
+                OR ($2 = 'user' AND user_id = $4))
          GROUP BY day, alias
          ORDER BY day DESC, alias",
     )
     .bind(days)
-    .bind(caller.map(|(kind, _)| kind.as_str()))
-    .bind(caller.map(|(_, label)| label))
+    .bind(binds.kind)
+    .bind(binds.label)
+    .bind(binds.user_id)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -84,14 +102,13 @@ pub enum TrendSplit {
     Model,
     /// Provider name (joined from `gateway_providers`).
     Provider,
-    /// Client identity: the UA's name (`agent`) wins, the gateway key's
-    /// self-name (`cardinal-x` → `x`, else its stored label) falls back — the
-    /// same display rule as the requests page (`named_client`). Rows with
-    /// neither group as NULL (the GUI renders them as 本机).
+    /// Client identity: the UA's name (`agent`) wins, the gateway key's label
+    /// falls back. Rows with neither group as NULL (the GUI renders them as
+    /// 本机).
     Client,
-    /// Caller identity recorded in `caller_key`: authenticated requests use the
-    /// gateway key label; loopback requests may use a self-named value or agent;
-    /// unrecognized callers are NULL. The GUI displays NULL as 本机.
+    /// Caller identity recorded in `caller_key`: the gateway key label;
+    /// in-process calls (and history from before loopback access was closed)
+    /// are NULL. The GUI displays NULL as 本机.
     User,
 }
 
@@ -142,7 +159,7 @@ pub async fn usage_trend(
     until: chrono::DateTime<chrono::Utc>,
     split: TrendSplit,
     local_offset: chrono::Duration,
-    caller: Option<(CallerFilter, &str)>,
+    caller: Option<CallerFilter<'_>>,
 ) -> anyhow::Result<Vec<TrendRow>> {
     let bucket = if hourly_buckets(since, until) {
         "to_char(date_trunc('hour', r.ts AT TIME ZONE 'UTC' + $3), 'YYYY-MM-DD HH24:00')"
@@ -167,14 +184,7 @@ pub async fn usage_trend(
             "LEFT JOIN gateway_providers p ON p.id = r.provider_id",
             "",
         ),
-        // `LIKE 'cardinal-_%'` demands at least one character after the prefix, so
-        // a bare `cardinal-` (empty self-name) falls back to the raw value — the
-        // same rule as the GUI's `client_of`.
-        TrendSplit::Client => (
-            "COALESCE(r.agent, CASE WHEN r.caller_key LIKE 'cardinal-_%' THEN substring(r.caller_key from 10) ELSE r.caller_key END)",
-            "",
-            "",
-        ),
+        TrendSplit::Client => ("COALESCE(r.agent, r.caller_key)", "", ""),
         TrendSplit::User => ("r.caller_key", "", ""),
     };
     let sql = format!(
@@ -192,19 +202,22 @@ pub async fn usage_trend(
          WHERE r.ts >= $1 AND r.ts < $2
            AND ($4::text IS NULL
                 OR ($4 = 'null' AND r.caller_key IS NULL)
-                OR ($4 = 'label' AND r.caller_key = $5)){filter}
+                OR ($4 = 'label' AND r.caller_key = $5)
+                OR ($4 = 'user' AND r.user_id = $6)){filter}
          GROUP BY 1, 2
          ORDER BY 1"
   );
     // Safe: the only interpolation is from the fixed
     // `bucket`/`category`/`join`/`filter` arms above; caller input goes through
     // bind parameters.
+    let binds = CallerBinds::from(caller);
     let rows = sqlx::query_as::<_, TrendRow>(sqlx::AssertSqlSafe(sql))
         .bind(since)
         .bind(until)
         .bind(local_offset)
-        .bind(caller.map(|(kind, _)| kind.as_str()))
-        .bind(caller.map(|(_, label)| label))
+        .bind(binds.kind)
+        .bind(binds.label)
+        .bind(binds.user_id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -240,8 +253,9 @@ pub async fn usage_window(
     pool: &PgPool,
     since: chrono::DateTime<chrono::Utc>,
     until: chrono::DateTime<chrono::Utc>,
-    caller: Option<(CallerFilter, &str)>,
+    caller: Option<CallerFilter<'_>>,
 ) -> anyhow::Result<UsageWindow> {
+    let binds = CallerBinds::from(caller);
     let window = sqlx::query_as::<_, UsageWindow>(
     "SELECT COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
             COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
@@ -257,12 +271,14 @@ pub async fn usage_window(
          WHERE ts >= $1 AND ts < $2
            AND ($3::text IS NULL
                 OR ($3 = 'null' AND caller_key IS NULL)
-                OR ($3 = 'label' AND caller_key = $4))",
+                OR ($3 = 'label' AND caller_key = $4)
+                OR ($3 = 'user' AND user_id = $5))",
   )
   .bind(since)
   .bind(until)
-  .bind(caller.map(|(kind, _)| kind.as_str()))
-  .bind(caller.map(|(_, label)| label))
+  .bind(binds.kind)
+  .bind(binds.label)
+  .bind(binds.user_id)
   .fetch_one(pool)
   .await?;
     Ok(window)

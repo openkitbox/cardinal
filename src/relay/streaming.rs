@@ -5,6 +5,10 @@
 //! failed over invisibly), then flush to the client as SSE byte chunks. No
 //! vendor or dialect knowledge lives here (see [`super::dialects`]).
 
+use std::ops::ControlFlow;
+
+use tokio_util::sync::CancellationToken;
+
 use crate::protocol::sse::RawFrame;
 use crate::protocol::wire::WireFrame;
 use crate::protocol::{self, ProtocolId};
@@ -17,19 +21,20 @@ use crate::upstream::transport::{self, StreamReader};
 use super::dispatcher::SlotGuard;
 use super::{PAYLOAD_TARGET, truncate_payload};
 
-/// Client-facing stream that owns the account-level slot until the response
-/// body is fully consumed or dropped by the HTTP server.
+/// Client-facing stream: the pump's frame channel, nothing more.
+///
+/// It deliberately does not own the account-level slot: the HTTP server drops
+/// this stream the moment the client disconnects, while the upstream request
+/// may still be running (see [`OnClientGone::DrainUsage`]). The slot lives in
+/// the pump task instead, so its lifetime is the upstream request's, not the
+/// client's response body.
 pub struct StreamFrames {
     frames: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
-    slot: Option<SlotGuard>,
 }
 
 impl StreamFrames {
-    pub fn new(
-        frames: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
-        slot: Option<SlotGuard>,
-    ) -> Self {
-        Self { frames, slot }
+    pub fn new(frames: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>) -> Self {
+        Self { frames }
     }
 }
 
@@ -40,13 +45,7 @@ impl futures::Stream for StreamFrames {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        match self.frames.poll_recv(cx) {
-            std::task::Poll::Ready(None) => {
-                self.slot.take();
-                std::task::Poll::Ready(None)
-            }
-            other => other,
-        }
+        self.frames.poll_recv(cx)
     }
 }
 
@@ -198,6 +197,9 @@ enum PumpRead {
     /// buffered and continue as a normal stream.
     WindowExpired,
     Transport(transport::TransportError),
+    /// The HTTP surface stopped (graceful shutdown cut the stream): stop
+    /// reading and settle with the usage observed so far.
+    ServerStopped,
 }
 
 /// One read step of the pump loop, bounding the wait by the remaining commit
@@ -382,17 +384,49 @@ pub(super) struct PumpSide {
     /// Dispatch request id, so a post-commit upstream death can be traced back
     /// to its ledger row and routing trace.
     pub(super) request_id: String,
+    /// What the pump does once a committed stream's client disconnects.
+    pub(super) on_client_gone: OnClientGone,
+    /// Cancelled when the HTTP surface has stopped (the graceful-shutdown
+    /// grace expired and the server cut the remaining streams). A pump that
+    /// is draining the upstream for usage must then settle immediately with
+    /// the last observed usage: the settlement drain that follows is far
+    /// shorter than the upstream idle/total limits, so lingering here would
+    /// drop the attempt row and undercharge the caller.
+    pub(super) server_stopped: CancellationToken,
+}
+
+/// The pump's reaction to a client that disconnects after the commit point.
+/// The pre-commit hold is unaffected: a client that leaves while held always
+/// stops the dispatch ([`HoldSignal::ClientGone`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OnClientGone {
+    /// Stop reading the upstream at once and report the usage observed so
+    /// far (free and in-process callers: nothing to charge).
+    Stop,
+    /// Stop forwarding but keep reading and observing the upstream until it
+    /// ends (EOF, terminal or transport error, still idle-bounded), so a
+    /// billed caller is charged for the generation it caused. OpenAI Chat
+    /// sends its usage chunk after `finish_reason`: a client that hangs up at
+    /// the finish would otherwise be served for free.
+    DrainUsage,
 }
 
 /// Start the streaming relay pump: a background task turns upstream frames
 /// into client SSE byte chunks pushed via `tx`; when the stream ends it sends
 /// the usage to `usage_tx`. `commit_tx` carries the one-shot hold verdict the
 /// dispatcher waits on before locking the attempt in.
+///
+/// `slot_rx` receives the dispatcher slot once the attempt commits (before
+/// the commit the dispatcher keeps it for failover; an aborted attempt drops
+/// the sender instead). The task holds the slot until the upstream read ends,
+/// so a client that hangs up mid-stream does not free its concurrency while
+/// the upstream is still generating.
 pub(super) fn spawn_stream_pump(
     mut reader: Box<StreamReader>,
     pump: StreamPump,
     usage_tx: tokio::sync::oneshot::Sender<StreamOutcome>,
     commit_tx: tokio::sync::oneshot::Sender<HoldSignal>,
+    slot_rx: tokio::sync::oneshot::Receiver<SlotGuard>,
     side: PumpSide,
 ) -> tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
@@ -401,6 +435,10 @@ pub(super) fn spawn_stream_pump(
             drive_stream(&mut reader, pump, &tx, commit_tx, side).await;
         drop(reader); // release the upstream response
         drop(tx); // close the client stream
+        // The upstream request is over: release the slot. The dispatcher
+        // sends it right after reading the commit verdict and drops the
+        // sender on every other path, so this wait is momentary.
+        drop(slot_rx.await);
         let _ = usage_tx.send(StreamOutcome {
             usage,
             ttft_ms,
@@ -436,7 +474,13 @@ async fn drive_stream(
         activity,
         started,
         request_id,
+        on_client_gone,
+        server_stopped,
     } = side;
+    // Set once a post-commit send fails: later frames are no longer sent
+    // (see [`deliver`]), and the stream's interruption note is dropped — a
+    // client that left is not an upstream truncation.
+    let mut client_gone = false;
     let mut activity = activity.map(|(sink, seq)| PumpActivity::new(sink, seq));
     let mut usage: Option<crate::protocol::usage::UsageCounts> = None;
     // Attempt start → first content frame. The kernel decoders' content_seen
@@ -463,7 +507,11 @@ async fn drive_stream(
                     signal_hold(&mut commit_tx, HoldSignal::ClientGone);
                     return (None, ttft_ms, captured, None);
                 }
-                let mut read = read_frame(reader.next_wire_frame(), hold.as_ref()).await;
+                let mut read = tokio::select! {
+                    biased;
+                    () = server_stopped.cancelled() => PumpRead::ServerStopped,
+                    read = read_frame(reader.next_wire_frame(), hold.as_ref()) => read,
+                };
                 // Passthrough only ever serves SSE protocols (Kiro has no client
                 // endpoint), so an AWS frame here is a wire mismatch. It is a
                 // terminal framing failure, not a frame to skip: dropping it and
@@ -478,6 +526,22 @@ async fn drive_stream(
                     PumpRead::WindowExpired => {
                         // The wait cap commits the hold with whatever was buffered.
                         commit_hold(tx, &mut hold, &mut commit_tx, &mut activity, &mut wire).await;
+                    }
+                    PumpRead::ServerStopped => {
+                        // The HTTP surface stopped and cut this stream: settle
+                        // now with the usage observed so far instead of
+                        // draining past the accounting window. A client that
+                        // left is not an upstream truncation.
+                        if hold.is_some() {
+                            signal_hold(&mut commit_tx, HoldSignal::ClientGone);
+                            return (None, ttft_ms, captured, None);
+                        }
+                        tracing::info!(
+                            request_id = %request_id,
+                            "server shutdown cut the stream; settling with the last observed usage"
+                        );
+                        client_gone = true;
+                        break;
                     }
                     PumpRead::Frame(frame) => {
                         let frame = match frame {
@@ -520,15 +584,18 @@ async fn drive_stream(
                                 )
                                 .await;
                             }
-                        } else {
-                            match send_frame(tx, &frame, &mut wire).await {
-                                Ok(bytes) => {
-                                    if let Some(activity) = &mut activity {
-                                        activity.frame(bytes);
-                                    }
-                                }
-                                Err(_) => return (None, ttft_ms, captured, None), // client disconnected
-                            }
+                        } else if deliver(
+                            tx,
+                            &frame,
+                            &mut wire,
+                            &mut activity,
+                            &mut client_gone,
+                            on_client_gone,
+                        )
+                        .await
+                        .is_break()
+                        {
+                            break;
                         }
                     }
                     PumpRead::Eof => {
@@ -563,13 +630,18 @@ async fn drive_stream(
                                 if let Some(captured) = &mut captured {
                                     captured.push(&frame.data);
                                 }
-                                match send_frame(tx, &frame, &mut wire).await {
-                                    Ok(bytes) => {
-                                        if let Some(activity) = &mut activity {
-                                            activity.frame(bytes);
-                                        }
-                                    }
-                                    Err(_) => return (None, ttft_ms, captured, None),
+                                if deliver(
+                                    tx,
+                                    &frame,
+                                    &mut wire,
+                                    &mut activity,
+                                    &mut client_gone,
+                                    on_client_gone,
+                                )
+                                .await
+                                .is_break()
+                                {
+                                    break;
                                 }
                             }
                             interrupted = Some(message.to_owned());
@@ -594,13 +666,18 @@ async fn drive_stream(
                             if let Some(captured) = &mut captured {
                                 captured.push(&frame.data);
                             }
-                            match send_frame(tx, &frame, &mut wire).await {
-                                Ok(bytes) => {
-                                    if let Some(activity) = &mut activity {
-                                        activity.frame(bytes);
-                                    }
-                                }
-                                Err(_) => return (None, ttft_ms, captured, None), // client disconnected
+                            if deliver(
+                                tx,
+                                &frame,
+                                &mut wire,
+                                &mut activity,
+                                &mut client_gone,
+                                on_client_gone,
+                            )
+                            .await
+                            .is_break()
+                            {
+                                break;
                             }
                         }
                         interrupted = Some(message);
@@ -625,7 +702,11 @@ async fn drive_stream(
                     signal_hold(&mut commit_tx, HoldSignal::ClientGone);
                     return (None, ttft_ms, captured, None);
                 }
-                let mut read = read_frame(reader.next_wire_frame(), hold.as_ref()).await;
+                let mut read = tokio::select! {
+                    biased;
+                    () = server_stopped.cancelled() => PumpRead::ServerStopped,
+                    read = read_frame(reader.next_wire_frame(), hold.as_ref()) => read,
+                };
                 // AWS framing/event failures are terminal: a malformed KAS frame
                 // means the wire cannot be trusted, so it takes the same path as a
                 // broken socket (pre-commit abort for failover; post-commit
@@ -648,6 +729,20 @@ async fn drive_stream(
                 match read {
                     PumpRead::WindowExpired => {
                         commit_hold(tx, &mut hold, &mut commit_tx, &mut activity, &mut wire).await;
+                    }
+                    PumpRead::ServerStopped => {
+                        // Same as passthrough: settle now; the decoder's final
+                        // usage below is still read.
+                        if hold.is_some() {
+                            signal_hold(&mut commit_tx, HoldSignal::ClientGone);
+                            return (None, ttft_ms, captured, None);
+                        }
+                        tracing::info!(
+                            request_id = %request_id,
+                            "server shutdown cut the stream; settling with the last observed usage"
+                        );
+                        client_gone = true;
+                        break;
                     }
                     PumpRead::Frame(frame) => {
                         if payload_log {
@@ -741,14 +836,22 @@ async fn drive_stream(
                             }
                         } else {
                             for frame in frames {
-                                match send_frame(tx, &frame, &mut wire).await {
-                                    Ok(bytes) => {
-                                        if let Some(activity) = &mut activity {
-                                            activity.frame(bytes);
-                                        }
-                                    }
-                                    Err(_) => return (None, ttft_ms, captured, None), // client disconnected
+                                if deliver(
+                                    tx,
+                                    &frame,
+                                    &mut wire,
+                                    &mut activity,
+                                    &mut client_gone,
+                                    on_client_gone,
+                                )
+                                .await
+                                .is_break()
+                                {
+                                    break;
                                 }
+                            }
+                            if client_gone && on_client_gone == OnClientGone::Stop {
+                                break;
                             }
                         }
                         if terminal_at_eof {
@@ -827,13 +930,18 @@ async fn drive_stream(
                                 }
                             }
                             for frame in frames {
-                                match send_frame(tx, &frame, &mut wire).await {
-                                    Ok(bytes) => {
-                                        if let Some(activity) = &mut activity {
-                                            activity.frame(bytes);
-                                        }
-                                    }
-                                    Err(_) => return (None, ttft_ms, captured, None),
+                                if deliver(
+                                    tx,
+                                    &frame,
+                                    &mut wire,
+                                    &mut activity,
+                                    &mut client_gone,
+                                    on_client_gone,
+                                )
+                                .await
+                                .is_break()
+                                {
+                                    break;
                                 }
                             }
                         }
@@ -862,13 +970,18 @@ async fn drive_stream(
                                 }
                             }
                             for frame in frames {
-                                match send_frame(tx, &frame, &mut wire).await {
-                                    Ok(bytes) => {
-                                        if let Some(activity) = &mut activity {
-                                            activity.frame(bytes);
-                                        }
-                                    }
-                                    Err(_) => return (None, ttft_ms, captured, None),
+                                if deliver(
+                                    tx,
+                                    &frame,
+                                    &mut wire,
+                                    &mut activity,
+                                    &mut client_gone,
+                                    on_client_gone,
+                                )
+                                .await
+                                .is_break()
+                                {
+                                    break;
                                 }
                             }
                         }
@@ -885,6 +998,11 @@ async fn drive_stream(
             }
         }
     }
+    // A client that left is not an upstream truncation: its stream's
+    // interruption note never reaches the ledger.
+    if client_gone {
+        interrupted = None;
+    }
     let usage = usage.map(|counts| StreamUsage {
         input_tokens: counts.input_tokens as i64,
         output_tokens: counts.output_tokens as i64,
@@ -893,6 +1011,42 @@ async fn drive_stream(
         cache_creation_1h_input_tokens: counts.cache_creation_1h_input_tokens.map(|v| v as i64),
     });
     (usage, ttft_ms, captured, interrupted)
+}
+
+/// Send one post-commit frame to the client. After the first failed send the
+/// client counts as gone and no frame is sent again; `Break` then tells the
+/// pump to stop reading (only under [`OnClientGone::Stop`]). Frames that
+/// reached the client count toward the activity feed.
+async fn deliver(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    frame: &RawFrame,
+    wire: &mut bytes::BytesMut,
+    activity: &mut Option<PumpActivity>,
+    client_gone: &mut bool,
+    on_client_gone: OnClientGone,
+) -> ControlFlow<()> {
+    if !*client_gone {
+        match send_frame(tx, frame, wire).await {
+            Ok(bytes) => {
+                if let Some(activity) = activity {
+                    activity.frame(bytes);
+                }
+                return ControlFlow::Continue(());
+            }
+            Err(_) => {
+                *client_gone = true;
+                if on_client_gone == OnClientGone::DrainUsage {
+                    tracing::info!(
+                        "client disconnected mid-stream; draining the upstream for usage"
+                    );
+                }
+            }
+        }
+    }
+    match on_client_gone {
+        OnClientGone::Stop => ControlFlow::Break(()),
+        OnClientGone::DrainUsage => ControlFlow::Continue(()),
+    }
 }
 
 /// Render one frame into SSE wire bytes. `wire` is a render buffer reused
