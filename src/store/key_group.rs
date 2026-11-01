@@ -140,3 +140,63 @@ pub(super) async fn replace_key_groups(
     })?;
     Ok(())
 }
+
+/// Why [`add_key_groups`] failed. The unknown-group case is caller input (the
+/// import endpoints answer 400), so it stays distinct from storage failures.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum AddKeyGroupsError {
+    #[error("unknown group id")]
+    UnknownGroup,
+    #[error(transparent)]
+    Other(sqlx::Error),
+}
+
+/// Whether every id in `group_ids` names an existing group (duplicates count
+/// once; empty = true). The Kiro import checks this before spending a vendor
+/// probe, so a stale group id cannot cost a token refresh; the foreign key in
+/// [`add_key_groups`] still guards the race with a concurrent delete.
+pub async fn key_groups_exist(pool: &PgPool, group_ids: &[i64]) -> anyhow::Result<bool> {
+    if group_ids.is_empty() {
+        return Ok(true);
+    }
+    let missing: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM unnest($1::bigint[]) AS g
+             WHERE NOT EXISTS (SELECT 1 FROM gateway_key_groups WHERE id = g)
+         )",
+    )
+    .bind(group_ids)
+    .fetch_one(pool)
+    .await?;
+    Ok(!missing)
+}
+
+/// Add one key to `group_ids` (duplicates collapse; existing memberships,
+/// including ones outside `group_ids`, are kept; empty = no-op). Runs on the
+/// caller's transaction: an unknown group id is an error and the caller rolls
+/// back.
+pub(super) async fn add_key_groups(
+    conn: &mut sqlx::PgConnection,
+    key_id: i64,
+    group_ids: &[i64],
+) -> Result<(), AddKeyGroupsError> {
+    if group_ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO gateway_key_group_members (group_id, key_id)
+         SELECT DISTINCT g, $1 FROM unnest($2::bigint[]) AS g
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(key_id)
+    .bind(group_ids)
+    .execute(&mut *conn)
+    .await
+    .map_err(|error| match &error {
+        sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
+            AddKeyGroupsError::UnknownGroup
+        }
+        _ => AddKeyGroupsError::Other(error),
+    })?;
+    Ok(())
+}

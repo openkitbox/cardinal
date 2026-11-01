@@ -768,11 +768,14 @@ impl Admin {
     /// so the already-probed credential is not sent upstream a second time.
     ///
     /// Returns `(key_id, created)` like [`store::upsert_kiro_key_by_label`].
+    /// `group_ids`, when given, are added to the key's memberships in the
+    /// same transaction (never removed); an unknown id fails the whole write.
     pub async fn upsert_kiro_key(
         &self,
         provider_id: i64,
         label: &str,
         oauth: KiroOAuth,
+        group_ids: Option<&[i64]>,
         max_concurrency: Option<Option<i32>>,
     ) -> anyhow::Result<(i64, bool)> {
         if label.is_empty() {
@@ -817,6 +820,11 @@ impl Admin {
             )
             .into());
         }
+        if let Some(group_ids) = group_ids
+            && !store::key_groups_exist(&self.pool, group_ids).await?
+        {
+            return Err(store::KiroUpsertError::InvalidInput("unknown group id".to_owned()).into());
+        }
         let expectation = store::kiro_upsert_expectation(&self.pool, provider_id, label).await?;
         let Some(tokens) = &self.kiro_tokens else {
             // Without the live manager there is no bearer to reuse, and minting
@@ -838,6 +846,7 @@ impl Admin {
             &candidate_oauth,
             &expectation,
             max_concurrency,
+            group_ids,
         )
         .await?;
         // The catalogue answer also becomes the key's model snapshot. That is a

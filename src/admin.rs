@@ -8,8 +8,9 @@
 //!   (a Kiro key carries `auth_kind: "kiro_oidc"` + `oauth` instead of `api_key`; PATCH replaces that bundle only on an existing Kiro key)
 //!   the key PATCH's `archived` (absent = untouched, true = archive keeping the first archive time, false = unarchive)
 //!   is independent of `enabled` and of group membership
-//! - `POST /api/providers/:id/kiro-key` `{label, oauth}` — probe then find-or-create a Kiro OIDC key by label
-//! - `POST /api/providers/:id/kiro-import` `{label, account?, credentials}` — allow-listed import of a raw `kiro.rs` object or account array
+//! - `POST /api/providers/:id/kiro-key` `{label, oauth, group_ids?}` — probe then find-or-create a Kiro OIDC key by label
+//! - `POST /api/providers/:id/kiro-import` `{label, account?, credentials, group_ids?}` — allow-listed import of a raw `kiro.rs` object or account array
+//!   (`group_ids` on both = groups to ADD the key to in the same transaction; existing memberships are kept, an unknown id → 400)
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
 //!   plaintext-serving endpoint; the list shape stays masked)
 //! - `POST /api/key-groups` `{name}` → `{id}`, `PATCH/DELETE /api/key-groups/:id` — account groups (409 on a taken name, 400 on an invalid one,
@@ -1208,6 +1209,9 @@ struct KiroKeyBody {
     /// Absent preserves an existing cap; null clears it; a positive number sets it.
     #[serde(default, deserialize_with = "tri_state")]
     max_concurrency: Option<Option<i32>>,
+    /// Groups to add the key to (append only); absent/null = untouched.
+    #[serde(default)]
+    group_ids: Option<Vec<i64>>,
 }
 
 /// Raw Kiro import body. `credentials` stays a JSON value until the pure
@@ -1222,6 +1226,9 @@ struct KiroImportBody {
     /// Absent preserves an existing cap; null clears it; a positive number sets it.
     #[serde(default, deserialize_with = "tri_state")]
     max_concurrency: Option<Option<i32>>,
+    /// Groups to add the key to (append only); absent/null = untouched.
+    #[serde(default)]
+    group_ids: Option<Vec<i64>>,
 }
 
 #[derive(Deserialize)]
@@ -1391,7 +1398,13 @@ async fn import_kiro_key(request: &mut Request, depot: &mut Depot, response: &mu
         }
     };
     match admin(depot)
-        .upsert_kiro_key(provider_id, &body.label, oauth, body.max_concurrency)
+        .upsert_kiro_key(
+            provider_id,
+            &body.label,
+            oauth,
+            body.group_ids.as_deref(),
+            body.max_concurrency,
+        )
         .await
     {
         Ok((id, created)) => {
@@ -1434,7 +1447,13 @@ async fn upsert_kiro_key(request: &mut Request, depot: &mut Depot, response: &mu
         return;
     };
     match admin(depot)
-        .upsert_kiro_key(provider_id, &body.label, body.oauth, body.max_concurrency)
+        .upsert_kiro_key(
+            provider_id,
+            &body.label,
+            body.oauth,
+            body.group_ids.as_deref(),
+            body.max_concurrency,
+        )
         .await
     {
         Ok((id, created)) => {

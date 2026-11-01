@@ -32,8 +32,8 @@ pub use key::{
     update_key_models, update_key_models_for_oauth, update_provider_key, upsert_kiro_key_by_label,
 };
 pub use key_group::{
-    KeyGroupError, KeyGroupView, create_key_group, delete_key_group, list_key_groups,
-    rename_key_group,
+    KeyGroupError, KeyGroupView, create_key_group, delete_key_group, key_groups_exist,
+    list_key_groups, rename_key_group,
 };
 pub use price::{
     ModelPrice, ModelSuccessRow, PriceTier, get_price, last_model_success,

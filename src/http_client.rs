@@ -633,32 +633,71 @@ impl GatewayHttpClient {
     /// label; returns `(key_id, created)`. The gateway validates the supplied
     /// credential against the Kiro model catalogue before persisting anything,
     /// so a failure here leaves an existing key's credential untouched.
+    /// `group_ids`, when given, are added to the key's memberships (never
+    /// removed); an unknown id fails the whole import.
     pub async fn upsert_kiro_key(
         &self,
         provider_id: i64,
         label: &str,
         oauth: &KiroOAuth,
+        group_ids: Option<&[i64]>,
         max_concurrency: Option<Option<i32>>,
     ) -> Result<(i64, bool), ClientError> {
-        #[derive(serde::Deserialize)]
-        struct Upserted {
-            id: i64,
-            created: bool,
-        }
         #[derive(serde::Serialize)]
         struct KiroUpsert<'a> {
             label: &'a str,
             oauth: &'a KiroOAuth,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            group_ids: Option<&'a [i64]>,
             #[serde(skip_serializing_if = "Option::is_none")]
             max_concurrency: Option<Option<i32>>,
         }
         let body = KiroUpsert {
             label,
             oauth,
+            group_ids,
             max_concurrency,
         };
-        let result: Upserted = json(
+        let result: KiroUpserted = json(
             self.post(&format!("/api/providers/{provider_id}/kiro-key"))
+                .json(&body),
+        )
+        .await?;
+        Ok((result.id, result.created))
+    }
+
+    /// Import one Kiro account from a raw credential document (the server's
+    /// allow-listed parser extracts the OAuth fields; `account` 0 is used),
+    /// then probe and create-or-replace the key selected by `label`; returns
+    /// `(key_id, created)`. `group_ids`, when given, are added to the key's
+    /// memberships (never removed); an unknown id fails the whole import.
+    pub async fn import_kiro(
+        &self,
+        provider_id: i64,
+        label: &str,
+        credentials: &serde_json::Value,
+        group_ids: Option<&[i64]>,
+        max_concurrency: Option<Option<i32>>,
+    ) -> Result<(i64, bool), ClientError> {
+        #[derive(serde::Serialize)]
+        struct KiroImport<'a> {
+            label: &'a str,
+            account: usize,
+            credentials: &'a serde_json::Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            group_ids: Option<&'a [i64]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_concurrency: Option<Option<i32>>,
+        }
+        let body = KiroImport {
+            label,
+            account: 0,
+            credentials,
+            group_ids,
+            max_concurrency,
+        };
+        let result: KiroUpserted = json(
+            self.post(&format!("/api/providers/{provider_id}/kiro-import"))
                 .json(&body),
         )
         .await?;
@@ -1053,6 +1092,13 @@ struct GatewayKeysResponse {
 #[derive(serde::Deserialize)]
 struct GatewayKeyCreateResponse {
     key: String,
+}
+
+/// `kiro-key` / `kiro-import` response: the key id and whether it was created.
+#[derive(serde::Deserialize)]
+struct KiroUpserted {
+    id: i64,
+    created: bool,
 }
 
 /// Decode the items envelope out of a list-endpoint request.

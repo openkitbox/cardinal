@@ -3,6 +3,8 @@ use sqlx::PgPool;
 use crate::kiro::{KeyCredential, KiroOAuth};
 use crate::probe::ProbeModel;
 
+use super::key_group::AddKeyGroupsError;
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct ProviderKeyRow {
     pub id: i64,
@@ -332,6 +334,10 @@ pub async fn kiro_upsert_expectation(
     }
 }
 
+/// Upsert a Kiro OIDC key by `(provider_id, label)` and, when `group_ids` is
+/// given, add the key to those groups in the same transaction. Membership is
+/// only ever added (repeat imports never drop the key out of other groups);
+/// an unknown group id rolls the whole upsert back as `InvalidInput`.
 pub async fn upsert_kiro_key_by_label(
     pool: &PgPool,
     provider_id: i64,
@@ -339,6 +345,7 @@ pub async fn upsert_kiro_key_by_label(
     oauth: &KiroOAuth,
     expected: &KiroUpsertExpectation,
     max_concurrency: Option<Option<i32>>,
+    group_ids: Option<&[i64]>,
 ) -> Result<(i64, bool), KiroUpsertError> {
     if label.is_empty() {
         return Err(KiroUpsertError::InvalidInput(
@@ -387,7 +394,7 @@ pub async fn upsert_kiro_key_by_label(
     .fetch_all(&mut *tx)
     .await
     .map_err(|error| KiroUpsertError::Internal(error.into()))?;
-    match rows.as_slice() {
+    let (key_id, created) = match rows.as_slice() {
         [] if matches!(expected, KiroUpsertExpectation::Missing) => {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtext('gateway_provider_keys.position'))")
                 .execute(&mut *tx)
@@ -407,10 +414,7 @@ pub async fn upsert_kiro_key_by_label(
             .fetch_one(&mut *tx)
             .await
             .map_err(|error| KiroUpsertError::Internal(error.into()))?;
-            tx.commit()
-                .await
-                .map_err(|error| KiroUpsertError::Internal(error.into()))?;
-            Ok((id, true))
+            (id, true)
         }
         [(id, auth_kind, current_oauth)] if matches!(expected, KiroUpsertExpectation::Existing { key_id, oauth: expected_oauth } if *key_id == *id && auth_kind == "kiro_oidc" && current_oauth.as_ref().and_then(|value| serde_json::from_value::<KiroOAuth>(value.clone()).ok()).as_ref() == Some(expected_oauth)) =>
         {
@@ -428,13 +432,25 @@ pub async fn upsert_kiro_key_by_label(
             .execute(&mut *tx)
             .await
             .map_err(|error| KiroUpsertError::Internal(error.into()))?;
-            tx.commit()
-                .await
-                .map_err(|error| KiroUpsertError::Internal(error.into()))?;
-            Ok((*id, false))
+            (*id, false)
         }
-        _ => Err(KiroUpsertError::Conflict),
+        _ => return Err(KiroUpsertError::Conflict),
+    };
+    if let Some(group_ids) = group_ids {
+        // Any error drops `tx`, which rolls the key upsert back too.
+        super::key_group::add_key_groups(&mut tx, key_id, group_ids)
+            .await
+            .map_err(|error| match error {
+                AddKeyGroupsError::UnknownGroup => {
+                    KiroUpsertError::InvalidInput("unknown group id".to_owned())
+                }
+                AddKeyGroupsError::Other(error) => KiroUpsertError::Internal(error.into()),
+            })?;
     }
+    tx.commit()
+        .await
+        .map_err(|error| KiroUpsertError::Internal(error.into()))?;
+    Ok((key_id, created))
 }
 
 /// Shared insert body for both credential shapes: validates, normalizes and

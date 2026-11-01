@@ -140,9 +140,11 @@ impl KiroOAuth {
                     "Kiro OAuth {name} must not be empty for IdC authentication"
                 );
             }
+            // 0 = unknown expiry (an export without `expiresAt`): the token
+            // counts as stale and is refreshed before first use.
             anyhow::ensure!(
-                self.expires_at > 0,
-                "Kiro OAuth expires_at must be positive for IdC authentication"
+                self.expires_at >= 0,
+                "Kiro OAuth expires_at must not be negative for IdC authentication"
             );
         }
         if let Some(profile_arn) = &self.profile_arn {
