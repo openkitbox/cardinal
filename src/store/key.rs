@@ -37,6 +37,17 @@ pub struct ProviderKeyRow {
     #[sqlx(json(nullable))]
     #[serde(skip)]
     pub oauth: Option<KiroOAuth>,
+    /// When the account was archived; None = not archived. Independent of
+    /// `enabled` and of group membership (migrations/0011).
+    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ProviderKeyRow {
+    /// Whether the key may be probed and dispatched: enabled and not archived.
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.enabled && self.archived_at.is_none()
+    }
 }
 
 /// Public view of ProviderKeyRow: hides api_key. `inflight` is the live
@@ -61,6 +72,9 @@ pub struct ProviderKeyView {
     pub models: Option<Vec<ProbeModel>>,
     /// The key's model whitelist (None = unrestricted).
     pub allowed_models: Option<Vec<String>>,
+    /// When the account was archived (None = not archived).
+    #[serde(default)]
+    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ProviderKeyView {
@@ -75,6 +89,7 @@ impl ProviderKeyView {
             inflight,
             models: row.models.clone(),
             allowed_models: row.allowed_models.clone(),
+            archived_at: row.archived_at,
         }
     }
 }
@@ -85,7 +100,7 @@ pub async fn list_provider_keys(
     provider_id: i64,
 ) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
          WHERE provider_id = $1 ORDER BY position, id",
   )
   .bind(provider_id)
@@ -98,7 +113,7 @@ pub async fn list_provider_keys(
 /// /v1/models route-object derivation resolves route entries against it.
 pub async fn list_all_keys(pool: &PgPool) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
          ORDER BY position, id",
   )
   .fetch_all(pool)
@@ -141,13 +156,13 @@ pub struct EnabledKeyModels {
     pub allowed_models: Option<Vec<String>>,
 }
 
-/// Enabled providers' enabled keys with their model snapshots (provider
-/// order, then global key order).
+/// Enabled providers' enabled, unarchived keys with their model snapshots
+/// (provider order, then global key order).
 pub async fn list_enabled_key_models(pool: &PgPool) -> anyhow::Result<Vec<EnabledKeyModels>> {
     let rows = sqlx::query_as::<_, EnabledKeyModels>(
         "SELECT p.name AS provider, k.models, k.allowed_models FROM gateway_provider_keys k
      JOIN gateway_providers p ON p.id = k.provider_id
-     WHERE p.enabled AND k.enabled
+     WHERE p.enabled AND k.enabled AND k.archived_at IS NULL
      ORDER BY p.name, k.position, k.id",
     )
     .fetch_all(pool)
@@ -158,7 +173,7 @@ pub async fn list_enabled_key_models(pool: &PgPool) -> anyhow::Result<Vec<Enable
 /// Keys by id (route expansion), in global (position, id) order.
 pub async fn list_keys_by_ids(pool: &PgPool, ids: &[i64]) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
          WHERE id = ANY($1) ORDER BY position, id",
   )
   .bind(ids)
@@ -598,6 +613,9 @@ pub struct KeyPatch<'a> {
     /// Group memberships: `None` = untouched, `Some` = replace the key's
     /// groups with exactly this set (`Some(&[])` = leave every group).
     pub group_ids: Option<&'a [i64]>,
+    /// Archive state: `None` = untouched, `Some(true)` = archive (keeps the
+    /// first archive time), `Some(false)` = unarchive.
+    pub archived: Option<bool>,
 }
 
 /// Partial update (PATCH semantics) that may also rotate the credential:
@@ -665,7 +683,10 @@ pub async fn patch_provider_key(
            enabled = COALESCE($4, enabled),
            max_concurrency = CASE WHEN $5 THEN $6 ELSE max_concurrency END,
            allowed_models = CASE WHEN $7 THEN $8 ELSE allowed_models END,
-           oauth = CASE WHEN $9 THEN $10 ELSE oauth END
+           oauth = CASE WHEN $9 THEN $10 ELSE oauth END,
+           archived_at = CASE WHEN $11::boolean IS NULL THEN archived_at
+                              WHEN $11 THEN COALESCE(archived_at, now())
+                              ELSE NULL END
          WHERE id = $1 AND provider_id = $2
            AND (NOT $9 OR auth_kind = 'kiro_oidc')",
     )
@@ -684,6 +705,7 @@ pub async fn patch_provider_key(
     )
     .bind(oauth.is_some())
     .bind(oauth)
+    .bind(patch.archived)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
@@ -734,6 +756,7 @@ pub async fn update_provider_key(
             allowed_models,
             oauth: None,
             group_ids: None,
+            archived: None,
         },
     )
     .await

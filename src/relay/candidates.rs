@@ -2,7 +2,7 @@
 //! upstream model it should serve); failure cooldown policy lives in `failover`.
 //!
 //! Ordering contracts, flattened onto keys:
-//! - the direct path (`provider/model`) tries the provider's enabled keys in
+//! - the direct path (`provider/model`) tries the provider's active keys in
 //!   their single global (position, id) order — the store's ORDER BY contract;
 //! - a route tries its entries in STORED order (the user arranges them in the
 //!   GUI); key position never reorders a route;
@@ -138,7 +138,7 @@ pub fn expand_direct(
     for (key, secret) in keys {
         let (supported, default) = effort_support(&key, upstream_model);
         let context_window = model_context(&key, upstream_model);
-        if !key.enabled {
+        if !key.active() {
             excluded.push((
                 Candidate {
                     provider: provider.clone(),
@@ -199,7 +199,7 @@ pub struct Expansion {
 
 /// Route path: ONE CANDIDATE PER ENTRY — the same key may appear several times
 /// with different models. Order is the entries' STORED order (the order the
-/// user arranged in the GUI). Disabled keys, keys of disabled providers,
+/// user arranged in the GUI). Disabled or archived keys, keys of disabled providers,
 /// dangling entries, and entries whose availability rules deny `now` are
 /// skipped.
 pub fn expand_route(
@@ -222,7 +222,7 @@ pub fn expand_route(
         let Some(provider) = providers.get(&key.provider_id) else {
             continue;
         }; // dangling provider
-        if !key.enabled {
+        if !key.active() {
             excluded.push((
                 make_candidate(key, secret, provider, &entry.model, entry),
                 SkipReason::Disabled,

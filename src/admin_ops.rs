@@ -44,6 +44,8 @@ pub struct KeyView {
     pub models: Option<Vec<ProbeModel>>,
     /// The key's model whitelist (None = unrestricted).
     pub allowed_models: Option<Vec<String>>,
+    /// When the account was archived (None = not archived).
+    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One concurrency-limited key with its live occupancy, for the health page.
@@ -170,6 +172,7 @@ pub fn key_view(row: &store::ProviderKeyRow, api_key: String) -> KeyView {
         inflight,
         models: row.models.clone(),
         allowed_models: row.allowed_models.clone(),
+        archived_at: row.archived_at,
     }
 }
 
@@ -224,7 +227,8 @@ pub async fn delete_key(
     store::delete_provider_key(pool, provider_id, key_id).await
 }
 
-/// Probe every enabled key of every enabled provider that has a quota source,
+/// Probe every enabled, unarchived key of every enabled provider that has a
+/// quota source,
 /// persist each successful reading as that key's snapshot
 /// (`gateway_key_quota_snapshots`), and return the live readings for the HTTP
 /// admin surface. One task per probe; each reading is persisted as it joins.
@@ -280,9 +284,9 @@ pub async fn probe_all_quotas(
                 continue;
             }
         };
-        // Only enabled keys get probed — filter BEFORE the probe: a disabled
-        // key never costs a vendor call.
-        let keys: Vec<_> = keys.into_iter().filter(|key| key.enabled).collect();
+        // Only enabled, unarchived keys get probed — filter BEFORE the probe:
+        // a disabled or archived key never costs a vendor call.
+        let keys: Vec<_> = keys.into_iter().filter(|key| key.active()).collect();
         for mut key in keys {
             let key_id = key.id;
             // Kiro's quota source is decided by the provider's protocol, not by
@@ -592,8 +596,8 @@ impl Admin {
         Ok(models)
     }
 
-    /// Live vendor quota/balance readings for every enabled key of an enabled
-    /// provider. Thin wrapper over [`probe_all_quotas`], which owns the
+    /// Live vendor quota/balance readings for every enabled, unarchived key of
+    /// an enabled provider. Thin wrapper over [`probe_all_quotas`], which owns the
     /// probe/persist fan-out; the HTTP response shape (`{"items": [...]}`) is
     /// unchanged.
     pub async fn quotas(&self) -> Vec<KeyQuotaRow> {

@@ -117,7 +117,8 @@ fn build_client(timeout: Option<Duration>) -> reqwest::Client {
 /// the PATCH body. `None` leaves a field out (the server keeps it); the
 /// nested options are three-state: `Some(None)` sends `null` (clear the cap /
 /// the whitelist). `group_ids` replaces the key's group memberships as a
-/// whole (`Some(&[])` leaves every group).
+/// whole (`Some(&[])` leaves every group). `archived` archives (`true`) or
+/// unarchives (`false`) the key.
 #[derive(Default, serde::Serialize)]
 pub struct KeyUpdate<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,6 +131,8 @@ pub struct KeyUpdate<'a> {
     pub allowed_models: Option<Option<Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_ids: Option<&'a [i64]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
 }
 
 /// HTTP client of the gateway's loopback admin API. Cheap to clone (the

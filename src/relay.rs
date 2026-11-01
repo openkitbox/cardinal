@@ -936,7 +936,7 @@ fn fetch_key_secrets(
 ) -> (Vec<(crate::store::ProviderKeyRow, SecretString)>, usize) {
     let mut resolved = Vec::with_capacity(keys.len());
     let mut skipped = 0usize;
-    for key in keys.into_iter().filter(|key| key.enabled) {
+    for key in keys.into_iter().filter(|key| key.active()) {
         if key.auth_kind == "kiro_oidc" {
             if key.oauth.is_some() {
                 resolved.push((key, SecretString::from(String::new())));

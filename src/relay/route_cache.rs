@@ -222,7 +222,8 @@ impl RouteCache {
         };
         // Replicates: SELECT p.name AS provider, k.models, k.allowed_models
         //   FROM gateway_provider_keys k JOIN gateway_providers p ON p.id = k.provider_id
-        //   WHERE p.enabled AND k.enabled ORDER BY p.name, k.position, k.id
+        //   WHERE p.enabled AND k.enabled AND k.archived_at IS NULL
+        //   ORDER BY p.name, k.position, k.id
         //   — minus the retrieval-only providers (see [`chat_capable`]): their
         //   models are embeddings ids, not chat model ids.
         let mut rows: Vec<EnabledKeyModels> = Vec::new();
@@ -236,7 +237,7 @@ impl RouteCache {
             let mut keys: Vec<&ProviderKeyRow> = inner
                 .keys_by_provider
                 .get(&provider.id)
-                .map(|keys| keys.iter().filter(|k| k.enabled).collect())
+                .map(|keys| keys.iter().filter(|k| k.active()).collect())
                 .unwrap_or_default();
             keys.sort_by_key(|k| (k.position, k.id));
             for key in keys {
@@ -313,7 +314,7 @@ impl RouteCache {
             let Some(provider) = inner.providers_by_id.get(&key.provider_id) else {
                 continue;
             };
-            if !key.enabled || !provider.enabled {
+            if !key.active() || !provider.enabled {
                 continue;
             }
             caps.push((
@@ -329,7 +330,7 @@ impl RouteCache {
                 let Some(provider) = inner.providers_by_id.get(&key.provider_id) else {
                     continue;
                 };
-                if !key.enabled || !provider.enabled {
+                if !key.active() || !provider.enabled {
                     continue;
                 }
                 caps.push((

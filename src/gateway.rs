@@ -192,7 +192,7 @@ impl Core {
 }
 
 /// Background vendor-quota prober: every [`QUOTA_PROBE_INTERVAL`], run the
-/// [`admin_ops::probe_all_quotas`] fan-out, which probes each enabled key that
+/// [`admin_ops::probe_all_quotas`] fan-out, which probes each enabled, unarchived key that
 /// has a quota source and persists its snapshot. `tokio::time::interval`'s
 /// first tick fires immediately, so the first round runs at boot rather than
 /// after one full interval.

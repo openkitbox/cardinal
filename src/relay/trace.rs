@@ -20,7 +20,7 @@ pub struct CandidateTrace {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
-    /// Key disabled or provider disabled.
+    /// Key disabled or archived, or provider disabled.
     Disabled,
     /// Entry's availability window denies this time.
     WindowSkipped,

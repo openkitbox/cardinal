@@ -6,6 +6,8 @@
 //! - `DELETE /api/providers/:id/if-empty` — atomically delete a provider only when it has no keys
 //! - `GET/POST /api/providers/:id/keys`, `PATCH/DELETE /api/providers/:id/keys/:key_id` — every credential is a named key
 //!   (a Kiro key carries `auth_kind: "kiro_oidc"` + `oauth` instead of `api_key`; PATCH replaces that bundle only on an existing Kiro key)
+//!   the key PATCH's `archived` (absent = untouched, true = archive keeping the first archive time, false = unarchive)
+//!   is independent of `enabled` and of group membership
 //! - `POST /api/providers/:id/kiro-key` `{label, oauth}` — probe then find-or-create a Kiro OIDC key by label
 //! - `POST /api/providers/:id/kiro-import` `{label, account?, credentials}` — allow-listed import of a raw `kiro.rs` object or account array
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
@@ -1245,6 +1247,10 @@ struct PatchKeyBody {
     /// set (`[]` leaves every group).
     #[serde(default)]
     group_ids: Option<Vec<i64>>,
+    /// Archive state: absent/null = untouched, true = archive (keeps the
+    /// first archive time), false = unarchive.
+    #[serde(default)]
+    archived: Option<bool>,
 }
 
 /// Presence-capturing deserializer for a tri-state field: serde only calls
@@ -1494,6 +1500,7 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
             allowed_models: body.allowed_models,
             oauth: body.oauth.as_ref(),
             group_ids: body.group_ids.as_deref(),
+            archived: body.archived,
         },
     )
     .await
