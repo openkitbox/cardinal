@@ -834,8 +834,8 @@ pub async fn delete_provider_key(
 /// single-global-ordering invariant intact); positions are assigned 0..n in array order.
 ///
 /// `position` is now only the deterministic tiebreak for a provider's key expansion order inside
-/// a route entry; dispatch order is decided by smart quota ranking (`relay::smart`). The GUI no
-/// longer exposes reordering; the endpoint stays for API clients.
+/// a route entry; dispatch order is decided by smart quota ranking (`relay::smart`). The GUI
+/// reorders through this endpoint again — by dragging account cards, in its 「全部」 view only.
 pub async fn reorder_keys(pool: &PgPool, ids: &[i64]) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('gateway_provider_keys.position'))")
