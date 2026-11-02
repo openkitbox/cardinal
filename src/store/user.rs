@@ -10,9 +10,10 @@ use sqlx::PgPool;
 /// Login of the built-in user that owns pre-existing and config-seeded keys
 /// (created by migration 0012, member of the zero-rate `internal` group).
 ///
-/// Its keys belong to no real user identity, so the usage client series names
-/// them by bare label ([`crate::store::usage::usage_trend`]) instead of
-/// `login/label`, and the admin UI lists them by label rather than by login.
+/// Its keys belong to no real user identity, so the usage client and user
+/// series name them by bare label ([`crate::store::usage::usage_trend`]) rather
+/// than `login/label` or an owner aggregate, and the admin UI lists them by
+/// label rather than by login.
 pub const OWNER_LOGIN: &str = "owner";
 
 /// Authenticated caller identity: one gateway key joined with its owning user

@@ -101,9 +101,11 @@ pub enum TrendSplit {
     /// scope, and the built-in owner's keys, show the bare label). Rows with
     /// neither group as NULL (the GUI renders them as 本机).
     Client,
-    /// Billed user: the login of the user owning the caller's gateway key
-    /// (`users.login` joined on `user_id`). In-process calls and historical
-    /// rows with no recorded user are NULL. The GUI displays NULL as 本机.
+    /// User identity: the built-in owner's requests are split by caller key
+    /// (bare label, one series per key, no agent override), while every real
+    /// user's keys aggregate into one series per login (`users.login` joined
+    /// on `user_id`). Rows with no owning user stay NULL; the GUI displays
+    /// NULL as （未归属）.
     User,
 }
 
@@ -165,7 +167,7 @@ pub async fn usage_trend(
         "to_char(date_trunc('day', r.ts AT TIME ZONE 'UTC' + $3), 'YYYY-MM-DD')"
     };
     // The fourth element is the extra bind an arm's SQL text needs: only the
-    // client split references `$6`. It lives beside the text so the
+    // client and user splits reference `$6`. It lives beside the text so the
     // placeholder and its bind cannot drift apart (a missing bind is a Bind-
     // time error, not a compile error).
     let (category, join, filter, owner_login) = match split {
@@ -204,8 +206,18 @@ pub async fn usage_trend(
             "",
             Some(OWNER_LOGIN),
         ),
-        // Logins are unique, so grouping by the login is grouping by user_id.
-        TrendSplit::User => ("u.login", "LEFT JOIN users u ON u.id = r.user_id", "", None),
+        // Owner rows split per key (bare label) so the owner is not a single
+        // aggregate; a real user's keys merge into one login series, because
+        // logins are unique, so grouping by the login is grouping by user_id.
+        // No agent override here: the agent is client identity, not user
+        // identity. Rows with no user stay NULL (GUI: （未归属）). A bare
+        // owner key label equal to a real user's login shares that series.
+        TrendSplit::User => (
+            "CASE WHEN u.login = $6 THEN r.caller_key ELSE u.login END",
+            "LEFT JOIN users u ON u.id = r.user_id",
+            "",
+            Some(OWNER_LOGIN),
+        ),
     };
     let sql = format!(
     "SELECT {bucket} AS bucket, {category} AS category,
@@ -238,9 +250,9 @@ pub async fn usage_trend(
         .bind(local_offset)
         .bind(binds.kind)
         .bind(binds.id);
-    // Only the client arm supplies an extra bind, because only its SQL text
-    // references `$6`; binding it for a statement without that placeholder
-    // makes PostgreSQL reject the parameter at Bind time.
+    // Only the client and user arms supply an extra bind, because only their
+    // SQL text references `$6`; binding it for a statement without that
+    // placeholder makes PostgreSQL reject the parameter at Bind time.
     if let Some(owner_login) = owner_login {
         query = query.bind(owner_login);
     }
