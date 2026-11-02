@@ -68,7 +68,7 @@ pub use usage::{
     usage_trend, usage_window,
 };
 pub use user::{
-    GroupPatch, GroupRow, NewUser, Principal, UserPatch, UserRow, authenticate_principal,
-    create_group, create_user, get_group, get_user, is_conflict, is_unknown_group, list_groups,
-    list_users, owner_user_id, patch_group, patch_user,
+    GroupPatch, GroupRow, NewUser, OWNER_LOGIN, Principal, UserPatch, UserRow,
+    authenticate_principal, create_group, create_user, get_group, get_user, is_conflict,
+    is_unknown_group, list_groups, list_users, owner_user_id, patch_group, patch_user,
 };

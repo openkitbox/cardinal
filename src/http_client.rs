@@ -138,15 +138,13 @@ pub struct KeyUpdate<'a> {
 }
 
 /// Which callers the usage endpoints aggregate over. One variant per
-/// request, so the mutually exclusive `caller`, `key_id` and `user_id` query
-/// parameters can never be sent together.
+/// request, so the mutually exclusive `key_id` and `user_id` query parameters
+/// can never be sent together.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UsageScope {
     /// Every caller.
     #[default]
     All,
-    /// Unidentified 本机 rows (`caller=null`).
-    Local,
     /// One gateway key, by id (labels are only unique per user).
     Key(i64),
     /// Every key one user owns.
@@ -154,24 +152,17 @@ pub enum UsageScope {
 }
 
 impl UsageScope {
-    fn caller(self) -> Option<&'static str> {
-        match self {
-            UsageScope::Local => Some("null"),
-            UsageScope::All | UsageScope::Key(_) | UsageScope::User(_) => None,
-        }
-    }
-
     fn key_id(self) -> Option<i64> {
         match self {
             UsageScope::Key(key_id) => Some(key_id),
-            UsageScope::All | UsageScope::Local | UsageScope::User(_) => None,
+            UsageScope::All | UsageScope::User(_) => None,
         }
     }
 
     fn user_id(self) -> Option<i64> {
         match self {
             UsageScope::User(user_id) => Some(user_id),
-            UsageScope::All | UsageScope::Local | UsageScope::Key(_) => None,
+            UsageScope::All | UsageScope::Key(_) => None,
         }
     }
 }
@@ -389,8 +380,6 @@ impl GatewayHttpClient {
             since: String,
             until: String,
             #[serde(skip_serializing_if = "Option::is_none")]
-            caller: Option<&'static str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
             key_id: Option<i64>,
             #[serde(skip_serializing_if = "Option::is_none")]
             user_id: Option<i64>,
@@ -398,7 +387,6 @@ impl GatewayHttpClient {
         let params = WindowParams {
             since: rfc3339(since),
             until: rfc3339(until),
-            caller: scope.caller(),
             key_id: scope.key_id(),
             user_id: scope.user_id(),
         };
@@ -424,8 +412,6 @@ impl GatewayHttpClient {
             split: TrendSplit,
             offset_seconds: i64,
             #[serde(skip_serializing_if = "Option::is_none")]
-            caller: Option<&'static str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
             key_id: Option<i64>,
             #[serde(skip_serializing_if = "Option::is_none")]
             user_id: Option<i64>,
@@ -435,7 +421,6 @@ impl GatewayHttpClient {
             until: rfc3339(until),
             split,
             offset_seconds: local_offset.num_seconds(),
-            caller: scope.caller(),
             key_id: scope.key_id(),
             user_id: scope.user_id(),
         };

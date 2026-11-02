@@ -1,3 +1,4 @@
+use crate::store::user::OWNER_LOGIN;
 use sqlx::PgPool;
 
 // ---------- admin reads: usage / request log / cooldowns ----------
@@ -97,8 +98,8 @@ pub enum TrendSplit {
     Provider,
     /// Client identity: the UA's name (`agent`) wins, the gateway key falls
     /// back as `login/label` (labels are only unique per user; a one-user
-    /// scope shows the bare label). Rows with neither group as NULL (the GUI
-    /// renders them as 本机).
+    /// scope, and the built-in owner's keys, show the bare label). Rows with
+    /// neither group as NULL (the GUI renders them as 本机).
     Client,
     /// Billed user: the login of the user owning the caller's gateway key
     /// (`users.login` joined on `user_id`). In-process calls and historical
@@ -163,8 +164,12 @@ pub async fn usage_trend(
     } else {
         "to_char(date_trunc('day', r.ts AT TIME ZONE 'UTC' + $3), 'YYYY-MM-DD')"
     };
-    let (category, join, filter) = match split {
-        TrendSplit::Route => ("r.alias", "", ""),
+    // The fourth element is the extra bind an arm's SQL text needs: only the
+    // client split references `$6`. It lives beside the text so the
+    // placeholder and its bind cannot drift apart (a missing bind is a Bind-
+    // time error, not a compile error).
+    let (category, join, filter, owner_login) = match split {
+        TrendSplit::Route => ("r.alias", "", "", None),
         // Rows without a served model (rejected/failed attempts) are excluded
         // from the model split entirely — no "unknown" bucket. A leading
         // `namespace/` is a vendor namespace, not part of the model's identity
@@ -175,25 +180,32 @@ pub async fn usage_trend(
             "LOWER(regexp_replace(r.served_model, '^[^/]+/', ''))",
             "",
             " AND r.served_model IS NOT NULL",
+            None,
         ),
         TrendSplit::Provider => (
             "p.name",
             "LEFT JOIN gateway_providers p ON p.id = r.provider_id",
             "",
+            None,
         ),
         // Labels are only unique per user, so the label fallback is
         // qualified with the owner's login (`alice/default`) unless the scope
-        // is already one user ($4 = 'user'), where the bare label is unique;
-        // historical rows with no recorded user keep the bare label.
+        // is already one user ($4 = 'user'), where the bare label is unique.
+        // The built-in owner's keys belong to no real user identity, so they
+        // keep the bare label (`default`), as do historical rows with no
+        // recorded user.
         TrendSplit::Client => (
             "COALESCE(r.agent,
-                      CASE WHEN $4 IS DISTINCT FROM 'user' THEN u.login || '/' || r.caller_key END,
+                      CASE WHEN $4 IS DISTINCT FROM 'user'
+                                AND u.login IS DISTINCT FROM $6
+                           THEN u.login || '/' || r.caller_key END,
                       r.caller_key)",
             "LEFT JOIN users u ON u.id = r.user_id",
             "",
+            Some(OWNER_LOGIN),
         ),
         // Logins are unique, so grouping by the login is grouping by user_id.
-        TrendSplit::User => ("u.login", "LEFT JOIN users u ON u.id = r.user_id", ""),
+        TrendSplit::User => ("u.login", "LEFT JOIN users u ON u.id = r.user_id", "", None),
     };
     let sql = format!(
     "SELECT {bucket} AS bucket, {category} AS category,
@@ -220,14 +232,19 @@ pub async fn usage_trend(
     // `bucket`/`category`/`join`/`filter` arms above; caller input goes through
     // bind parameters.
     let binds = CallerBinds::from(caller);
-    let rows = sqlx::query_as::<_, TrendRow>(sqlx::AssertSqlSafe(sql))
+    let mut query = sqlx::query_as::<_, TrendRow>(sqlx::AssertSqlSafe(sql))
         .bind(since)
         .bind(until)
         .bind(local_offset)
         .bind(binds.kind)
-        .bind(binds.id)
-        .fetch_all(pool)
-        .await?;
+        .bind(binds.id);
+    // Only the client arm supplies an extra bind, because only its SQL text
+    // references `$6`; binding it for a statement without that placeholder
+    // makes PostgreSQL reject the parameter at Bind time.
+    if let Some(owner_login) = owner_login {
+        query = query.bind(owner_login);
+    }
+    let rows = query.fetch_all(pool).await?;
     Ok(rows)
 }
 
