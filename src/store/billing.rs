@@ -64,14 +64,66 @@ pub struct Overflowed {
     pub request_id: String,
 }
 
-/// A user's stored balance next to the sum of their ledger entries, and the
-/// same check for each of their keys; each pair must be equal.
+/// The answer of `GET /api/users/{id}/reconcile`: the stored balances next
+/// to the ledger sums, the request log's charge total next to the ledger's
+/// (`uncollected_microus` is the gap), and the server's verdict on whether
+/// everything agrees.
+///
+/// It lives next to [`Reconciliation`] because both ends of the wire need it:
+/// the handler serializes it and the GUI deserializes it (re-exported as
+/// [`crate::http_client::ReconcileReport`]). Flattening the report means a
+/// field added there reaches the GUI without a second place to edit.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReconcileReport {
+    /// The numbers, flattened into the response object.
+    #[serde(flatten)]
+    pub report: Reconciliation,
+    /// [`Reconciliation::is_consistent`] as of the same read.
+    pub consistent: bool,
+}
+
+/// A user's stored balance next to the sum of their ledger entries, the same
+/// check for each of their keys, and the request log's total charge next to
+/// the ledger's; each pair must be equal, and the two totals must agree.
+///
+/// The pairs are written by one transaction ([`settle_charges`]) and therefore
+/// agree by construction; [`Self::uncollected_microus`] is the check that can
+/// actually disagree, because it compares the money the request log says was
+/// owed (`gateway_requests.charged_microus`, written at dispatch) with the
+/// money the ledger took.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reconciliation {
     pub balance_microus: i64,
     pub entries_sum_microus: i64,
+    /// The total the request log says this user should have been charged,
+    /// micro-USD, over settled requests only (positive).
+    pub requests_sum_microus: i64,
+    /// `requests_sum_microus - charged_total`: positive means the ledger did
+    /// not take charges the request log recorded — lost revenue, or money
+    /// still waiting in the writer's retry queue after a failed settlement;
+    /// negative means the ledger charged more than the request rows account
+    /// for.
+    pub uncollected_microus: i64,
     /// One row per key the user owns, by key id.
     pub keys: Vec<KeyReconciliation>,
+}
+
+impl Reconciliation {
+    /// Whether every pair the ledger promises agrees: the stored balance with
+    /// its entries, each key's spend with its charge entries, and the charged
+    /// total with the request log. A non-zero [`Self::uncollected_microus`] is
+    /// real money and makes the user inconsistent even when the local pairs
+    /// match.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        let keys_agree = self
+            .keys
+            .iter()
+            .all(|key| key.spent_microus == key.entries_sum_microus);
+        self.balance_microus == self.entries_sum_microus
+            && keys_agree
+            && self.uncollected_microus == 0
+    }
 }
 
 /// A key's stored spend next to the negated sum of its charge entries.
@@ -191,12 +243,27 @@ pub async fn settle_charges(
     Ok(report)
 }
 
-/// A user's stored balance and the sum of their ledger entries, plus each
-/// owned key's stored spend and the negated sum of its charge entries, or
-/// `None` when the user does not exist.
+/// A user's stored balance and the sum of their ledger entries, each owned
+/// key's stored spend and the negated sum of its charge entries, and the
+/// request log's charge total next to the ledger's charge total, or `None`
+/// when the user does not exist.
+///
+/// `settled_before` bounds both totals: only request rows and ledger entries
+/// older than it count. A request row younger than that may still be sitting
+/// in the ledger writer's flush buffer, so counting it would read a
+/// just-settled charge as uncollected; conversely its ledger entry is already
+/// there, so counting that alone would read as an overcharge. The two rows are
+/// written by the same flush and both stamp `now()` at insert, so one cutoff
+/// covers both. How old is old enough is the caller's policy (`admin` passes
+/// the ledger writer's grace), and this layer does not import it: `relay`
+/// depends on `store`, never the other way round. The cutoff is not a
+/// statement that everything older has been settled — after a failed
+/// settlement the entries sit in the retry queue while their request rows are
+/// already written, which reads as uncollected until the retry lands.
 pub async fn reconcile_user(
     pool: &PgPool,
     user_id: i64,
+    settled_before: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<Reconciliation>, sqlx::Error> {
     let row: Option<(i64, i64)> = sqlx::query_as(
         "SELECT u.balance_microus,
@@ -210,6 +277,22 @@ pub async fn reconcile_user(
     let Some((balance_microus, entries_sum_microus)) = row else {
         return Ok(None);
     };
+    let requests_sum_microus: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(charged_microus), 0)::bigint FROM gateway_requests
+          WHERE user_id = $1 AND charged_microus > 0 AND ts < $2",
+    )
+    .bind(user_id)
+    .bind(settled_before)
+    .fetch_one(pool)
+    .await?;
+    let charged_total_microus: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(-SUM(amount_microus), 0)::bigint FROM billing_entries
+          WHERE user_id = $1 AND kind = 'charge' AND created_at < $2",
+    )
+    .bind(user_id)
+    .bind(settled_before)
+    .fetch_one(pool)
+    .await?;
     let keys = sqlx::query_as::<_, KeyReconciliation>(
         "SELECT k.id AS key_id, k.spent_microus,
                 COALESCE(s.charged, 0)::bigint AS entries_sum_microus
@@ -227,6 +310,8 @@ pub async fn reconcile_user(
     Ok(Some(Reconciliation {
         balance_microus,
         entries_sum_microus,
+        requests_sum_microus,
+        uncollected_microus: requests_sum_microus - charged_total_microus,
         keys,
     }))
 }

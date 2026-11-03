@@ -22,6 +22,8 @@ pub struct AppState {
     pub queue_timeout: std::time::Duration,
     /// Failover state: consecutive-failure counters + the last-candidate retry pause.
     pub failover: Arc<relay::Failover>,
+    /// Per-user in-flight exposure counts (in-process; no DB, no persistence).
+    pub exposure: Arc<crate::exposure::Exposure>,
     /// Centralized dispatcher for slot assignment.
     pub dispatcher: tokio::sync::mpsc::UnboundedSender<crate::relay::dispatcher::DispatchEvent>,
     /// Routing trace ring (last N dispatches), shared with relay dispatch and
@@ -213,6 +215,7 @@ async fn relay_dispatch(
         queue_timeout: state.queue_timeout,
         dispatcher: &state.dispatcher,
         failover: &state.failover,
+        exposure: &state.exposure,
         kiro_tokens: state.kiro_tokens.as_ref(),
         opencode_tokens: state.opencode_tokens.as_ref(),
         trace_ring: &state.trace_ring,

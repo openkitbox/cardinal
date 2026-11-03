@@ -21,8 +21,8 @@ mod user;
 
 pub use balance_history::{BalanceHistoryPoint, balance_history_record, list_balance_history};
 pub use billing::{
-    Charge, CreditError, CreditKind, EntryRow, KeyReconciliation, Overflowed, Reconciliation,
-    SettleReport, credit, list_entries, reconcile_user, settle_charges,
+    Charge, CreditError, CreditKind, EntryRow, KeyReconciliation, Overflowed, ReconcileReport,
+    Reconciliation, SettleReport, credit, list_entries, reconcile_user, settle_charges,
 };
 pub use gateway_key::{
     GatewayKeyPatch, GatewayKeyRow, KeyTerms, create_gateway_key, create_user_gateway_key,

@@ -27,6 +27,7 @@ pub mod client;
 pub mod config;
 pub mod credentials;
 pub mod db;
+pub mod exposure;
 pub mod gateway;
 pub mod http_client;
 pub mod key_terms;

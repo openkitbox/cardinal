@@ -63,6 +63,13 @@ pub fn effective_rate_bp(user_rate_bp: Option<i64>, group_rate_bp: i64) -> i64 {
     user_rate_bp.unwrap_or(group_rate_bp)
 }
 
+/// Whether this identity pays for usage (rate > 0). Billed callers fail
+/// closed on unpriced models and their outstanding requests are capped.
+#[must_use]
+pub fn is_billed(principal: &Principal) -> bool {
+    rate_bp(principal) > 0
+}
+
 /// Parse a decimal USD string (`"10"`, `"0.5"`, `"-1.25"`) into micro-USD
 /// exactly, without going through a float. Accepts one leading `-` and at
 /// most six fractional digits; anything else (empty, `+`, exponent, more
@@ -299,7 +306,7 @@ pub fn admit(principal: &Principal, model: &str) -> Result<(), Deny> {
     {
         return Err(Deny::KeyQuotaExhausted);
     }
-    if rate_bp(principal) > 0 && principal.balance_microus <= 0 {
+    if is_billed(principal) && principal.balance_microus <= 0 {
         return Err(Deny::InsufficientBalance);
     }
     Ok(())
@@ -310,5 +317,5 @@ pub fn admit(principal: &Principal, model: &str) -> Result<(), Deny> {
 /// not need prices.
 #[must_use]
 pub fn needs_price(principal: Option<&Principal>) -> bool {
-    principal.is_some_and(|principal| rate_bp(principal) > 0)
+    principal.is_some_and(is_billed)
 }

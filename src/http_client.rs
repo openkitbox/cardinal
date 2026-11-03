@@ -40,9 +40,8 @@ use crate::kiro::KiroOAuth;
 use crate::probe::ProbeModel;
 use crate::relay::DispatchTrace;
 use crate::store::{
-    EntryRow, GatewayKeyRow, GroupRow, ModelSuccessRow, ProviderInput, ProviderRow, Reconciliation,
-    RequestRow, RestRow, RouteEntry, RouteRow, RouteStrategy, TrendRow, TrendSplit, UsageWindow,
-    UserRow,
+    EntryRow, GatewayKeyRow, GroupRow, ModelSuccessRow, ProviderInput, ProviderRow, RequestRow,
+    RestRow, RouteEntry, RouteRow, RouteStrategy, TrendRow, TrendSplit, UsageWindow, UserRow,
 };
 
 /// What the GUI shows when the gateway is not running (spec §8 decision 1).
@@ -247,14 +246,10 @@ pub struct Credited {
     pub balance_usd: String,
 }
 
-/// The answer of `GET /api/users/{id}/reconcile`: the stored balances next
-/// to the ledger sums, and whether every pair agrees.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ReconcileReport {
-    #[serde(flatten)]
-    pub report: Reconciliation,
-    pub consistent: bool,
-}
+/// The answer of `GET /api/users/{id}/reconcile`. Defined next to the numbers
+/// it wraps so the handler can serialize it without the server reaching into
+/// the client module; re-exported here because it is also what the GUI reads.
+pub use crate::store::ReconcileReport;
 
 /// The body of `POST /api/providers/{id}/opencode-login`: the OpenCode account
 /// to start logging in. `key_id` re-authenticates an existing account instead

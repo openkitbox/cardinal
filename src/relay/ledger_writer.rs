@@ -52,6 +52,19 @@ pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// Default early-flush trigger for the production writer.
 pub const DEFAULT_BATCH_SIZE: usize = 100;
 
+/// How long a settled charge may still sit in the flush buffer. Reconciliation
+/// ignores request rows and ledger entries younger than this (it is 12 ×
+/// [`DEFAULT_FLUSH_INTERVAL`]), so a charge that has just been queued never
+/// reads as uncollected before its first flush attempt.
+///
+/// It does not cover the retry queue: after a failed *settlement* the request
+/// rows are still written (the flush inserts them whatever the settle did)
+/// while their entries wait for the next flush, so reconciliation reports them
+/// as uncollected until the retry lands. That is the honest answer — the money
+/// is not in the ledger yet — but it means a positive gap after a
+/// settlement-only failure (lock timeout, one bad row) is pending, not lost.
+pub const SETTLEMENT_GRACE: Duration = Duration::from_secs(60);
+
 /// Most unsettled charges kept for retry while PG is unreachable; beyond
 /// this the oldest are dropped so memory stays bounded.
 pub const MAX_PENDING_CHARGES: usize = 100_000;

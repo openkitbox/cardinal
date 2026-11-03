@@ -1563,7 +1563,9 @@ async fn list_user_entries(request: &mut Request, depot: &mut Depot, response: &
 }
 
 /// `GET /api/users/{id}/reconcile`: stored balance against the ledger sum,
-/// and each owned key's stored spend against the sum of its charges.
+/// each owned key's stored spend against the sum of its charges, and the
+/// request log's charge total against the ledger's (requests younger than the
+/// settlement grace are excluded: they may still be buffered).
 #[handler]
 async fn reconcile_user(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let pool = state_pool(depot);
@@ -1571,16 +1573,16 @@ async fn reconcile_user(request: &mut Request, depot: &mut Depot, response: &mut
         json_error(response, StatusCode::BAD_REQUEST, "invalid user id");
         return;
     };
-    match store::reconcile_user(pool, id).await {
+    let settled_before = chrono::Utc::now() - crate::relay::ledger_writer::SETTLEMENT_GRACE;
+    match store::reconcile_user(pool, id, settled_before).await {
+        // Serialized as the type the GUI deserializes (it flattens the
+        // reconciliation), so a new field there needs no edit here.
         Ok(Some(report)) => json_response(
             response,
-            &json!({
-                "balance_microus": report.balance_microus,
-                "entries_sum_microus": report.entries_sum_microus,
-                "consistent": report.balance_microus == report.entries_sum_microus
-                    && report.keys.iter().all(|key| key.spent_microus == key.entries_sum_microus),
-                "keys": report.keys,
-            }),
+            &store::ReconcileReport {
+                consistent: report.is_consistent(),
+                report,
+            },
         ),
         Ok(None) => json_error(response, StatusCode::NOT_FOUND, "user not found"),
         Err(error) => internal(response, error.into()),

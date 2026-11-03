@@ -1539,6 +1539,10 @@ pub struct DispatchDeps<'a> {
     pub queue_timeout: std::time::Duration,
     pub dispatcher: &'a tokio::sync::mpsc::UnboundedSender<dispatcher::DispatchEvent>,
     pub failover: &'a std::sync::Arc<Failover>,
+    /// Per-user outstanding-request counts. `Arc` (not a plain reference) for
+    /// the same reason as `failover`: the streaming settlement task outlives
+    /// this call, and that task is what frees the user's slot.
+    pub exposure: &'a std::sync::Arc<crate::exposure::Exposure>,
     /// Per-key Kiro OIDC token manager (lazy refresh, single-flight, write-back).
     pub kiro_tokens: &'a KiroTokens,
     /// Per-key OpenCode account bearer manager (lazy refresh, single-flight, CAS
@@ -1631,6 +1635,7 @@ pub async fn dispatch_at(
         queue_timeout,
         dispatcher,
         failover,
+        exposure,
         kiro_tokens,
         opencode_tokens,
         trace_ring,
@@ -1671,6 +1676,40 @@ pub async fn dispatch_at(
             retry_after_secs: None,
         };
     }
+    // Exposure gate: how many requests a billed caller may have in flight is
+    // bounded by the user's `max_concurrent`, because admission reads the
+    // balance from the authentication snapshot while the debit only lands on
+    // the next ledger flush — inside that window a small balance could go
+    // arbitrarily negative. Free callers (rate 0) and in-process calls take no
+    // slot: their traffic creates no receivable.
+    //
+    // The slot frees itself on `Drop`, so every early return below balances it
+    // without another line of code, and so does the non-streaming success (it
+    // queues its attempt rows before returning). Only the streaming arm moves
+    // the slot into the settlement task, where the charge is still in flight
+    // until those rows are queued.
+    let mut exposure_slot = match principal {
+        Some(principal) if billing::is_billed(principal) => {
+            match exposure.try_acquire(principal.user_id, principal.max_concurrent) {
+                Some(slot) => Some(slot),
+                None => {
+                    tracing::debug!(
+                        user_id = principal.user_id,
+                        limit = principal.max_concurrent,
+                        in_flight = exposure.in_flight(principal.user_id),
+                        "refusing dispatch: the user is at max_concurrent requests in flight"
+                    );
+                    return DispatchOutcome::Failed {
+                        status: 429,
+                        message: "too many concurrent requests for this account; retry shortly"
+                            .into(),
+                        retry_after_secs: Some(1),
+                    };
+                }
+            }
+        }
+        _ => None,
+    };
     // The caller's rate multiplier, `Copy` so the streaming accounting task
     // captures it without holding the principal.
     let rate_bp = principal.map(billing::rate_bp);
@@ -2375,6 +2414,11 @@ pub async fn dispatch_at(
                     let (finalize_tx, finalize_rx) = tokio::sync::oneshot::channel();
                     // Streaming post-processing: after the pump ends, take usage → account → clear the rest → queue the ledger rows, all in a background task,
                     // so neither the HTTP nor the in-process entry has to duplicate this.
+                    //
+                    // The exposure slot travels with the rows: until this task
+                    // queues them the charge is still in flight, so the user's
+                    // slot must not be freed when dispatch returns.
+                    let exposure_claim = exposure_slot.take();
                     let failover = std::sync::Arc::clone(failover);
                     let body_log = body_log.clone();
                     let ledger = ledger.clone();
@@ -2394,6 +2438,10 @@ pub async fn dispatch_at(
                     let mut attempts = std::mem::take(&mut attempts);
                     let settlement_ledger = ledger.clone();
                     settlement_ledger.spawn_settlement(async move {
+                        // Held until this block ends, i.e. past `ledger.push`
+                        // below: the user's slot must cover the charge until
+                        // the attempt rows are queued, and no longer.
+                        let _exposure_claim = exposure_claim;
                         let outcome = usage_rx.await.ok();
                         let ttft_ms = outcome.as_ref().and_then(|outcome| outcome.ttft_ms);
                         let usage = outcome.as_ref().and_then(|outcome| outcome.usage);

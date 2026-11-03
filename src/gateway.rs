@@ -58,6 +58,11 @@ struct Core {
     /// ([gateway].queue_timeout_secs; at least one second).
     queue_timeout: Duration,
     failover: Arc<relay::Failover>,
+    /// Per-user counts of admitted-but-unsettled requests, the bound on a
+    /// billed user's in-flight exposure (`crate::exposure`). Process-wide and
+    /// shared by every dispatch entry (HTTP surface and in-process callers), so
+    /// one user's cap is one number, not one per entry point.
+    exposure: Arc<crate::exposure::Exposure>,
     /// Routing trace ring (last N dispatches), shared by the relay and the
     /// admin surface.
     trace_ring: Arc<relay::trace::TraceRing>,
@@ -209,6 +214,7 @@ impl Core {
             opencode_logins: crate::opencode::login::OpencodeLogins::new(),
             queue_timeout,
             failover: relay::Failover::new(),
+            exposure: Arc::new(crate::exposure::Exposure::new()),
             trace_ring: Arc::new(relay::trace::TraceRing::new()),
             body_log: crate::body_log::BodyLog::new(),
             ledger,
@@ -398,6 +404,7 @@ impl Gateway {
             transport: core.transport.clone(),
             queue_timeout: core.queue_timeout,
             failover: Arc::clone(&core.failover),
+            exposure: Arc::clone(&core.exposure),
             dispatcher: dispatcher_tx.clone(),
             trace_ring: Arc::clone(&core.trace_ring),
             body_log: core.body_log.clone(),
