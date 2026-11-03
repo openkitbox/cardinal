@@ -11,7 +11,7 @@ A headless LLM gateway that routes requests across multiple AI providers with fa
 - **Quota monitoring** — Periodic probing of provider quota/balance endpoints; quota-aware routing decisions
 - **Usage metering** — Per-request token counting and cost calculation (USD) with provider/model price tables
 - **Concurrency control** — Per-key concurrency limits with semaphore-based queuing
-- **Availability rules** — Per-route time-window and weekday rules (allow/deny) for provider availability
+- **Availability rules** — Per-route time-window and weekday rules (allow/deny) for route-entry availability
 - **Admin API** — Full HTTP management API (providers, keys, routes, pricing, quotas, activity)
 - **SSE activity stream** — Real-time event feed of all gateway activity
 - **TLS** — Optional TLS via rustls (configured in config file)

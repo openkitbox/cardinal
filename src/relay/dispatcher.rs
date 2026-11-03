@@ -43,15 +43,17 @@ pub enum SlotKey {
     Entry(u64),
 }
 
-/// Stable identity for one route entry's concurrency slot: (route, provider,
-/// model). Every key of the provider maps to the same slot, so the entry cap
-/// bounds the provider's total concurrency on this route.
-pub fn entry_slot_key(route_id: &str, provider_id: i64, model: &str) -> SlotKey {
+/// Stable identity for one route entry's concurrency slot: (route, account
+/// key, model) — exactly the entry's own identity. An entry's
+/// `max_concurrency` therefore bounds that one account on that one route and
+/// model; the same account on another route, or serving another model, gets
+/// its own slot.
+pub fn entry_slot_key(route_id: &str, key_id: i64, model: &str) -> SlotKey {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     route_id.hash(&mut hasher);
-    provider_id.hash(&mut hasher);
+    key_id.hash(&mut hasher);
     model.hash(&mut hasher);
     SlotKey::Entry(hasher.finish())
 }
@@ -503,9 +505,8 @@ fn has_possible_candidate(
 }
 
 /// Announce a key-level slot's occupancy (absolute, after the change) to the
-/// live activity feed. An entry-level slot is shared by every key of the
-/// entry's provider on the route and has no admin surface, so only key slots
-/// are published.
+/// live activity feed. An entry-level slot is one account on one route and
+/// model and has no admin surface of its own, so only key slots are published.
 fn publish_slot(sink: &ActivitySink, slots: &HashMap<SlotKey, SlotState>, key: SlotKey) {
     if let SlotKey::Key(id) = key
         && let Some(state) = slots.get(&key)
@@ -519,10 +520,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_slot_identity_is_per_route_provider_and_model() {
+    fn entry_slot_identity_is_per_route_account_and_model() {
         let base = entry_slot_key("alias", 10, "m");
-        // Every key of one provider maps to the same slot: the identity is the
-        // entry, not the key.
         assert_eq!(
             base,
             entry_slot_key("alias", 10, "m"),
@@ -531,12 +530,12 @@ mod tests {
         assert_ne!(
             base,
             entry_slot_key("alias", 11, "m"),
-            "two providers must not share an entry slot"
+            "two accounts must not share an entry slot"
         );
         assert_ne!(
             base,
             entry_slot_key("alias", 10, "m2"),
-            "two models of one provider must not share an entry slot"
+            "two models of one account must not share an entry slot"
         );
         assert_ne!(
             base,

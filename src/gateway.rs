@@ -6,9 +6,10 @@
 //! (relay failover, metering) lives in the serving process, so a second process
 //! binding the same address fails with AddrInUse instead of being adopted.
 //!
-//! Candidate model: the client-supplied `model` string is either a route alias (a named key subset,
-//! tried in the keys' global position order) or `"<provider>/<upstream model>"` addressing one
-//! provider's keys directly; a failed key cools down alone and failover walks the remaining keys.
+//! Candidate model: the client-supplied `model` string is either a route alias (a named list of
+//! account × model entries, ordered by the route's strategy) or `"<provider>/<upstream model>"`
+//! addressing one provider's keys directly; one route entry is one account, a failed key cools
+//! down alone, and failover walks the remaining candidates.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

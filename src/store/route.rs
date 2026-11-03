@@ -1,9 +1,59 @@
 use std::collections::HashSet;
 
+use sqlx::PgConnection;
 use sqlx::PgPool;
 
 use super::key::{RouteEntry, RouteRow, RouteStrategy};
 use crate::translation::ir::Effort;
+
+/// Strip every route entry naming one of `key_ids`, in the caller's transaction.
+///
+/// The single owner of the "a deleted account leaves no dangling entry" rule:
+/// both delete paths ([`super::key::delete_provider_key`] for one account,
+/// [`super::provider::delete_provider`] for all of a provider's) call this, so
+/// the entry shape is encoded in exactly one statement.
+///
+/// A dangling entry resolves to zero candidates (a misleading 404) and makes the
+/// next whole-route save fail validation, so it is removed here, keeping the
+/// remaining entries' order; a route left empty keeps its alias so it can be
+/// re-pointed instead of silently vanishing from /v1/models.
+///
+/// Malformed rows fail closed to "left untouched" so one hand-edited row cannot
+/// make every delete fail: a route whose `entries` is not a JSON array is
+/// skipped, and an element whose `key_id` is missing or not a JSON number is
+/// kept (it names no account, so it is not ours to drop). The type check sits in
+/// `CASE` because Postgres does not guarantee `AND`/`OR` evaluation order, and
+/// the comparison goes through `numeric` so a fractional or out-of-range value
+/// cannot raise a cast error.
+pub(super) async fn strip_entries_of_keys(
+    conn: &mut PgConnection,
+    key_ids: &[i64],
+) -> anyhow::Result<()> {
+    if key_ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE gateway_routes
+         SET entries = COALESCE(
+             (SELECT jsonb_agg(entry ORDER BY ord)
+                FROM jsonb_array_elements(entries) WITH ORDINALITY AS e(entry, ord)
+               WHERE NOT CASE WHEN jsonb_typeof(entry->'key_id') = 'number'
+                              THEN (entry->>'key_id')::numeric = ANY($1::bigint[])
+                              ELSE false END),
+             '[]'::jsonb)
+         WHERE CASE WHEN jsonb_typeof(entries) = 'array'
+                    THEN EXISTS (
+                        SELECT 1 FROM jsonb_array_elements(entries) AS x(entry)
+                         WHERE CASE WHEN jsonb_typeof(entry->'key_id') = 'number'
+                                    THEN (entry->>'key_id')::numeric = ANY($1::bigint[])
+                                    ELSE false END)
+                    ELSE false END",
+    )
+    .bind(key_ids)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
 
 /// One raw `gateway_routes` row straight off SQL, before entries/strategy parsing.
 type RawRouteRow = (
@@ -52,24 +102,23 @@ pub enum EffortsUpdate {
     Set(Option<Vec<String>>),
 }
 
-/// The first entry whose (provider, model) pair already appeared earlier in
-/// `entries`, if any. A route may list a provider once per model; a repeat
-/// would expand to the same keys twice.
+/// The first entry whose (key, model) pair already appeared earlier in
+/// `entries`, if any. A route may list an account once per model; a repeat
+/// would be the same candidate twice.
 #[must_use]
 pub fn duplicate_entry(entries: &[RouteEntry]) -> Option<(i64, &str)> {
     let mut seen: HashSet<(i64, &str)> = HashSet::new();
     entries
         .iter()
-        .map(|entry| (entry.provider_id, entry.model.as_str()))
+        .map(|entry| (entry.key_id, entry.model.as_str()))
         .find(|pair| !seen.insert(*pair))
 }
 
-/// Validate and write one route: every referenced provider must exist and
-/// each (provider, model) pair may appear only once (the same provider may
-/// appear repeatedly, one entry per model; enabled is irrelevant — disabled
-/// providers and keys are skipped at dispatch). Validation and write share
-/// one transaction so a provider deleted mid-flight cannot leave a dangling
-/// entry.
+/// Validate and write one route: every referenced account must exist and each
+/// (key, model) pair may appear only once (the same account may appear
+/// repeatedly, one entry per model; enabled is irrelevant — disabled accounts
+/// are skipped at dispatch). Validation and write share one transaction so a key
+/// deleted mid-flight cannot leave a dangling entry.
 pub async fn put_route(
     pool: &PgPool,
     alias: &str,
@@ -94,10 +143,8 @@ pub async fn put_route(
         note.as_ref().is_none_or(|note| note.chars().count() <= 200),
         "route {alias} note exceeds 200 characters"
     );
-    if let Some((provider_id, model)) = duplicate_entry(entries) {
-        anyhow::bail!(
-            "route {alias} lists provider {provider_id} with model {model} more than once"
-        );
+    if let Some((key_id, model)) = duplicate_entry(entries) {
+        anyhow::bail!("route {alias} lists key {key_id} with model {model} more than once");
     }
     let mut tx = pool.begin().await?;
     for entry in entries {
@@ -123,16 +170,17 @@ pub async fn put_route(
                 .map_err(|error| anyhow::anyhow!("route {alias} entry {}: {error}", entry.model))?;
         }
         let exists: Option<(i64,)> =
-            // FOR SHARE: a concurrent delete_provider (FOR UPDATE) waits for
-            // this transaction instead of deleting the provider mid-write.
-            sqlx::query_as("SELECT id FROM gateway_providers WHERE id = $1 FOR SHARE")
-                .bind(entry.provider_id)
+            // FOR SHARE: a concurrent delete_provider_key (which deletes the key
+            // row and strips its route entries in the same transaction) waits
+            // for this transaction instead of deleting the account mid-write.
+            sqlx::query_as("SELECT id FROM gateway_provider_keys WHERE id = $1 FOR SHARE")
+                .bind(entry.key_id)
                 .fetch_optional(&mut *tx)
                 .await?;
         anyhow::ensure!(
             exists.is_some(),
-            "route {alias} references a nonexistent provider {}",
-            entry.provider_id
+            "route {alias} references a nonexistent key {}",
+            entry.key_id
         );
     }
     let preserve = matches!(efforts, EffortsUpdate::Preserve);
@@ -181,8 +229,8 @@ fn parse_route(
     note: Option<String>,
     efforts: Option<serde_json::Value>,
 ) -> anyhow::Result<RouteRow> {
-    // Empty entries are a legitimate state: deleting a provider cascades it out
-    // of every route, and the emptied route keeps its alias so it can be
+    // Empty entries are a legitimate state: deleting a key cascades it out of
+    // every route, and the emptied route keeps its alias so it can be
     // re-pointed (it expands to zero candidates → 404 at dispatch).
     let entries: Vec<RouteEntry> = serde_json::from_value(entries)
         .map_err(|e| anyhow::anyhow!("route {alias} has invalid entries JSON: {e}"))?;
@@ -213,9 +261,9 @@ fn parse_route(
 mod tests {
     use super::*;
 
-    fn entry(provider_id: i64, model: &str) -> RouteEntry {
+    fn entry(key_id: i64, model: &str) -> RouteEntry {
         RouteEntry {
-            provider_id,
+            key_id,
             model: model.to_owned(),
             label: None,
             max_concurrency: None,
@@ -230,12 +278,12 @@ mod tests {
         assert_eq!(
             duplicate_entry(&entries),
             None,
-            "same provider with different models is allowed"
+            "same account with different models is allowed"
         );
     }
 
     #[test]
-    fn repeated_provider_and_model_is_reported() {
+    fn repeated_key_and_model_is_reported() {
         let entries = [entry(10, "a"), entry(3, "b"), entry(10, "a")];
         assert_eq!(
             duplicate_entry(&entries),

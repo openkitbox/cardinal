@@ -4,10 +4,10 @@
 //!
 //! Derivation is pure and total: a route whose entries cannot ALL be resolved
 //! against the snapshots (snapshot missing, model absent from it) still lists —
-//! it just carries no derived attributes. An entry whose provider has no
-//! servable key contributes nothing instead of voiding the route, exactly as
-//! dispatch skips it. A declared context window on the route always wins over
-//! derivation.
+//! it just carries no derived attributes. An entry whose account is gone (key
+//! deleted, disabled or archived) contributes nothing instead of voiding the
+//! route, exactly as dispatch skips it. A declared context window on the route
+//! always wins over derivation.
 
 use serde_json::{Value, json};
 
@@ -33,11 +33,12 @@ use crate::store::{KeyModels, RouteRow};
 ///   treated as unconstrained, not as a veto), in the first declaring member's
 ///   order, only when non-empty.
 ///
-/// A resolving entry contributes its provider's servable keys' models. An
-/// entry whose provider has no servable key contributes nothing (dispatch
-/// skips it too). Any entry that has a provider but fails to resolve (snapshot
-/// missing, model not in the snapshot) voids ALL derived fields; a declared
-/// context window and a declared efforts list are still emitted.
+/// A resolving entry contributes the model its own account serves. An entry
+/// whose account is not in `keys` (deleted, disabled, archived) contributes
+/// nothing (dispatch skips it too). An entry whose account IS present but whose
+/// snapshot cannot resolve the model (no snapshot, model absent from it) voids
+/// ALL derived fields; a declared context window and a declared efforts list
+/// are still emitted.
 ///
 /// `chat_capable` = the route serves a chat protocol. A retrieval route
 /// (`openai_embeddings`) is listed — OpenAI's own catalog lists embedding
@@ -153,12 +154,12 @@ pub fn gemini_model_object(route: &RouteRow, keys: &[KeyModels]) -> Value {
     object
 }
 
-/// Every route entry's member models: one per key of the entry's provider,
-/// whose snapshot must exist and contain the entry's model id. An entry whose
-/// provider has no servable key is skipped, not fatal: dispatch skips it too,
-/// so it must not void the surviving entries' attributes. `None` when an
-/// entry with keys fails to resolve, or when no entry contributed a member.
-/// Empty routes are a real state (provider deletion cascades entries out, the
+/// Every route entry's member model: the one its own account (key) serves —
+/// the key's snapshot must exist and contain the entry's model id. An entry
+/// whose account is gone from `keys` is skipped, not fatal: dispatch skips it
+/// too, so it must not void the surviving entries' attributes. `None` when an
+/// entry with a key fails to resolve, or when no entry contributed a member.
+/// Empty routes are a real state (key deletion cascades entries out, the
 /// emptied route keeps its alias so it can be re-pointed) and resolve to no
 /// attributes.
 fn resolve_members<'a>(route: &RouteRow, keys: &'a [KeyModels]) -> Option<Vec<&'a ProbeModel>> {
@@ -167,34 +168,30 @@ fn resolve_members<'a>(route: &RouteRow, keys: &'a [KeyModels]) -> Option<Vec<&'
     }
     let mut members: Vec<&'a ProbeModel> = Vec::new();
     for entry in &route.entries {
-        let provider_keys: Vec<&KeyModels> = keys
-            .iter()
-            .filter(|key| key.provider_id == entry.provider_id)
-            .collect();
-        if provider_keys.is_empty() {
-            // Dangling provider, or every key of it disabled/archived: the
-            // entry serves nothing, so it contributes no member — same as
-            // dispatch, which skips the entry. The `members.is_empty()` check
-            // below covers the case where NO entry contributes.
+        let Some(key) = keys.iter().find(|key| key.id == entry.key_id) else {
+            // Dangling entry, or an account that is disabled/archived: the
+            // cache's key-model snapshot (`servable_key_models`) drops it, so it
+            // never reaches `keys`.
+            // Dispatch skips such an entry, so derivation must skip it too
+            // instead of voiding the whole route. The `members.is_empty()`
+            // check below covers the case where NO entry contributes.
+            continue;
+        };
+        // The whitelist gates the same way relay dispatch does: a key that does
+        // not serve the entry's model is not a member at all — skip it (do not
+        // poison the whole route the way an unresolvable key does).
+        let whitelisted_away = key.allowed_models.as_ref().is_some_and(|allowed| {
+            !allowed.is_empty() && !allowed.iter().any(|model| model == &entry.model)
+        });
+        if whitelisted_away {
             continue;
         }
-        for key in provider_keys {
-            // The whitelist gates the same way relay dispatch does: a key that
-            // does not serve the entry's model is not a member at all — skip it
-            // (do not poison the whole route the way an unresolvable key does).
-            let whitelisted_away = key.allowed_models.as_ref().is_some_and(|allowed| {
-                !allowed.is_empty() && !allowed.iter().any(|model| model == &entry.model)
-            });
-            if whitelisted_away {
-                continue;
-            }
-            let member = key
-                .models
-                .as_ref()?
-                .iter()
-                .find(|model| model.id == entry.model)?;
-            members.push(member);
-        }
+        let member = key
+            .models
+            .as_ref()?
+            .iter()
+            .find(|model| model.id == entry.model)?;
+        members.push(member);
     }
     // Every member whitelisted away: nothing to derive from (the route still
     // exists and is listed, just without derived attributes).
@@ -229,9 +226,9 @@ mod tests {
     use super::*;
     use crate::store::{RouteEntry, RouteStrategy};
 
-    fn entry(provider_id: i64, model: &str) -> RouteEntry {
+    fn entry(key_id: i64, model: &str) -> RouteEntry {
         RouteEntry {
-            provider_id,
+            key_id,
             model: model.to_owned(),
             label: None,
             max_concurrency: None,
@@ -263,10 +260,9 @@ mod tests {
         }
     }
 
-    fn key(id: i64, provider_id: i64, model: ProbeModel) -> KeyModels {
+    fn key(id: i64, model: ProbeModel) -> KeyModels {
         KeyModels {
             id,
-            provider_id,
             models: Some(vec![model]),
             allowed_models: None,
         }
@@ -274,12 +270,12 @@ mod tests {
 
     #[test]
     fn one_unservable_entry_does_not_void_the_other_entries_attributes() {
-        // Provider 2 has no servable key (every key disabled or archived, or
-        // the provider itself disabled): `list_all_key_models` drops it, so it
-        // never reaches `keys`. Dispatch skips such an entry, so derivation
-        // must skip it too instead of voiding the whole route.
+        // Entry 2's account is gone (deleted, or disabled/archived): the cache's
+        // key-model snapshot drops it, so it never reaches `keys`. Dispatch
+        // skips such an entry, so derivation must skip it too instead of
+        // voiding the whole route.
         let route = route(vec![entry(1, "m"), entry(2, "n")]);
-        let keys = vec![key(1, 1, model("m", 128_000))];
+        let keys = vec![key(1, model("m", 128_000))];
         let object = route_model_object(&route, &keys, true);
         assert_eq!(
             object["context_window"], 128_000,

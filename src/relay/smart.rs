@@ -81,6 +81,21 @@ pub fn order(
         .collect()
 }
 
+/// The verdict reason per candidate, in the INPUT order — for the strategies
+/// that keep the stored order (`Ordered`, `Rotate`) yet still report why a key
+/// ranks where it does. Same evaluation as [`order`], no sorting, so the output
+/// stays position-aligned with the caller's candidate list.
+pub fn verdicts(
+    candidates: &[Candidate],
+    snapshots: &HashMap<i64, KeyQuota>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|candidate| evaluate(snapshots.get(&candidate.key.id), now).0.reason)
+        .collect()
+}
+
 /// One window's surplus in percentage points, or `None` when the window
 /// carries no time anchor. A renewed window (reset in the past) reads 0:
 /// quota and time are both full again.

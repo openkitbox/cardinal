@@ -1,16 +1,17 @@
-//! Candidate expansion: a candidate is one key row (plus its provider and the
-//! upstream model it should serve); failure cooldown policy lives in `failover`.
+//! Candidate expansion: a candidate is ONE ROUTE ENTRY — one account (key row)
+//! plus its provider and the single upstream model it serves. Failure cooldown
+//! policy lives in `failover`.
 //!
-//! Ordering contracts, flattened onto keys:
+//! Ordering contracts:
 //! - the direct path (`provider/model`) expands to the provider's active keys
 //!   in their single global (position, id) order — the store's ORDER BY
-//!   contract. That is the EXPANSION order only: the dispatch order is ranked
-//!   by quota in `route_order`, because direct is one Smart entry group;
-//! - a route entry expands to every active key of its provider, in that
-//!   provider's (position, id) order, each candidate tagged with its entry's
-//!   index; `route_order` keeps Ordered entry groups in STORED order (the user
-//!   arranges them in the GUI), rotates them for Rotate, ranks all candidates
-//!   globally for Smart, and always ranks keys inside a group by quota;
+//!   contract — all serving the same model. That is the EXPANSION order only:
+//!   `relay::order_ready` ranks it by quota, because direct resolution is
+//!   deliberately Smart (see [`expand_direct`]);
+//! - a route expands to one candidate per entry, in the entries' STORED order
+//!   (the order the user arranged in the GUI); `relay::order_ready` then
+//!   applies the route's strategy to that whole list — Ordered keeps it,
+//!   Rotate moves the cursor over it, Smart ranks it by quota;
 //! - a failure cools at its own granularity (whole key, or one (key, model)
 //!   pair for an unserved model — see `failover`); resting candidates are
 //!   deferred behind ready ones (restLast) instead of being skipped, so a
@@ -24,7 +25,8 @@ use super::trace::SkipReason;
 use crate::store::{ProviderKeyRow, ProviderRow, RouteEntry};
 use crate::translation::ir::Effort;
 
-/// One triable candidate: a key, the provider it belongs to, and the upstream model to request.
+/// One triable candidate: the route entry's account (key row), the provider it
+/// belongs to, and the upstream model to request.
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub key: ProviderKeyRow,
@@ -38,11 +40,6 @@ pub struct Candidate {
     /// Per-item concurrency cap of the route entry (None = only the key-level
     /// cap applies).
     pub entry_cap: Option<i32>,
-    /// Index of the route entry this candidate expanded from, in stored entry
-    /// order (0 on the direct path, which is a single group). Candidates of
-    /// one entry form one ordering group: the strategy orders groups, quota
-    /// orders the keys inside a group.
-    pub entry_index: usize,
     /// Effort levels the candidate's snapshot says its upstream model accepts,
     /// canonical and ascending. `None` = unconstrained (no snapshot, model
     /// absent from it, or nothing listed).
@@ -137,9 +134,14 @@ fn model_context(key: &ProviderKeyRow, model: &str) -> Option<u64> {
 
 /// Direct path ("<provider>/<model>"): the provider's active keys — which must arrive in global
 /// (position, id) order (the store's ORDER BY contract), each paired with its resolved secret —
-/// all serving the same upstream model as ONE entry group (`entry_index` 0). This is the
-/// expansion order; `route_order` then ranks the group by quota. Returns the candidates plus
-/// the excluded ones with their reasons.
+/// all serving the same upstream model. This is the expansion order; quota ranking happens in
+/// `relay::order_ready`.
+///
+/// Direct resolution is deliberately `RouteStrategy::Smart` even though entries are per account
+/// again: these keys are interchangeable routes to ONE model, so ranking them by quota surplus is
+/// what keeps a multi-account provider from always using the first account. Their stored
+/// (position, id) order only breaks quota ties. Returns the candidates plus the excluded ones
+/// with their reasons.
 pub fn expand_direct(
     provider: ProviderRow,
     keys: Vec<(ProviderKeyRow, SecretString)>,
@@ -148,8 +150,9 @@ pub fn expand_direct(
     let mut candidates = Vec::with_capacity(keys.len());
     let mut excluded = Vec::new();
     for (key, secret) in keys {
-        // `fetch_key_secrets` already drops inactive keys; this stays as the
-        // fail-closed guard for any caller that does not.
+        // `fetch_key_secrets` hands inactive rows through on purpose, so a
+        // disabled or archived account is excluded here with a reason instead
+        // of silently disappearing from the provider's key list.
         let skip = if !key.active() {
             Some(SkipReason::Disabled)
         } else if !serves_model(&key, upstream_model) {
@@ -166,7 +169,6 @@ pub fn expand_direct(
             upstream_model: upstream_model.to_owned(),
             route_alias: None,
             entry_cap: None,
-            entry_index: 0,
             supported_efforts: supported,
             default_effort: default,
             context_window,
@@ -189,55 +191,53 @@ pub struct Expansion {
     pub excluded: Vec<(Candidate, SkipReason)>,
 }
 
-/// Route path: each entry expands to every key of its provider present in
-/// `keys` (in `keys` order, which must be the provider's (position, id)
-/// order), each candidate tagged with the entry's stored index; the same key
-/// may appear several times with different models. Entries keep their STORED
-/// order (the order the user arranged in the GUI). Keys of a disabled
-/// provider, inactive keys, and keys whose whitelist lacks the entry's model
-/// are excluded with their reason; entries whose availability rules deny
-/// `now` exclude all their keys as window-skipped; dangling entries are
-/// skipped silently.
+/// Route path: ONE CANDIDATE PER ENTRY — the same account may appear several
+/// times with different models, and one entry never expands to another
+/// account. Candidates keep the entries' STORED order (the order the user
+/// arranged in the GUI); key position never reorders a route. A dangling entry
+/// (its account is gone from `keys`) is skipped silently. An inactive account
+/// or a disabled provider excludes the entry as `Disabled`, a whitelist that
+/// lacks the entry's model as `ModelNotAllowed`, and an entry whose
+/// availability rules deny `now` as `WindowSkipped`.
 pub fn expand_route(
     entries: &[RouteEntry],
     keys: Vec<(ProviderKeyRow, SecretString)>,
     providers: &HashMap<i64, ProviderRow>,
     now: chrono::DateTime<chrono::Local>,
 ) -> Expansion {
+    let keys_by_id: HashMap<i64, (ProviderKeyRow, SecretString)> = keys
+        .into_iter()
+        .map(|(key, secret)| (key.id, (key, secret)))
+        .collect();
     let mut window_skipped = 0;
-    let mut candidates = Vec::with_capacity(keys.len());
+    let mut candidates = Vec::with_capacity(entries.len());
     let mut excluded = Vec::new();
-    for (entry_index, entry) in entries.iter().enumerate() {
-        let Some(provider) = providers.get(&entry.provider_id) else {
-            continue;
-        }; // dangling provider
-        let provider_keys = keys
-            .iter()
-            .filter(|(key, _)| key.provider_id == entry.provider_id);
-        // Judged once per entry: `window_skipped` counts entries, not keys —
-        // one denied entry is one skip however many keys its provider has.
-        let available = entry.is_available(now);
-        let mut entry_window_skipped = false;
-        for (key, secret) in provider_keys {
-            // Inactive keys are already dropped by `fetch_key_secrets`; the
-            // check stays as the fail-closed guard.
-            let skip = if !provider.enabled || !key.active() {
-                Some(SkipReason::Disabled)
-            } else if !serves_model(key, &entry.model) {
-                Some(SkipReason::ModelNotAllowed)
-            } else if !available {
-                entry_window_skipped = true;
-                Some(SkipReason::WindowSkipped)
-            } else {
-                None
-            };
-            let candidate = make_candidate(key, secret, provider, entry, entry_index);
-            match skip {
-                Some(reason) => excluded.push((candidate, reason)),
-                None => candidates.push(candidate),
-            }
+    for entry in entries {
+        let Some((key, secret)) = keys_by_id.get(&entry.key_id) else {
+            continue; // dangling entry: its account is gone
+        };
+        let Some(provider) = providers.get(&key.provider_id) else {
+            continue; // dangling provider
+        };
+        // `fetch_key_secrets` hands inactive rows through on purpose, so a
+        // route entry naming a disabled or archived account is reported here
+        // instead of vanishing as a dangling entry.
+        let skip = if !provider.enabled || !key.active() {
+            Some(SkipReason::Disabled)
+        } else if !serves_model(key, &entry.model) {
+            Some(SkipReason::ModelNotAllowed)
+        } else if !entry.is_available(now) {
+            // One candidate per entry, so one denied entry is one skip.
+            window_skipped += 1;
+            Some(SkipReason::WindowSkipped)
+        } else {
+            None
+        };
+        let candidate = make_candidate(key, secret, provider, entry);
+        match skip {
+            Some(reason) => excluded.push((candidate, reason)),
+            None => candidates.push(candidate),
         }
-        window_skipped += usize::from(entry_window_skipped);
     }
     Expansion {
         candidates,
@@ -252,7 +252,6 @@ fn make_candidate(
     secret: &SecretString,
     provider: &ProviderRow,
     entry: &RouteEntry,
-    entry_index: usize,
 ) -> Candidate {
     let model = entry.model.as_str();
     let (supported, default) = effort_support(key, model);
@@ -260,8 +259,7 @@ fn make_candidate(
         key: key.clone(),
         // A key serving several entries clones its row and secret per
         // candidate (each secret clone is its own zeroizing allocation; route
-        // entries and a provider's keys are few, and this runs once per
-        // request at resolve time).
+        // entries are few, and this runs once per request at resolve time).
         secret: secret.clone(),
         provider: provider.clone(),
         upstream_model: model.to_owned(),
@@ -271,7 +269,6 @@ fn make_candidate(
         entry_cap: entry
             .max_concurrency
             .and_then(|cap| i32::try_from(cap).ok()),
-        entry_index,
         supported_efforts: supported,
         default_effort: default,
         context_window: model_context(key, model),
@@ -317,9 +314,9 @@ mod tests {
         )
     }
 
-    fn entry(provider_id: i64, model: &str) -> RouteEntry {
+    fn entry(key_id: i64, model: &str) -> RouteEntry {
         RouteEntry {
-            provider_id,
+            key_id,
             model: model.to_owned(),
             label: None,
             max_concurrency: None,
@@ -339,49 +336,48 @@ mod tests {
             .expect("noon on a weekday is an unambiguous local time")
     }
 
-    fn ids(candidates: &[Candidate]) -> Vec<(i64, usize)> {
+    fn ids(candidates: &[Candidate]) -> Vec<i64> {
         candidates
             .iter()
-            .map(|candidate| (candidate.key.id, candidate.entry_index))
+            .map(|candidate| candidate.key.id)
+            .collect()
+    }
+
+    fn served(candidates: &[Candidate]) -> Vec<(i64, &str)> {
+        candidates
+            .iter()
+            .map(|candidate| (candidate.key.id, candidate.upstream_model.as_str()))
             .collect()
     }
 
     #[test]
-    fn expand_route_expands_every_active_key_with_its_entry_index() {
+    fn expand_route_yields_one_candidate_per_entry() {
+        // Three accounts of one provider, two entries: an entry only ever
+        // yields itself, never the provider's other accounts.
         let entries = vec![entry(1, "m"), entry(2, "n")];
-        let keys = vec![key(1, 1, None), key(2, 1, None), key(3, 2, None)];
-        let expansion = expand_route(
-            &entries,
-            keys,
-            &providers(&[provider(1, true), provider(2, true)]),
-            now(),
-        );
+        let keys = vec![key(1, 1, None), key(2, 1, None), key(3, 1, None)];
+        let expansion = expand_route(&entries, keys, &providers(&[provider(1, true)]), now());
         assert_eq!(
-            ids(&expansion.candidates),
-            vec![(1, 0), (2, 0), (3, 1)],
-            "one candidate per active key, keys keep their input order"
+            served(&expansion.candidates),
+            vec![(1, "m"), (2, "n")],
+            "one candidate per entry, each carrying its own model"
         );
         assert!(expansion.excluded.is_empty(), "nothing to exclude");
         assert_eq!(expansion.window_skipped, 0, "no availability window");
     }
 
     #[test]
-    fn expand_route_excludes_keys_whose_whitelist_lacks_the_model() {
+    fn expand_route_excludes_an_entry_whose_key_whitelist_lacks_the_model() {
         let entries = vec![entry(1, "m")];
-        let keys = vec![
-            key(1, 1, Some(&["other"])),
-            key(2, 1, Some(&["m"])),
-            key(3, 1, None),
-        ];
+        let keys = vec![key(1, 1, Some(&["other"])), key(2, 1, Some(&["m"]))];
         let expansion = expand_route(&entries, keys, &providers(&[provider(1, true)]), now());
-        assert_eq!(
-            ids(&expansion.candidates),
-            vec![(2, 0), (3, 0)],
-            "whitelist and unrestricted keys serve"
+        assert!(
+            expansion.candidates.is_empty(),
+            "the whitelisted-out entry serves nothing"
         );
-        assert_eq!(expansion.excluded.len(), 1, "one key is excluded");
+        assert_eq!(expansion.excluded.len(), 1, "one entry is excluded");
         let (excluded, reason) = &expansion.excluded[0];
-        assert_eq!(excluded.key.id, 1, "the whitelisted-out key");
+        assert_eq!(excluded.key.id, 1, "the whitelisted-out account");
         assert!(
             matches!(reason, SkipReason::ModelNotAllowed),
             "reason: {reason:?}"
@@ -389,9 +385,9 @@ mod tests {
     }
 
     #[test]
-    fn expand_route_marks_every_key_of_a_disabled_provider_disabled() {
-        let entries = vec![entry(1, "m"), entry(2, "n")];
-        let keys = vec![key(1, 1, None), key(2, 1, None), key(3, 2, None)];
+    fn expand_route_marks_an_entry_of_a_disabled_provider_disabled() {
+        let entries = vec![entry(1, "m"), entry(3, "n")];
+        let keys = vec![key(1, 1, None), key(3, 2, None)];
         let expansion = expand_route(
             &entries,
             keys,
@@ -399,27 +395,19 @@ mod tests {
             now(),
         );
         assert_eq!(
-            ids(&expansion.candidates),
-            vec![(3, 1)],
-            "only the enabled provider serves"
+            served(&expansion.candidates),
+            vec![(3, "n")],
+            "only the enabled provider's entry serves"
         );
-        assert_eq!(
-            expansion.excluded.len(),
-            2,
-            "both keys of the disabled provider"
-        );
-        for (candidate, reason) in &expansion.excluded {
-            assert!(matches!(reason, SkipReason::Disabled), "reason: {reason:?}");
-            assert_eq!(
-                candidate.entry_index, 0,
-                "excluded keys keep their entry index"
-            );
-        }
+        assert_eq!(expansion.excluded.len(), 1, "one entry is excluded");
+        let (excluded, reason) = &expansion.excluded[0];
+        assert_eq!(excluded.key.id, 1, "the disabled provider's account");
+        assert!(matches!(reason, SkipReason::Disabled), "reason: {reason:?}");
     }
 
     #[test]
     fn expand_route_counts_a_denied_window_once_per_entry() {
-        // A deny-only rule that matches every moment: 00:00–00:00 is the whole day.
+        // A deny-all rule: 00:00–00:00 covers the whole day.
         let deny = AvailabilityRule {
             window: ActiveWindow {
                 start: "00:00".to_owned(),
@@ -430,8 +418,8 @@ mod tests {
         };
         let mut denied = entry(1, "m");
         denied.rules = vec![deny];
-        let entries = vec![denied, entry(2, "n")];
-        let keys = vec![key(1, 1, None), key(2, 1, None), key(3, 2, None)];
+        let entries = vec![denied, entry(3, "n")];
+        let keys = vec![key(1, 1, None), key(3, 2, None)];
         let expansion = expand_route(
             &entries,
             keys,
@@ -439,36 +427,28 @@ mod tests {
             now(),
         );
         assert_eq!(
-            ids(&expansion.candidates),
-            vec![(3, 1)],
+            served(&expansion.candidates),
+            vec![(3, "n")],
             "the denied entry serves nothing"
         );
-        assert_eq!(
-            expansion.window_skipped, 1,
-            "one denied entry, however many keys it has"
+        assert_eq!(expansion.window_skipped, 1, "one denied entry is one skip");
+        assert_eq!(expansion.excluded.len(), 1, "the denied entry is reported");
+        let (_, reason) = &expansion.excluded[0];
+        assert!(
+            matches!(reason, SkipReason::WindowSkipped),
+            "reason: {reason:?}"
         );
-        assert_eq!(
-            expansion.excluded.len(),
-            2,
-            "both keys are reported as window-skipped"
-        );
-        for (_, reason) in &expansion.excluded {
-            assert!(
-                matches!(reason, SkipReason::WindowSkipped),
-                "reason: {reason:?}"
-            );
-        }
     }
 
     #[test]
-    fn expand_route_skips_an_entry_whose_provider_is_gone() {
+    fn expand_route_skips_a_dangling_entry_silently() {
         let entries = vec![entry(9, "m"), entry(1, "n")];
         let keys = vec![key(1, 1, None), key(2, 9, None)];
         let expansion = expand_route(&entries, keys, &providers(&[provider(1, true)]), now());
         assert_eq!(
-            ids(&expansion.candidates),
-            vec![(1, 1)],
-            "dangling provider is skipped"
+            served(&expansion.candidates),
+            vec![(1, "n")],
+            "an entry whose account is gone is skipped"
         );
         assert!(
             expansion.excluded.is_empty(),
@@ -481,43 +461,28 @@ mod tests {
     }
 
     #[test]
-    fn expand_direct_uses_a_single_entry_group() {
+    fn expand_direct_expands_the_providers_active_keys() {
         let keys = vec![key(1, 1, None), key(2, 1, Some(&["m"]))];
         let (candidates, excluded) = expand_direct(provider(1, true), keys, "m");
         assert_eq!(
             ids(&candidates),
-            vec![(1, 0), (2, 0)],
-            "direct is one group"
+            vec![1, 2],
+            "every key of the provider serves the direct model"
         );
         assert!(excluded.is_empty(), "both keys serve the model");
     }
 
     #[test]
-    fn expand_route_repeats_a_key_for_each_entry_of_its_provider() {
-        // One provider listed twice, once per model: every key of it appears
-        // once per entry, each copy tagged with its own entry's index.
+    fn expand_route_keeps_two_models_of_one_account_as_two_candidates() {
+        // One account listed twice, once per model: two independent candidates
+        // in stored order.
         let entries = vec![entry(1, "m"), entry(2, "x"), entry(1, "n")];
-        let keys = vec![key(1, 1, None), key(2, 1, None), key(3, 2, None)];
-        let expansion = expand_route(
-            &entries,
-            keys,
-            &providers(&[provider(1, true), provider(2, true)]),
-            now(),
-        );
+        let keys = vec![key(1, 1, None), key(2, 1, None)];
+        let expansion = expand_route(&entries, keys, &providers(&[provider(1, true)]), now());
         assert_eq!(
-            ids(&expansion.candidates),
-            vec![(1, 0), (2, 0), (3, 1), (1, 2), (2, 2)],
-            "each entry of the provider gets its own copy of every key"
-        );
-        let models: Vec<&str> = expansion
-            .candidates
-            .iter()
-            .map(|candidate| candidate.upstream_model.as_str())
-            .collect();
-        assert_eq!(
-            models,
-            vec!["m", "m", "x", "n", "n"],
-            "each copy carries its own entry's model"
+            served(&expansion.candidates),
+            vec![(1, "m"), (2, "x"), (1, "n")],
+            "one candidate per entry, in stored order"
         );
     }
 
@@ -527,7 +492,7 @@ mod tests {
         let (candidates, excluded) = expand_direct(provider(1, true), keys, "m");
         assert_eq!(
             ids(&candidates),
-            vec![(2, 0)],
+            vec![2],
             "only the unrestricted key serves"
         );
         assert_eq!(excluded.len(), 1, "one key is excluded");

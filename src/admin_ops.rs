@@ -245,8 +245,8 @@ pub async fn create_key(
     }
 }
 
-/// Delete a key row. Route entries reference the provider, so routes are
-/// untouched.
+/// Delete a key row (this account's route entries are stripped in the same
+/// transaction).
 /// Returns the deleted row's `auth_kind` (None = no such row), which the caller
 /// uses to evict the per-key token cache that credential owned.
 pub async fn delete_key(

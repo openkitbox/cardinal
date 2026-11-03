@@ -23,10 +23,10 @@
 //! - `PUT /api/keys/order` `{ids: [..]}` — assign global positions sequentially in array order (one transaction)
 //! - `POST /api/keys/validate` `{name, protocol, base_url, auth_scheme?, enabled?, api_key}` — probe a not-yet-saved credential
 //! - `GET/PUT /api/keys/:id/models` — a key's model list: GET re-probes the provider, PUT persists a list as the snapshot
-//! - `GET /api/routes`, `GET/PUT/DELETE /api/routes/:alias` — route = named list of (provider, model) entries exposed to clients
-//!   as a model id; each entry expands to the provider's active keys at dispatch;
-//!   PUT body `{entries: [{provider_id, model}], context_window?, strategy?}` (`strategy` = `ordered`|`smart`|`rotate`, absent = `ordered`;
-//!   400 when the body is malformed, a referenced provider does not exist, or a (provider, model) pair repeats). PUT is a full
+//! - `GET /api/routes`, `GET/PUT/DELETE /api/routes/:alias` — route = named list of (account, model) entries exposed to clients
+//!   as a model id; each entry names one account (`gateway_provider_keys` row) and the model it serves;
+//!   PUT body `{entries: [{key_id, model}], context_window?, strategy?}` (`strategy` = `ordered`|`smart`|`rotate`, absent = `ordered`;
+//!   400 when the body is malformed, a referenced key does not exist, or a (key, model) pair repeats). PUT is a full
 //!   replace: a strategy-preserving client MUST send it back, or the save resets to `ordered`
 //! - `GET /api/rests`, `DELETE /api/rests/keys/:key_id`, `DELETE /api/rests/providers/:provider_id` — cooldowns, identity = key
 //! - `GET /api/usage?days=N` (aggregated by day × alias; `key_id` restricts to one gateway key, `caller=null` = unidentified,

@@ -135,26 +135,46 @@ impl RouteCache {
         self.inner.read().ok()?.providers_by_name.get(name).cloned()
     }
 
-    /// Every ACTIVE key (enabled, not archived) of the given providers, in
-    /// each provider's (position, id) order, cloned under one lock. Dispatch
-    /// resolves a whole route's entries from this, so an archived or disabled
-    /// account never reaches the candidate set.
-    pub fn active_keys_for_providers(&self, provider_ids: &[i64]) -> Vec<ProviderKeyRow> {
+    /// Every key of one provider in the provider's (position, id) order,
+    /// cloned under one lock. Used by the direct `provider/model` path, which
+    /// deliberately serves every account of the provider.
+    pub fn keys_for_provider(&self, provider_id: i64) -> Vec<ProviderKeyRow> {
         let inner = match self.inner.read() {
             Ok(inner) => inner,
             Err(_) => return Vec::new(),
         };
-        let mut rows: Vec<ProviderKeyRow> = Vec::new();
-        for id in provider_ids {
-            if let Some(keys) = inner.keys_by_provider.get(id) {
-                rows.extend(keys.iter().filter(|key| key.active()).cloned());
-            }
-        }
-        rows
+        inner
+            .keys_by_provider
+            .get(&provider_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn route_by_alias(&self, alias: &str) -> Option<RouteRow> {
         self.inner.read().ok()?.routes_by_alias.get(alias).cloned()
+    }
+
+    /// The keys named by `ids`, in (position, id) order, cloned under one lock.
+    /// Dispatch resolves a whole route's entries from this: a route entry is
+    /// one account, so the caller collects `entry.key_id` and gets the rows
+    /// back in the store's global order (ids missing from the cache — a
+    /// dangling entry — are simply absent).
+    ///
+    /// The order is kept for determinism, not because today's caller reads it:
+    /// route expansion re-indexes the rows by id, since the entries' own order
+    /// is the dispatch order. Sorting a handful of rows costs less than a
+    /// lookup whose output depends on hash iteration.
+    pub fn keys_by_ids(&self, ids: &[i64]) -> Vec<ProviderKeyRow> {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        let mut rows: Vec<ProviderKeyRow> = ids
+            .iter()
+            .filter_map(|id| inner.keys_by_id.get(id).cloned())
+            .collect();
+        rows.sort_by_key(|k| (k.position, k.id));
+        rows
     }
 
     pub fn providers_by_ids(&self, ids: &[i64]) -> Vec<ProviderRow> {
@@ -192,8 +212,9 @@ impl RouteCache {
             .map(|route| {
                 let chat_capable = route.entries.iter().any(|entry| {
                     inner
-                        .providers_by_id
-                        .get(&entry.provider_id)
+                        .keys_by_id
+                        .get(&entry.key_id)
+                        .and_then(|key| inner.providers_by_id.get(&key.provider_id))
                         .is_some_and(chat_capable)
                 });
                 (route.clone(), chat_capable)
@@ -320,17 +341,22 @@ impl RouteCache {
         }
         for route in &inner.all_routes {
             for entry in &route.entries {
-                // One slot per entry, shared by every key of the provider.
-                let Some(provider) = inner.providers_by_id.get(&entry.provider_id) else {
+                // One slot per entry: (route, account, model), the entry's own
+                // identity. An inactive account or a disabled provider serves
+                // nothing, so it needs no cap entry.
+                let Some(key) = inner.keys_by_id.get(&entry.key_id) else {
                     continue;
                 };
-                if !provider.enabled {
+                let Some(provider) = inner.providers_by_id.get(&key.provider_id) else {
+                    continue;
+                };
+                if !key.active() || !provider.enabled {
                     continue;
                 }
                 caps.push((
                     crate::relay::dispatcher::entry_slot_key(
                         &route.alias,
-                        entry.provider_id,
+                        entry.key_id,
                         &entry.model,
                     ),
                     entry
@@ -378,10 +404,10 @@ fn chat_capable(provider: &ProviderRow) -> bool {
 /// keys are not part of their provider and disabled keys serve nothing, so
 /// neither may void or narrow a route's derived /v1/models attributes.
 ///
-/// Replicates [`crate::store::list_all_key_models`]: SELECT k.id, k.provider_id,
-/// k.models, k.allowed_models FROM gateway_provider_keys k JOIN gateway_providers p
-/// ON p.id = k.provider_id WHERE p.enabled AND k.enabled AND k.archived_at IS NULL
-/// ORDER BY k.id
+/// Replicates [`crate::store::list_all_key_models`] intersected with the
+/// enabled-provider filter: SELECT k.id, k.models, k.allowed_models
+/// FROM gateway_provider_keys k JOIN gateway_providers p ON p.id = k.provider_id
+/// WHERE p.enabled AND k.enabled AND k.archived_at IS NULL ORDER BY k.id
 fn servable_key_models<'a>(
     keys: impl Iterator<Item = &'a ProviderKeyRow>,
     providers: &HashMap<i64, ProviderRow>,
@@ -391,7 +417,6 @@ fn servable_key_models<'a>(
         .filter(|k| providers.get(&k.provider_id).is_some_and(|p| p.enabled))
         .map(|k| KeyModels {
             id: k.id,
-            provider_id: k.provider_id,
             models: k.models.clone(),
             allowed_models: k.allowed_models.clone(),
         })

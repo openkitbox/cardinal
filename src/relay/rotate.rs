@@ -1,10 +1,10 @@
 //! Round-robin cursor for Rotate route ordering.
 //!
-//! Rotate cycles through route ENTRY GROUPS: each dispatch starts from the
-//! entry after the last one served (keys inside an entry are still ranked by
-//! quota — see `route_order`). The cursor
-//! is a per-alias `AtomicUsize` — one `fetch_add` on the request path, no
-//! lock held, no allocation, no deep copy.
+//! A route expands to ONE CANDIDATE PER ENTRY (one account × one model), so
+//! Rotate cycles through that ready candidate list: each dispatch starts from
+//! the candidate after the last one served (see `relay::order_ready`). The
+//! cursor is a per-alias `AtomicUsize` — one `fetch_add` on the request path,
+//! no lock held, no allocation, no deep copy.
 //!
 //! Ownership: one instance on `Core`, shared with relay via `DispatchDeps`.
 //! Unlike `SmartCache` (a read-mostly store refreshed by a background prober),
@@ -27,7 +27,7 @@ impl RotateCursors {
     }
 
     /// Advance the cursor for `alias` and return the previous value.
-    /// The caller mods by the current ready group count, so membership changes
+    /// The caller mods by the current ready candidate count, so membership changes
     /// (keys added/removed/rested) can never overflow into a panic.
     pub fn next(&self, alias: &str) -> usize {
         self.inner

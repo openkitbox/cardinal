@@ -12,8 +12,10 @@ pub struct ProviderKeyRow {
     pub id: i64,
     pub provider_id: i64,
     pub label: String,
-    /// The row-stored plaintext credential (0013). NULL = not entered yet;
-    /// the relay skips such rows with a warning.
+    /// The row-stored plaintext credential, for `auth_kind = 'static'` rows.
+    /// NULL on an OAuth row (`kiro_oidc`, `opencode_oauth`) by constraint — its
+    /// credential lives in `oauth`, and the relay resolves it by `auth_kind`
+    /// instead; only a `static` row with no key is skipped with a warning.
     pub api_key: Option<String>,
     pub enabled: bool,
     /// Single global ordering across all providers (app-maintained).
@@ -218,15 +220,16 @@ pub async fn list_all_keys(pool: &PgPool) -> anyhow::Result<Vec<ProviderKeyRow>>
     Ok(rows)
 }
 
-/// The (key id, provider id, model snapshot) rows the /v1/models route-object
-/// derivation needs — nothing else: no api_key plaintext, no concurrency
-/// lookups. Route entries name a provider, so keys are matched by provider.
-/// Only active keys of enabled providers are listed: an archived or disabled
-/// key serves nothing, so it must not void or narrow a route's attributes.
+/// The (key id, model snapshot) rows the /v1/models route-object derivation
+/// needs — nothing else: no api_key plaintext, no concurrency lookups. Route
+/// entries name one account each, so keys are matched by id.
+/// Only enabled, unarchived keys are listed: a disabled or archived account
+/// serves nothing, so it must not void or narrow a route's derived attributes.
+/// (The live `/v1/models` path is `relay::route_cache::servable_key_models`,
+/// which additionally requires the provider to be enabled.)
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct KeyModels {
     pub id: i64,
-    pub provider_id: i64,
     #[sqlx(json(nullable))]
     pub models: Option<Vec<ProbeModel>>,
     /// The key's model whitelist (NULL/empty = every model). The /v1/models
@@ -238,10 +241,9 @@ pub struct KeyModels {
 
 pub async fn list_all_key_models(pool: &PgPool) -> anyhow::Result<Vec<KeyModels>> {
     let rows = sqlx::query_as::<_, KeyModels>(
-        "SELECT k.id, k.provider_id, k.models, k.allowed_models FROM gateway_provider_keys k
-     JOIN gateway_providers p ON p.id = k.provider_id
-     WHERE p.enabled AND k.enabled AND k.archived_at IS NULL
-     ORDER BY k.id",
+        "SELECT id, models, allowed_models FROM gateway_provider_keys
+     WHERE enabled AND archived_at IS NULL
+     ORDER BY id",
     )
     .fetch_all(pool)
     .await?;
@@ -274,7 +276,9 @@ pub async fn list_enabled_key_models(pool: &PgPool) -> anyhow::Result<Vec<Enable
     Ok(rows)
 }
 
-/// Keys by id (route expansion), in global (position, id) order.
+/// Keys by id, in global (position, id) order — the admin's single-account
+/// lookups. Route expansion reads the in-memory snapshot instead
+/// (`relay::route_cache::RouteCache::keys_by_ids`).
 pub async fn list_keys_by_ids(pool: &PgPool, ids: &[i64]) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
     "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
@@ -1017,11 +1021,10 @@ pub async fn key_api_key(
     Ok(reference.flatten())
 }
 
-/// Delete a key row, returning the deleted row's `auth_kind` (None = no such
-/// row). Callers evict the per-key runtime state that credential owned — the
-/// Kiro token cache for `kiro_oidc`, the OpenCode one for `opencode_oauth`.
-///
-/// Route entries reference the provider, so routes are left as they are.
+/// Delete a key row and strip it out of every route in the same transaction,
+/// returning the deleted row's `auth_kind` (None = no such row). Callers evict
+/// the per-key runtime state that credential owned — the Kiro token cache for
+/// `kiro_oidc`, the OpenCode one for `opencode_oauth`.
 pub async fn delete_provider_key(
     pool: &PgPool,
     provider_id: i64,
@@ -1032,8 +1035,6 @@ pub async fn delete_provider_key(
         .bind(provider_id)
         .fetch_optional(&mut *tx)
         .await?;
-    // Routes reference providers, not keys: deleting a key leaves every route
-    // untouched (its provider's other keys keep serving the entry).
     let deleted: Option<(String,)> = sqlx::query_as(
         "DELETE FROM gateway_provider_keys
          WHERE id = $1 AND provider_id = $2
@@ -1043,6 +1044,9 @@ pub async fn delete_provider_key(
     .bind(provider_id)
     .fetch_optional(&mut *tx)
     .await?;
+    if deleted.is_some() {
+        super::route::strip_entries_of_keys(&mut tx, std::slice::from_ref(&key_id)).await?;
+    }
     tx.commit().await?;
     Ok(deleted.map(|(auth_kind,)| auth_kind))
 }
@@ -1050,9 +1054,9 @@ pub async fn delete_provider_key(
 /// Reorder keys globally: `ids` must list every key exactly once (full-list contract keeps the
 /// single-global-ordering invariant intact); positions are assigned 0..n in array order.
 ///
-/// `position` is now only the deterministic tiebreak for a provider's key expansion order inside
-/// a route entry; dispatch order is decided by smart quota ranking (`relay::smart`). The GUI
-/// reorders through this endpoint again — by dragging account cards, in its 「全部」 view only.
+/// `position` is the account order the GUI and the direct `provider/model` picker show, and the
+/// tiebreak when a provider's keys are listed together. The GUI reorders through this endpoint — by
+/// dragging account cards, in its 「全部」 view only.
 pub async fn reorder_keys(pool: &PgPool, ids: &[i64]) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('gateway_provider_keys.position'))")
@@ -1086,21 +1090,22 @@ pub async fn reorder_keys(pool: &PgPool, ids: &[i64]) -> anyhow::Result<()> {
 
 // ---------- availability rules (route entry scheduling) ----------
 
-/// One route entry: a provider plus the upstream model it should serve. At
-/// dispatch the entry expands to every active key of that provider. Identity
-/// is (route, provider, model): the same provider may appear several times
-/// with different models, never twice with the same model. `label` is an
-/// optional display name — clients and the GUI show the model id when it is
-/// unset.
+/// One route entry: a single account (one `gateway_provider_keys` row) plus the
+/// upstream model that account should serve, so an operator picks which account
+/// runs which model. Identity is (route, key, model): the same account may
+/// appear several times with different models, never twice with the same model.
+/// `label` is an optional display name — clients and the GUI show the model id
+/// when it is unset.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RouteEntry {
-    pub provider_id: i64,
+    pub key_id: i64,
     pub model: String,
     #[serde(default)]
     pub label: Option<String>,
-    /// Total concurrency of this provider on this route (None = unlimited at
-    /// the entry level; each key's own cap still applies). All of the
-    /// provider's keys share one slot, identified by (route, provider, model).
+    /// This account's concurrency cap on this route and model (None = unlimited
+    /// at the entry level; the key's own cap still applies). The slot is
+    /// identified by (route, key, model), so the same account carries an
+    /// independent cap per route and per model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<i64>,
     /// Ordered availability rules (first match wins, top to bottom). A matched
@@ -1246,22 +1251,22 @@ impl ActiveWindow {
     }
 }
 
-/// How a route orders its entries at dispatch. Each entry expands to its
-/// provider's active keys, and the keys inside one entry are always ranked by
-/// quota surplus (`relay::smart`); the strategy only orders the entries:
-/// `ordered` keeps the stored order, `rotate` round-robins over entries,
-/// `smart` ranks every key of every entry globally by quota surplus.
+/// How a route orders its entries at dispatch. One entry is one candidate
+/// (account × model), so the strategy is the whole ordering: `ordered` keeps the
+/// stored order (first live candidate wins), `rotate` round-robins over the
+/// ready candidates, `smart` ranks candidates by quota surplus
+/// (`relay::smart`; an empty snapshot set degrades to stored order).
 /// Serialized snake_case on the wire; rows written before the strategy column existed (and old
 /// clients omitting the field) deserialize as [`RouteStrategy::Ordered`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteStrategy {
-    /// Entries in stored order; keys inside each entry by quota.
+    /// Dispatch walks entries in stored order, first live candidate wins.
     #[default]
     Ordered,
-    /// Every key of every entry ranked globally by quota surplus.
+    /// Ready candidates ranked globally by quota surplus.
     Smart,
-    /// Entries round-robin per request; keys inside each entry by quota.
+    /// Ready candidates round-robin per request, ignoring quota/balance.
     Rotate,
 }
 
@@ -1366,38 +1371,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_entry_round_trips_provider_id() {
-        let json =
-            serde_json::json!({"provider_id": 10, "model": "deepseek-v4.1-flash", "label": null});
-        let entry: RouteEntry = serde_json::from_value(json).expect("provider_id entry parses");
-        assert_eq!(
-            entry.provider_id, 10,
-            "provider id lost in parse: {entry:?}"
-        );
+    fn route_entry_round_trips_key_id() {
+        let json = serde_json::json!({"key_id": 10, "model": "deepseek-v4.1-flash", "label": null});
+        let entry: RouteEntry = serde_json::from_value(json).expect("key_id entry parses");
+        assert_eq!(entry.key_id, 10, "key id lost in parse: {entry:?}");
         assert_eq!(
             entry.model, "deepseek-v4.1-flash",
             "model lost in parse: {entry:?}"
         );
         let back = serde_json::to_value(&entry).expect("entry serializes");
         assert_eq!(
-            back["provider_id"], 10,
-            "serialized form must carry provider_id: {back}"
+            back["key_id"], 10,
+            "serialized form must carry key_id: {back}"
         );
         assert!(
-            back.get("key_id").is_none(),
-            "serialized form must not carry key_id: {back}"
+            back.get("provider_id").is_none(),
+            "serialized form must not carry provider_id: {back}"
         );
         let again: RouteEntry = serde_json::from_value(back).expect("round trip parses");
         assert_eq!(again, entry, "round trip changed the entry");
     }
 
     #[test]
-    fn route_entry_without_provider_id_is_rejected() {
-        let json = serde_json::json!({"key_id": 10, "model": "deepseek-v4.1-flash"});
+    fn route_entry_without_key_id_is_rejected() {
+        let json = serde_json::json!({"provider_id": 10, "model": "deepseek-v4.1-flash"});
         let parsed: Result<RouteEntry, _> = serde_json::from_value(json);
         assert!(
             parsed.is_err(),
-            "a key_id-only entry must not parse: {parsed:?}"
+            "a provider_id-only entry must not parse: {parsed:?}"
         );
     }
 }

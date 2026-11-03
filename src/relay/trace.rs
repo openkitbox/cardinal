@@ -1,6 +1,12 @@
 //! Routing trace: records the full decision context of each dispatch —
 //! which candidates were available, which were skipped and why, and which
 //! was selected. Stored in a ring buffer for the admin API and GUI.
+//!
+//! A route yields ONE CANDIDATE PER ENTRY (one account × one model), so a
+//! trace row is that entry: the same account shows up once per model it serves.
+//! `relay::order_ready` has already applied the route's strategy to the list by
+//! the time it is traced (the direct `provider/model` path is always ranked by
+//! quota — plan D5), and `smart_reason` is the verdict computed there.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

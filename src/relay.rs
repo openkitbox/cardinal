@@ -13,7 +13,6 @@ mod price_cache;
 mod rest_cache;
 mod rotate;
 mod route_cache;
-mod route_order;
 mod smart;
 pub mod smart_cache;
 mod streaming;
@@ -979,10 +978,9 @@ fn prepare_translated(
 /// Two ways to call:
 /// - `"<provider_name>/<upstream_model>"` whose prefix names an ENABLED provider → that provider's
 ///   enabled keys in global (position, id) order, all serving the suffix model (direct path);
-/// - otherwise the string is looked up as a route alias → every active key of
-///   each entry's provider, entries in the route's STORED order (the
-///   user-arranged GUI order), each entry carrying its own upstream model
-///   (route path).
+/// - otherwise the string is looked up as a route alias → one candidate per
+///   entry in the route's STORED order (the user-arranged GUI order), each
+///   entry carrying its own account and upstream model (route path).
 enum Resolution {
     /// alias = Some(route) on the route path, None on the direct path.
     /// `window_skipped` counts route entries filtered out by their active
@@ -994,9 +992,11 @@ enum Resolution {
     /// window-denied entries, model-not-allowed) with their skip reasons.
     Candidates {
         alias: Option<String>,
-        /// The route's strategy on the route path. Direct `provider/model`
-        /// resolution is always Smart over its single entry group: the
-        /// provider's keys are ranked by quota like any entry's keys.
+        /// The route's strategy on the route path: it orders the candidate list
+        /// (one candidate per entry). Direct `provider/model` resolution is
+        /// always Smart, a deliberate exception (plan D5): its keys are
+        /// interchangeable routes to one model, so ranking them by quota beats
+        /// always taking the first account by position.
         strategy: store::RouteStrategy,
         candidates: Vec<candidates::Candidate>,
         /// Candidates excluded during expansion, with the reason.
@@ -1029,12 +1029,16 @@ enum Resolution {
 /// A row missing the credential its `auth_kind` requires is dropped from
 /// candidacy with a warning — never cooled, since a missing credential is not an
 /// upstream failure.
+///
+/// Inactive rows (disabled or archived) are deliberately NOT dropped here: the
+/// expansion decides that, so a route entry naming a disabled account is
+/// reported as `SkipReason::Disabled` instead of vanishing as a dangling entry.
 fn fetch_key_secrets(
     keys: Vec<crate::store::ProviderKeyRow>,
 ) -> (Vec<(crate::store::ProviderKeyRow, SecretString)>, usize) {
     let mut resolved = Vec::with_capacity(keys.len());
     let mut skipped = 0usize;
-    for key in keys.into_iter().filter(|key| key.active()) {
+    for key in keys {
         if key.auth_kind == "kiro_oidc" {
             if key.kiro_oauth().is_some() {
                 resolved.push((key, SecretString::from(String::new())));
@@ -1082,11 +1086,17 @@ fn resolve(
         if let Some(provider) = route_cache.provider_by_name(prefix)
             && provider.enabled
         {
-            let keys = route_cache.active_keys_for_providers(&[provider.id]);
+            let keys = route_cache.keys_for_provider(provider.id);
             let (keys, secret_skipped) = fetch_key_secrets(keys);
             let (candidates, excluded) = candidates::expand_direct(provider, keys, upstream_model);
             return Ok(Resolution::Candidates {
                 alias: None,
+                // Deliberate (plan D5): direct `provider/model` stays
+                // quota-ranked even though route entries are per account
+                // again. These keys are interchangeable routes to ONE model,
+                // so stored position ordering would pin a multi-account
+                // provider to its first account forever; position only breaks
+                // quota ties inside `smart::order`.
                 strategy: store::RouteStrategy::Smart,
                 candidates,
                 excluded,
@@ -1100,14 +1110,19 @@ fn resolve(
     }
     match route_cache.route_by_alias(model) {
         Some(route) => {
-            let mut provider_ids: Vec<i64> = Vec::new();
-            for entry in &route.entries {
-                if !provider_ids.contains(&entry.provider_id) {
-                    provider_ids.push(entry.provider_id);
-                }
-            }
-            let keys = route_cache.active_keys_for_providers(&provider_ids);
+            // One candidate per entry: each entry names its own account, so
+            // the key set is just the entries' key ids (dangling ids drop out).
+            // Deduped: one account serving several models on this route is the
+            // normal case, and the cache would clone its row and secret once per
+            // entry before expansion discards all but one.
+            let mut key_ids: Vec<i64> = route.entries.iter().map(|entry| entry.key_id).collect();
+            key_ids.sort_unstable();
+            key_ids.dedup();
+            let keys = route_cache.keys_by_ids(&key_ids);
             let (keys, secret_skipped) = fetch_key_secrets(keys);
+            let mut provider_ids: Vec<i64> = keys.iter().map(|(key, _)| key.provider_id).collect();
+            provider_ids.sort_unstable();
+            provider_ids.dedup();
             let providers = route_cache
                 .providers_by_ids(&provider_ids)
                 .into_iter()
@@ -1570,13 +1585,29 @@ pub struct DispatchDeps<'a> {
     pub server_stopped: &'a tokio_util::sync::CancellationToken,
 }
 
+/// The verdict reason per READY candidate, position-aligned with the ordered
+/// ready list the dispatch loop walks (the resting tail is chained after it, so
+/// a resting candidate lands past the end and reads as "no reason", never as
+/// its ready sibling's verdict). Position, not key id, is the identity: a route
+/// may hang several models on one account, and each entry is its own candidate
+/// with its own verdict.
+type VerdictReasons = Vec<String>;
+
 /// Order the ready partition per the route's strategy and compute each
-/// candidate's verdict reason. Every strategy ranks the keys inside one entry
-/// group by quota; the strategy only orders the groups themselves (Ordered:
-/// stored order, Rotate: cursor over groups, Smart: global). The in-memory
-/// snapshot cache is read once (no PG round-trip); an empty cache degrades to
-/// stored order with a debug log — dispatch must NEVER fail because of quota
-/// lookups. [`route_order`] owns the computation; this is only the wiring.
+/// candidate's verdict reason:
+/// - `Ordered` keeps the stored order (the user-arranged GUI order);
+/// - `Rotate` moves the whole list around the per-alias cursor — a no-op below
+///   two ready candidates, and a no-op must not consume a tick;
+/// - `Smart` ranks the whole list by quota surplus (`smart::order`).
+///
+/// The snapshot cache is read once and only BORROWED (`with_snapshots`, no
+/// clone); an empty cache degrades to the stored order with a debug log —
+/// dispatch must NEVER fail because of quota lookups.
+///
+/// Every strategy reports the quota reason of each candidate, because the feed
+/// shows it: `Smart` gets the reasons from its ranking (computed once, moved
+/// alongside), the stored-order strategies get the same verdicts in their final
+/// order (`smart::verdicts`, no ranking side effect).
 fn order_ready(
     smart_cache: &smart_cache::SmartCache,
     rotate_cursors: &rotate::RotateCursors,
@@ -1584,25 +1615,64 @@ fn order_ready(
     alias: Option<&str>,
     ready: Vec<candidates::Candidate>,
     now: chrono::DateTime<chrono::Utc>,
-) -> (Vec<candidates::Candidate>, route_order::VerdictReasons) {
-    // Direct `provider/model` resolution has no alias and is one Smart group,
-    // so it never reaches the cursor; the closure stays total regardless.
-    let rotate_start = |_groups: usize| alias.map_or(0, |alias| rotate_cursors.next(alias));
+) -> (Vec<candidates::Candidate>, VerdictReasons) {
     smart_cache.with_snapshots(|quotas| {
         if quotas.is_empty() {
             // Not a warning: the prober may not have run yet, and many healthy
             // keys legitimately carry no snapshot.
             tracing::debug!(
                 route = alias.unwrap_or(""),
-                "no quota snapshots yet; keys keep their stored order"
+                "no quota snapshots yet; no quota verdict this dispatch"
             );
         }
-        route_order::order_groups(strategy, ready, quotas, rotate_start, now)
+        let (ready, ranked_reasons) = match strategy {
+            store::RouteStrategy::Smart if !quotas.is_empty() => {
+                let (ordered, reasons): (Vec<_>, VerdictReasons) = smart::order(ready, quotas, now)
+                    .into_iter()
+                    .map(|(candidate, verdict)| (candidate, verdict.reason))
+                    .unzip();
+                (ordered, Some(reasons))
+            }
+            store::RouteStrategy::Rotate => (rotate_ready(ready, rotate_cursors, alias), None),
+            // Ordered, and Smart with no snapshot to rank by.
+            _ => (ready, None),
+        };
+        let reasons = match ranked_reasons {
+            Some(reasons) => reasons,
+            // Nothing to report without snapshots; an empty list reads as "no
+            // verdict", never as a stale sibling's reason.
+            None if quotas.is_empty() => VerdictReasons::new(),
+            None => smart::verdicts(&ready, quotas, now),
+        };
+        (ready, reasons)
     })
 }
 
+/// Rotate: start the ready list after the candidate that served last. A no-op
+/// below two candidates must not advance the cursor (it would only cause a skip
+/// once a second candidate becomes ready again). Pure apart from the cursor's
+/// `fetch_add`.
+fn rotate_ready(
+    mut ready: Vec<candidates::Candidate>,
+    rotate_cursors: &rotate::RotateCursors,
+    alias: Option<&str>,
+) -> Vec<candidates::Candidate> {
+    // Direct `provider/model` has no alias and is never Rotate; the guard keeps
+    // this total.
+    let Some(alias) = alias else {
+        return ready;
+    };
+    let len = ready.len();
+    if len < 2 {
+        return ready;
+    }
+    let start = rotate_cursors.next(alias) % len;
+    ready.rotate_left(start);
+    ready
+}
+
 /// Orchestration core: model resolution → candidate expansion (ready first, resting last) → strategy ordering
-/// (entry groups ordered by the route strategy, keys inside a group by quota) → ordered
+/// (the route's strategy orders the ready candidates; Smart ranks them by quota) → ordered
 /// attempts → accounting and persistence.
 ///
 /// Shared by the /v1/chat/completions, /v1/messages and /v1/responses HTTP handlers.
@@ -1880,11 +1950,11 @@ pub async fn dispatch_at(
             "candidate resting, deferred behind ready keys"
         );
     }
-    // Order the READY partition: strategy across entry groups, quota within.
-    // Dispatch must never fail because of a quota lookup: when no snapshots
-    // exist yet (or the cache lock is poisoned) the keys keep their stored
-    // order for this request — `order_ready` logs the empty cache at debug,
-    // and the cache warns on a poisoned lock.
+    // Order the READY partition by the route's strategy (one candidate per
+    // entry). Dispatch must never fail because of a quota lookup: when no
+    // snapshots exist yet (or the cache lock is poisoned) the candidates keep
+    // their stored order for this request — `order_ready` logs the empty cache
+    // at debug, and the cache warns on a poisoned lock.
     let (ready, reasons) = order_ready(
         smart_cache,
         rotate_cursors,
@@ -1949,8 +2019,8 @@ pub async fn dispatch_at(
     // key id and the route-entry identity, so it never holds the candidates
     // (an Arc<[Candidate]> here would deep-clone every SecretString into the
     // pending queue). The entry-slot hash mirrors the route entry identity:
-    // provider id + upstream model + route alias, so every key of one
-    // provider shares the entry's slot.
+    // key id + upstream model + route alias — one slot per account, route and
+    // model.
     let slot_keys: Vec<(SlotKey, Option<SlotKey>)> = candidates
         .iter()
         .map(|c| {
@@ -1958,7 +2028,7 @@ pub async fn dispatch_at(
             let entry_slot = c
                 .route_alias
                 .as_deref()
-                .map(|alias| dispatcher::entry_slot_key(alias, c.provider.id, &c.upstream_model));
+                .map(|alias| dispatcher::entry_slot_key(alias, c.key.id, &c.upstream_model));
             (key_slot, entry_slot)
         })
         .collect();
