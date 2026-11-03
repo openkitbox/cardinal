@@ -41,7 +41,10 @@ pub struct ProbeModel {
     /// Longest reply in tokens (`max_output_tokens`).
     #[serde(default)]
     pub max_output: Option<u64>,
-    /// Non-text input modalities (`image`, `audio`, …).
+    /// Non-text input modalities, coarsened to the media family (`image`,
+    /// `audio`, `video`, `pdf`, …). Vendors name them inconsistently — Kiro
+    /// says `IMAGE`, OpenCode lists MIME types (`image/jpeg`) — so the parsed
+    /// kind, not the wire token, is what a snapshot stores and a UI shows.
     #[serde(default)]
     pub input_modalities: Vec<String>,
     /// Reasoning effort levels the list says the model takes.
@@ -236,6 +239,50 @@ async fn read_bounded(response: reqwest::Response) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// Coarsen one vendor modality token to its media family.
+///
+/// Callers act on "can this model take an image?", never on the concrete MIME
+/// type, and the list shapes differ: Kiro publishes `IMAGE`, OpenCode publishes
+/// MIME types (`image/jpeg`, `application/pdf`), OpenRouter publishes families
+/// already. Keeping the wire token verbatim made every UI chip that lists a
+/// model's inputs dozens of words long, so the family is the stored unit. An
+/// unknown family is kept as-is rather than dropped — silently hiding a
+/// capability is worse than an unexpected label.
+fn coarse_modality(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() || value == "text" {
+        return None;
+    }
+    let family = value
+        .split_once('/')
+        .map_or(value.as_str(), |(family, _)| family);
+    let coarse = match family {
+        "image" | "audio" | "video" => family.to_owned(),
+        // Documents arrive as `application/pdf`; the family alone ("application")
+        // says nothing, so the subtype is the honest unit here.
+        "application" => value
+            .split_once('/')
+            .map_or_else(|| family.to_owned(), |(_, subtype)| subtype.to_owned()),
+        _ => family.to_owned(),
+    };
+    Some(coarse)
+}
+
+/// Normalize a vendor modality list: text dropped, families coarsened, first
+/// occurrence wins (duplicates across MIME types collapse to one badge).
+fn normalize_modalities(values: Vec<String>) -> Vec<String> {
+    let mut normalized: Vec<String> = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(coarse) = coarse_modality(&value) else {
+            continue;
+        };
+        if !normalized.contains(&coarse) {
+            normalized.push(coarse);
+        }
+    }
+    normalized
+}
+
 /// Parse both wire shapes a model list comes in: OpenAI's `{"data": [...]}`
 /// and the `{"models": [...]}` flavour (Gemini/Anthropic); the id is `id` or
 /// `name` (a Gemini `models/<id>` name is stripped to the id). Blank ids are
@@ -349,14 +396,13 @@ fn parse_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
                 .max_output_tokens
                 .or(entry.output_token_limit)
                 .and_then(token_count);
-            let mut input_modalities: Vec<String> = entry
-                .modalities
-                .map(|m| m.input)
-                .or(entry.input_modalities)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|input| input != "text")
-                .collect();
+            let mut input_modalities = normalize_modalities(
+                entry
+                    .modalities
+                    .map(|m| m.input)
+                    .or(entry.input_modalities)
+                    .unwrap_or_default(),
+            );
             if entry.kind.as_deref() == Some("image")
                 && !input_modalities.iter().any(|input| input == "image")
             {
@@ -518,12 +564,7 @@ fn parse_kiro_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
             if id.is_empty() {
                 return None;
             }
-            let input_modalities = entry
-                .supported_input_types
-                .into_iter()
-                .map(|kind| kind.trim().to_ascii_lowercase())
-                .filter(|kind| !kind.is_empty() && kind != "text")
-                .collect();
+            let input_modalities = normalize_modalities(entry.supported_input_types);
             let limits = entry.token_limits;
             Some(ProbeModel {
                 id,
