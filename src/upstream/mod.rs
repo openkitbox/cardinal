@@ -10,6 +10,8 @@
 
 pub(crate) mod dns;
 pub mod kiro_tokens;
+pub mod opencode_tokens;
 pub mod transport;
 
 pub use kiro_tokens::{KiroCallContext, KiroProbeCredential, KiroTokenError, KiroTokens};
+pub use opencode_tokens::{OpencodeTokenError, OpencodeTokens};

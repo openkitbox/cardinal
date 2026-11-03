@@ -23,6 +23,9 @@ pub use dispatcher::{
     Assignment, CandidateCaps, CandidateState, DispatchDecision, DispatchEvent, DispatchRequest,
     SlotGuard, SlotKey,
 };
+// The one dialect predicate read outside this module: the OpenCode login flow
+// refuses a provider whose host the console's tokens could not be minted for.
+pub(crate) use dialects::is_opencode_upstream;
 pub use failover::Failover;
 pub use ledger_writer::{LedgerWriter, LedgerWriterHandle};
 pub use price_cache::{PriceCache, PriceInput};
@@ -43,11 +46,13 @@ use crate::activity::{ActivitySink, EndMetrics, EndStatus};
 use crate::billing;
 use crate::body_log::{BodyLog, CapturedBodies, CapturedBody};
 use crate::metering::UsageCertainty;
+use crate::opencode::OpencodeOAuth;
 use crate::protocol::{self, ProtocolError, TargetView};
 use crate::store::{self, AttemptLog};
 use crate::translation;
 use crate::translation::ir::Effort;
 use crate::upstream::kiro_tokens::{self, KiroCallContext, KiroTokens};
+use crate::upstream::opencode_tokens::OpencodeTokens;
 use crate::upstream::transport::{self, Transport};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,7 +68,7 @@ fn next_dispatch_event_id() -> u64 {
 
 use dialects::{
     ChatFixups, conversation_seed, fill_missing_reasoning, fill_missing_reasoning_pending,
-    is_deepseek_model, is_glm_upstream, is_opencode_upstream, join_split_tool_call_turns,
+    is_deepseek_model, is_glm_upstream, join_split_tool_call_turns,
     join_split_tool_call_turns_pending, opencode_headers, vendor_thinking_off_fields,
 };
 use streaming::{
@@ -264,7 +269,7 @@ async fn probe_quota_reset(
     api_key: Option<&str>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let api_key = api_key?;
-    let quota = crate::quota::fetch_quota(provider_name, base_url, api_key).await?;
+    let quota = crate::quota::fetch_quota(provider_name, base_url, api_key, None).await?;
     let now = chrono::Utc::now();
     let reset = quota
         .windows
@@ -336,6 +341,20 @@ struct KiroDeps<'a> {
     tokens: &'a KiroTokens,
 }
 
+/// Everything the OpenCode token plane needs for one candidate: the key's id
+/// (the cache and gate key), the gateway database (rereads and the CAS
+/// write-back), and the manager itself.
+///
+/// Selected by the key's `auth_kind`, never by the upstream protocol: one
+/// account serves chat, messages and responses. Bundled as one optional field so
+/// a static candidate pays nothing for it.
+#[derive(Clone, Copy)]
+struct OpencodeDeps<'a> {
+    tokens: &'a OpencodeTokens,
+    pool: &'a sqlx::PgPool,
+    key_id: i64,
+}
+
 /// The unchanging surroundings of one dispatch attempt: transport, the chosen
 /// upstream capability, credential material, the learned-refusal registry, the
 /// vendor fixup fields this candidate's upstream must never see, and — for
@@ -369,6 +388,23 @@ struct AttemptContext<'a> {
     /// Kiro only: this candidate's token plumbing. `None` for every non-Kiro
     /// protocol, which therefore never touches the token manager or PG.
     kiro: Option<KiroDeps<'a>>,
+    /// OpenCode account rows only: this candidate's bearer plumbing. `None` for
+    /// every static key, so those never touch the token manager or PG.
+    opencode: Option<OpencodeDeps<'a>>,
+}
+
+/// The OpenCode account's auth headers: the resolved bearer plus, for an
+/// organization-scoped login, the workspace the console bound the token to.
+///
+/// Built here rather than through [`crate::providers::AuthSchemeMaterial`]
+/// because the material is a rotating bundle, not the row's static credential;
+/// every other header on the request is unaffected.
+fn opencode_auth_headers(bundle: &OpencodeOAuth) -> Vec<(&'static str, String)> {
+    let mut headers = vec![("authorization", format!("Bearer {}", bundle.access_token))];
+    if let Some(org_id) = bundle.org_id.as_deref() {
+        headers.push(("x-opencode-org-id", org_id.to_owned()));
+    }
+    headers
 }
 
 /// Shared send for both attempt flavors: prepare (passthrough or translated),
@@ -402,6 +438,7 @@ async fn send_attempt(
         route_efforts,
         dial,
         kiro,
+        opencode,
     } = *ctx;
     // The selected capability IS the upstream protocol: passthrough when it
     // matches the client protocol, translation target otherwise.
@@ -440,6 +477,19 @@ async fn send_attempt(
     // rotates it mid-attempt). Owned: the call context it came from is replaced
     // by the refresh, while the strip round still prepares from this copy.
     let mut kiro_profile_arn = kiro_call.as_ref().and_then(|call| call.profile_arn.clone());
+    // An OpenCode account bearer rotates on the console's schedule, so it is
+    // resolved per attempt: one cache lookup while the bundle is fresh, a
+    // single-flight refresh otherwise. The row's own credential never carries it
+    // (an `opencode_oauth` row's `api_key` is NULL).
+    let mut opencode_bundle = match opencode {
+        Some(deps) => Some(
+            deps.tokens
+                .resolve(deps.pool, deps.key_id)
+                .await
+                .map_err(failover::AttemptError::OpencodeTokenError)?,
+        ),
+        None => None,
+    };
     let target = TargetView {
         protocol,
         endpoint: &capability.endpoint,
@@ -552,15 +602,17 @@ async fn send_attempt(
     // strips never move it — and was computed once per dispatch.
     // Kiro's Authorization is the call-context bearer; the row's own credential
     // (the static-scheme placeholder, or a secret an operator typed on a Kiro
-    // row) never goes upstream.
-    let mut headers = match &kiro_call {
-        Some(call) => vec![("authorization", format!("Bearer {}", call.bearer()))],
-        None => credential.headers(),
+    // row) never goes upstream. The same holds for an OpenCode account row, whose
+    // bearer is the resolved bundle's access token.
+    let mut headers = match (&kiro_call, &opencode_bundle) {
+        (_, Some(bundle)) => opencode_auth_headers(bundle),
+        (Some(call), None) => vec![("authorization", format!("Bearer {}", call.bearer()))],
+        (None, None) => credential.headers(),
     };
     if let Some(seed) = opencode_seed {
         headers.extend(opencode_headers(seed));
     }
-    let query_pairs = if kiro_call.is_some() {
+    let query_pairs = if kiro_call.is_some() || opencode_bundle.is_some() {
         Vec::new()
     } else {
         credential.query_pairs()
@@ -568,6 +620,7 @@ async fn send_attempt(
 
     let mut rounds = 0u32;
     let mut kiro_retried = false;
+    let mut opencode_retried = false;
     loop {
         let response = transport
             .send_with_headers(&prepared, &headers, &query_pairs, deadline)
@@ -585,6 +638,35 @@ async fn send_attempt(
             .read_body(response, transport::MAX_ERROR_BODY, deadline)
             .await
             .unwrap_or_default();
+        // OpenCode: the gateway's own 401 licences exactly one refresh-and-resend
+        // of this same call. The wire body carries no bearer, so only the headers
+        // are rebuilt — same request, one attempt later. Concurrent requests that
+        // presented the same stale bearer de-duplicate on the key's gate, and a
+        // 401 raised after another request already rotated the bundle adopts that
+        // bundle instead of rotating it a second time.
+        if !opencode_retried
+            && status == 401
+            && let Some(deps) = opencode
+            && let Some(presented) = opencode_bundle.as_deref()
+        {
+            opencode_retried = true;
+            let bundle = deps
+                .tokens
+                .resolve_forced(deps.pool, deps.key_id, &presented.access_token)
+                .await
+                .map_err(failover::AttemptError::OpencodeTokenError)?;
+            headers = opencode_auth_headers(&bundle);
+            if let Some(seed) = opencode_seed {
+                headers.extend(opencode_headers(seed));
+            }
+            opencode_bundle = Some(bundle);
+            tracing::warn!(
+                key_id = deps.key_id,
+                status,
+                "OpenCode rejected the bearer; refreshed once, resending the same call"
+            );
+            continue;
+        }
         // Kiro: the runtime's own invalidation signal licenses exactly one
         // refresh-and-resend of this SAME invocation (same invocation id, the
         // wire re-prepared with the refreshed identity, attempt advanced).
@@ -655,13 +737,18 @@ async fn send_attempt(
         // A vendor error body can echo the credential it just rejected; excise it
         // before the body becomes the attempt's error — that error is what the
         // caller reads, what the attempt log prints, and what the request row keeps.
-        let redacted = match &kiro_call {
-            Some(call) => crate::providers::AuthSchemeMaterial::new(
+        let redacted = match (&kiro_call, &opencode_bundle) {
+            (_, Some(bundle)) => crate::providers::AuthSchemeMaterial::new(
+                crate::providers::AuthScheme::Bearer,
+                &bundle.access_token,
+            )
+            .redact(&body),
+            (Some(call), None) => crate::providers::AuthSchemeMaterial::new(
                 crate::providers::AuthScheme::Bearer,
                 call.bearer(),
             )
             .redact(&body),
-            None => credential.redact(&body),
+            (None, None) => credential.redact(&body),
         };
         let body = match redacted {
             Some(redacted) => bytes::Bytes::from(redacted),
@@ -935,7 +1022,9 @@ enum Resolution {
 /// * `kiro_oidc` — the row's OAuth bundle is the credential and `api_key` is
 ///   NULL. The access token inside that bundle rotates, so it is resolved per
 ///   attempt by [`crate::upstream::KiroTokens`], not carried in the candidate:
-///   the candidate's placeholder secret is empty and never reaches the wire.
+///   the candidate's placeholder secret is empty and never reaches the wire;
+/// * `opencode_oauth` — the same shape, resolved per attempt by
+///   [`crate::upstream::OpencodeTokens`].
 ///
 /// A row missing the credential its `auth_kind` requires is dropped from
 /// candidacy with a warning — never cooled, since a missing credential is not an
@@ -947,13 +1036,25 @@ fn fetch_key_secrets(
     let mut skipped = 0usize;
     for key in keys.into_iter().filter(|key| key.active()) {
         if key.auth_kind == "kiro_oidc" {
-            if key.oauth.is_some() {
+            if key.kiro_oauth().is_some() {
                 resolved.push((key, SecretString::from(String::new())));
             } else {
                 skipped += 1;
                 tracing::warn!(
                     key_id = key.id,
                     "Kiro provider key has no OAuth bundle; skipped"
+                );
+            }
+            continue;
+        }
+        if key.auth_kind == "opencode_oauth" {
+            if key.opencode_oauth().is_some() {
+                resolved.push((key, SecretString::from(String::new())));
+            } else {
+                skipped += 1;
+                tracing::warn!(
+                    key_id = key.id,
+                    "OpenCode provider key has no OAuth bundle; skipped"
                 );
             }
             continue;
@@ -1426,11 +1527,12 @@ pub struct Observability<'a> {
 /// secret store (the relay resolves credentials from it at resolve time).
 /// Bundled because they always travel together.
 ///
-/// `pool` is the one deliberate PG touch on the request path, and only Kiro
-/// candidates reach it: an OIDC access token expires hourly, so the credential
-/// plane must reread the row (another process may have rotated it) and persist
-/// the rotated bundle. Every other candidate still reads cached state only, and
-/// every other write still goes through `ledger`.
+/// `pool` is the one deliberate PG touch on the request path, and only the
+/// rotating-credential candidates reach it: a Kiro OIDC access token expires
+/// hourly and an OpenCode account bearer rotates on the console's schedule, so
+/// the credential plane must reread the row (another process may have rotated
+/// it) and persist the rotated bundle. Every other candidate still reads cached
+/// state only, and every other write still goes through `ledger`.
 pub struct DispatchDeps<'a> {
     pub pool: &'a sqlx::PgPool,
     pub transport: &'a Transport,
@@ -1439,6 +1541,9 @@ pub struct DispatchDeps<'a> {
     pub failover: &'a std::sync::Arc<Failover>,
     /// Per-key Kiro OIDC token manager (lazy refresh, single-flight, write-back).
     pub kiro_tokens: &'a KiroTokens,
+    /// Per-key OpenCode account bearer manager (lazy refresh, single-flight, CAS
+    /// write-back). The same instance backs model and quota probing.
+    pub opencode_tokens: &'a OpencodeTokens,
     /// Routing trace ring: each dispatch pushes its decision record here.
     pub trace_ring: &'a trace::TraceRing,
     /// In-memory quota snapshots for Smart ordering — no PG read on the
@@ -1527,6 +1632,7 @@ pub async fn dispatch_at(
         dispatcher,
         failover,
         kiro_tokens,
+        opencode_tokens,
         trace_ring,
         smart_cache,
         rotate_cursors,
@@ -2109,6 +2215,16 @@ pub async fn dispatch_at(
                             pool,
                             tokens: kiro_tokens,
                         }),
+                        // An OpenCode account row authenticates per attempt. The
+                        // key's `auth_kind` decides, not the protocol: one
+                        // account serves chat, messages and responses.
+                        opencode: (candidate.key.auth_kind == "opencode_oauth").then_some(
+                            OpencodeDeps {
+                                tokens: opencode_tokens,
+                                pool,
+                                key_id: candidate.key.id,
+                            },
+                        ),
                     },
                     target_model,
                     request,

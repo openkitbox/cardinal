@@ -14,9 +14,20 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
+use chrono::Duration;
+use chrono::Utc;
 use sqlx::PgPool;
+use uuid::Uuid;
 
-use crate::kiro::{KeyCredential, KiroOAuth};
+use crate::credentials::AuthKind;
+use crate::credentials::KeyCredential;
+use crate::kiro::KiroOAuth;
+use crate::opencode::OpencodeOAuth;
+use crate::opencode::auth;
+use crate::opencode::auth::TokenGrant;
+use crate::opencode::login;
+use crate::opencode::login::SessionState;
 use crate::probe::{self, ProbeModel};
 use crate::quota::{self, KeyQuota};
 use crate::store::{self, ProviderInput};
@@ -44,6 +55,10 @@ pub struct KeyView {
     pub models: Option<Vec<ProbeModel>>,
     /// The key's model whitelist (None = unrestricted).
     pub allowed_models: Option<Vec<String>>,
+    /// How the row authenticates upstream (`static`, `kiro_oidc`,
+    /// `opencode_oauth`): the reveal view names the credential kind so the GUI
+    /// can label the account instead of guessing from the api_key shape.
+    pub auth_kind: String,
     /// When the account was archived (None = not archived).
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -172,16 +187,18 @@ pub fn key_view(row: &store::ProviderKeyRow, api_key: String) -> KeyView {
         inflight,
         models: row.models.clone(),
         allowed_models: row.allowed_models.clone(),
+        auth_kind: row.auth_kind.clone(),
         archived_at: row.archived_at,
     }
 }
 
 /// Create a key with the credential its create request resolved to: a static
-/// api_key row, or a Kiro OIDC row whose OAuth bundle replaces the api_key.
-/// The caller ([`crate::admin::router`]'s create endpoint) resolves the
-/// provider's protocol and validates the bundle via
-/// [`crate::kiro::resolve_key_credential`]; the empty-static-key guard stays
-/// here as well so this public facade cannot store a blank credential.
+/// api_key row, or an OAuth row whose bundle replaces the api_key (a Kiro OIDC
+/// bundle or an OpenCode Console bundle). The caller
+/// ([`crate::admin::router`]'s create endpoint) resolves the provider's protocol
+/// and validates the bundle via [`crate::credentials::resolve_key_credential`];
+/// the empty-static-key guard stays here as well so this public facade cannot
+/// store a blank credential.
 pub async fn create_key(
     pool: &PgPool,
     provider_id: i64,
@@ -214,17 +231,29 @@ pub async fn create_key(
             )
             .await
         }
+        KeyCredential::OpencodeOauth(oauth) => {
+            store::insert_opencode_provider_key(
+                pool,
+                provider_id,
+                label,
+                oauth,
+                max_concurrency,
+                allowed_models,
+            )
+            .await
+        }
     }
 }
 
 /// Delete a key row. Route entries reference the provider, so routes are
 /// untouched.
-/// Returns whether the row existed and was deleted.
+/// Returns the deleted row's `auth_kind` (None = no such row), which the caller
+/// uses to evict the per-key token cache that credential owned.
 pub async fn delete_key(
     pool: &PgPool,
     provider_id: i64,
     key_id: i64,
-) -> anyhow::Result<Option<bool>> {
+) -> anyhow::Result<Option<String>> {
     store::delete_provider_key(pool, provider_id, key_id).await
 }
 
@@ -235,11 +264,12 @@ pub async fn delete_key(
 /// admin surface. One task per probe; each reading is persisted as it joins.
 ///
 /// Two probe kinds: a static key asks its provider's vendor endpoint
-/// ([`quota::fetch_quota`]) with its own credential, while a Kiro key has no
-/// api_key — its OAuth bundle (and the AWS region host the usage call lives on)
-/// comes from the shared [`crate::upstream::KiroTokens`] instance
-/// ([`quota::fetch_kiro_quota`]). That instance is the same one dispatch uses,
-/// so a probe's token refresh is a chat's refresh too, never a second cache.
+/// ([`quota::fetch_quota`]) with its own credential, while a Kiro key and an
+/// OpenCode account key have no api_key — their OAuth bundles come from the
+/// shared token managers ([`crate::upstream::KiroTokens`],
+/// [`crate::upstream::OpencodeTokens`]). Those are the same instances dispatch
+/// uses, so a probe's token refresh is a chat's refresh too, never a second
+/// cache.
 ///
 /// Quota is decorative: a key whose probe fails (or whose provider has no quota
 /// source) simply has no entry, and a store failure degrades to a warning —
@@ -253,6 +283,7 @@ pub async fn probe_all_quotas(
     pool: &PgPool,
     smart_cache: Option<&crate::relay::SmartCache>,
     kiro_tokens: Option<&Arc<crate::upstream::KiroTokens>>,
+    opencode_tokens: Option<&Arc<crate::upstream::OpencodeTokens>>,
 ) -> Vec<KeyQuotaRow> {
     /// Which credential a key's probe uses.
     enum QuotaSource {
@@ -260,6 +291,9 @@ pub async fn probe_all_quotas(
         Static(String),
         /// The shared Kiro token manager, at the credential's region host.
         Kiro(Arc<crate::upstream::KiroTokens>),
+        /// The shared OpenCode token manager: the account's bearer, with the
+        /// workspace header an organization-scoped login requires.
+        Opencode(Arc<crate::upstream::OpencodeTokens>),
     }
     let providers = match store::list_providers(pool).await {
         Ok(providers) => providers,
@@ -303,6 +337,16 @@ pub async fn probe_all_quotas(
                     break;
                 };
                 QuotaSource::Kiro(Arc::clone(tokens))
+            } else if key.auth_kind == AuthKind::OpencodeOauth.as_str() {
+                // Same rule for an OpenCode account row: no api_key by
+                // construction, and minting a second token cache would race
+                // dispatch's refreshes (which would lock the account out, since
+                // the console rotates the refresh token).
+                let Some(tokens) = opencode_tokens else {
+                    tracing::warn!(provider = %provider.name, "quota probe: no OpenCode token manager wired; skipping its keys");
+                    break;
+                };
+                QuotaSource::Opencode(Arc::clone(tokens))
             } else {
                 match key.api_key.take() {
                     Some(api_key) => QuotaSource::Static(api_key),
@@ -316,8 +360,25 @@ pub async fn probe_all_quotas(
             tasks.spawn(async move {
                 let mut quota = match &source {
                     QuotaSource::Kiro(tokens) => quota::fetch_kiro_quota(&pool, tokens, &key).await,
+                    QuotaSource::Opencode(tokens) => match tokens.resolve(&pool, key_id).await {
+                        Ok(bundle) => {
+                            quota::fetch_quota(
+                                &provider_name,
+                                &base_url,
+                                &bundle.access_token,
+                                bundle.org_id.as_deref(),
+                            )
+                            .await
+                        }
+                        Err(error) => {
+                            // Quota is decorative: a credential-plane failure
+                            // only costs this round's reading.
+                            tracing::warn!(key_id, error = %error, "quota probe: OpenCode bearer unavailable");
+                            None
+                        }
+                    },
                     QuotaSource::Static(api_key) => {
-                        quota::fetch_quota(&provider_name, &base_url, api_key).await
+                        quota::fetch_quota(&provider_name, &base_url, api_key, None).await
                     }
                 };
                 // The vendor read's own instant, taken before any DB work: the
@@ -401,6 +462,14 @@ pub struct Admin {
     /// bearer through it — the same single-flight cache dispatch uses — so a
     /// refresh is shared instead of duplicated.
     kiro_tokens: Option<Arc<crate::upstream::KiroTokens>>,
+    /// The same arrangement for OpenCode account rows (None until
+    /// [`Self::with_opencode_tokens`] wires it): model probing and quota probing
+    /// resolve their bearer through dispatch's cache.
+    opencode_tokens: Option<Arc<crate::upstream::OpencodeTokens>>,
+    /// The OpenCode device-login flow's dependencies (None until
+    /// [`Self::with_opencode_login`] wires them): the same stateless console
+    /// client dispatch uses, plus the process's session registry.
+    opencode_login: Option<OpencodeLogin>,
     /// Centralized dispatcher: queried for live slot occupancy (None until
     /// [`Self::with_dispatcher`] wires it).
     dispatcher: Option<tokio::sync::mpsc::UnboundedSender<crate::relay::dispatcher::DispatchEvent>>,
@@ -429,6 +498,8 @@ impl Admin {
             rest_cache,
             activity,
             kiro_tokens: None,
+            opencode_tokens: None,
+            opencode_login: None,
             dispatcher: None,
         }
     }
@@ -438,6 +509,29 @@ impl Admin {
     /// owns the same instance.
     pub fn with_kiro_tokens(mut self, kiro_tokens: Arc<crate::upstream::KiroTokens>) -> Self {
         self.kiro_tokens = Some(kiro_tokens);
+        self
+    }
+
+    /// Wire the live OpenCode token manager so its model and quota probes share
+    /// dispatch's bearer cache. Called once by the admin surface which owns the
+    /// same instance.
+    pub fn with_opencode_tokens(
+        mut self,
+        opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
+    ) -> Self {
+        self.opencode_tokens = Some(opencode_tokens);
+        self
+    }
+
+    /// Wire the OpenCode login flow: the console client and the process's
+    /// session registry. Called once by the admin surface, which owns the same
+    /// client instance dispatch and probing use.
+    pub fn with_opencode_login(
+        mut self,
+        client: Arc<auth::Client>,
+        logins: login::OpencodeLogins,
+    ) -> Self {
+        self.opencode_login = Some(OpencodeLogin { client, logins });
         self
     }
 
@@ -606,6 +700,7 @@ impl Admin {
             &self.pool,
             Some(&self.smart_cache),
             self.kiro_tokens.as_ref(),
+            self.opencode_tokens.as_ref(),
         )
         .await;
         if !rows.is_empty() {
@@ -659,6 +754,7 @@ impl Admin {
             input.protocol,
             input.resolved_auth_scheme(),
             api_key,
+            None,
         )
         .await
         .map_err(ProbeError::Regular)?)
@@ -672,7 +768,9 @@ impl Admin {
     /// Two credential shapes reach two catalogues: a static key asks its
     /// provider's `/models` with `api_key`; a Kiro key has no api_key and its
     /// catalogue lives on the credential's control plane
-    /// ([`Self::probe_kiro_models`]).
+    /// ([`Self::probe_kiro_models`]); an OpenCode account key also has no
+    /// api_key and asks the provider's `/models` with its resolved bearer
+    /// ([`Self::probe_opencode_models`]).
     pub async fn list_key_models(&self, key_id: i64) -> anyhow::Result<Vec<probe::ProbeModel>> {
         let keys = store::list_keys_by_ids(&self.pool, &[key_id]).await?;
         let Some(key) = keys.into_iter().next() else {
@@ -683,6 +781,8 @@ impl Admin {
         };
         let models = if provider.protocol == "kiro" {
             self.probe_kiro_models(&key).await?
+        } else if key.auth_kind == AuthKind::OpencodeOauth.as_str() {
+            self.probe_opencode_models(&provider, &key).await?
         } else {
             let api_key = key
                 .api_key
@@ -693,6 +793,7 @@ impl Admin {
                 &provider.protocol,
                 &provider.auth_scheme,
                 api_key,
+                None,
             )
             .await
             .map_err(ProbeError::Regular)?
@@ -734,6 +835,34 @@ impl Admin {
         probe::fetch_kiro_models(tokens.transport(), &context)
             .await
             .map_err(|error| ProbeError::Kiro(error).into())
+    }
+
+    /// One OpenCode account key's model catalogue via the provider's `/models`,
+    /// authenticated with the account's resolved bearer. The bearer comes from
+    /// the shared [`crate::upstream::OpencodeTokens`] instance — the same
+    /// single-flight cache dispatch uses — so a probe's refresh is a chat's
+    /// refresh, never a second rotation of the account's refresh token.
+    async fn probe_opencode_models(
+        &self,
+        provider: &store::ProviderRow,
+        key: &store::ProviderKeyRow,
+    ) -> anyhow::Result<Vec<ProbeModel>> {
+        let Some(tokens) = &self.opencode_tokens else {
+            anyhow::bail!("OpenCode 模型列表需要已接线的 token 管理器")
+        };
+        let bundle = tokens
+            .resolve(&self.pool, key.id)
+            .await
+            .map_err(|error| ProbeError::Regular(error.into()))?;
+        probe::fetch_models(
+            &provider.base_url,
+            &provider.protocol,
+            &provider.auth_scheme,
+            &bundle.access_token,
+            bundle.org_id.as_deref(),
+        )
+        .await
+        .map_err(|error| ProbeError::Regular(error).into())
     }
 
     /// Persist a key's model-list snapshot. The add-account flow already holds
@@ -878,9 +1007,470 @@ impl Admin {
         Ok((key_id, created))
     }
 
+    /// Start one OpenCode Console device login; the browser half comes back
+    /// here and the rest of the handshake continues in the background.
+    ///
+    /// Every check runs before the console is dialed, so a rejected request
+    /// leaves no session behind: the provider must be an OpenCode gateway on an
+    /// inference protocol, `group_ids` must name existing groups, and `label`
+    /// must be free (a taken label is a conflict, not an overwrite). For a
+    /// re-login (`key_id`) the row must exist and already be an
+    /// `opencode_oauth` account, whose label and memberships stay untouched.
+    ///
+    /// The poller is spawned here and owns everything after this call — the
+    /// session, the account it creates or replaces, and its verdict — because a
+    /// login outlives the HTTP request that started it. Its state therefore
+    /// lives in the shared registry ([`login::OpencodeLogins`]), not in this
+    /// call.
+    pub async fn start_opencode_login(
+        &self,
+        provider_id: i64,
+        label: &str,
+        key_id: Option<i64>,
+        group_ids: &[i64],
+        max_concurrency: Option<i32>,
+    ) -> Result<OpencodeLoginStarted, OpencodeLoginError> {
+        let wiring = self.opencode_login()?;
+        let Some(provider) = store::get_provider(&self.pool, provider_id).await? else {
+            return Err(OpencodeLoginError::ProviderNotFound(provider_id));
+        };
+        ensure_opencode_provider(&provider)?;
+        if max_concurrency.is_some_and(|limit| limit <= 0) {
+            return Err(OpencodeLoginError::Invalid(
+                "max_concurrency must be positive".to_owned(),
+            ));
+        }
+        let keys = store::list_provider_keys(&self.pool, provider_id).await?;
+        let (label, key_id, group_ids) = match key_id {
+            Some(key_id) => {
+                let Some(existing) = keys.iter().find(|row| row.id == key_id) else {
+                    return Err(OpencodeLoginError::KeyNotFound(key_id));
+                };
+                if existing.auth_kind != AuthKind::OpencodeOauth.as_str() {
+                    return Err(OpencodeLoginError::KeyNotFound(key_id));
+                }
+                // A re-login replaces the credential of an account that already
+                // exists and is configured: the key editor's PATCH owns its
+                // label and memberships, so the login neither reads nor rewrites
+                // them.
+                (existing.label.clone(), Some(key_id), Vec::new())
+            }
+            None => {
+                let label = label.trim();
+                if label.is_empty() {
+                    return Err(OpencodeLoginError::Invalid(
+                        "label must not be empty".to_owned(),
+                    ));
+                }
+                if keys.iter().any(|row| row.label == label) {
+                    return Err(OpencodeLoginError::LabelConflict(label.to_owned()));
+                }
+                if !store::key_groups_exist(&self.pool, group_ids).await? {
+                    return Err(OpencodeLoginError::Invalid("unknown group id".to_owned()));
+                }
+                (label.to_owned(), None, group_ids.to_vec())
+            }
+        };
+        let code = wiring
+            .client
+            .device_code(auth::DEFAULT_SERVER)
+            .await
+            .context("starting an OpenCode device login")?;
+        let auth::DeviceCode {
+            device_code,
+            user_code,
+            verification_url,
+            expires_in,
+            interval,
+        } = code;
+        // The console's lifetime is trusted for the answer but bounded for the
+        // session: a bogus `expires_in` must not park a session in the registry
+        // (and a poller) for the life of the process.
+        let lifetime = i64::try_from(expires_in)
+            .unwrap_or(i64::MAX)
+            .min(LOGIN_MAX_LIFETIME_SECS);
+        let now = Utc::now();
+        let session = login::Session::new(device_code, now + Duration::seconds(lifetime), key_id);
+        let (id, session) = wiring.logins.insert(session, now);
+        let poll = LoginPoll {
+            session,
+            client: Arc::clone(&wiring.client),
+            provider,
+            label,
+            group_ids,
+            max_concurrency,
+            interval,
+        };
+        tokio::spawn(self.clone().drive_opencode_login(poll));
+        Ok(OpencodeLoginStarted {
+            session: id.to_string(),
+            user_code,
+            verification_url,
+            expires_in,
+            interval,
+        })
+    }
+
+    /// Drive one started login to its verdict: wait `interval`, trade the
+    /// device code, back off on `slow_down`, give up at the deadline, and on
+    /// `Ready` commit the account and land the session.
+    ///
+    /// A transient console failure (unreachable, 5xx, 429) only skips a round:
+    /// the grant still lives, and a DNS blip must not kill a login the human is
+    /// completing. The deadline ends it either way.
+    async fn drive_opencode_login(self, poll: LoginPoll) {
+        let LoginPoll {
+            session,
+            client,
+            provider,
+            label,
+            group_ids,
+            max_concurrency,
+            interval,
+        } = poll;
+        let mut wait = std::time::Duration::from_secs(interval.max(LOGIN_MIN_INTERVAL_SECS));
+        loop {
+            tokio::time::sleep(wait).await;
+            // Cancelled between ticks: the cancel already wrote the verdict.
+            if session.is_terminal() {
+                return;
+            }
+            let now = Utc::now();
+            if now >= session.expires_at() {
+                session.finish(SessionState::Expired, now);
+                return;
+            }
+            match client
+                .poll_device_token(auth::DEFAULT_SERVER, session.device_code())
+                .await
+            {
+                Ok(TokenGrant::Pending) => {}
+                Ok(TokenGrant::SlowDown) => {
+                    wait = std::time::Duration::from_secs(
+                        wait.as_secs().saturating_add(LOGIN_SLOW_DOWN_STEP_SECS),
+                    );
+                }
+                Ok(TokenGrant::Expired) => {
+                    session.finish(SessionState::Expired, Utc::now());
+                    return;
+                }
+                Ok(TokenGrant::Ready(token)) => {
+                    // The poll's own round trip may have outlived the grant: a
+                    // session the registry (or this loop's next round) will
+                    // report `expired` must not leave a key behind. Re-check
+                    // before committing and drop the grant when it lost the
+                    // race; the token itself never reaches a log line.
+                    let approved_at = Utc::now();
+                    if approved_at >= session.expires_at() {
+                        tracing::warn!(
+                            provider = %provider.name,
+                            key_id = ?session.key_id(),
+                            "OpenCode login was approved after its grant deadline; discarding the issued grant"
+                        );
+                        session.finish(SessionState::Expired, approved_at);
+                        return;
+                    }
+                    let verdict = match self
+                        .finish_opencode_login(
+                            &provider,
+                            &label,
+                            session.key_id(),
+                            &group_ids,
+                            max_concurrency,
+                            token,
+                        )
+                        .await
+                    {
+                        Ok(key_id) => SessionState::Succeeded { key_id },
+                        Err(error) => {
+                            tracing::warn!(
+                                provider = %provider.name,
+                                error = %format!("{error:#}"),
+                                "OpenCode account login could not be committed"
+                            );
+                            // The session state is GUI text, so it carries a
+                            // fixed message: a store error's DETAIL can quote
+                            // the row (tokens included).
+                            SessionState::Failed {
+                                message: login_failure_message(&error),
+                            }
+                        }
+                    };
+                    session.finish(verdict, Utc::now());
+                    return;
+                }
+                Err(error) if is_transient_poll_failure(&error) => {
+                    tracing::warn!(
+                        %error,
+                        "OpenCode device poll failed transiently; retrying until the grant expires"
+                    );
+                }
+                Err(error) => {
+                    session.finish(
+                        SessionState::Failed {
+                            message: error.to_string(),
+                        },
+                        Utc::now(),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Commit one approved login: read the account's display identity from the
+    /// console (best effort — decoration only), build and validate the bundle,
+    /// persist it, probe the model catalogue, adopt the bundle into the bearer
+    /// cache and refresh the route cache. Returns the account key id.
+    ///
+    /// Only persistence can fail the login. A missing display email, an
+    /// unreachable catalogue or a failed cache refresh degrade to warnings: the
+    /// credential is already committed, and the first dispatch refreshes what
+    /// this step missed.
+    async fn finish_opencode_login(
+        &self,
+        provider: &store::ProviderRow,
+        label: &str,
+        key_id: Option<i64>,
+        group_ids: &[i64],
+        max_concurrency: Option<i32>,
+        token: auth::ReadyToken,
+    ) -> anyhow::Result<i64> {
+        let wiring = self.opencode_login()?;
+        let expires_at = token.expires_at(Utc::now());
+        let auth::ReadyToken {
+            access_token,
+            refresh_token,
+            org_id,
+            ..
+        } = token;
+        let email = match wiring
+            .client
+            .fetch_account(auth::DEFAULT_SERVER, &access_token)
+            .await
+        {
+            Ok(account) => Some(account.email),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "OpenCode account lookup failed after login; storing the account without an email"
+                );
+                None
+            }
+        };
+        let org_name = match wiring
+            .client
+            .fetch_organizations(auth::DEFAULT_SERVER, &access_token)
+            .await
+        {
+            Ok(organizations) => org_id.as_deref().and_then(|org_id| {
+                organizations
+                    .iter()
+                    .find(|org| org.id == org_id)
+                    .map(|org| org.name.clone())
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "OpenCode organization lookup failed after login; storing the account without an organization name"
+                );
+                None
+            }
+        };
+        let bundle = OpencodeOAuth {
+            access_token,
+            refresh_token,
+            expires_at,
+            server: auth::DEFAULT_SERVER.to_owned(),
+            org_id,
+            org_name,
+            email,
+        };
+        bundle.validate()?;
+        let key_id = match key_id {
+            Some(key_id) => {
+                self.replace_opencode_bundle(key_id, &bundle).await?;
+                key_id
+            }
+            None => {
+                self.insert_opencode_bundle(provider, label, group_ids, max_concurrency, &bundle)
+                    .await?
+            }
+        };
+        // The credential is committed: everything below is best effort, and the
+        // new bearer is the one just minted, so the catalogue probe runs before
+        // the cache adoption (which consumes the bundle).
+        match probe::fetch_models(
+            &provider.base_url,
+            &provider.protocol,
+            &provider.auth_scheme,
+            &bundle.access_token,
+            bundle.org_id.as_deref(),
+        )
+        .await
+        {
+            Ok(models) => {
+                if let Err(error) = store::update_key_models(&self.pool, key_id, &models).await {
+                    tracing::warn!(
+                        key_id,
+                        error = %format!("{error:#}"),
+                        "model snapshot persistence failed after a successful OpenCode login"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                key_id,
+                error = %format!("{error:#}"),
+                "model probe failed after a successful OpenCode login; the key keeps its old snapshot"
+            ),
+        }
+        match &self.opencode_tokens {
+            Some(tokens) => {
+                tokens.adopt(key_id, bundle);
+            }
+            None => tracing::warn!(
+                key_id,
+                "OpenCode token manager is not wired; the first dispatch will read the row instead of this cache"
+            ),
+        }
+        if let Err(error) = self.refresh_route_cache().await {
+            tracing::warn!(
+                key_id,
+                error = %format!("{error:#}"),
+                "route cache refresh after an OpenCode login failed"
+            );
+        }
+        // The account list changed: the same signal a quota round sends, so an
+        // open GUI re-reads its account cards instead of waiting for the poll.
+        self.activity.quota_refreshed();
+        Ok(key_id)
+    }
+
+    /// Create the account key a fresh login lands on, attaching the form's
+    /// group memberships the way the Kiro import attaches them.
+    async fn insert_opencode_bundle(
+        &self,
+        provider: &store::ProviderRow,
+        label: &str,
+        group_ids: &[i64],
+        max_concurrency: Option<i32>,
+        bundle: &OpencodeOAuth,
+    ) -> anyhow::Result<i64> {
+        // One clone for the row: the caller still needs the bundle for the
+        // catalogue probe and the cache adoption, and this path runs once per
+        // manual login rather than per request.
+        let key_id = store::insert_opencode_provider_key(
+            &self.pool,
+            provider.id,
+            label,
+            bundle.clone(),
+            max_concurrency,
+            None,
+        )
+        .await?;
+        if !group_ids.is_empty() {
+            // The insert and the memberships are two statements (the public
+            // store surface attaches groups through the key PATCH), so a race
+            // with a group delete can leave the row without them. The key row is
+            // already committed, though: failing the login here would report a
+            // dead account that exists, so the memberships degrade to a warning
+            // and the key editor owns attaching them.
+            if let Err(error) = store::patch_provider_key(
+                &self.pool,
+                provider.id,
+                key_id,
+                store::KeyPatch {
+                    group_ids: Some(group_ids),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                tracing::warn!(
+                    key_id,
+                    provider = provider.id,
+                    groups = group_ids.len(),
+                    error = %format!("{error:#}"),
+                    "OpenCode account key was created, but attaching its groups failed; attach them from the key editor"
+                );
+            }
+        }
+        Ok(key_id)
+    }
+
+    /// Write a re-login's bundle over the pinned row with one retry when a
+    /// concurrent writer (a dispatch-time refresh of the same account) wins the
+    /// compare-and-swap: the retry rereads the row it lost to, so the second
+    /// attempt is still compared against the current bundle.
+    async fn replace_opencode_bundle(
+        &self,
+        key_id: i64,
+        bundle: &OpencodeOAuth,
+    ) -> anyhow::Result<()> {
+        for _ in 0..LOGIN_CAS_ATTEMPTS {
+            let Some(stored) = store::opencode_oauth(&self.pool, key_id).await? else {
+                anyhow::bail!(
+                    "account key {key_id} no longer exists or is no longer an OpenCode account"
+                );
+            };
+            if store::replace_opencode_oauth(&self.pool, key_id, &stored, bundle).await? {
+                return Ok(());
+            }
+            tracing::warn!(
+                key_id,
+                "OpenCode login write lost the compare-and-swap; rereading the row"
+            );
+        }
+        anyhow::bail!(
+            "account key {key_id} was rewritten concurrently, so the login's bundle was not stored"
+        )
+    }
+
+    /// One login's current state; `Ok(None)` when the id is unknown (never
+    /// issued, or pruned after its verdict aged out). A login past its deadline
+    /// is marked `Expired` here, so a status read never reports `waiting` for a
+    /// grant that can no longer be approved.
+    pub fn opencode_login_status(&self, session: &str) -> anyhow::Result<Option<SessionState>> {
+        let wiring = self.opencode_login()?;
+        let id: Uuid = match session.parse() {
+            Ok(id) => id,
+            Err(_) => return Ok(None),
+        };
+        let now = Utc::now();
+        let Some(session) = wiring.logins.get(&id, now) else {
+            return Ok(None);
+        };
+        let state = session.state();
+        if state == SessionState::Waiting && now >= session.expires_at() {
+            session.finish(SessionState::Expired, now);
+            return Ok(Some(SessionState::Expired));
+        }
+        Ok(Some(state))
+    }
+
+    /// Cancel a waiting login; `Ok(false)` when the id is unknown or the login
+    /// already has a verdict (a finished login is not cancellable, and the
+    /// admin API answers 404 for both).
+    pub fn cancel_opencode_login(&self, session: &str) -> anyhow::Result<bool> {
+        let wiring = self.opencode_login()?;
+        let id: Uuid = match session.parse() {
+            Ok(id) => id,
+            Err(_) => return Ok(false),
+        };
+        Ok(wiring.logins.cancel(&id, Utc::now()))
+    }
+
+    /// The wired login dependencies, or a configuration error: every login
+    /// endpoint fails closed when the surface was built without them.
+    fn opencode_login(&self) -> anyhow::Result<&OpencodeLogin> {
+        self.opencode_login
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenCode 登录需要已接线的 console 客户端与会话注册表"))
+    }
+
     /// Add a named key to a provider; returns the new key id.
-    /// `credential`: the validated credential shape — a static api_key or a
-    /// Kiro OIDC bundle (see [`crate::kiro::resolve_key_credential`]).
+    /// `credential`: the validated credential shape — a static api_key or an
+    /// OAuth bundle (see [`crate::credentials::resolve_key_credential`]).
     /// `max_concurrency`: per-key in-flight cap (None = unlimited).
     /// `allowed_models`: the key's model whitelist (None/empty = unrestricted).
     pub async fn create_key(
@@ -929,5 +1519,150 @@ impl Admin {
     /// All active cooldown rows (admin display).
     pub async fn list_rests(&self) -> anyhow::Result<Vec<crate::store::RestRow>> {
         self.rest_cache.list_all().await
+    }
+}
+
+// ---------- OpenCode account login ----------
+
+/// How long a login poller waits between attempts before the console asks for
+/// more (the protocol's floor; the console's `interval` only raises it).
+const LOGIN_MIN_INTERVAL_SECS: u64 = 5;
+
+/// Added to the poll interval every time the console answers `slow_down`.
+const LOGIN_SLOW_DOWN_STEP_SECS: u64 = 5;
+
+/// Ceiling on a login's lifetime. The console's `expires_in` is reported
+/// verbatim to the GUI but bounded for the session: a bogus value must not park
+/// a session (and a poller) in the registry for the life of the process.
+const LOGIN_MAX_LIFETIME_SECS: i64 = 15 * 60;
+
+/// Compare-and-swap attempts for a re-login's write (one retry after losing to
+/// a concurrent writer, whose row the retry rereads).
+const LOGIN_CAS_ATTEMPTS: usize = 2;
+
+/// The wiring a login needs: the stateless console client and the process's
+/// session registry. Grouped so one `None` covers both, and
+/// [`Admin::with_opencode_login`] is the single place that supplies them.
+#[derive(Clone)]
+struct OpencodeLogin {
+    client: Arc<auth::Client>,
+    logins: login::OpencodeLogins,
+}
+
+/// Everything one spawned login needs to reach its verdict.
+struct LoginPoll {
+    session: Arc<login::Session>,
+    client: Arc<auth::Client>,
+    /// The provider the account belongs to: its endpoint, protocol and auth
+    /// scheme are what the catalogue probe uses once the bundle is committed.
+    provider: store::ProviderRow,
+    /// The label of the key to create (ignored by a re-login).
+    label: String,
+    /// Groups to attach to a newly created key (ignored by a re-login).
+    group_ids: Vec<i64>,
+    max_concurrency: Option<i32>,
+    /// The console's poll cadence in seconds, before any `slow_down` backoff.
+    interval: u64,
+}
+
+/// A started OpenCode device login: what
+/// `POST /api/providers/{id}/opencode-login` answers with. The GUI shows the
+/// code and the URL, then polls `session`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct OpencodeLoginStarted {
+    /// The registry id to poll and to cancel.
+    pub session: String,
+    /// The short code the browser asks the user to confirm.
+    pub user_code: String,
+    /// Absolute console URL that prefills the code.
+    pub verification_url: String,
+    /// Seconds the console keeps the grant open (reported verbatim).
+    pub expires_in: u64,
+    /// Seconds between polls, as the console asked for them.
+    pub interval: u64,
+}
+
+/// Why a login could not be started. The variants mirror the admin API's status
+/// codes (404 / 400 / 409 / 500), so the handler maps them without parsing
+/// messages.
+#[derive(Debug, thiserror::Error)]
+pub enum OpencodeLoginError {
+    /// No such provider row.
+    #[error("provider {0} does not exist")]
+    ProviderNotFound(i64),
+    /// The provider is not an OpenCode gateway, or speaks a protocol the
+    /// console's tokens cannot authenticate.
+    #[error(
+        "provider {provider_id} is not an OpenCode gateway (protocol {protocol:?}, base_url {base_url:?})"
+    )]
+    NotOpencodeProvider {
+        provider_id: i64,
+        protocol: String,
+        base_url: String,
+    },
+    /// A re-login named a row that is absent, or is not an OpenCode account.
+    #[error("key {0} does not exist on this provider or is not an OpenCode account")]
+    KeyNotFound(i64),
+    /// Caller input: an empty label, a non-positive cap, an unknown group id.
+    #[error("{0}")]
+    Invalid(String),
+    /// The label already names another key of this provider.
+    #[error("a key with label {0:?} already exists on this provider")]
+    LabelConflict(String),
+    /// Wiring or storage failed. Never raised for caller input.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Whether the login may mint a console token for this provider: the endpoint
+/// host must be OpenCode's gateway (Zen or Go) and the protocol one of the
+/// inference protocols that gateway serves. The provider name is user-chosen,
+/// so the wire host is the factual identity — the relay's own
+/// [`crate::relay::is_opencode_upstream`] decides it, once for both planes.
+fn ensure_opencode_provider(provider: &store::ProviderRow) -> Result<(), OpencodeLoginError> {
+    let protocol = provider.protocol.as_str();
+    let served = matches!(
+        protocol,
+        "openai_chat" | "anthropic_messages" | "openai_responses"
+    );
+    if served && crate::relay::is_opencode_upstream(&provider.base_url) {
+        return Ok(());
+    }
+    Err(OpencodeLoginError::NotOpencodeProvider {
+        provider_id: provider.id,
+        protocol: provider.protocol.clone(),
+        base_url: provider.base_url.clone(),
+    })
+}
+
+/// The operator-facing reason an approved login could not be committed.
+///
+/// Never the raw error: the session state is shown in the GUI, and a store
+/// failure's `DETAIL` can quote the row (credential bundle included), while a
+/// vendor error can quote a request. The detail goes to the log instead.
+fn login_failure_message(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<store::LabelTaken>() {
+        // The label passed the pre-check and was taken before the commit.
+        Some(taken) => format!(
+            "a key with label {:?} already exists on this provider; log in again with another label",
+            taken.label
+        ),
+        None => {
+            "the account could not be stored after the console approved the login; see the server log"
+                .to_owned()
+        }
+    }
+}
+
+/// Whether a poll failure is worth retrying: the console unreachable, or
+/// answering 5xx/429. Everything else (wire drift, a refusal the protocol does
+/// not model as a grant verdict) cannot improve by waiting.
+fn is_transient_poll_failure(error: &auth::AuthError) -> bool {
+    match error {
+        auth::AuthError::Transport { .. } => true,
+        auth::AuthError::Status { status, .. } => {
+            status.is_server_error() || status.as_u16() == 429
+        }
+        _ => false,
     }
 }

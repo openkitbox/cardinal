@@ -11,6 +11,11 @@
 //! - `POST /api/providers/:id/kiro-key` `{label, oauth, group_ids?}` — probe then find-or-create a Kiro OIDC key by label
 //! - `POST /api/providers/:id/kiro-import` `{label, account?, credentials, group_ids?}` — allow-listed import of a raw `kiro.rs` object or account array
 //!   (`group_ids` on both = groups to ADD the key to in the same transaction; existing memberships are kept, an unknown id → 400)
+//! - `POST /api/providers/:id/opencode-login` `{label, key_id?, group_ids?, max_concurrency?}` → 201 `{session, user_code,
+//!   verification_url, expires_in, interval}` — start an OpenCode Console device login (`key_id` re-authenticates that account;
+//!   a taken label → 409, a non-OpenCode provider or unknown group → 400)
+//! - `GET /api/opencode-logins/:session` → `{state, key_id, message}` (`waiting|succeeded|failed|expired|cancelled`, 404 once
+//!   the session is unknown or its verdict aged out) / `DELETE` cancels a waiting login (204; 404 when unknown or finished)
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
 //!   plaintext-serving endpoint; the list shape stays masked)
 //! - `POST /api/key-groups` `{name}` → `{id}`, `PATCH/DELETE /api/key-groups/:id` — account groups (409 on a taken name, 400 on an invalid one,
@@ -60,9 +65,11 @@ use salvo::sse::SseEvent;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::admin_ops::OpencodeLoginError;
 use crate::agent;
+use crate::credentials::{AuthKind, KeyCredential, resolve_key_credential};
 use crate::key_terms;
-use crate::kiro::{KeyCredential, KiroOAuth, resolve_key_credential};
+use crate::kiro::KiroOAuth;
 use crate::store::{self, ProviderInput, RouteEntry, RouteStrategy};
 
 /// Admin key SHA-256 (shared in-process, injected by main from config).
@@ -178,6 +185,11 @@ fn admin(depot: &Depot) -> crate::admin_ops::Admin {
         state.activity.clone(),
     )
     .with_kiro_tokens(Arc::clone(&state.kiro_tokens))
+    .with_opencode_tokens(Arc::clone(&state.opencode_tokens))
+    .with_opencode_login(
+        Arc::clone(&state.opencode_client),
+        state.opencode_logins.clone(),
+    )
     .with_dispatcher(state.dispatcher.clone())
 }
 
@@ -1637,6 +1649,12 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
         )
         .push(Router::with_path("providers/{id}/kiro-key").post(upsert_kiro_key))
         .push(Router::with_path("providers/{id}/kiro-import").post(import_kiro_key))
+        .push(Router::with_path("providers/{id}/opencode-login").post(start_opencode_login))
+        .push(
+            Router::with_path("opencode-logins/{session}")
+                .get(opencode_login_status)
+                .delete(cancel_opencode_login),
+        )
         .push(
             Router::with_path("providers/{id}/keys/{key_id}")
                 .patch(patch_key)
@@ -1718,14 +1736,15 @@ struct KeyBody {
     /// The static credential. Absent/empty is only valid for a Kiro OIDC key.
     #[serde(default)]
     api_key: Option<String>,
-    /// `static` (default) or `kiro_oidc`; decides which credential field the
-    /// new row carries. Unknown values are rejected by the resolver.
+    /// `static` (default), `kiro_oidc` or `opencode_oauth`; decides which
+    /// credential field the new row carries. Unknown values are rejected by the
+    /// resolver.
     #[serde(default)]
     auth_kind: Option<String>,
-    /// The Kiro OIDC bundle; only accepted with `auth_kind = "kiro_oidc"` on
-    /// a provider whose protocol is `kiro`.
+    /// The OAuth bundle, raw: its shape follows `auth_kind`, so the resolver
+    /// decodes it as that kind's bundle instead of this body guessing a type.
     #[serde(default)]
-    oauth: Option<KiroOAuth>,
+    oauth: Option<serde_json::Value>,
     /// Per-key in-flight cap; absent or null = unlimited.
     #[serde(default)]
     max_concurrency: Option<i32>,
@@ -1862,11 +1881,18 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
             return;
         }
     };
-    // The token manager verifies the committed row and reconciles it with any
+    // The token managers verify the committed row and reconcile it with any
     // in-memory refresh under the key lock before the first dispatch.
-    let created_oauth = match credential {
+    let created_kiro = match &credential {
         KeyCredential::KiroOidc(oauth) => Some(oauth.clone()),
-        KeyCredential::Static(_) => None,
+        KeyCredential::Static(_) | KeyCredential::OpencodeOauth(_) => None,
+    };
+    // The OpenCode bundle is adopted as imported: it came from this very
+    // request, so there is no newer row to reconcile with and the first
+    // dispatch needs no row read.
+    let created_opencode = match &credential {
+        KeyCredential::OpencodeOauth(oauth) => Some(oauth.clone()),
+        KeyCredential::Static(_) | KeyCredential::KiroOidc(_) => None,
     };
     match crate::admin_ops::create_key(
         pool,
@@ -1879,13 +1905,16 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
     .await
     {
         Ok(id) => {
-            if let Some(oauth) = created_oauth {
+            if let Some(oauth) = created_kiro {
                 // Verify the committed row and reconcile it with any newer
                 // in-memory refresh under the token manager's key lock.
                 state(depot)
                     .kiro_tokens
                     .adopt_persisted(pool, provider_id, id, oauth)
                     .await;
+            }
+            if let Some(oauth) = created_opencode {
+                state(depot).opencode_tokens.adopt(id, oauth);
             }
             let _ = admin(depot).refresh_route_cache().await;
             response.status_code(StatusCode::CREATED);
@@ -1952,6 +1981,106 @@ async fn import_kiro_key(request: &mut Request, depot: &mut Depot, response: &mu
             Ok(store::KiroUpsertError::Internal(error)) => internal(response, error),
             Err(error) => internal(response, error),
         },
+    }
+}
+
+/// `POST /api/providers/{id}/opencode-login` body: the OpenCode account to
+/// create — or, with `key_id`, the existing OpenCode account to re-authenticate
+/// (whose label and groups the row already owns).
+#[derive(serde::Deserialize)]
+struct OpencodeLoginBody {
+    /// The label of the key a fresh login creates; ignored for a re-login, so
+    /// an absent value is just the empty label (rejected by a fresh login).
+    #[serde(default)]
+    label: String,
+    /// The existing `opencode_oauth` key to replace instead of creating one.
+    #[serde(default)]
+    key_id: Option<i64>,
+    /// Groups to attach to the new key (ignored for a re-login).
+    #[serde(default)]
+    group_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    max_concurrency: Option<i32>,
+}
+
+/// `POST /api/providers/{id}/opencode-login`: start a device login and answer
+/// with the code the operator confirms in the browser. The login continues in
+/// the background; this response does not wait for it.
+#[handler]
+async fn start_opencode_login(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(provider_id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid provider id");
+        return;
+    };
+    let Ok(body) = request.parse_json::<OpencodeLoginBody>().await else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid OpenCode login body");
+        return;
+    };
+    let group_ids = body.group_ids.unwrap_or_default();
+    match admin(depot)
+        .start_opencode_login(
+            provider_id,
+            &body.label,
+            body.key_id,
+            &group_ids,
+            body.max_concurrency,
+        )
+        .await
+    {
+        Ok(started) => {
+            response.status_code(StatusCode::CREATED);
+            json_response(response, &started);
+        }
+        Err(
+            error @ (OpencodeLoginError::NotOpencodeProvider { .. }
+            | OpencodeLoginError::Invalid(_)),
+        ) => bad_request(response, anyhow::Error::new(error)),
+        Err(OpencodeLoginError::ProviderNotFound(_)) => not_found(response, "provider"),
+        Err(OpencodeLoginError::KeyNotFound(_)) => not_found(response, "OpenCode account key"),
+        Err(OpencodeLoginError::LabelConflict(label)) => {
+            response.status_code(StatusCode::CONFLICT);
+            let _ = response.body(format!(
+                "a key with label {label:?} already exists on this provider"
+            ));
+        }
+        Err(OpencodeLoginError::Internal(error)) => internal(response, error),
+    }
+}
+
+/// `GET /api/opencode-logins/{session}`: the login's state. Unknown ids (and
+/// ids whose verdict aged out of the registry) are a 404 — the GUI treats that
+/// as "start over", the same as every other unknown resource.
+#[handler]
+async fn opencode_login_status(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(session) = request.param::<String>("session") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid login session");
+        return;
+    };
+    match admin(depot).opencode_login_status(&session) {
+        Ok(Some(state)) => json_response(response, &state.status()),
+        Ok(None) => not_found(response, "OpenCode login session"),
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `DELETE /api/opencode-logins/{session}`: cancel a waiting login. A finished
+/// login is not cancellable and reads as unknown (404).
+#[handler]
+async fn cancel_opencode_login(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(session) = request.param::<String>("session") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid login session");
+        return;
+    };
+    match admin(depot).cancel_opencode_login(&session) {
+        Ok(true) => {
+            response.status_code(StatusCode::NO_CONTENT);
+        }
+        Ok(false) => not_found(response, "OpenCode login session"),
+        Err(error) => internal(response, error),
     }
 }
 
@@ -2054,6 +2183,11 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
                     .adopt_persisted(pool, provider_id, key_id, oauth)
                     .await;
             }
+            // Any patch may carry a credential replacement (Kiro's bundle
+            // today), so the OpenCode cache drops its copy rather than risk
+            // serving a bearer the row no longer authorizes. One cache miss
+            // afterwards costs a single row read, never a refresh.
+            state(depot).opencode_tokens.forget(key_id);
             let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
@@ -2165,9 +2299,14 @@ async fn delete_key(request: &mut Request, depot: &mut Depot, response: &mut Res
     };
     let pool = state_pool(depot);
     match crate::admin_ops::delete_key(pool, provider_id, key_id).await {
-        Ok(Some(is_kiro)) => {
-            if is_kiro {
+        Ok(Some(auth_kind)) => {
+            if auth_kind == AuthKind::KiroOidc.as_str() {
                 state(depot).kiro_tokens.remove(key_id);
+            }
+            if auth_kind == AuthKind::OpencodeOauth.as_str() {
+                // Drop the cached bundle: nothing else holds an OpenCode bearer,
+                // and a deleted row must never authenticate again.
+                state(depot).opencode_tokens.forget(key_id);
             }
             let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))

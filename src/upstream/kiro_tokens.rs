@@ -661,10 +661,11 @@ impl KiroTokens {
         key: &ProviderKeyRow,
         endpoint: &str,
     ) -> Result<KiroCallContext, KiroTokenError> {
-        let oauth = key
-            .oauth
-            .as_ref()
-            .ok_or(KiroTokenError::MissingCredential)?;
+        // Typed decode rather than the raw JSON: the precheck only needs the
+        // region, but a bundle that no longer decodes is a missing credential
+        // here too (one decode per Kiro call is noise next to the token
+        // resolution that follows).
+        let oauth = key.kiro_oauth().ok_or(KiroTokenError::MissingCredential)?;
         ensure_endpoint(key, endpoint, &oauth.api_region, EndpointStage::Precheck)?;
         let call = self.access_token(pool, key).await?;
         ensure_endpoint(key, endpoint, &call.api_region, EndpointStage::Resolved)?;
@@ -764,7 +765,7 @@ impl KiroTokens {
         if let Some(existing) = self.states.get(&key.id) {
             return Ok(Arc::clone(existing.value()));
         }
-        let oauth = key.oauth.clone().ok_or(KiroTokenError::MissingCredential)?;
+        let oauth = key.kiro_oauth().ok_or(KiroTokenError::MissingCredential)?;
         let created = Arc::new(Mutex::new(KiroTokenState {
             oauth,
             persisted: true,

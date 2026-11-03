@@ -17,6 +17,7 @@ use regex::Regex;
 use super::optional;
 use crate::protocol::ProtocolError;
 use crate::upstream::kiro_tokens::KiroTokenError;
+use crate::upstream::opencode_tokens::OpencodeTokenError;
 use crate::upstream::transport::TransportError;
 
 /// Mapping transport failures → protocol error codes is orchestration policy, owned by the relay layer;
@@ -52,6 +53,10 @@ pub enum AttemptError {
     /// relay can skip a dead account without either blaming the request or
     /// forwarding a token-plane error to the client.
     KiroTokenError(KiroTokenError),
+    /// The candidate's OpenCode account credential could not produce a bearer
+    /// (a lazily refreshed token pair, or the row itself). Same contract as
+    /// [`Self::KiroTokenError`]: the token module's own verdict — never a token.
+    OpencodeTokenError(OpencodeTokenError),
     Protocol(ProtocolError),
 }
 
@@ -74,6 +79,7 @@ impl AttemptError {
             // upstream family, not the request's fault.
             Self::AbortedStream => ProtocolError::UpstreamError.status(),
             Self::KiroTokenError(error) => error.client_status(),
+            Self::OpencodeTokenError(error) => error.client_status(),
             Self::Protocol(error) => error.status(),
         }
     }
@@ -96,6 +102,7 @@ impl AttemptError {
             Self::Transport(error) => as_protocol_error(error).code(),
             Self::AbortedStream => ProtocolError::UpstreamError.code(),
             Self::KiroTokenError(error) => error.code(),
+            Self::OpencodeTokenError(error) => error.code(),
             Self::Protocol(error) => error.code(),
         }
     }
@@ -106,6 +113,7 @@ impl AttemptError {
             Self::AbortedStream => "upstream stream died before the response committed".to_owned(),
             // Safe to surface: the token error carries no OAuth material.
             Self::KiroTokenError(error) => error.to_string(),
+            Self::OpencodeTokenError(error) => error.to_string(),
             Self::Protocol(error) => format!("{error:?}"),
         }
     }
@@ -296,6 +304,18 @@ pub fn classify(error: &AttemptError) -> Failure {
                         .and_then(crate::upstream::transport::parse_retry_after),
                 },
                 _ => Failure::Other,
+            };
+        }
+        // Same credential-plane rule for an OpenCode account: a dead grant (or a
+        // missing row) needs a new login — fail over, rest nobody. A store
+        // failure and a console hiccup are both transient: the credential may
+        // well be fine, so the key rests like any other transport failure.
+        AttemptError::OpencodeTokenError(error) => {
+            return match error {
+                OpencodeTokenError::Missing | OpencodeTokenError::Expired => Failure::Blameless,
+                OpencodeTokenError::Store
+                | OpencodeTokenError::Transport
+                | OpencodeTokenError::Client => Failure::Other,
             };
         }
         // Request-shape problems: the request itself is at fault.

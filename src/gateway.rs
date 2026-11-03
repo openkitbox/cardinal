@@ -90,6 +90,15 @@ struct Core {
     /// the quota prober all share this instance, so a Kiro credential refresh
     /// happens once and its rotated bundle is visible to every caller.
     kiro_tokens: Arc<crate::upstream::KiroTokens>,
+    /// The same arrangement for OpenCode account rows: one bearer cache shared
+    /// by dispatch, model probing and quota probing.
+    opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
+    /// The OpenCode Console client (stateless: tokens are per-call arguments), so
+    /// one instance serves login, dispatch and probing.
+    opencode_client: Arc<crate::opencode::auth::Client>,
+    /// The process's in-flight OpenCode device logins: the admin surface starts,
+    /// polls and cancels them through the shared registry.
+    opencode_logins: crate::opencode::login::OpencodeLogins,
     /// Per-alias round-robin cursors for Rotate ordering — one atomic
     /// increment per dispatch, no lock, no allocation.
     rotate_cursors: relay::RotateCursors,
@@ -185,10 +194,19 @@ impl Core {
         // it, so the quota probe reaches Kiro through the same policy.
         let transport = transport::Transport::new(limits(config))?;
         let kiro_tokens = Arc::new(crate::upstream::KiroTokens::new(transport.clone()));
+        // The OpenCode console client is stateless (tokens are per-call
+        // arguments), so one instance serves login, dispatch and probing.
+        let opencode_client = Arc::new(crate::opencode::auth::Client::new());
+        let opencode_tokens = Arc::new(crate::upstream::OpencodeTokens::new(Arc::clone(
+            &opencode_client,
+        )));
         Ok(Self {
             pool,
             transport,
             kiro_tokens,
+            opencode_tokens,
+            opencode_client,
+            opencode_logins: crate::opencode::login::OpencodeLogins::new(),
             queue_timeout,
             failover: relay::Failover::new(),
             trace_ring: Arc::new(relay::trace::TraceRing::new()),
@@ -232,6 +250,7 @@ async fn quota_prober(
     pool: sqlx::PgPool,
     smart_cache: relay::SmartCache,
     kiro_tokens: Arc<crate::upstream::KiroTokens>,
+    opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
     activity: crate::activity::ActivitySink,
     cancel: CancellationToken,
 ) {
@@ -243,7 +262,13 @@ async fn quota_prober(
     loop {
         tokio::select! {
           _ = ticker.tick() => {
-            let rows = admin_ops::probe_all_quotas(&pool, Some(&smart_cache), Some(&kiro_tokens)).await;
+            let rows = admin_ops::probe_all_quotas(
+                &pool,
+                Some(&smart_cache),
+                Some(&kiro_tokens),
+                Some(&opencode_tokens),
+            )
+            .await;
             if !rows.is_empty() {
                 activity.quota_refreshed();
             }
@@ -352,6 +377,7 @@ impl Gateway {
             core.pool.clone(),
             core.smart_cache.clone(),
             Arc::clone(&core.kiro_tokens),
+            Arc::clone(&core.opencode_tokens),
             core.activity.clone(),
             core.prober_cancel.clone(),
         ));
@@ -382,6 +408,9 @@ impl Gateway {
             rest_cache: core.rest_cache.clone(),
             price_cache: core.price_cache.clone(),
             kiro_tokens: core.kiro_tokens.clone(),
+            opencode_tokens: core.opencode_tokens.clone(),
+            opencode_client: Arc::clone(&core.opencode_client),
+            opencode_logins: core.opencode_logins.clone(),
             ledger: core.ledger.clone(),
             server_stopped: core.server_stopped.clone(),
             payload_log: core.payload_log,

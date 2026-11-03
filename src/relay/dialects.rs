@@ -43,8 +43,9 @@ const OPENCODE_VERSION: &str = "1.18.34";
 
 /// The endpoint is OpenCode's gateway (Zen or Go). The provider name is
 /// user-chosen, so the wire host is the factual identity (same rule as
-/// `is_glm_upstream`).
-pub(super) fn is_opencode_upstream(endpoint: &str) -> bool {
+/// `is_glm_upstream`). Shared with the login flow, which only mints console
+/// tokens for this host too.
+pub(crate) fn is_opencode_upstream(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
         return false;
     };

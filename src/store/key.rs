@@ -1,11 +1,13 @@
 use sqlx::PgPool;
 
-use crate::kiro::{KeyCredential, KiroOAuth};
+use crate::credentials::{AuthKind, KeyCredential};
+use crate::kiro::KiroOAuth;
+use crate::opencode::OpencodeOAuth;
 use crate::probe::ProbeModel;
 
 use super::key_group::AddKeyGroupsError;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct ProviderKeyRow {
     pub id: i64,
     pub provider_id: i64,
@@ -29,19 +31,48 @@ pub struct ProviderKeyRow {
     #[sqlx(json(nullable))]
     pub allowed_models: Option<Vec<String>>,
     /// How the row authenticates upstream: `static` (the plaintext api_key
-    /// above) or `kiro_oidc` (the OAuth bundle below). Mirrors the column's
-    /// CHECK constraint (migrations/0007).
+    /// above), `kiro_oidc` or `opencode_oauth` (the OAuth bundle below).
+    /// Mirrors the column's CHECK constraint (migrations/0007, 0017).
     pub auth_kind: String,
-    /// The Kiro OIDC bundle for `auth_kind = "kiro_oidc"` rows; NULL for every
-    /// static key (the DB keeps the two credential shapes disjoint). Never
-    /// serialized: this row is an internal read shape and the tokens must not
-    /// reach any JSON surface (the bootstrap/reveal views carry no credential).
+    /// The OAuth bundle of the row's `auth_kind`; NULL for every static key
+    /// (the DB keeps the two credential shapes disjoint). Deliberately untyped:
+    /// `auth_kind` alone says which bundle a row holds, so the typed accessors
+    /// ([`ProviderKeyRow::kiro_oauth`], [`ProviderKeyRow::opencode_oauth`])
+    /// decode it and a payload that does not decode is a missing credential,
+    /// never a guess. Never serialized: this row is an internal read shape and
+    /// the tokens must not reach any JSON surface (the bootstrap/reveal views
+    /// carry no credential).
     #[sqlx(json(nullable))]
     #[serde(skip)]
-    pub oauth: Option<KiroOAuth>,
+    pub oauth: Option<serde_json::Value>,
     /// When the account was archived; None = not archived. Independent of
     /// `enabled` and of group membership (migrations/0011).
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The row as diagnostics see it: every field except the credentials.
+///
+/// A row carries two live secrets — the plaintext `api_key` and the OAuth
+/// bundle in `oauth` (an access and a refresh token) — and `relay::candidates`
+/// derives `Debug` over this type, so one `{:?}` would put them in a log line.
+/// Both print as `<redacted>`; nothing in the gateway needs their debug form.
+impl std::fmt::Debug for ProviderKeyRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderKeyRow")
+            .field("id", &self.id)
+            .field("provider_id", &self.provider_id)
+            .field("label", &self.label)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("enabled", &self.enabled)
+            .field("position", &self.position)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("models", &self.models)
+            .field("allowed_models", &self.allowed_models)
+            .field("auth_kind", &self.auth_kind)
+            .field("oauth", &self.oauth.as_ref().map(|_| "<redacted>"))
+            .field("archived_at", &self.archived_at)
+            .finish()
+    }
 }
 
 impl ProviderKeyRow {
@@ -50,6 +81,41 @@ impl ProviderKeyRow {
     pub fn active(&self) -> bool {
         self.enabled && self.archived_at.is_none()
     }
+
+    /// The row's Kiro OIDC bundle in its typed form.
+    ///
+    /// `None` when the row is not a `kiro_oidc` row or the stored JSON no
+    /// longer decodes into a bundle: a credential the reader cannot type-check
+    /// is a missing credential, so the caller skips the row instead of guessing
+    /// at its contents. The decode borrows the stored JSON — no copy per read.
+    #[must_use]
+    pub fn kiro_oauth(&self) -> Option<KiroOAuth> {
+        if self.auth_kind != AuthKind::KiroOidc.as_str() {
+            return None;
+        }
+        decode_stored_bundle(self.oauth.as_ref()?)
+    }
+
+    /// The row's OpenCode Console bundle in its typed form; same contract as
+    /// [`Self::kiro_oauth`].
+    #[must_use]
+    pub fn opencode_oauth(&self) -> Option<OpencodeOAuth> {
+        if self.auth_kind != AuthKind::OpencodeOauth.as_str() {
+            return None;
+        }
+        decode_stored_bundle(self.oauth.as_ref()?)
+    }
+}
+
+/// Decode one stored bundle straight from the borrowed JSON (serde_json drives
+/// the typed decode from `&Value`, so a row read costs no clone). A failure
+/// means "no usable credential", not "corrupt row": the row still dispatches or
+/// not according to its kind, and the caller decides how loudly to skip it.
+fn decode_stored_bundle<T>(value: &serde_json::Value) -> Option<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    T::deserialize(value).ok()
 }
 
 /// Public view of ProviderKeyRow: hides api_key. `inflight` is the live
@@ -74,6 +140,19 @@ pub struct ProviderKeyView {
     pub models: Option<Vec<ProbeModel>>,
     /// The key's model whitelist (None = unrestricted).
     pub allowed_models: Option<Vec<String>>,
+    /// How the row authenticates upstream: `static`, `kiro_oidc` or
+    /// `opencode_oauth`. Defaults to `static` for a payload that predates the
+    /// field (an older gateway never had anything else to report).
+    #[serde(default = "static_auth_kind")]
+    pub auth_kind: String,
+    /// The OpenCode account's e-mail, when its bundle carries one. None for
+    /// every other credential kind — and for an account whose login could not
+    /// read it, so a card falls back to the label rather than to a blank.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// The OpenCode account's organization name, when it belongs to one.
+    #[serde(default)]
+    pub organization: Option<String>,
     /// When the account was archived (None = not archived).
     #[serde(default)]
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -81,6 +160,13 @@ pub struct ProviderKeyView {
 
 impl ProviderKeyView {
     pub fn new(row: &ProviderKeyRow, inflight: Option<i32>) -> Self {
+        // The bundle is decoded once per row; only the display projection is
+        // kept, so the tokens never reach the view (and the decode's String
+        // fields are moved out, not cloned).
+        let (account, organization) = match row.opencode_oauth() {
+            Some(bundle) => (bundle.email, bundle.org_name),
+            None => (None, None),
+        };
         Self {
             id: row.id,
             provider_id: row.provider_id,
@@ -91,9 +177,18 @@ impl ProviderKeyView {
             inflight,
             models: row.models.clone(),
             allowed_models: row.allowed_models.clone(),
+            auth_kind: row.auth_kind.clone(),
+            account,
+            organization,
             archived_at: row.archived_at,
         }
     }
+}
+
+/// The `auth_kind` of a payload that predates the field: a row of that era
+/// authenticated with its plaintext api_key.
+fn static_auth_kind() -> String {
+    AuthKind::Static.as_str().to_owned()
 }
 
 /// One provider's keys in global (position, id) order.
@@ -241,7 +336,8 @@ pub async fn update_key_models_for_oauth(
 /// bought nothing for a single-user local service).
 ///
 /// This is the static-credential shape (`auth_kind = "static"`) every
-/// pre-Kiro provider uses; [`insert_kiro_provider_key`] owns the OAuth shape.
+/// pre-login provider uses; [`insert_kiro_provider_key`] and
+/// [`insert_opencode_provider_key`] own the OAuth shapes.
 pub async fn insert_provider_key(
     pool: &PgPool,
     provider_id: i64,
@@ -263,12 +359,13 @@ pub async fn insert_provider_key(
 
 /// Insert a Kiro OIDC key: no api_key, the OAuth bundle stored under
 /// `auth_kind = "kiro_oidc"`. The bundle is validated here too — the store
-/// never persists an incomplete credential, whatever the caller checked.
+/// never persists an incomplete credential, whatever the caller checked. The
+/// bundle is taken by value because the row is the only owner it gains.
 pub async fn insert_kiro_provider_key(
     pool: &PgPool,
     provider_id: i64,
     label: &str,
-    oauth: &KiroOAuth,
+    oauth: KiroOAuth,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
 ) -> anyhow::Result<i64> {
@@ -278,6 +375,28 @@ pub async fn insert_kiro_provider_key(
         provider_id,
         label,
         KeyCredential::KiroOidc(oauth),
+        max_concurrency,
+        allowed_models,
+    )
+    .await
+}
+
+/// Insert an OpenCode Console account key: no api_key, the device-flow bundle
+/// stored under `auth_kind = "opencode_oauth"`, validated here as well.
+pub async fn insert_opencode_provider_key(
+    pool: &PgPool,
+    provider_id: i64,
+    label: &str,
+    oauth: OpencodeOAuth,
+    max_concurrency: Option<i32>,
+    allowed_models: Option<Vec<String>>,
+) -> anyhow::Result<i64> {
+    oauth.validate()?;
+    insert_key_row(
+        pool,
+        provider_id,
+        label,
+        KeyCredential::OpencodeOauth(oauth),
         max_concurrency,
         allowed_models,
     )
@@ -460,8 +579,21 @@ pub async fn upsert_kiro_key_by_label(
     Ok((key_id, created))
 }
 
-/// Shared insert body for both credential shapes: validates, normalizes and
-/// appends under the position lock.
+/// One provider holds at most one key per label. Typed rather than a plain
+/// message so a caller can answer it as caller input: the login flow reports
+/// "label already in use" instead of a storage failure, and the HTTP admin
+/// handlers answer every store error — this one included — as a 400 through
+/// `bad_request`, so nothing matches on the text.
+#[derive(Debug, thiserror::Error)]
+#[error("a key with label {label:?} already exists for provider {provider_id}")]
+pub struct LabelTaken {
+    pub label: String,
+    pub provider_id: i64,
+}
+
+/// Shared insert body for every credential shape: validates, normalizes and
+/// appends under the position lock. The credential variant itself names the
+/// `auth_kind` that is written, so the column and the payload cannot disagree.
 async fn insert_key_row(
     pool: &PgPool,
     provider_id: i64,
@@ -471,8 +603,15 @@ async fn insert_key_row(
     allowed_models: Option<Vec<String>>,
 ) -> anyhow::Result<i64> {
     let (api_key, auth_kind, oauth) = match credential {
-        KeyCredential::Static(api_key) => (Some(api_key), "static", None),
-        KeyCredential::KiroOidc(oauth) => (None, "kiro_oidc", Some(oauth)),
+        KeyCredential::Static(api_key) => (Some(api_key), AuthKind::Static, None),
+        KeyCredential::KiroOidc(oauth) => {
+            (None, AuthKind::KiroOidc, Some(serde_json::to_value(oauth)?))
+        }
+        KeyCredential::OpencodeOauth(oauth) => (
+            None,
+            AuthKind::OpencodeOauth,
+            Some(serde_json::to_value(oauth)?),
+        ),
     };
     anyhow::ensure!(!label.is_empty(), "label must not be empty");
     ensure_valid_max_concurrency(max_concurrency)?;
@@ -487,15 +626,20 @@ async fn insert_key_row(
         anyhow::bail!("provider {provider_id} does not exist");
     };
     match auth_kind {
-        "static" => anyhow::ensure!(
+        AuthKind::Static => anyhow::ensure!(
             protocol != "kiro",
             "a provider with protocol \"kiro\" requires auth_kind \"kiro_oidc\""
         ),
-        "kiro_oidc" => anyhow::ensure!(
+        AuthKind::KiroOidc => anyhow::ensure!(
             protocol == "kiro",
             "auth_kind \"kiro_oidc\" requires a provider with protocol \"kiro\" (got {protocol:?})"
         ),
-        _ => unreachable!("credential resolved to an unknown auth kind"),
+        // The Kiro kernel owns `protocol = "kiro"`; an OpenCode bearer must
+        // never be written into a row that would send it there.
+        AuthKind::OpencodeOauth => anyhow::ensure!(
+            protocol != "kiro",
+            "auth_kind \"opencode_oauth\" is not a Kiro credential (got provider protocol {protocol:?})"
+        ),
     }
     let duplicate: (bool,) = sqlx::query_as(
         "SELECT EXISTS(
@@ -506,10 +650,13 @@ async fn insert_key_row(
     .bind(label)
     .fetch_one(&mut *tx)
     .await?;
-    anyhow::ensure!(
-        !duplicate.0,
-        "a key with label {label:?} already exists for provider {provider_id}"
-    );
+    if duplicate.0 {
+        return Err(LabelTaken {
+            label: label.to_owned(),
+            provider_id,
+        }
+        .into());
+    }
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('gateway_provider_keys.position'))")
         .execute(&mut *tx)
         .await?;
@@ -520,8 +667,8 @@ async fn insert_key_row(
   .bind(provider_id)
   .bind(label)
   .bind(api_key)
-  .bind(auth_kind)
-  .bind(oauth.map(serde_json::to_value).transpose()?)
+  .bind(auth_kind.as_str())
+  .bind(oauth)
   .bind(max_concurrency)
   .bind(allowed_models.map(serde_json::to_value).transpose()?)
   .fetch_one(&mut *tx)
@@ -566,7 +713,10 @@ pub async fn replace_kiro_oauth(
     .await?;
     match existing {
         Some((auth_kind,)) => {
-            anyhow::bail!("oauth can only be updated on a Kiro OIDC key (auth_kind: {auth_kind})")
+            anyhow::bail!(
+                "oauth can only be rotated on a kiro_oidc key; this row's auth_kind is \
+                 {auth_kind:?} and its credential is maintained by its own login or import flow"
+            )
         }
         None => Ok(false),
     }
@@ -589,6 +739,66 @@ pub async fn kiro_oauth(pool: &PgPool, key_id: i64) -> anyhow::Result<Option<Kir
         Some(value) => Ok(Some(serde_json::from_value(value)?)),
         None => Ok(None),
     }
+}
+
+/// One OpenCode account's stored bundle, read fresh from the row.
+///
+/// Same contract and the same reason as [`kiro_oauth`]: the token manager
+/// rereads under its per-key lock before refreshing, because a bundle written by
+/// another process is newer than the route cache's copy and refreshing from a
+/// stale refresh token would rotate it twice. `Ok(None)` means the row is gone,
+/// is not an `opencode_oauth` row, or holds a bundle that no longer decodes;
+/// `Err` is reserved for a real database failure, because an undecodable
+/// payload is a missing credential rather than a storage outage.
+pub async fn opencode_oauth(pool: &PgPool, key_id: i64) -> anyhow::Result<Option<OpencodeOAuth>> {
+    let stored: Option<(String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT auth_kind, oauth FROM gateway_provider_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((auth_kind, oauth)) = stored else {
+        return Ok(None);
+    };
+    if auth_kind != AuthKind::OpencodeOauth.as_str() {
+        return Ok(None);
+    }
+    let Some(value) = oauth else {
+        return Ok(None);
+    };
+    match serde_json::from_value(value) {
+        Ok(bundle) => Ok(Some(bundle)),
+        Err(_) => {
+            // The payload is never printed: it carries the account's tokens.
+            tracing::warn!(
+                key_id,
+                "stored OpenCode bundle does not decode; the account has no usable credential"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Replace one OpenCode account's bundle when the stored one is still
+/// `expected` (compare-and-swap). Returns whether the row was written: `false`
+/// means a concurrent writer won, so the caller keeps serving from memory and
+/// adopts the newer row instead of overwriting it.
+pub async fn replace_opencode_oauth(
+    pool: &PgPool,
+    key_id: i64,
+    expected: &OpencodeOAuth,
+    next: &OpencodeOAuth,
+) -> anyhow::Result<bool> {
+    next.validate()?;
+    let result = sqlx::query(
+        "UPDATE gateway_provider_keys SET oauth = $3
+         WHERE id = $1 AND auth_kind = 'opencode_oauth' AND oauth = $2",
+    )
+    .bind(key_id)
+    .bind(serde_json::to_value(expected)?)
+    .bind(serde_json::to_value(next)?)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// The concurrency cap must be positive when set (mirrors the column CHECK,
@@ -649,8 +859,8 @@ pub struct KeyPatch<'a> {
 /// `max_concurrency` is three-state: outer None = untouched, inner None = clear to unlimited.
 /// `allowed_models` is three-state likewise: outer None = untouched, inner None
 /// (or an empty list) = clear to unrestricted (stored as NULL).
-/// Returns false when no such key exists. An `oauth` bundle on a `static` row
-/// is an error: converting a key's credential kind is not a patch.
+/// Returns false when no such key exists. An `oauth` bundle on a row of any
+/// other kind is an error: converting a key's credential kind is not a patch.
 pub async fn patch_provider_key(
     pool: &PgPool,
     provider_id: i64,
@@ -695,10 +905,13 @@ pub async fn patch_provider_key(
         .bind(key_id)
         .fetch_optional(&mut *tx)
         .await?;
-        anyhow::ensure!(
-            duplicate.is_none(),
-            "a key with label {label:?} already exists for provider {provider_id}"
-        );
+        if duplicate.is_some() {
+            return Err(LabelTaken {
+                label: label.to_owned(),
+                provider_id,
+            }
+            .into());
+        }
     }
     let result = sqlx::query(
         "UPDATE gateway_provider_keys SET
@@ -742,7 +955,8 @@ pub async fn patch_provider_key(
         tx.rollback().await?;
         return match existing {
             Some((auth_kind,)) => anyhow::bail!(
-                "oauth can only be updated on a Kiro OIDC key (auth_kind: {auth_kind})"
+                "oauth can only be rotated on a kiro_oidc key; this row's auth_kind is \
+                 {auth_kind:?} and its credential is maintained by its own login or import flow"
             ),
             None => Ok(false),
         };
@@ -803,13 +1017,16 @@ pub async fn key_api_key(
     Ok(reference.flatten())
 }
 
-/// Delete a key row. Route entries reference the provider, so routes are
-/// left as they are.
+/// Delete a key row, returning the deleted row's `auth_kind` (None = no such
+/// row). Callers evict the per-key runtime state that credential owned — the
+/// Kiro token cache for `kiro_oidc`, the OpenCode one for `opencode_oauth`.
+///
+/// Route entries reference the provider, so routes are left as they are.
 pub async fn delete_provider_key(
     pool: &PgPool,
     provider_id: i64,
     key_id: i64,
-) -> anyhow::Result<Option<bool>> {
+) -> anyhow::Result<Option<String>> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT id FROM gateway_providers WHERE id = $1 FOR UPDATE")
         .bind(provider_id)
@@ -827,7 +1044,7 @@ pub async fn delete_provider_key(
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(deleted.map(|(auth_kind,)| auth_kind == "kiro_oidc"))
+    Ok(deleted.map(|(auth_kind,)| auth_kind))
 }
 
 /// Reorder keys globally: `ids` must list every key exactly once (full-list contract keeps the

@@ -45,6 +45,15 @@ pub struct AppState {
     /// write-back of the rotated bundle. The admin plane updates it on
     /// credential replace/delete.
     pub kiro_tokens: Arc<crate::upstream::KiroTokens>,
+    /// Per-key OpenCode account bearer manager, same contract; shared with model
+    /// and quota probing.
+    pub opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
+    /// The stateless OpenCode Console client: one instance serves the login
+    /// flow, dispatch and probing (tokens are per-call arguments).
+    pub opencode_client: Arc<crate::opencode::auth::Client>,
+    /// In-flight OpenCode device logins: the admin surface starts one, the GUI
+    /// polls it, an operator can cancel it.
+    pub opencode_logins: crate::opencode::login::OpencodeLogins,
     /// Batch ledger writer: relay dispatch queues attempt rows here.
     pub ledger: relay::LedgerWriter,
     /// Cancelled once graceful shutdown has stopped the HTTP surface (shared
@@ -205,6 +214,7 @@ async fn relay_dispatch(
         dispatcher: &state.dispatcher,
         failover: &state.failover,
         kiro_tokens: state.kiro_tokens.as_ref(),
+        opencode_tokens: state.opencode_tokens.as_ref(),
         trace_ring: &state.trace_ring,
         smart_cache: &state.smart_cache,
         rotate_cursors: &state.rotate_cursors,

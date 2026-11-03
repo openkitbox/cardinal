@@ -32,7 +32,16 @@ struct Endpoint {
 /// Probe one key's quota/balance at its provider. `None` when the provider
 /// name has no quota source, the base_url is not a valid http(s) URL, or the
 /// fetch/parse failed (logged — callers treat quota as decorative).
-pub async fn fetch_quota(provider_name: &str, base_url: &str, api_key: &str) -> Option<KeyQuota> {
+///
+/// `org_id` is the OpenCode workspace an organization-scoped account bearer is
+/// bound to; it rides as `x-opencode-org-id` and every other vendor passes
+/// `None` (the header is meaningless there).
+pub async fn fetch_quota(
+    provider_name: &str,
+    base_url: &str,
+    api_key: &str,
+    org_id: Option<&str>,
+) -> Option<KeyQuota> {
     let endpoint = quota_endpoint(provider_name, base_url)?;
     let client = reqwest::Client::new();
     let request = client
@@ -42,6 +51,10 @@ pub async fn fetch_quota(provider_name: &str, base_url: &str, api_key: &str) -> 
     let request = match endpoint.bare_auth {
         true => request.header(reqwest::header::AUTHORIZATION, api_key),
         false => request.bearer_auth(api_key),
+    };
+    let request = match org_id {
+        Some(org_id) => request.header("x-opencode-org-id", org_id),
+        None => request,
     };
     let body = async {
         let response = request.send().await?;

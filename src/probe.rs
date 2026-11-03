@@ -76,17 +76,24 @@ where
 /// `{base}/v1/models` with the version header. Every candidate is tried in
 /// order; the error aggregates all attempts so a misconfigured base_url
 /// shows everything that was asked.
+///
+/// `org_id` is the OpenCode workspace an organization-scoped account bearer is
+/// bound to; it rides as `x-opencode-org-id` and every other caller passes
+/// `None` (the header is meaningless there). Without it the gateway answers the
+/// organization's default scope, so the catalogue probe would cache the wrong
+/// account's models.
 pub async fn fetch_models(
     base_url: &str,
     protocol: &str,
     auth_scheme: &str,
     api_key: &str,
+    org_id: Option<&str>,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     let urls = model_list_urls(base_url, protocol)?;
     let client = reqwest::Client::new();
     let mut errors = Vec::new();
     for url in &urls {
-        match fetch_at(&client, url, protocol, auth_scheme, api_key).await {
+        match fetch_at(&client, url, protocol, auth_scheme, api_key, org_id).await {
             Ok(models) if !models.is_empty() => return Ok(models),
             Ok(_) => errors.push(format!("{url}: no models listed")),
             Err(error) => errors.push(format!("{error:#}")),
@@ -146,6 +153,7 @@ async fn fetch_at(
     protocol: &str,
     auth_scheme: &str,
     api_key: &str,
+    org_id: Option<&str>,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     let mut request = client
         .get(url)
@@ -157,6 +165,10 @@ async fn fetch_at(
         "x_goog_api_key" => request.header("x-goog-api-key", api_key),
         "query" => request.query(&[("key", api_key)]),
         other => anyhow::bail!("auth scheme {other} 不支持探测"),
+    };
+    request = match org_id {
+        Some(org_id) => request.header("x-opencode-org-id", org_id),
+        None => request,
     };
     if protocol == "anthropic_messages" {
         request = request.header("anthropic-version", "2023-06-01");

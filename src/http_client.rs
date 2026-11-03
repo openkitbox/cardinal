@@ -256,6 +256,51 @@ pub struct ReconcileReport {
     pub consistent: bool,
 }
 
+/// The body of `POST /api/providers/{id}/opencode-login`: the OpenCode account
+/// to start logging in. `key_id` re-authenticates an existing account instead
+/// of creating one (the server then ignores `label` and `group_ids`, which the
+/// row already owns).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpencodeLoginRequest {
+    /// The label of the account a fresh login creates.
+    pub label: String,
+    /// An existing `opencode_oauth` key to replace the credential of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<i64>,
+    /// Groups to attach to the new account (ignored for a re-login).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub group_ids: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<i32>,
+}
+
+/// The answer of `POST /api/providers/{id}/opencode-login`: the browser half of
+/// a device login plus the session id to poll.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpencodeLoginStart {
+    /// The login's registry id.
+    pub session: String,
+    /// The short code the operator confirms on the console.
+    pub user_code: String,
+    /// Absolute console URL that prefills the code.
+    pub verification_url: String,
+    /// Seconds the console keeps the grant open.
+    pub expires_in: u64,
+    /// Seconds the server polls the console with.
+    pub interval: u64,
+}
+
+/// The answer of `GET /api/opencode-logins/{session}`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpencodeLoginStatus {
+    /// `waiting`, `succeeded`, `failed`, `expired` or `cancelled`.
+    pub state: String,
+    /// The account key a successful login landed on.
+    pub key_id: Option<i64>,
+    /// Why a login failed; the server's wording is already display-safe.
+    pub message: Option<String>,
+}
+
 /// HTTP client of the gateway's loopback admin API. Cheap to clone (the
 /// reqwest clients are shared).
 #[derive(Clone)]
@@ -953,6 +998,39 @@ impl GatewayHttpClient {
         )
         .await?;
         Ok((result.id, result.created))
+    }
+
+    // ---------- OpenCode account login ----------
+
+    /// Start an OpenCode Console device login. The login continues
+    /// server-side: poll it with [`Self::opencode_login_status`] and abandon a
+    /// waiting one with [`Self::cancel_opencode_login`].
+    pub async fn start_opencode_login(
+        &self,
+        provider_id: i64,
+        body: &OpencodeLoginRequest,
+    ) -> Result<OpencodeLoginStart, ClientError> {
+        json(
+            self.post(&format!("/api/providers/{provider_id}/opencode-login"))
+                .json(body),
+        )
+        .await
+    }
+
+    /// One device login's state. An unknown session, or one whose verdict aged
+    /// out of the registry, answers 404 — an error like any other; the caller
+    /// starts the flow over.
+    pub async fn opencode_login_status(
+        &self,
+        session: &str,
+    ) -> Result<OpencodeLoginStatus, ClientError> {
+        json(self.get(&format!("/api/opencode-logins/{session}"))).await
+    }
+
+    /// Cancel a waiting device login (204). A finished login is not
+    /// cancellable: the server answers 404 and this returns an error.
+    pub async fn cancel_opencode_login(&self, session: &str) -> Result<(), ClientError> {
+        ok(self.delete(&format!("/api/opencode-logins/{session}"))).await
     }
 
     /// Patch a key. Every unset field is left out of the body, so the server
