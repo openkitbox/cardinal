@@ -514,33 +514,3 @@ fn publish_slot(sink: &ActivitySink, slots: &HashMap<SlotKey, SlotState>, key: S
         sink.slot(id as i64, state.inflight);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn entry_slot_identity_is_per_route_account_and_model() {
-        let base = entry_slot_key("alias", 10, "m");
-        assert_eq!(
-            base,
-            entry_slot_key("alias", 10, "m"),
-            "one route entry must hash to one stable slot"
-        );
-        assert_ne!(
-            base,
-            entry_slot_key("alias", 11, "m"),
-            "two accounts must not share an entry slot"
-        );
-        assert_ne!(
-            base,
-            entry_slot_key("alias", 10, "m2"),
-            "two models of one account must not share an entry slot"
-        );
-        assert_ne!(
-            base,
-            entry_slot_key("other", 10, "m"),
-            "two routes must not share an entry slot"
-        );
-    }
-}

@@ -23,8 +23,8 @@ pub(super) fn parse_opencode_go_quota(body: &str) -> Option<KeyQuota> {
     }
     let response: Response = serde_json::from_str(body).ok()?;
     let windows = [
-        ("rolling", "5 小时", 300),
-        ("weekly", "7 天", 7 * 1440),
+        ("rolling", "5h", 300),
+        ("weekly", "7d", 7 * 1440),
         ("monthly", "本月", 30 * 1440),
     ]
     .into_iter()

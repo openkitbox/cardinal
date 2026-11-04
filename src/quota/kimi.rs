@@ -190,7 +190,7 @@ pub(super) fn parse_kimi_code_usages(body: &str) -> Option<KeyQuota> {
     if !windows.iter().any(|window| window.name.ends_with("小时"))
         && let Some(five_hour) = &response.usages.limit_5h
     {
-        windows.extend(ratio_window("5 小时", five_hour, 300));
+        windows.extend(ratio_window("5h", five_hour, 300));
     }
     if windows.is_empty() {
         None

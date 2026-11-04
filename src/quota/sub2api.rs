@@ -104,9 +104,9 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
     let mut windows = Vec::new();
     for limit in &response.rate_limits {
         let (name, period_minutes) = match limit.window.as_str() {
-            "5h" => ("5 小时", 300),
-            "1d" => ("今日", 1440),
-            "7d" => ("7 天", 7 * 1440),
+            "5h" => ("5h", 300),
+            "1d" => ("1d", 1440),
+            "7d" => ("7d", 7 * 1440),
             _ => continue,
         };
         windows.extend(window(

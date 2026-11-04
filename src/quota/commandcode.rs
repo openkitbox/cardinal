@@ -78,7 +78,7 @@ pub(super) fn parse_commandcode_quota(body: &str) -> Option<KeyQuota> {
     let mut implied_monthly = None::<f64>;
     if let Some(limits) = &response.windows {
         for (window, name, period_minutes, fraction) in [
-            (limits.five_hour.as_ref(), "5 小时", 300i64, 5.),
+            (limits.five_hour.as_ref(), "5h", 300i64, 5.),
             (limits.weekly.as_ref(), "本周", 7 * 1440, 2.),
         ] {
             let Some(window) = window else { continue };

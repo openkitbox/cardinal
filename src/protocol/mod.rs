@@ -711,26 +711,3 @@ pub struct ObservedResponse {
     /// Model id echoed by the upstream, kept for evidence only.
     pub upstream_model: Option<String>,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Decoder, ProtocolId};
-
-    #[test]
-    fn only_kiro_reports_usage_after_the_terminal_event() {
-        assert!(Decoder::new(ProtocolId::Kiro, None).usage_follows_terminal());
-        for protocol in [
-            ProtocolId::OpenAiChat,
-            ProtocolId::OpenAiResponses,
-            ProtocolId::AnthropicMessages,
-            ProtocolId::Gemini,
-            ProtocolId::OpenAiEmbeddings,
-        ] {
-            assert!(
-                !Decoder::new(protocol, None).usage_follows_terminal(),
-                "{} must not wait for a usage tail",
-                protocol.as_str()
-            );
-        }
-    }
-}

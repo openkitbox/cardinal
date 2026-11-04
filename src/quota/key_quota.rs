@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 /// (gateway_key_quota_snapshots) for the GUI's instant first paint.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct QuotaWindow {
-    /// Display name ("5 小时", "本周").
+    /// Display name ("5h", "本周").
     pub name: String,
     /// Share of the window already used, 0–100.
     pub used_pct: f64,
