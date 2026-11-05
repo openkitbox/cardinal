@@ -37,6 +37,11 @@ pub const OPTIONAL_FIELDS: &[&str] = &[
 /// safety rail rather than a real limit.
 pub const MAX_STRIP_ROUNDS: u32 = 6;
 
+/// The field that asks for JSON output mode. It is not on [`OPTIONAL_FIELDS`]:
+/// that list is stripped once an upstream *names* it, while a mode refusal
+/// names nothing and is transposed to this field by [`refuses_json_mode`].
+pub const JSON_MODE_FIELD: &str = "response_format";
+
 /// Learned per-upstream field refusals. Identity = (provider row id,
 /// protocol, field): the refusal is a property of the upstream API, not of a
 /// key, and protocol body shapes differ. Stale rows after a provider edit or
@@ -100,10 +105,64 @@ pub fn refused_optional(status: u16, error_body: &[u8], request_body: &Value) ->
     out
 }
 
+/// Does this request ask for JSON output mode?
+///
+/// Only `json_object` asks for a feature; `{"type":"text"}` is the default
+/// shape and needs nothing from the upstream, so it is not a mode request.
+#[must_use]
+pub fn carries_json_object(request: &Value) -> bool {
+    request
+        .get(JSON_MODE_FIELD)
+        .and_then(|format| format.get("type"))
+        .and_then(Value::as_str)
+        == Some("json_object")
+}
+
+/// Does this 400/422 refuse the JSON output *mode* without naming a field?
+///
+/// The two wordings seen in front of one DeepSeek model: a node that lacks the
+/// feature answers `this feature is not yet supported`, and the model's own
+/// precondition answers that the prompt `must contain 'json'`. Neither names a
+/// request field, so [`refused_optional`] attributes nothing — but
+/// `response_format` is the only field that asks for a mode rather than a
+/// value, and dropping it is what the upstream then accepts.
+///
+/// This is deliberately NOT learned by [`Unfit`]: these refusals follow the node
+/// serving the request (the same bytes are refused and then served within one
+/// day), while `Unfit` records a property of the provider's API. A client keeps
+/// asking for JSON mode and keeps getting constrained decoding whenever its
+/// request lands on a node that has it; a request that lands on a node without
+/// it pays one strip round-trip instead of failing.
+///
+/// A refusal of some *other* feature costs that one round-trip and no more: the
+/// stripped request no longer carries `json_object`, so the caller re-checks
+/// [`carries_json_object`] and lets the original error through.
+#[must_use]
+pub fn refuses_json_mode(status: u16, error_body: &[u8]) -> bool {
+    if status != 400 && status != 422 {
+        return false;
+    }
+    // Prose-level match on purpose: both wordings arrive inside a JSON error
+    // body (sometimes a wrapped one), and the phrases survive quoting.
+    let text = String::from_utf8_lossy(error_body);
+    let tables = tables();
+    let refusals = [&tables.feature, &tables.json_word];
+    refusals
+        .into_iter()
+        .flatten()
+        .any(|pattern| pattern.is_match(&text))
+}
+
 struct Tables {
     unknown: Option<Regex>,
     unquoted: Option<Regex>,
     rejected: Option<Regex>,
+    /// A feature the node does not implement, with no field named:
+    /// `this feature is not yet supported by …`.
+    feature: Option<Regex>,
+    /// The model's JSON-mode precondition, with no field named:
+    /// `prompt must contain the word 'json' …`.
+    json_word: Option<Regex>,
 }
 
 fn tables() -> &'static Tables {
@@ -120,6 +179,8 @@ fn tables() -> &'static Tables {
       unquoted: compile(r"(?i)\bunsupported (?:parameter|field|property|argument):\s*([a-z_]+)\b"),
       // Rejected word order: `'store' is unsupported`.
       rejected: compile(r#"(?i)(?:^|\b(?:parameter|field|property|argument)\s+)['"\x60]([a-z_]+)['"\x60]\s+(?:is\s+)?(?:unsupported|not supported)\b"#),
+      feature: compile(r"(?i)\bthis feature is not (?:yet )?supported\b"),
+      json_word: compile(r#"(?i)\bprompt must contain (?:the word )?['"\x60]?json['"\x60]?"#),
     }
   })
 }

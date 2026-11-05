@@ -731,6 +731,23 @@ async fn send_attempt(
                     rounds += 1;
                     continue;
                 }
+            } else if optional::carries_json_object(&sent)
+                && optional::refuses_json_mode(status, &body)
+            {
+                // A node without JSON output mode names no field. Ask once more
+                // without the mode; not learned, because the next request may
+                // land on a node that has it (see `optional::refuses_json_mode`).
+                skip.push(optional::JSON_MODE_FIELD);
+                if let Ok(retried) = prepare(&skip, kiro_profile_arn.as_deref()) {
+                    tracing::info!(
+                        provider_id,
+                        protocol = protocol.as_str(),
+                        "upstream refused JSON output mode; dropped response_format, retrying"
+                    );
+                    prepared = retried;
+                    rounds += 1;
+                    continue;
+                }
             }
         }
         // A vendor error body can echo the credential it just rejected; excise it
