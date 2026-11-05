@@ -626,7 +626,9 @@ async fn send_attempt(
             .await
             .map_err(failover::AttemptError::Transport)?;
         let status = response.status().as_u16();
-        if status < 400 {
+        // Only 2xx is a success. Redirects are never followed (the credential
+        // must not reach another authority), so a 3xx is a failed attempt too.
+        if (200..300).contains(&status) {
             return Ok((status, response, protocol));
         }
         // Capture the vendor's error body (bounded, best-effort: an unreadable body
@@ -773,7 +775,7 @@ async fn send_attempt(
         return Err(
             match transport::status_error(status, &response_headers, body) {
                 Some(error) => failover::AttemptError::Transport(error),
-                // Unreachable (status >= 400 always classifies), kept total without panicking.
+                // Unreachable (a non-2xx status always classifies), kept total without panicking.
                 None => failover::AttemptError::Transport(transport::TransportError::InvalidBody),
             },
         );
@@ -1347,6 +1349,13 @@ impl AttemptLog {
         self
     }
 
+    /// Stamp the upstream model a failed attempt requested ([`Self::from_error`]
+    /// leaves it empty), so the model split counts the failure under its model.
+    fn with_served_model(mut self, served_model: &str) -> Self {
+        self.served_model = Some(served_model.to_owned());
+        self
+    }
+
     /// The ledger numbers the attempt's End reports ([`EndMetrics`]) so a settled
     /// feed row shows the same duration/decode-window speed as the 请求 page
     /// without a ledger read — taken from the very row about to be inserted.
@@ -1376,6 +1385,8 @@ struct AbandonGuard<'a> {
     provider: &'a str,
     key: &'a str,
     model: &'a str,
+    /// The upstream model the in-flight attempt requested.
+    served_model: &'a str,
     alias: Option<&'a str>,
     protocol: ProtocolId,
     client_protocol: ProtocolId,
@@ -1418,7 +1429,8 @@ impl Drop for AbandonGuard<'_> {
         .with_agent(self.agent)
         .with_client_protocol(self.client_protocol)
         .with_effort(self.effort)
-        .with_request_id(self.request_id);
+        .with_request_id(self.request_id)
+        .with_served_model(self.served_model);
         let metrics = row.end_metrics();
         tracing::warn!(
             request_id = self.request_id,
@@ -2308,6 +2320,7 @@ pub async fn dispatch_at(
                     provider: provider.name.as_str(),
                     key: candidate.key.label.as_str(),
                     model: &model,
+                    served_model: target_model,
                     alias: alias.as_deref(),
                     protocol: capability.protocol,
                     client_protocol: request.protocol,
@@ -2620,7 +2633,8 @@ pub async fn dispatch_at(
                     .with_agent(agent)
                     .with_client_protocol(request.protocol)
                     .with_effort(effort.as_deref())
-                    .with_request_id(&request_id);
+                    .with_request_id(&request_id)
+                    .with_served_model(target_model);
                     let metrics = attempt.end_metrics();
                     attempts.push(attempt);
                     // The attempt resolved in failure: drop its live row (the row it

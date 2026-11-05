@@ -70,10 +70,11 @@ impl AttemptError {
     /// The HTTP status the client sees (the failure of the last attempt, or a
     /// non-transferable failure). A status-bearing transport error shows the
     /// upstream's own code — collapsing 404/503 to 502 would hide the vendor's
-    /// actual verdict from the caller and the request log.
+    /// actual verdict from the caller and the request log. A non-error status
+    /// (an unfollowed 3xx) is no verdict to forward: the client gets 502.
     pub fn client_status(&self) -> u16 {
         match self {
-            Self::Transport(TransportError::Status { status, .. }) => *status,
+            Self::Transport(TransportError::Status { status, .. }) if *status >= 400 => *status,
             Self::Transport(error) => as_protocol_error(error).status(),
             // An abort only ever surfaces when every candidate died pre-commit: the
             // upstream family, not the request's fault.
@@ -416,8 +417,10 @@ pub fn classify(error: &AttemptError) -> Failure {
                 .or_else(|| retry_after.map(|d| now + d.min(chrono::Duration::hours(1)))),
         };
     }
-    // 8. Transferable statuses: auth-ish, request timeout, server errors.
-    if matches!(status, 401 | 403 | 404 | 408) || status >= 500 {
+    // 8. Transferable statuses: auth-ish, request timeout, server errors, and
+    //    any non-2xx outside 4xx (an unfollowed 3xx redirect is the upstream's
+    //    doing, not the request's).
+    if matches!(status, 401 | 403 | 404 | 408) || !(400..500).contains(&status) {
         return Failure::Other;
     }
     // 9. Everything else (plain 400/413/422, any other 4xx): the request itself.

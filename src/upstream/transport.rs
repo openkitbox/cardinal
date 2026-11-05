@@ -619,7 +619,7 @@ impl Transport {
 /// never need more than this).
 pub const MAX_ERROR_BODY: usize = 8192;
 
-/// Classify a non-success status, capturing the cooldown's reset-evidence
+/// Classify a non-2xx status, capturing the cooldown's reset-evidence
 /// headers (raw; parsing lives on [`TransportError`]) and the (already
 /// bounded) error body the caller captured.
 pub fn status_error(
@@ -627,7 +627,7 @@ pub fn status_error(
     headers: &HeaderMap,
     body: bytes::Bytes,
 ) -> Option<TransportError> {
-    if status < 400 {
+    if (200..300).contains(&status) {
         return None;
     }
     let value = |name: &str| {
