@@ -600,7 +600,7 @@ pub fn from_ir<'a>(request: &'a IrRequest, model: &str) -> super::Parsed<Value> 
     );
     conversation_state.insert(
         "currentMessage".to_owned(),
-        json!({ "userInputMessage": Value::Object(user) }),
+        keyed("userInputMessage", Value::Object(user)),
     );
     if !history.is_empty() {
         conversation_state.insert("history".to_owned(), Value::Array(history));
@@ -915,7 +915,7 @@ impl<'a> Conversion<'a> {
             context.insert("tools".to_owned(), Value::Array(Vec::new()));
             user.insert("userInputMessageContext".to_owned(), Value::Object(context));
         }
-        json!({ "userInputMessage": Value::Object(user) })
+        keyed("userInputMessage", Value::Object(user))
     }
 
     fn assistant_entry(&mut self, run: &'a [IrMessage]) -> Value {
@@ -938,11 +938,11 @@ impl<'a> Conversion<'a> {
                             self.dropped.push("tool_call.id");
                             continue;
                         };
-                        tool_uses.push(json!({
-                            "toolUseId": id,
-                            "name": name,
-                            "input": args,
-                        }));
+                        let mut tool_use = Map::new();
+                        tool_use.insert("toolUseId".to_owned(), Value::String(id.to_owned()));
+                        tool_use.insert("name".to_owned(), Value::String(name.clone()));
+                        tool_use.insert("input".to_owned(), args.clone());
+                        tool_uses.push(Value::Object(tool_use));
                     }
                 }
             }
@@ -961,7 +961,7 @@ impl<'a> Conversion<'a> {
         if !tool_uses.is_empty() {
             assistant.insert("toolUses".to_owned(), Value::Array(tool_uses));
         }
-        json!({ "assistantResponseMessage": Value::Object(assistant) })
+        keyed("assistantResponseMessage", Value::Object(assistant))
     }
 
     fn current_user(
@@ -1199,7 +1199,10 @@ fn clipped(value: &str, limit: usize) -> String {
 /// never on the structured tool-result channel and never as an invented call.
 fn append_quoted(content: &mut String, quoted: Vec<(QuotedKind, Value)>) {
     for (kind, result) in quoted {
-        let evidence = json!({ "kind": kind.wire(), "result": result });
+        let mut evidence = Map::new();
+        evidence.insert("kind".to_owned(), Value::String(kind.wire().to_owned()));
+        evidence.insert("result".to_owned(), result);
+        let evidence = Value::Object(evidence);
         if !content.is_empty() {
             content.push_str("\n\n");
         }
@@ -1266,13 +1269,25 @@ fn user_tool_results(entry: &mut Value) -> Option<&mut Vec<Value>> {
 }
 
 fn tool_spec(tool: &IrTool) -> Value {
-    json!({
-        "toolSpecification": {
-            "name": tool.name,
-            "description": tool.description,
-            "inputSchema": { "json": normalized_schema(&tool.schema) },
-        },
-    })
+    let mut specification = Map::new();
+    specification.insert("name".to_owned(), Value::String(tool.name.clone()));
+    specification.insert(
+        "description".to_owned(),
+        Value::String(tool.description.clone()),
+    );
+    specification.insert(
+        "inputSchema".to_owned(),
+        keyed("json", normalized_schema(&tool.schema)),
+    );
+    keyed("toolSpecification", Value::Object(specification))
+}
+
+/// A one-key object that takes ownership of its value: `json!` would
+/// serialize (deep-copy) an interpolated `Value` instead of moving it.
+fn keyed(key: &str, value: Value) -> Value {
+    let mut object = Map::new();
+    object.insert(key.to_owned(), value);
+    Value::Object(object)
 }
 
 /// The reference's `normalizeJsonSchema`: KAS answers 400 to a schema whose

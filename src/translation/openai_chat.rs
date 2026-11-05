@@ -33,6 +33,9 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
 
     let mut system: Vec<String> = Vec::new();
     let mut messages: Vec<IrMessage> = Vec::new();
+    // Stand-ins for absent fields, borrowed instead of cloning the present ones.
+    let empty_object = Value::Object(Map::new());
+    let empty_content = Value::String(String::new());
     let raw_messages = object
         .get("messages")
         .and_then(Value::as_array)
@@ -75,10 +78,7 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
                     .into_iter()
                     .flatten()
                 {
-                    let function = call
-                        .get("function")
-                        .cloned()
-                        .unwrap_or_else(|| Value::Object(Map::new()));
+                    let function = call.get("function").unwrap_or(&empty_object);
                     let name = function
                         .get("name")
                         .and_then(Value::as_str)
@@ -108,10 +108,8 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                let content = content
-                    .cloned()
-                    .unwrap_or_else(|| Value::String(String::new()));
-                let (text, images) = tool_output(&content);
+                let content = content.unwrap_or(&empty_content);
+                let (text, images) = tool_output(content);
                 messages.push(IrMessage {
                     role: IrRole::User,
                     parts: vec![IrPart::ToolResult {
@@ -269,7 +267,7 @@ pub fn from_ir(
                         serde_json::json!({"type": "text", "text": "[From the previous tool result:]"}),
                     ];
                     image_parts.append(&mut pending_images);
-                    messages.push(serde_json::json!({"role": "user", "content": image_parts}));
+                    messages.push(role_message("user", Value::Array(image_parts)));
                 }
                 let mut calls: Vec<Value> = Vec::new();
                 let mut text = String::new();
@@ -287,7 +285,7 @@ pub fn from_ir(
                             };
                             call_names.insert(id.clone(), name.clone());
                             call_ids.insert(ir_id, id.clone());
-                            calls.push(serde_json::json!({"id": id, "type": "function", "function": {"name": name, "arguments": args.to_string()}}));
+                            calls.push(tool_call_value(id, name, args.to_string()));
                         }
                         // DeepSeek requires reasoning_content replay when tools
                         // are present; other vendors ignore the field.
@@ -319,16 +317,14 @@ pub fn from_ir(
                                 ImageSource::Url(url) => url.clone(),
                                 ImageSource::Base64(data) => format!("data:{media};base64,{data}"),
                             };
-                            content.push(
-                                serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
-                            );
+                            content.push(image_url_part(url));
                         }
                         IrPart::File { media, source } => {
                             let where_at = match source {
                                 FileSource::Url(url) => format!("[attachment {media}: {url}]"),
                                 FileSource::Base64(_) => format!("[attachment {media}]"),
                             };
-                            content.push(serde_json::json!({"type": "text", "text": where_at}));
+                            content.push(text_part(where_at));
                         }
                         IrPart::ToolResult {
                             call_id,
@@ -336,7 +332,7 @@ pub fn from_ir(
                             images,
                             is_error,
                         } => {
-                            let Some(wire_id) = call_ids.get(call_id).cloned() else {
+                            let Some(wire_id) = call_ids.get(call_id) else {
                                 dropped.push("tool_result.unpaired");
                                 continue;
                             };
@@ -359,14 +355,20 @@ pub fn from_ir(
                                     "[The tool returned images; they follow in the next message.]"
                                 });
                             }
-                            let of = call_names
-                                .get(call_id)
-                                .cloned()
-                                .unwrap_or_else(|| format!("tool call {call_id}"));
-                            messages.push(serde_json::json!({"role": "tool", "tool_call_id": call_id, "content": out}));
-                            let mut seen = vec![
-                                serde_json::json!({"type": "text", "text": format!("[From the result of {of}:]")}),
-                            ];
+                            let label = match call_names.get(call_id) {
+                                Some(name) => format!("[From the result of {name}:]"),
+                                None => format!("[From the result of tool call {call_id}:]"),
+                            };
+                            let mut tool_message = Map::new();
+                            tool_message
+                                .insert("role".to_owned(), Value::String("tool".to_owned()));
+                            tool_message.insert(
+                                "tool_call_id".to_owned(),
+                                Value::String(call_id.to_owned()),
+                            );
+                            tool_message.insert("content".to_owned(), Value::String(out));
+                            messages.push(Value::Object(tool_message));
+                            let mut seen = vec![text_part(label)];
                             for image in images {
                                 if let IrPart::Image { media, source } = image {
                                     let url = match source {
@@ -375,7 +377,7 @@ pub fn from_ir(
                                             format!("data:{media};base64,{data}")
                                         }
                                     };
-                                    seen.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
+                                    seen.push(image_url_part(url));
                                 }
                             }
                             // Image gating arms only for actual images: a text-only
@@ -402,17 +404,17 @@ pub fn from_ir(
                         .iter()
                         .filter_map(|part| part.get("text").and_then(Value::as_str))
                         .collect::<String>();
-                    messages.push(serde_json::json!({"role": "user", "content": joined}));
+                    messages.push(role_message("user", Value::String(joined)));
                 } else if !content.is_empty() {
                     let mut full = std::mem::take(&mut pending_images);
                     full.append(&mut content);
-                    messages.push(serde_json::json!({"role": "user", "content": full}));
+                    messages.push(role_message("user", Value::Array(full)));
                 }
             }
         }
     }
     if !pending_images.is_empty() {
-        messages.push(serde_json::json!({"role": "user", "content": pending_images}));
+        messages.push(role_message("user", Value::Array(pending_images)));
     }
     dropped.dedup();
 
@@ -461,14 +463,23 @@ pub fn from_ir(
             && format.get("schema").is_some()
             && format.get("json_schema").is_none()
         {
-            serde_json::json!({
-              "type": "json_schema",
-              "json_schema": {
-                "name": format.get("name").cloned().unwrap_or(Value::String("response".to_owned())),
-                "schema": format["schema"].clone(),
-                "strict": format.get("strict").cloned().unwrap_or(Value::Bool(true)),
-              }
-            })
+            let mut envelope = Map::new();
+            envelope.insert(
+                "name".to_owned(),
+                format
+                    .get("name")
+                    .cloned()
+                    .unwrap_or(Value::String("response".to_owned())),
+            );
+            envelope.insert("schema".to_owned(), format["schema"].clone());
+            envelope.insert(
+                "strict".to_owned(),
+                format.get("strict").cloned().unwrap_or(Value::Bool(true)),
+            );
+            let mut wrapped = Map::new();
+            wrapped.insert("type".to_owned(), Value::String("json_schema".to_owned()));
+            wrapped.insert("json_schema".to_owned(), Value::Object(envelope));
+            Value::Object(wrapped)
         } else {
             format.clone()
         };
@@ -592,7 +603,7 @@ pub fn emit_response_json(response: &super::ir::IrResponse) -> Result<Vec<u8>, P
                 let id = id.clone().unwrap_or_else(|| {
                     format!("call_{:016x}", index as u64 + args.to_string().len() as u64)
                 });
-                calls.push(serde_json::json!({"id": id, "type": "function", "function": {"name": name, "arguments": args.to_string()}}));
+                calls.push(tool_call_value(id, name, args.to_string()));
             }
             _ => {}
         }
@@ -618,13 +629,20 @@ pub fn emit_response_json(response: &super::ir::IrResponse) -> Result<Vec<u8>, P
         IrStop::Other(reason) if reason == "content_filter" => "content_filter",
         IrStop::Other(_) => "stop",
     };
+    let mut choice = Map::new();
+    choice.insert("index".to_owned(), Value::from(0));
+    choice.insert("message".to_owned(), Value::Object(message));
+    choice.insert(
+        "finish_reason".to_owned(),
+        Value::String(finish_reason.to_owned()),
+    );
     let mut body = serde_json::json!({
       "id": format!("chatcmpl-{:032x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().unsigned_abs()),
       "object": "chat.completion",
       "created": chrono::Utc::now().timestamp(),
       "model": response.model,
-      "choices": [{"index": 0, "message": Value::Object(message), "finish_reason": finish_reason}],
     });
+    body["choices"] = Value::Array(vec![Value::Object(choice)]);
     if let Some(usage) = &response.usage {
         body["usage"] = usage_to_chat(usage);
     }
@@ -703,13 +721,8 @@ fn chat_parts(content: &Value) -> Vec<IrPart> {
                 .and_then(Value::as_str)
                 .map(|text| IrPart::Text(text.to_owned())),
             Some("image_url") => {
-                let url = item.get("image_url").and_then(|image| {
-                    image
-                        .as_str()
-                        .map(str::to_owned)
-                        .or_else(|| image.get("url").and_then(Value::as_str).map(str::to_owned))
-                })?;
-                Some(image_part(&url))
+                let url = item.get("image_url").and_then(image_url_of)?;
+                Some(image_part(url))
             }
             _ => None,
         })
@@ -740,17 +753,59 @@ fn tool_output(content: &Value) -> (String, Vec<IrPart>) {
     let mut images = Vec::new();
     for item in content.as_array().into_iter().flatten() {
         if item.get("type").and_then(Value::as_str) == Some("image_url")
-            && let Some(url) = item.get("image_url").and_then(|image| {
-                image
-                    .as_str()
-                    .map(str::to_owned)
-                    .or_else(|| image.get("url").and_then(Value::as_str).map(str::to_owned))
-            })
+            && let Some(url) = item.get("image_url").and_then(image_url_of)
         {
-            images.push(image_part(&url));
+            images.push(image_part(url));
         }
     }
     (text, images)
+}
+
+/// The URL of an `image_url` field: the bare string form or `{"url": …}`.
+fn image_url_of(image: &Value) -> Option<&str> {
+    image
+        .as_str()
+        .or_else(|| image.get("url").and_then(Value::as_str))
+}
+
+/// A `{"type": "text"}` content part that takes ownership of its text.
+fn text_part(text: String) -> Value {
+    let mut part = Map::new();
+    part.insert("type".to_owned(), Value::String("text".to_owned()));
+    part.insert("text".to_owned(), Value::String(text));
+    Value::Object(part)
+}
+
+/// A `{"type": "image_url"}` content part that takes ownership of the URL,
+/// which is often a large data URL.
+fn image_url_part(url: String) -> Value {
+    let mut image = Map::new();
+    image.insert("url".to_owned(), Value::String(url));
+    let mut part = Map::new();
+    part.insert("type".to_owned(), Value::String("image_url".to_owned()));
+    part.insert("image_url".to_owned(), Value::Object(image));
+    Value::Object(part)
+}
+
+/// A `{"role", "content"}` message that takes ownership of its content.
+fn role_message(role: &str, content: Value) -> Value {
+    let mut message = Map::new();
+    message.insert("role".to_owned(), Value::String(role.to_owned()));
+    message.insert("content".to_owned(), content);
+    Value::Object(message)
+}
+
+/// A `function` tool call that takes ownership of its id and serialized
+/// arguments.
+fn tool_call_value(id: String, name: &str, arguments: String) -> Value {
+    let mut function = Map::new();
+    function.insert("name".to_owned(), Value::String(name.to_owned()));
+    function.insert("arguments".to_owned(), Value::String(arguments));
+    let mut call = Map::new();
+    call.insert("id".to_owned(), Value::String(id));
+    call.insert("type".to_owned(), Value::String("function".to_owned()));
+    call.insert("function".to_owned(), Value::Object(function));
+    Value::Object(call)
 }
 
 /// Read a JSON value that is either a string or an array of text blocks.

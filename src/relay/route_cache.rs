@@ -20,8 +20,11 @@ pub struct RouteCache {
 struct RouteCacheInner {
     providers_by_name: HashMap<String, ProviderRow>,
     providers_by_id: HashMap<i64, ProviderRow>,
-    keys_by_id: HashMap<i64, ProviderKeyRow>,
-    keys_by_provider: HashMap<i64, Vec<ProviderKeyRow>>, // provider_id → keys
+    /// Shared rows: dispatch hands each resolved row to its candidates by
+    /// `Arc`, so a request never deep-copies a row (its model snapshot, OAuth
+    /// bundle and whitelist) out of the cache.
+    keys_by_id: HashMap<i64, Arc<ProviderKeyRow>>,
+    keys_by_provider: HashMap<i64, Vec<Arc<ProviderKeyRow>>>, // provider_id → keys
     routes_by_alias: HashMap<String, RouteRow>,
     all_routes: Vec<RouteRow>,
 }
@@ -97,12 +100,13 @@ impl RouteCache {
         }
 
         let mut keys_by_id = HashMap::new();
-        let mut keys_by_provider: HashMap<i64, Vec<ProviderKeyRow>> = HashMap::new();
+        let mut keys_by_provider: HashMap<i64, Vec<Arc<ProviderKeyRow>>> = HashMap::new();
         for k in keys {
+            let k = Arc::new(k);
             keys_by_provider
                 .entry(k.provider_id)
                 .or_default()
-                .push(k.clone());
+                .push(Arc::clone(&k));
             keys_by_id.insert(k.id, k);
         }
 
@@ -136,9 +140,9 @@ impl RouteCache {
     }
 
     /// Every key of one provider in the provider's (position, id) order,
-    /// cloned under one lock. Used by the direct `provider/model` path, which
+    /// shared under one lock. Used by the direct `provider/model` path, which
     /// deliberately serves every account of the provider.
-    pub fn keys_for_provider(&self, provider_id: i64) -> Vec<ProviderKeyRow> {
+    pub fn keys_for_provider(&self, provider_id: i64) -> Vec<Arc<ProviderKeyRow>> {
         let inner = match self.inner.read() {
             Ok(inner) => inner,
             Err(_) => return Vec::new(),
@@ -154,7 +158,7 @@ impl RouteCache {
         self.inner.read().ok()?.routes_by_alias.get(alias).cloned()
     }
 
-    /// The keys named by `ids`, in (position, id) order, cloned under one lock.
+    /// The keys named by `ids`, in (position, id) order, shared under one lock.
     /// Dispatch resolves a whole route's entries from this: a route entry is
     /// one account, so the caller collects `entry.key_id` and gets the rows
     /// back in the store's global order (ids missing from the cache — a
@@ -164,14 +168,14 @@ impl RouteCache {
     /// route expansion re-indexes the rows by id, since the entries' own order
     /// is the dispatch order. Sorting a handful of rows costs less than a
     /// lookup whose output depends on hash iteration.
-    pub fn keys_by_ids(&self, ids: &[i64]) -> Vec<ProviderKeyRow> {
+    pub fn keys_by_ids(&self, ids: &[i64]) -> Vec<Arc<ProviderKeyRow>> {
         let inner = match self.inner.read() {
             Ok(inner) => inner,
             Err(_) => return Vec::new(),
         };
-        let mut rows: Vec<ProviderKeyRow> = ids
+        let mut rows: Vec<Arc<ProviderKeyRow>> = ids
             .iter()
-            .filter_map(|id| inner.keys_by_id.get(id).cloned())
+            .filter_map(|id| inner.keys_by_id.get(id).map(Arc::clone))
             .collect();
         rows.sort_by_key(|k| (k.position, k.id));
         rows
@@ -254,7 +258,12 @@ impl RouteCache {
             let mut keys: Vec<&ProviderKeyRow> = inner
                 .keys_by_provider
                 .get(&provider.id)
-                .map(|keys| keys.iter().filter(|k| k.active()).collect())
+                .map(|keys| {
+                    keys.iter()
+                        .map(Arc::as_ref)
+                        .filter(|k| k.active())
+                        .collect()
+                })
                 .unwrap_or_default();
             keys.sort_by_key(|k| (k.position, k.id));
             for key in keys {
@@ -377,7 +386,10 @@ impl RouteCache {
             Ok(inner) => inner,
             Err(_) => return Vec::new(),
         };
-        servable_key_models(inner.keys_by_id.values(), &inner.providers_by_id)
+        servable_key_models(
+            inner.keys_by_id.values().map(Arc::as_ref),
+            &inner.providers_by_id,
+        )
     }
 
     pub fn is_empty(&self) -> bool {

@@ -443,7 +443,10 @@ impl Decoder {
             }
             ProtocolId::Gemini => Self::Gemini(gemini::StreamDecoder::new()),
             ProtocolId::OpenAiEmbeddings => Self::Unstreamed,
-            ProtocolId::Kiro => Self::Kiro(kiro::StreamDecoder::new(context_window)),
+            ProtocolId::Kiro => Self::Kiro(kiro::StreamDecoder::new(
+                context_window,
+                kiro::Retention::CountsOnly,
+            )),
         }
     }
 

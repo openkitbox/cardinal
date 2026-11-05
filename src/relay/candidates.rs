@@ -18,6 +18,7 @@
 //!   lone resting key is still tried.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use secrecy::SecretString;
 
@@ -29,7 +30,9 @@ use crate::translation::ir::Effort;
 /// belongs to, and the upstream model to request.
 #[derive(Clone, Debug)]
 pub struct Candidate {
-    pub key: ProviderKeyRow,
+    /// Shared with the route cache: every candidate of one account points at
+    /// the same row, never a copy of it.
+    pub key: Arc<ProviderKeyRow>,
     /// The key's secret, resolved from the secret store in one batch at resolve
     /// time (SecretString: zeroize-on-drop, redacted Debug — never log it).
     pub secret: SecretString,
@@ -144,7 +147,7 @@ fn model_context(key: &ProviderKeyRow, model: &str) -> Option<u64> {
 /// with their reasons.
 pub fn expand_direct(
     provider: ProviderRow,
-    keys: Vec<(ProviderKeyRow, SecretString)>,
+    keys: Vec<(Arc<ProviderKeyRow>, SecretString)>,
     upstream_model: &str,
 ) -> (Vec<Candidate>, Vec<(Candidate, SkipReason)>) {
     let mut candidates = Vec::with_capacity(keys.len());
@@ -201,11 +204,11 @@ pub struct Expansion {
 /// availability rules deny `now` as `WindowSkipped`.
 pub fn expand_route(
     entries: &[RouteEntry],
-    keys: Vec<(ProviderKeyRow, SecretString)>,
+    keys: Vec<(Arc<ProviderKeyRow>, SecretString)>,
     providers: &HashMap<i64, ProviderRow>,
     now: chrono::DateTime<chrono::Local>,
 ) -> Expansion {
-    let keys_by_id: HashMap<i64, (ProviderKeyRow, SecretString)> = keys
+    let keys_by_id: HashMap<i64, (Arc<ProviderKeyRow>, SecretString)> = keys
         .into_iter()
         .map(|(key, secret)| (key.id, (key, secret)))
         .collect();
@@ -248,7 +251,7 @@ pub fn expand_route(
 
 /// Build a Candidate for either the candidates or excluded list.
 fn make_candidate(
-    key: &ProviderKeyRow,
+    key: &Arc<ProviderKeyRow>,
     secret: &SecretString,
     provider: &ProviderRow,
     entry: &RouteEntry,
@@ -256,10 +259,11 @@ fn make_candidate(
     let model = entry.model.as_str();
     let (supported, default) = effort_support(key, model);
     Candidate {
-        key: key.clone(),
-        // A key serving several entries clones its row and secret per
-        // candidate (each secret clone is its own zeroizing allocation; route
-        // entries are few, and this runs once per request at resolve time).
+        key: Arc::clone(key),
+        // A key serving several entries shares its row and clones its secret
+        // per candidate (each secret clone is its own zeroizing allocation;
+        // route entries are few, and this runs once per request at resolve
+        // time).
         secret: secret.clone(),
         provider: provider.clone(),
         upstream_model: model.to_owned(),

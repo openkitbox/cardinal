@@ -166,11 +166,11 @@ impl HoldState {
         }
     }
 
-    /// Buffer one client frame (a RawFrame clone is a `Bytes` refcount bump,
-    /// not a copy).
-    fn push(&mut self, frame: &RawFrame) {
+    /// Buffer one client frame. Takes ownership: the caller is done with it,
+    /// and a clone would re-allocate the `event`/`id` strings.
+    fn push(&mut self, frame: RawFrame) {
         self.bytes += frame.data.len() + frame.event.as_deref().map_or(0, str::len);
-        self.buf.push(frame.clone());
+        self.buf.push(frame);
     }
 
     /// Remaining pre-commit read wait (zero once the window expired).
@@ -579,7 +579,7 @@ async fn drive_stream(
                             usage = Some(counts);
                         }
                         if let Some(held) = &mut hold {
-                            held.push(&frame);
+                            held.push(frame);
                             if held.commits(decoder.content_seen(), decoder.terminal_seen()) {
                                 commit_hold(
                                     tx,
@@ -838,7 +838,7 @@ async fn drive_stream(
                             }
                         }
                         if let Some(held) = &mut hold {
-                            for frame in &frames {
+                            for frame in frames {
                                 held.push(frame);
                             }
                             if held.commits(content, terminal_at_eof) {
@@ -906,7 +906,7 @@ async fn drive_stream(
                                         }
                                     }
                                     if let Some(held) = &mut hold {
-                                        for frame in &frames {
+                                        for frame in frames {
                                             held.push(frame);
                                         }
                                     }

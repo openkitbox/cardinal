@@ -11,7 +11,7 @@ use super::ir::{
     Effort, IrMessage, IrPart, IrRequest, IrResponse, IrRole, IrStop, IrTool, IrToolChoice,
 };
 use crate::protocol::ProtocolError;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Responses-only concepts no translated hop can carry. `store`/`background`
 /// are stateless-relay concerns: the kernel refuses their non-default values
@@ -421,13 +421,13 @@ pub fn emit_response_json(
                 // within the response by construction (a hash of position/args can
                 // collide on repeated identical calls).
                 let call_id = id.clone().unwrap_or_else(|| format!("call_{calls}"));
-                output.push(serde_json::json!({
-                  "id": format!("fc_{calls:016x}"),
-                  "type": "function_call",
-                  "call_id": call_id,
-                  "name": name,
-                  "arguments": args.to_string(),
-                }));
+                let mut item = Map::new();
+                item.insert("id".to_owned(), Value::String(format!("fc_{calls:016x}")));
+                item.insert("type".to_owned(), Value::String("function_call".to_owned()));
+                item.insert("call_id".to_owned(), Value::String(call_id));
+                item.insert("name".to_owned(), Value::String(name.clone()));
+                item.insert("arguments".to_owned(), Value::String(args.to_string()));
+                output.push(Value::Object(item));
             }
             // The Thinking arm above accumulates into `thinking`; nothing else
             // to do here.
@@ -454,8 +454,8 @@ pub fn emit_response_json(
       "created_at": chrono::Utc::now().timestamp(),
       "status": status,
       "model": response.model,
-      "output": output,
     });
+    body["output"] = Value::Array(output);
     // Unknown usage stays unknown: an absent `usage` is honest, three zeroes
     // are not (same rule as the streaming terminal).
     if let Some(usage) = &response.usage {
@@ -480,13 +480,17 @@ pub fn emit_response_json(
 }
 
 fn message_item(seq: u64, text: String) -> Value {
-    serde_json::json!({
+    let mut part = Map::new();
+    part.insert("type".to_owned(), Value::String("output_text".to_owned()));
+    part.insert("text".to_owned(), Value::String(text));
+    let mut item = serde_json::json!({
       "id": format!("msg_{seq:016x}"),
       "type": "message",
       "status": "completed",
       "role": "assistant",
-      "content": [{"type": "output_text", "text": text}],
-    })
+    });
+    item["content"] = Value::Array(vec![Value::Object(part)]);
+    item
 }
 
 /// Push the accumulated thinking as one reasoning item, if any. The client's
@@ -498,11 +502,15 @@ fn flush_reasoning(output: &mut Vec<Value>, thinking: &mut String, seq: &mut u64
     }
     *seq += 1;
     let text = std::mem::take(thinking);
-    output.push(serde_json::json!({
+    let mut part = Map::new();
+    part.insert("type".to_owned(), Value::String("summary_text".to_owned()));
+    part.insert("text".to_owned(), Value::String(text));
+    let mut item = serde_json::json!({
       "id": format!("rs_{seq:016x}"),
       "type": "reasoning",
-      "summary": [{"type": "summary_text", "text": text}],
-    }));
+    });
+    item["summary"] = Value::Array(vec![Value::Object(part)]);
+    output.push(item);
 }
 
 /// Responses is never the translation *target* (`OPENED` carries only the

@@ -98,35 +98,44 @@ impl Framer {
     }
 
     /// Feed a chunk without copying completed data into a `String`.
+    ///
+    /// The chunk is scanned run by run: a line that lies wholly inside the
+    /// chunk is parsed in place, and only a line split across chunks is
+    /// buffered. An error is terminal (the caller marks its stream broken and
+    /// never feeds the framer again), and the frames this call already
+    /// completed are discarded with it.
     pub fn push_raw(&mut self, chunk: &[u8]) -> Result<Vec<RawFrame>, SseError> {
         let mut frames = Vec::new();
-        let mut bytes = chunk;
+        let mut rest = chunk;
         if !self.started {
             self.started = true;
-            if bytes.len() >= 3 && bytes[..3] == [0xEF, 0xBB, 0xBF] {
-                bytes = &bytes[3..];
+            if rest.len() >= 3 && rest[..3] == [0xEF, 0xBB, 0xBF] {
+                rest = &rest[3..];
             }
         }
-        for byte in bytes {
+        while let Some((&first, tail)) = rest.split_first() {
             if self.skip_lf {
                 self.skip_lf = false;
-                if *byte == b'\n' {
+                if first == b'\n' {
+                    rest = tail;
                     continue;
                 }
             }
-            match byte {
-                b'\n' => self.end_line(&mut frames)?,
-                b'\r' => {
-                    self.end_line(&mut frames)?;
-                    self.skip_lf = true;
-                }
-                _ => {
-                    self.line.push(*byte);
-                    if self.line.len() > MAX_LINE_BYTES {
-                        return Err(SseError::LineTooLong);
-                    }
-                }
+            let Some(end) = rest.iter().position(|byte| matches!(byte, b'\n' | b'\r')) else {
+                self.append(rest)?;
+                break;
+            };
+            let run = &rest[..end];
+            if self.line.is_empty() && run.len() <= MAX_LINE_BYTES {
+                self.dispatch_line(run, &mut frames)?;
+            } else {
+                self.append(run)?;
+                self.end_line(&mut frames)?;
             }
+            if rest[end] == b'\r' {
+                self.skip_lf = true;
+            }
+            rest = &rest[end + 1..];
         }
         Ok(frames)
     }
@@ -143,8 +152,25 @@ impl Framer {
         Ok(frames)
     }
 
+    /// Buffer part of a line that continues past the current chunk.
+    fn append(&mut self, run: &[u8]) -> Result<(), SseError> {
+        if self.line.len() + run.len() > MAX_LINE_BYTES {
+            return Err(SseError::LineTooLong);
+        }
+        self.line.extend_from_slice(run);
+        Ok(())
+    }
+
+    /// Parse the buffered line, then empty the buffer keeping its capacity.
     fn end_line(&mut self, frames: &mut Vec<RawFrame>) -> Result<(), SseError> {
-        let line = std::mem::take(&mut self.line);
+        let mut line = std::mem::take(&mut self.line);
+        let result = self.dispatch_line(&line, frames);
+        line.clear();
+        self.line = line;
+        result
+    }
+
+    fn dispatch_line(&mut self, line: &[u8], frames: &mut Vec<RawFrame>) -> Result<(), SseError> {
         if line.is_empty() {
             if !self.data.is_empty() {
                 frames.push(self.take_event());
@@ -166,7 +192,7 @@ impl Framer {
                     },
                 )
             }
-            None => (&line[..], &line[line.len()..]),
+            None => (line, &line[line.len()..]),
         };
         let value = std::str::from_utf8(value).map_err(|_| SseError::InvalidUtf8)?;
         match field {

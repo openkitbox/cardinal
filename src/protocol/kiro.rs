@@ -72,12 +72,14 @@
 //!   are never forwarded; the usage estimate they yield goes to the ledger and
 //!   is placed before the finish event for the client. A buffered response
 //!   observes the whole body by construction.
-//! * **The streaming decoder accumulates the full text and reasoning.** The
-//!   same [`StreamDecoder`] backs the streamed and buffered paths (one state
-//!   machine, no drift), so a streamed response keeps one full copy of the
-//!   text/reasoning in memory although only deltas are forwarded, and each
-//!   delta event costs one small allocation. The buffered path moves the
-//!   accumulated text into the IR rather than copying it again.
+//! * **Only the buffered decoder retains the text and reasoning.** The same
+//!   [`StreamDecoder`] state machine backs the streamed and buffered paths
+//!   (no drift); [`Retention`] decides whether it keeps the content. Both
+//!   modes keep running character counts, which are what [`StreamDecoder::usage`]
+//!   and [`StreamDecoder::content_seen`] read, so the two paths report the
+//!   same numbers. A streamed response forwards only deltas (one small
+//!   allocation each) and holds no copy of the text; the buffered path moves
+//!   the accumulated text into the IR rather than copying it again.
 
 use super::awseventstream::{Framer, Message};
 use super::usage::UsageCounts;
@@ -168,6 +170,16 @@ pub struct ToolCall {
     pub complete: bool,
 }
 
+/// Whether a [`StreamDecoder`] keeps the accumulated text and reasoning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Retention {
+    /// Streamed: content leaves as delta events; only counts are kept.
+    #[default]
+    CountsOnly,
+    /// Buffered ([`aggregate`]): the text and reasoning are kept for the IR.
+    Full,
+}
+
 /// Raw `meteringEvent` evidence, kept as diagnostics only.
 ///
 /// KAS bills credits, not total tokens: [`StreamDecoder::usage`] estimates the
@@ -188,8 +200,15 @@ pub struct Metering {
 /// the same events.
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
+    retention: Retention,
+    /// Accumulated text; stays empty under [`Retention::CountsOnly`].
     text: String,
+    /// Accumulated reasoning; stays empty under [`Retention::CountsOnly`].
     reasoning: String,
+    /// Characters of text observed, in both retention modes.
+    text_chars: usize,
+    /// Characters of reasoning observed, in both retention modes.
+    reasoning_chars: usize,
     /// Native reasoning signature. Kept as internal evidence only: no
     /// translated hop can carry a signature, and faking one outward would
     /// poison a client that replays it.
@@ -218,8 +237,9 @@ pub struct StreamDecoder {
 }
 
 impl StreamDecoder {
-    pub fn new(context_window: Option<u64>) -> Self {
+    pub fn new(context_window: Option<u64>, retention: Retention) -> Self {
         Self {
+            retention,
             context_window,
             ..Self::default()
         }
@@ -290,7 +310,10 @@ impl StreamDecoder {
                 if content.is_empty() {
                     return Ok(Vec::new());
                 }
-                self.text.push_str(content);
+                self.text_chars += content.chars().count();
+                if self.retention == Retention::Full {
+                    self.text.push_str(content);
+                }
                 Ok(vec![StreamEvent::TextDelta(content.to_owned())])
             }
             "reasoningContentEvent" => {
@@ -302,7 +325,10 @@ impl StreamDecoder {
                 if text.is_empty() {
                     return Ok(Vec::new());
                 }
-                self.reasoning.push_str(text);
+                self.reasoning_chars += text.chars().count();
+                if self.retention == Retention::Full {
+                    self.reasoning.push_str(text);
+                }
                 Ok(vec![StreamEvent::ReasoningDelta(text.to_owned())])
             }
             "toolUseEvent" => self.observe_tool_use(message),
@@ -475,8 +501,8 @@ impl StreamDecoder {
             return None;
         }
         let input_tokens = (context_window as f64 * percentage / 100.0).floor() as u64;
-        let total_chars = self.text.chars().count()
-            + self.reasoning.chars().count()
+        let total_chars = self.text_chars
+            + self.reasoning_chars
             + self
                 .tools
                 .iter()
@@ -510,27 +536,32 @@ impl StreamDecoder {
 
     /// Whether real content (text, reasoning or a tool call) was observed.
     pub fn content_seen(&self) -> bool {
-        !self.text.is_empty() || !self.reasoning.is_empty() || !self.tools.is_empty()
+        self.text_chars > 0 || self.reasoning_chars > 0 || !self.tools.is_empty()
     }
 
+    /// The accumulated text; empty under [`Retention::CountsOnly`].
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    /// The accumulated reasoning; empty under [`Retention::CountsOnly`].
     pub fn reasoning(&self) -> &str {
         &self.reasoning
     }
 
-    /// Move the accumulated text out, leaving the decoder's copy empty. Call
-    /// it after every read that depends on the text ([`Self::usage`] counts
-    /// its characters, [`Self::content_seen`] its emptiness).
+    /// Move the accumulated text out, leaving the decoder's copy (and its
+    /// character count) empty. Call it after every read that depends on the
+    /// text ([`Self::usage`] counts its characters, [`Self::content_seen`]
+    /// its emptiness).
     pub fn take_text(&mut self) -> String {
+        self.text_chars = 0;
         std::mem::take(&mut self.text)
     }
 
     /// Move the accumulated reasoning out; same ordering caveat as
     /// [`Self::take_text`].
     pub fn take_reasoning(&mut self) -> String {
+        self.reasoning_chars = 0;
         std::mem::take(&mut self.reasoning)
     }
 
@@ -598,7 +629,7 @@ pub fn aggregate(body: &[u8], context_window: Option<u64>) -> Result<StreamDecod
     framer
         .finish()
         .map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
-    let mut decoder = StreamDecoder::new(context_window);
+    let mut decoder = StreamDecoder::new(context_window, Retention::Full);
     for message in &messages {
         decoder.observe(message)?;
     }

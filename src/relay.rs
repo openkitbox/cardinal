@@ -319,13 +319,14 @@ async fn attempt(
     ctx: &AttemptContext<'_>,
     target_model: &str,
     request: &RelayRequest,
+    client_ir: &mut ClientIr,
     request_id: &str,
     deadline: std::time::Instant,
 ) -> Result<RelayOutcome, failover::AttemptError> {
     if !request.stream {
-        attempt_json(ctx, target_model, request, deadline).await
+        attempt_json(ctx, target_model, request, client_ir, deadline).await
     } else {
-        attempt_stream(ctx, target_model, request, request_id, deadline).await
+        attempt_stream(ctx, target_model, request, client_ir, request_id, deadline).await
     }
 }
 
@@ -427,6 +428,7 @@ async fn send_attempt(
     ctx: &AttemptContext<'_>,
     target_model: &str,
     request: &RelayRequest,
+    client_ir: &mut ClientIr,
     stream: bool,
     deadline: std::time::Instant,
 ) -> Result<Sent, failover::AttemptError> {
@@ -587,9 +589,9 @@ async fn send_attempt(
     // Only the first preparation digests the prompt: a re-prepare strips
     // optional fields or rotates the profile, neither of which is prompt, so it
     // passes no scope and skips the hashing.
-    let prepare = |fields: &[&str],
-                   profile_arn: Option<&str>,
-                   prompt_scope: Option<prompt_cache::Scope<'_>>| {
+    let mut prepare = |fields: &[&str],
+                       profile_arn: Option<&str>,
+                       prompt_scope: Option<prompt_cache::Scope<'_>>| {
         if request.protocol == protocol {
             protocol::prepare(
                 protocol,
@@ -606,6 +608,7 @@ async fn send_attempt(
         } else {
             prepare_translated(
                 &request.body,
+                client_ir,
                 request.protocol,
                 protocol,
                 &target,
@@ -755,8 +758,11 @@ async fn send_attempt(
         }
         // Refusal detection skips Anthropic upstreams (its API never names
         // request fields in errors).
+        // Both refusal readers answer nothing outside 400/422, so any other
+        // status skips the parse of the sent body.
         if protocol != ProtocolId::AnthropicMessages
             && rounds < optional::MAX_STRIP_ROUNDS
+            && (status == 400 || status == 422)
             && let Ok(sent) = serde_json::from_slice::<Value>(&prepared.body)
         {
             let refused = optional::refused_optional(status, &body, &sent);
@@ -842,6 +848,7 @@ async fn attempt_stream(
     ctx: &AttemptContext<'_>,
     target_model: &str,
     request: &RelayRequest,
+    client_ir: &mut ClientIr,
     request_id: &str,
     deadline: std::time::Instant,
 ) -> Result<RelayOutcome, failover::AttemptError> {
@@ -850,7 +857,7 @@ async fn attempt_stream(
         response,
         protocol,
         cache_read,
-    } = send_attempt(ctx, target_model, request, true, deadline).await?;
+    } = send_attempt(ctx, target_model, request, client_ir, true, deadline).await?;
     let reader = Box::new(ctx.transport.stream(response, deadline, protocol));
 
     let pump = if request.protocol == protocol {
@@ -883,6 +890,7 @@ async fn attempt_json(
     ctx: &AttemptContext<'_>,
     target_model: &str,
     request: &RelayRequest,
+    client_ir: &mut ClientIr,
     deadline: std::time::Instant,
 ) -> Result<RelayOutcome, failover::AttemptError> {
     let Sent {
@@ -890,7 +898,7 @@ async fn attempt_json(
         response,
         protocol,
         cache_read,
-    } = send_attempt(ctx, target_model, request, false, deadline).await?;
+    } = send_attempt(ctx, target_model, request, client_ir, false, deadline).await?;
     let body = ctx
         .transport
         .read_body(response, ctx.transport.limits().max_json_bytes, deadline)
@@ -992,12 +1000,43 @@ struct PreparedBody {
     prompt_prefix: Option<prompt_cache::Prefix>,
 }
 
+/// The client body's IR, translated at most once per dispatch.
+///
+/// The client body never changes during a dispatch and `to_ir` is a pure
+/// function of it, so every translated preparation (each candidate, each
+/// optional-field strip round, the Kiro 401 re-prepare) reads the same IR. The
+/// slot stays empty on a passthrough-only dispatch. A translation error is
+/// kept too: the same body fails the same way for every candidate.
+#[derive(Default)]
+struct ClientIr(Option<Result<translation::ir::IrRequest, ProtocolError>>);
+
+impl ClientIr {
+    /// The IR of `body`, translated with `dialect` on first use.
+    fn get_or_translate(
+        &mut self,
+        dialect: &translation::Dialect,
+        body: &Value,
+    ) -> Result<&mut translation::ir::IrRequest, ProtocolError> {
+        let slot = self.0.get_or_insert_with(|| {
+            (dialect.to_ir)(body, translation::ir::NO_DECLARED_LIMIT).map(|(ir, _)| ir)
+        });
+        match slot {
+            Ok(ir) => Ok(ir),
+            Err(error) => Err(*error),
+        }
+    }
+}
+
 /// Request preparation for the translation path: source to_ir → target from_ir → target prepare.
+/// The source IR comes from `client_ir` (translated once per dispatch); the
+/// per-candidate effort clamp is applied for this preparation only and undone
+/// before returning, so the next candidate starts from the client's own level.
 /// `skip` passes through to the target kernel (learned refusals, vendor fixups).
 /// `fixups` are the vendor Chat-body adaptations (see [`ChatFixups`]).
 /// With a `prompt_scope`, the IR prompt's prefix digest comes back too.
 fn prepare_translated(
     source_body: &Value,
+    client_ir: &mut ClientIr,
     source: ProtocolId,
     upstream: ProtocolId,
     target: &TargetView<'_>,
@@ -1006,7 +1045,8 @@ fn prepare_translated(
 ) -> Result<PreparedBody, ProtocolError> {
     let source_dialect = translation::dialect(source)?;
     let upstream_dialect = translation::dialect(upstream)?;
-    let (mut ir, _) = (source_dialect.to_ir)(source_body, translation::ir::NO_DECLARED_LIMIT)?;
+    let ir = client_ir.get_or_translate(&source_dialect, source_body)?;
+    let client_effort = ir.effort;
     // 与 passthrough 同一套归一:路由列表(已配置)或 legacy 快照 → 方言
     // 可接受集。显式 off 不在此 clamp——它在下方按厂商标记注入。
     if let Some(effort) = ir.effort {
@@ -1029,13 +1069,20 @@ fn prepare_translated(
             ir.effort = Some(resolved);
         }
     }
-    let (mut upstream_value, _) = (upstream_dialect.from_ir)(&ir, target.upstream_model)?;
-    let prompt_prefix = tweaks
-        .prompt_scope
-        .map(|scope| prompt_cache::Prefix::of(scope, &ir));
+    // Emit and digest against the clamped IR, then undo the clamp (it belongs
+    // to this candidate only) before any early return.
+    let emitted = (upstream_dialect.from_ir)(ir, target.upstream_model).map(|(value, _)| {
+        let prompt_prefix = tweaks
+            .prompt_scope
+            .map(|scope| prompt_cache::Prefix::of(scope, ir));
+        (value, prompt_prefix)
+    });
+    let effort_off = matches!(ir.effort, Some(Effort::None));
+    ir.effort = client_effort;
+    let (mut upstream_value, prompt_prefix) = emitted?;
     // Chat 发射器对显式 off 省略字段;按厂商方言注入 off 标记,让"关思考"
     // 在翻译路径真正生效(纯思考模型由方言降级为最低档)。
-    if upstream == ProtocolId::OpenAiChat && matches!(ir.effort, Some(Effort::None)) {
+    if upstream == ProtocolId::OpenAiChat && effort_off {
         upstream_value["reasoning_effort"] =
             Value::String(translation::effort_clamp::off_wire_name(tweaks.dial).to_owned());
     }
@@ -1144,8 +1191,11 @@ enum Resolution {
 /// expansion decides that, so a route entry naming a disabled account is
 /// reported as `SkipReason::Disabled` instead of vanishing as a dangling entry.
 fn fetch_key_secrets(
-    keys: Vec<crate::store::ProviderKeyRow>,
-) -> (Vec<(crate::store::ProviderKeyRow, SecretString)>, usize) {
+    keys: Vec<std::sync::Arc<crate::store::ProviderKeyRow>>,
+) -> (
+    Vec<(std::sync::Arc<crate::store::ProviderKeyRow>, SecretString)>,
+    usize,
+) {
     let mut resolved = Vec::with_capacity(keys.len());
     let mut skipped = 0usize;
     for key in keys {
@@ -1223,8 +1273,8 @@ fn resolve(
             // One candidate per entry: each entry names its own account, so
             // the key set is just the entries' key ids (dangling ids drop out).
             // Deduped: one account serving several models on this route is the
-            // normal case, and the cache would clone its row and secret once per
-            // entry before expansion discards all but one.
+            // normal case, and the cache would share its row and clone its
+            // secret once per entry before expansion discards all but one.
             let mut key_ids: Vec<i64> = route.entries.iter().map(|entry| entry.key_id).collect();
             key_ids.sort_unstable();
             key_ids.dedup();
@@ -2115,6 +2165,9 @@ pub async fn dispatch_at(
     // on its stability across attempts and processes). `None` while no OpenCode
     // upstream has appeared.
     let mut opencode_seed: Option<String> = None;
+    // The client body's IR, shared by every translated attempt of this
+    // dispatch (see [`ClientIr`]).
+    let mut client_ir = ClientIr::default();
 
     // === Dispatcher integration: centralized slot assignment ===
     // Instead of acquiring semaphores per-candidate, submit a DispatchRequest
@@ -2470,6 +2523,7 @@ pub async fn dispatch_at(
                     },
                     target_model,
                     request,
+                    &mut client_ir,
                     &request_id,
                     deadline,
                 )

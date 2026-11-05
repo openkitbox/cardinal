@@ -71,14 +71,18 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
             _ => return Err(ProtocolError::InvalidRequest),
         };
         let mut parts: Vec<IrPart> = Vec::new();
-        let raw = message
-            .get("content")
-            .cloned()
-            .unwrap_or_else(|| Value::String(String::new()));
-        let blocks: Vec<Value> = match raw {
-            Value::String(text) => vec![serde_json::json!({"type": "text", "text": text})],
-            Value::Array(blocks) => blocks,
-            _ => Vec::new(),
+        // The blocks stay borrowed from the request. A bare string reads as
+        // one text block, so it lands directly as its text part (an empty or
+        // missing one yields nothing, as an empty text block would).
+        let blocks: &[Value] = match message.get("content") {
+            Some(Value::String(text)) => {
+                if !text.is_empty() {
+                    parts.push(IrPart::Text(text.clone()));
+                }
+                &[]
+            }
+            Some(Value::Array(blocks)) => blocks,
+            _ => &[],
         };
         for block in blocks {
             if block
@@ -195,11 +199,9 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned();
-                    let content = block
+                    let (text, images) = block
                         .get("content")
-                        .cloned()
-                        .unwrap_or_else(|| Value::String(String::new()));
-                    let (text, images) = tool_result_content(&content);
+                        .map_or_else(|| (String::new(), Vec::new()), tool_result_content);
                     parts.push(IrPart::ToolResult {
                         call_id,
                         text,
@@ -340,26 +342,20 @@ pub fn from_ir(
         let mut blocks: Vec<Value> = Vec::new();
         for part in &message.parts {
             match part {
-                IrPart::Text(text) => {
-                    blocks.push(serde_json::json!({"type": "text", "text": text}))
-                }
+                IrPart::Text(text) => blocks.push(text_block(text.clone())),
                 IrPart::Image { media, source } => {
                     let source = match source {
-                        ImageSource::Base64(data) => {
-                            serde_json::json!({"type": "base64", "media_type": media, "data": data})
-                        }
-                        ImageSource::Url(url) => serde_json::json!({"type": "url", "url": url}),
+                        ImageSource::Base64(data) => base64_source(media, data),
+                        ImageSource::Url(url) => url_source(url),
                     };
-                    blocks.push(serde_json::json!({"type": "image", "source": source}));
+                    blocks.push(sourced_block("image", source));
                 }
                 IrPart::File { media, source } => {
                     let source = match source {
-                        FileSource::Base64(data) => {
-                            serde_json::json!({"type": "base64", "media_type": media, "data": data})
-                        }
-                        FileSource::Url(url) => serde_json::json!({"type": "url", "url": url}),
+                        FileSource::Base64(data) => base64_source(media, data),
+                        FileSource::Url(url) => url_source(url),
                     };
-                    blocks.push(serde_json::json!({"type": "document", "source": source}));
+                    blocks.push(sourced_block("document", source));
                 }
                 IrPart::ToolCall { id, name, args } => {
                     let ir_id = id.clone();
@@ -373,7 +369,7 @@ pub fn from_ir(
                     if let Some(ir_id) = ir_id {
                         call_ids.insert(ir_id, id.clone());
                     }
-                    blocks.push(serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": args}));
+                    blocks.push(tool_use_block(id, name, args.clone()));
                 }
                 IrPart::ToolResult {
                     call_id,
@@ -390,19 +386,15 @@ pub fn from_ir(
                     entry.insert("tool_use_id".to_owned(), Value::String(wire_id));
                     let mut content: Vec<Value> = Vec::new();
                     if !text.is_empty() {
-                        content.push(serde_json::json!({"type": "text", "text": text}));
+                        content.push(text_block(text.clone()));
                     }
                     for image in images {
                         if let IrPart::Image { media, source } = image {
                             let source = match source {
-                                ImageSource::Base64(data) => {
-                                    serde_json::json!({"type": "base64", "media_type": media, "data": data})
-                                }
-                                ImageSource::Url(url) => {
-                                    serde_json::json!({"type": "url", "url": url})
-                                }
+                                ImageSource::Base64(data) => base64_source(media, data),
+                                ImageSource::Url(url) => url_source(url),
                             };
-                            content.push(serde_json::json!({"type": "image", "source": source}));
+                            content.push(sourced_block("image", source));
                         }
                     }
                     match content.len() {
@@ -410,14 +402,14 @@ pub fn from_ir(
                         // a single bare block object is rejected by strict validators.
                         0 => entry.insert("content".to_owned(), Value::String(String::new())),
                         1 if content[0].get("type").and_then(Value::as_str) == Some("text") => {
-                            entry.insert(
-                                "content".to_owned(),
-                                content
-                                    .swap_remove(0)
-                                    .get("text")
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            )
+                            // The lone text block's text moves out; it is not copied.
+                            let text = match content.swap_remove(0) {
+                                Value::Object(mut block) => {
+                                    block.remove("text").unwrap_or_default()
+                                }
+                                _ => Value::Null,
+                            };
+                            entry.insert("content".to_owned(), text)
                         }
                         _ => entry.insert("content".to_owned(), Value::Array(content)),
                     };
@@ -436,7 +428,10 @@ pub fn from_ir(
             IrRole::User => "user",
             IrRole::Assistant => "assistant",
         };
-        messages.push(serde_json::json!({"role": role, "content": blocks}));
+        let mut entry = Map::new();
+        entry.insert("role".to_owned(), Value::String(role.to_owned()));
+        entry.insert("content".to_owned(), Value::Array(blocks));
+        messages.push(Value::Object(entry));
     }
     dropped.sort_unstable();
     dropped.dedup();
@@ -641,13 +636,12 @@ pub fn emit_response_json(
                 // Merge adjacent text parts into one text block.
                 if let Some(last) = content.last_mut()
                     && last.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(Value::String(existing)) = last.get_mut("text")
                 {
-                    let existing = last.get("text").and_then(Value::as_str).unwrap_or_default();
-                    *last =
-                        serde_json::json!({"type": "text", "text": format!("{existing}{text}")});
+                    existing.push_str(text);
                     continue;
                 }
-                content.push(serde_json::json!({"type": "text", "text": text}));
+                content.push(text_block(text.clone()));
             }
             IrPart::ToolCall { id, name, args } => {
                 let id = id.clone().unwrap_or_else(|| {
@@ -656,9 +650,7 @@ pub fn emit_response_json(
                         (name.len() as u64) << 32 | args.to_string().len() as u64
                     )
                 });
-                content.push(
-                    serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": args}),
-                );
+                content.push(tool_use_block(id, name, args.clone()));
             }
             // Upstream thinking signatures were discarded at parse time; emitting
             // an unsigned block would poison a client that replays it. Drop it.
@@ -680,10 +672,10 @@ pub fn emit_response_json(
       "type": "message",
       "role": "assistant",
       "model": response.model,
-      "content": content,
-      "stop_reason": stop_reason,
-      "stop_sequence": stop_sequence,
     });
+    body["content"] = Value::Array(content);
+    body["stop_reason"] = stop_reason;
+    body["stop_sequence"] = stop_sequence;
     // An upstream that reported no token usage leaves the field out entirely:
     // zeroes would be read as a real (free) measurement.
     if let Some(usage) = &response.usage {
@@ -703,6 +695,48 @@ pub(crate) fn effort_name(effort: Effort) -> &'static str {
         Effort::High => "high",
         Effort::Xhigh | Effort::Max | Effort::Budget(_) => "max",
     }
+}
+
+/// A `{"type": "text"}` block that takes ownership of its text.
+fn text_block(text: String) -> Value {
+    let mut block = Map::new();
+    block.insert("type".to_owned(), Value::String("text".to_owned()));
+    block.insert("text".to_owned(), Value::String(text));
+    Value::Object(block)
+}
+
+/// An inline `base64` media source; the bytes are copied once, here.
+fn base64_source(media: &str, data: &str) -> Value {
+    let mut source = Map::new();
+    source.insert("type".to_owned(), Value::String("base64".to_owned()));
+    source.insert("media_type".to_owned(), Value::String(media.to_owned()));
+    source.insert("data".to_owned(), Value::String(data.to_owned()));
+    Value::Object(source)
+}
+
+fn url_source(url: &str) -> Value {
+    let mut source = Map::new();
+    source.insert("type".to_owned(), Value::String("url".to_owned()));
+    source.insert("url".to_owned(), Value::String(url.to_owned()));
+    Value::Object(source)
+}
+
+/// An `image` / `document` block that takes ownership of its source.
+fn sourced_block(kind: &str, source: Value) -> Value {
+    let mut block = Map::new();
+    block.insert("type".to_owned(), Value::String(kind.to_owned()));
+    block.insert("source".to_owned(), source);
+    Value::Object(block)
+}
+
+/// A `tool_use` block that takes ownership of its id and input.
+fn tool_use_block(id: String, name: &str, input: Value) -> Value {
+    let mut block = Map::new();
+    block.insert("type".to_owned(), Value::String("tool_use".to_owned()));
+    block.insert("id".to_owned(), Value::String(id));
+    block.insert("name".to_owned(), Value::String(name.to_owned()));
+    block.insert("input".to_owned(), input);
+    Value::Object(block)
 }
 
 /// Tool result content: string or blocks.

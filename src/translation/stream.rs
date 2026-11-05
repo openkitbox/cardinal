@@ -9,7 +9,9 @@ use crate::protocol::sse::RawFrame;
 use crate::protocol::usage::UsageCounts;
 use crate::protocol::{ProtocolId, StreamEvent, Terminal};
 use bytes::Bytes;
-use serde_json::Value;
+use serde::{Serialize, Serializer};
+use serde_json::{Map, Value};
+use std::fmt;
 
 /// Synthesizes client frames from upstream stream events.
 ///
@@ -262,10 +264,7 @@ impl StreamTranslator {
                                 text: String::new(),
                             },
                         );
-                        out.push(frame(
-              Some("content_block_delta"),
-              serde_json::json!({"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": delta}}),
-            ));
+                        out.push(content_block_delta(index, AnthropicDelta::Text(&delta)));
                     }
                     ProtocolId::OpenAiResponses => {
                         let position = match blocks.last() {
@@ -307,25 +306,17 @@ impl StreamTranslator {
                         {
                             text.push_str(&delta);
                         }
-                        out.push(responses_frame(
-                            "response.output_text.delta",
-                            serde_json::json!({
-                              "item_id": message_item_id(&self.request_id, position),
-                              "output_index": position,
-                              "content_index": 0,
-                              "delta": delta,
-                            }),
-                        ));
+                        out.push(responses_delta(ResponsesDelta {
+                            content_index: Some(0),
+                            delta: &delta,
+                            item_id: message_item_id(&self.request_id, position),
+                            output_index: position,
+                            summary_index: None,
+                            kind: "response.output_text.delta",
+                        }));
                     }
                     ProtocolId::OpenAiChat => {
-                        out.push(chat_chunk(
-                            &self.model,
-                            serde_json::json!({"content": delta}),
-                            Value::Null,
-                            None,
-                            None,
-                            None,
-                        ));
+                        out.push(chat_delta_chunk(&self.model, ChatDelta::Content(&delta)));
                     }
                     ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
                         unreachable!("only the three chat protocols are translation clients")
@@ -345,10 +336,7 @@ impl StreamTranslator {
                                 text: String::new(),
                             },
                         );
-                        out.push(frame(
-              Some("content_block_delta"),
-              serde_json::json!({"type": "content_block_delta", "index": index, "delta": {"type": "thinking_delta", "thinking": delta}}),
-            ));
+                        out.push(content_block_delta(index, AnthropicDelta::Thinking(&delta)));
                     }
                     ProtocolId::OpenAiResponses => {
                         // Reasoning rides its own output item, summarized (not signed):
@@ -392,25 +380,17 @@ impl StreamTranslator {
                         {
                             text.push_str(&delta);
                         }
-                        out.push(responses_frame(
-                            "response.reasoning_summary_text.delta",
-                            serde_json::json!({
-                              "item_id": reasoning_item_id(&self.request_id, position),
-                              "output_index": position,
-                              "summary_index": 0,
-                              "delta": delta,
-                            }),
-                        ));
+                        out.push(responses_delta(ResponsesDelta {
+                            content_index: None,
+                            delta: &delta,
+                            item_id: reasoning_item_id(&self.request_id, position),
+                            output_index: position,
+                            summary_index: Some(0),
+                            kind: "response.reasoning_summary_text.delta",
+                        }));
                     }
                     ProtocolId::OpenAiChat => {
-                        out.push(chat_chunk(
-                            &self.model,
-                            serde_json::json!({"reasoning_content": delta}),
-                            Value::Null,
-                            None,
-                            None,
-                            None,
-                        ));
+                        out.push(chat_delta_chunk(&self.model, ChatDelta::Reasoning(&delta)));
                     }
                     ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
                         unreachable!("only the three chat protocols are translation clients")
@@ -475,14 +455,14 @@ impl StreamTranslator {
                             {
                                 accumulated.push_str(&arguments);
                             }
-                            out.push(responses_frame(
-                                "response.function_call_arguments.delta",
-                                serde_json::json!({
-                                  "item_id": function_call_item_id(&self.request_id, position),
-                                  "output_index": position,
-                                  "delta": arguments,
-                                }),
-                            ));
+                            out.push(responses_delta(ResponsesDelta {
+                                content_index: None,
+                                delta: &arguments,
+                                item_id: function_call_item_id(&self.request_id, position),
+                                output_index: position,
+                                summary_index: None,
+                                kind: "response.function_call_arguments.delta",
+                            }));
                         }
                     }
                     ProtocolId::AnthropicMessages => {
@@ -496,27 +476,26 @@ impl StreamTranslator {
                     out.push(frame(Some("content_block_stop"), serde_json::json!({"type": "content_block_stop", "index": last_index})));
                   }
                   let block_index = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
-                  let call_id = id.clone().unwrap_or_else(|| format!("toolu_{index:024x}"));
-                  let name = name.clone().unwrap_or_default();
+                  let call_id = id.unwrap_or_else(|| format!("toolu_{index:024x}"));
+                  let name = name.unwrap_or_default();
                   blocks.push(Block {
                     closed: false,
                     kind: BlockKind::Tool { index, call_id: call_id.clone(), name: name.clone(), arguments: String::new() },
                   });
-                  out.push(frame(
-                    Some("content_block_start"),
-                    serde_json::json!({
-                      "type": "content_block_start", "index": block_index,
-                      "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {}}
-                    }),
-                  ));
+                  let mut content_block = Map::new();
+                  content_block.insert("type".to_owned(), Value::from("tool_use"));
+                  content_block.insert("id".to_owned(), Value::String(call_id));
+                  content_block.insert("name".to_owned(), Value::String(name));
+                  content_block.insert("input".to_owned(), Value::Object(Map::new()));
+                  out.push(content_block_start(block_index, Value::Object(content_block)));
                   block_index
                 }
               };
                         if !arguments.is_empty() {
-                            out.push(frame(
-                Some("content_block_delta"),
-                serde_json::json!({"type": "content_block_delta", "index": block_index, "delta": {"type": "input_json_delta", "partial_json": arguments}}),
-              ));
+                            out.push(content_block_delta(
+                                block_index,
+                                AnthropicDelta::InputJson(&arguments),
+                            ));
                         }
                     }
                     ProtocolId::OpenAiChat => {
@@ -537,18 +516,18 @@ impl StreamTranslator {
                             });
                         }
                         let (id, name) = if known { (None, None) } else { (id, name) };
-                        out.push(chat_chunk(
-              &self.model,
-              serde_json::json!({
-                "tool_calls": [
-                  {"index": index, "id": id, "type": "function", "function": {"name": name, "arguments": arguments}}
-                ]
-              }),
-              Value::Null,
-              None,
-              None,
-              None,
-            ));
+                        out.push(chat_delta_chunk(
+                            &self.model,
+                            ChatDelta::ToolCall(ChatToolCall {
+                                function: ChatFunction {
+                                    arguments: &arguments,
+                                    name: name.as_deref(),
+                                },
+                                id: id.as_deref(),
+                                index,
+                                kind: "function",
+                            }),
+                        ));
                     }
                     ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
                         unreachable!("only the three chat protocols are translation clients")
@@ -646,25 +625,33 @@ impl StreamTranslator {
                             serde_json::json!({"reasoning_tokens": reasoning});
                     }
                 }
-                let mut response = serde_json::json!({
-                  "id": format!("resp_{}", self.request_id),
-                  "object": "response",
-                  "status": status,
-                  "model": self.model,
-                  "output": output,
-                  "usage": usage_json,
-                });
+                // Owned `output`/`usage` move into the maps; `json!` would deep-copy
+                // every accumulated item a second time.
+                let mut response = Map::new();
+                response.insert(
+                    "id".to_owned(),
+                    Value::String(format!("resp_{}", self.request_id)),
+                );
+                response.insert("object".to_owned(), Value::from("response"));
+                response.insert("status".to_owned(), Value::from(status));
+                response.insert("model".to_owned(), Value::String(self.model.clone()));
+                response.insert("output".to_owned(), Value::Array(output));
+                response.insert("usage".to_owned(), usage_json);
                 if truncated {
-                    response["incomplete_details"] =
-                        serde_json::json!({"reason": "max_output_tokens"});
+                    response.insert(
+                        "incomplete_details".to_owned(),
+                        serde_json::json!({"reason": "max_output_tokens"}),
+                    );
                 }
                 if failed {
-                    response["error"] = serde_json::json!({"code": "upstream_error"});
+                    response.insert(
+                        "error".to_owned(),
+                        serde_json::json!({"code": "upstream_error"}),
+                    );
                 }
-                out.push(responses_frame(
-                    event,
-                    serde_json::json!({"response": response}),
-                ));
+                let mut payload = Map::new();
+                payload.insert("response".to_owned(), Value::Object(response));
+                out.push(responses_frame(event, Value::Object(payload)));
             }
             ProtocolId::AnthropicMessages => {
                 // Every announced block gets its stop before the message envelope.
@@ -770,11 +757,17 @@ fn block_index(out: &mut Vec<RawFrame>, blocks: &mut Vec<Block>, kind: BlockKind
         closed: false,
         kind,
     });
-    out.push(frame(
-    Some("content_block_start"),
-    serde_json::json!({"type": "content_block_start", "index": index, "content_block": content_block}),
-  ));
+    out.push(content_block_start(index, content_block));
     index
+}
+
+/// Anthropic `content_block_start`; the owned block moves into the payload.
+fn content_block_start(index: u32, content_block: Value) -> RawFrame {
+    let mut payload = Map::new();
+    payload.insert("type".to_owned(), Value::from("content_block_start"));
+    payload.insert("index".to_owned(), Value::from(index));
+    payload.insert("content_block".to_owned(), content_block);
+    frame(Some("content_block_start"), Value::Object(payload))
 }
 
 fn frame(event: Option<&str>, data: serde_json::Value) -> RawFrame {
@@ -783,6 +776,155 @@ fn frame(event: Option<&str>, data: serde_json::Value) -> RawFrame {
         id: None,
         data: Bytes::from(serde_json::to_string(&data).unwrap_or_default()),
     }
+}
+
+/// Serializes a borrowed per-delta payload straight into the frame bytes, so
+/// the delta text is copied once (into the output buffer). Same fallback as
+/// [`frame`]: an unserializable payload yields an empty data field.
+fn serialized_frame(event: Option<&str>, data: &impl Serialize) -> RawFrame {
+    RawFrame {
+        event: event.map(str::to_owned),
+        id: None,
+        data: Bytes::from(serde_json::to_vec(data).unwrap_or_default()),
+    }
+}
+
+// Per-delta hot frames. `serde_json` is built without `preserve_order`, so the
+// `json!` objects these replace serialized their keys in sorted order: every
+// struct below declares its fields in that order, keeping the bytes identical.
+
+/// Anthropic `content_block_delta`: `{"delta":..,"index":..,"type":..}`.
+#[derive(Serialize)]
+struct ContentBlockDelta<'a> {
+    delta: AnthropicDelta<'a>,
+    index: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// The inner Anthropic delta: one payload key plus `type` (every payload key
+/// sorts before `type`).
+enum AnthropicDelta<'a> {
+    Text(&'a str),
+    Thinking(&'a str),
+    InputJson(&'a str),
+}
+
+impl Serialize for AnthropicDelta<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let (key, value, kind) = match self {
+            Self::Text(text) => ("text", text, "text_delta"),
+            Self::Thinking(text) => ("thinking", text, "thinking_delta"),
+            Self::InputJson(text) => ("partial_json", text, "input_json_delta"),
+        };
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry(key, value)?;
+        map.serialize_entry("type", kind)?;
+        map.end()
+    }
+}
+
+fn content_block_delta(index: u32, delta: AnthropicDelta<'_>) -> RawFrame {
+    serialized_frame(
+        Some("content_block_delta"),
+        &ContentBlockDelta {
+            delta,
+            index,
+            kind: "content_block_delta",
+        },
+    )
+}
+
+/// Responses `*.delta` payload; `type` mirrors the SSE event name, as
+/// [`responses_frame`] writes it.
+#[derive(Serialize)]
+struct ResponsesDelta<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_index: Option<u8>,
+    delta: &'a str,
+    item_id: ItemId<'a>,
+    output_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_index: Option<u8>,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+fn responses_delta(payload: ResponsesDelta<'_>) -> RawFrame {
+    serialized_frame(Some(payload.kind), &payload)
+}
+
+/// Chat `chat.completion.chunk` carrying one delta and no usage.
+#[derive(Serialize)]
+struct ChatDeltaChunk<'a> {
+    choices: [ChatChoice<'a>; 1],
+    id: &'static str,
+    model: &'a str,
+    object: &'static str,
+}
+
+#[derive(Serialize)]
+struct ChatChoice<'a> {
+    delta: ChatDelta<'a>,
+    /// Always `null` on a delta chunk.
+    finish_reason: Option<&'static str>,
+    index: u8,
+}
+
+/// The Chat `delta` object: a single key.
+enum ChatDelta<'a> {
+    Content(&'a str),
+    Reasoning(&'a str),
+    ToolCall(ChatToolCall<'a>),
+}
+
+impl Serialize for ChatDelta<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Content(text) => map.serialize_entry("content", text)?,
+            Self::Reasoning(text) => map.serialize_entry("reasoning_content", text)?,
+            Self::ToolCall(call) => {
+                map.serialize_entry("tool_calls", std::slice::from_ref(call))?
+            }
+        }
+        map.end()
+    }
+}
+
+/// `{"function":{..},"id":..,"index":..,"type":"function"}`; an absent
+/// identity serializes as `null`, as the `json!` form did.
+#[derive(Serialize)]
+struct ChatToolCall<'a> {
+    function: ChatFunction<'a>,
+    id: Option<&'a str>,
+    index: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct ChatFunction<'a> {
+    arguments: &'a str,
+    name: Option<&'a str>,
+}
+
+fn chat_delta_chunk<'a>(model: &'a str, delta: ChatDelta<'a>) -> RawFrame {
+    serialized_frame(
+        None,
+        &ChatDeltaChunk {
+            choices: [ChatChoice {
+                delta,
+                finish_reason: None,
+                index: 0,
+            }],
+            id: "chatcmpl-xh",
+            model,
+            object: "chat.completion.chunk",
+        },
+    )
 }
 
 /// Responses emission: the payload carries its own `type` (mirroring the SSE
@@ -895,16 +1037,52 @@ fn final_item_payload(request_id: &str, output_index: usize, kind: &BlockKind) -
 
 /// Synthetic item ids are deterministic in (response, output index) so the
 /// `.added`/`.delta`/`.done` frames of one item agree with each other.
-fn message_item_id(request_id: &str, output_index: usize) -> String {
-    format!("msg_{request_id}_{output_index}")
+fn message_item_id(request_id: &str, output_index: usize) -> ItemId<'_> {
+    ItemId {
+        prefix: "msg",
+        request_id,
+        output_index,
+    }
 }
 
-fn reasoning_item_id(request_id: &str, output_index: usize) -> String {
-    format!("rs_{request_id}_{output_index}")
+fn reasoning_item_id(request_id: &str, output_index: usize) -> ItemId<'_> {
+    ItemId {
+        prefix: "rs",
+        request_id,
+        output_index,
+    }
 }
 
-fn function_call_item_id(request_id: &str, output_index: usize) -> String {
-    format!("fc_{request_id}_{output_index}")
+fn function_call_item_id(request_id: &str, output_index: usize) -> ItemId<'_> {
+    ItemId {
+        prefix: "fc",
+        request_id,
+        output_index,
+    }
+}
+
+/// `{prefix}_{request_id}_{output_index}`, rendered at serialization time so
+/// a delta frame does not allocate the id first.
+struct ItemId<'a> {
+    prefix: &'static str,
+    request_id: &'a str,
+    output_index: usize,
+}
+
+impl fmt::Display for ItemId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}_{}_{}",
+            self.prefix, self.request_id, self.output_index
+        )
+    }
+}
+
+impl Serialize for ItemId<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
 fn message_item_payload(request_id: &str, output_index: usize) -> Value {
