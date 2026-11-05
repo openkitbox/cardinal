@@ -36,7 +36,8 @@
 //!   `StreamEvent::Usage`; the relay hands the estimate to the ledger AND to
 //!   the client. Streamed: the pump drains the tail, then places the estimate
 //!   before the finish event. Buffered: it is written into the body `usage`.
-//!   The Chat shape writes `cached_tokens` and reasoning tokens as 0.
+//!   This kernel reports no cached split; the relay adds a simulated one
+//!   (`relay::prompt_cache`) before the usage reaches the client or ledger.
 //!   Deviation (2026-10-30): estimates are client-visible so context-aware
 //!   clients (ox) can drive compaction; billing consumers must not treat them
 //!   as vendor counts.
@@ -609,8 +610,9 @@ pub fn aggregate(body: &[u8], context_window: Option<u64>) -> Result<StreamDecod
 /// `usage` estimates input tokens from `context_window` and the KAS context
 /// percentage, and output tokens from accumulated content with a chars/4
 /// heuristic. Missing input evidence omits usage rather than recording zeros.
-/// The estimates also reach the client body (not vendor-reported counts), with
-/// `cached_tokens` and reasoning tokens written as 0 by the Chat shape.
+/// The estimates also reach the client body (not vendor-reported counts). No
+/// cached split comes from here; the relay may add a simulated one
+/// (`relay::prompt_cache`).
 /// `context_window` is the served model's declared input window; the decoder
 /// combines it with the context percentage for the input estimate rather than
 /// inventing one from a bare percentage.

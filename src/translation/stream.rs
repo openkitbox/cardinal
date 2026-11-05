@@ -232,6 +232,7 @@ impl StreamTranslator {
                     Value::Null,
                     usage.as_ref().map(|usage| usage.input_tokens),
                     None,
+                    None,
                 ));
             }
             ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
@@ -323,6 +324,7 @@ impl StreamTranslator {
                             Value::Null,
                             None,
                             None,
+                            None,
                         ));
                     }
                     ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
@@ -405,6 +407,7 @@ impl StreamTranslator {
                             &self.model,
                             serde_json::json!({"reasoning_content": delta}),
                             Value::Null,
+                            None,
                             None,
                             None,
                         ));
@@ -542,6 +545,7 @@ impl StreamTranslator {
                 ]
               }),
               Value::Null,
+              None,
               None,
               None,
             ));
@@ -708,6 +712,7 @@ impl StreamTranslator {
                     } else {
                         None
                     },
+                    usage.as_ref().and_then(|usage| usage.cached_input_tokens),
                 ));
                 // SH-02: `[DONE]` is an SSE framing marker, not JSON — the wire must
                 // carry `data: [DONE]` (no quotes). JSON-serializing a string value
@@ -941,6 +946,7 @@ fn chat_chunk(
     finish_reason: serde_json::Value,
     input: Option<u64>,
     output: Option<u64>,
+    cached: Option<u64>,
 ) -> RawFrame {
     let mut usage = serde_json::json!({});
     if let Some(input) = input {
@@ -948,6 +954,9 @@ fn chat_chunk(
     }
     if let Some(output) = output {
         usage["completion_tokens"] = serde_json::json!(output);
+    }
+    if let Some(cached) = cached {
+        usage["prompt_tokens_details"] = serde_json::json!({"cached_tokens": cached});
     }
     let chunk = serde_json::json!({
       "id": "chatcmpl-xh",

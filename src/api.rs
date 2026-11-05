@@ -47,6 +47,8 @@ pub struct AppState {
     /// write-back of the rotated bundle. The admin plane updates it on
     /// credential replace/delete.
     pub kiro_tokens: Arc<crate::upstream::KiroTokens>,
+    /// Simulated Kiro prompt cache (remembered prompt prefixes).
+    pub prompt_cache: relay::PromptCache,
     /// Per-key OpenCode account bearer manager, same contract; shared with model
     /// and quota probing.
     pub opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
@@ -217,6 +219,7 @@ async fn relay_dispatch(
         failover: &state.failover,
         exposure: &state.exposure,
         kiro_tokens: state.kiro_tokens.as_ref(),
+        prompt_cache: &state.prompt_cache,
         opencode_tokens: state.opencode_tokens.as_ref(),
         trace_ring: &state.trace_ring,
         smart_cache: &state.smart_cache,

@@ -19,6 +19,7 @@ use crate::translation;
 use crate::upstream::transport::{self, StreamReader};
 
 use super::dispatcher::SlotGuard;
+use super::prompt_cache::{self, PendingRead};
 use super::{PAYLOAD_TARGET, truncate_payload};
 
 /// Client-facing stream: the pump's frame channel, nothing more.
@@ -96,6 +97,11 @@ pub(super) enum StreamPump {
         /// The served model's declared context window, handed to the upstream
         /// decoder (Kiro derives prompt tokens from it).
         context_window: Option<u64>,
+        /// Kiro only: the simulated cache read, settled when the stream reaches
+        /// its terminal; the hit then applies wherever the decoder's usage
+        /// leaves the pump (client frames and the ledger). A stream that
+        /// fails first drops it unsettled.
+        cache_read: Option<PendingRead>,
     },
 }
 
@@ -690,7 +696,9 @@ async fn drive_stream(
             upstream,
             mut translator,
             context_window,
+            mut cache_read,
         } => {
+            let mut cache_hit = None;
             let mut upstream = protocol::Decoder::new(upstream, context_window);
             // A protocol that reports its usage after the terminal event (KAS)
             // makes the client close wait for the tail; every other upstream
@@ -783,11 +791,20 @@ async fn drive_stream(
                         let terminal_at_eof = events
                             .iter()
                             .any(|event| matches!(event, protocol::StreamEvent::Finish { .. }));
+                        if terminal_at_eof {
+                            // Settle once: a second terminal sighting never erases the hit.
+                            if let Some(read) = cache_read.take() {
+                                cache_hit = read.settle();
+                            }
+                        }
                         let mut tail_drained = false;
                         let events = if tail_before_finish && terminal_at_eof {
                             drain_tail(reader, &mut upstream).await;
                             tail_drained = true;
-                            translation::stream::usage_before_finish(events, upstream.usage())
+                            translation::stream::usage_before_finish(
+                                events,
+                                prompt_cache::with_hit(upstream.usage(), cache_hit),
+                            )
                         } else {
                             events
                         };
@@ -862,6 +879,14 @@ async fn drive_stream(
                         }
                     }
                     PumpRead::Eof => {
+                        // A stream whose decoder saw it complete reached its
+                        // terminal even without a finish event in the frames.
+                        if matches!(upstream.finish(), protocol::Terminal::Completed) {
+                            // Settle once: a second terminal sighting never erases the hit.
+                            if let Some(read) = cache_read.take() {
+                                cache_hit = read.settle();
+                            }
+                        }
                         if hold.is_some() {
                             let ceiling = upstream.output_ceiling_reached();
                             if HoldState::delivers(upstream.finish()) || ceiling {
@@ -993,7 +1018,7 @@ async fn drive_stream(
             // context usage only in the tail drained above, and every other
             // kernel's last observed counts are the same ones its `Usage`
             // events already delivered.
-            if let Some(counts) = upstream.usage() {
+            if let Some(counts) = prompt_cache::with_hit(upstream.usage(), cache_hit) {
                 usage = Some(counts);
             }
         }

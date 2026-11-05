@@ -10,6 +10,7 @@ mod failover;
 pub mod ledger_writer;
 pub(crate) mod optional;
 mod price_cache;
+mod prompt_cache;
 mod rest_cache;
 mod rotate;
 mod route_cache;
@@ -28,6 +29,7 @@ pub(crate) use dialects::is_opencode_upstream;
 pub use failover::Failover;
 pub use ledger_writer::{LedgerWriter, LedgerWriterHandle};
 pub use price_cache::{PriceCache, PriceInput};
+pub use prompt_cache::PromptCache;
 pub use rest_cache::RestCache;
 pub use rotate::RotateCursors;
 pub use route_cache::RouteCache;
@@ -329,7 +331,8 @@ async fn attempt(
 
 /// Everything the Kiro token plane needs for one candidate: the key row (its
 /// stored bundle seeds the manager and its id keys the per-key lock), the
-/// gateway database (rereads and write-backs), and the manager itself.
+/// gateway database (rereads and write-backs), the manager itself, and the
+/// simulated prompt cache (KAS reports no cached-token split).
 ///
 /// Bundled as one optional field so every non-Kiro candidate pays nothing for
 /// it — and so the credential path reads as one thing at the construction site.
@@ -338,6 +341,12 @@ struct KiroDeps<'a> {
     key: &'a crate::store::ProviderKeyRow,
     pool: &'a sqlx::PgPool,
     tokens: &'a KiroTokens,
+    prompt_cache: &'a PromptCache,
+    /// The gateway key that called, when this candidate takes part in the
+    /// simulated cache: a cached prefix is only ever read back by the caller
+    /// that sent it. `None` disables the cache (in-process calls, or a model
+    /// with no cache-read price, whose hit would bill as free input).
+    cache_caller_key_id: Option<i64>,
 }
 
 /// Everything the OpenCode token plane needs for one candidate: the key's id
@@ -420,7 +429,7 @@ async fn send_attempt(
     request: &RelayRequest,
     stream: bool,
     deadline: std::time::Instant,
-) -> Result<(u16, reqwest::Response, ProtocolId), failover::AttemptError> {
+) -> Result<Sent, failover::AttemptError> {
     let AttemptContext {
         transport,
         capability,
@@ -565,7 +574,22 @@ async fn send_attempt(
     let passthrough_body: &Value = adapted_body
         .as_ref()
         .map_or(&request.body, std::borrow::Cow::as_ref);
-    let prepare = |fields: &[&str], profile_arn: Option<&str>| {
+    // Kiro: the scope a simulated cache read is confined to (account, caller,
+    // upstream model); `None` keeps every other attempt out of the cache.
+    let prompt_scope = kiro.and_then(|deps| {
+        deps.cache_caller_key_id
+            .map(|caller_key_id| prompt_cache::Scope {
+                account_key_id: deps.key.id,
+                caller_key_id,
+                model: target_model,
+            })
+    });
+    // Only the first preparation digests the prompt: a re-prepare strips
+    // optional fields or rotates the profile, neither of which is prompt, so it
+    // passes no scope and skips the hashing.
+    let prepare = |fields: &[&str],
+                   profile_arn: Option<&str>,
+                   prompt_scope: Option<prompt_cache::Scope<'_>>| {
         if request.protocol == protocol {
             protocol::prepare(
                 protocol,
@@ -575,6 +599,10 @@ async fn send_attempt(
                 fields,
                 fixups.strip_glm_images,
             )
+            .map(|prepared| PreparedBody {
+                prepared,
+                prompt_prefix: None,
+            })
         } else {
             prepare_translated(
                 &request.body,
@@ -589,12 +617,16 @@ async fn send_attempt(
                     route_efforts,
                     dial,
                     kiro_profile_arn: profile_arn,
+                    prompt_scope,
                 },
             )
         }
     };
-    let mut prepared =
-        prepare(&skip, kiro_profile_arn.as_deref()).map_err(failover::AttemptError::Protocol)?;
+    let PreparedBody {
+        mut prepared,
+        prompt_prefix,
+    } = prepare(&skip, kiro_profile_arn.as_deref(), prompt_scope)
+        .map_err(failover::AttemptError::Protocol)?;
     // OpenCode's gateway (Zen or Go) refuses requests that name no conversation
     // (400 MissingSessionID), so its header family rides beside the credential.
     // The session seed derives from the first user message — top-level field
@@ -629,7 +661,20 @@ async fn send_attempt(
         // Only 2xx is a success. Redirects are never followed (the credential
         // must not reach another authority), so a 3xx is a failed attempt too.
         if (200..300).contains(&status) {
-            return Ok((status, response, protocol));
+            // The vendor accepted this prompt; the cache is read and written
+            // only once the attempt completes (the caller settles it).
+            let cache_read = match (kiro, prompt_prefix) {
+                (Some(deps), Some(prefix)) => {
+                    Some(prompt_cache::PendingRead::new(deps.prompt_cache, prefix))
+                }
+                _ => None,
+            };
+            return Ok(Sent {
+                status,
+                response,
+                protocol,
+                cache_read,
+            });
         }
         // Capture the vendor's error body (bounded, best-effort: an unreadable body
         // still yields the Status error, just without evidence) so the relay can
@@ -698,8 +743,9 @@ async fn send_attempt(
             // identity (`profileArn`), and `prepare` advances the shared
             // `KasCall` itself, so the retry headers are replaced wholesale —
             // same invocation id, one attempt later — with no second writer.
-            prepared = prepare(&skip, kiro_profile_arn.as_deref())
-                .map_err(failover::AttemptError::Protocol)?;
+            prepared = prepare(&skip, kiro_profile_arn.as_deref(), None)
+                .map_err(failover::AttemptError::Protocol)?
+                .prepared;
             tracing::warn!(
                 key_id = deps.key.id,
                 status,
@@ -719,7 +765,10 @@ async fn send_attempt(
                 // client tree — cheaper than parsing and re-serializing the wire
                 // body, and it covers kernel-injected fields identically.
                 skip.extend(refused.iter().copied());
-                if let Ok(retried) = prepare(&skip, kiro_profile_arn.as_deref()) {
+                if let Ok(PreparedBody {
+                    prepared: retried, ..
+                }) = prepare(&skip, kiro_profile_arn.as_deref(), None)
+                {
                     for field in &refused {
                         unfit.record(provider_id, protocol, field);
                     }
@@ -740,7 +789,10 @@ async fn send_attempt(
                 // without the mode; not learned, because the next request may
                 // land on a node that has it (see `optional::refuses_json_mode`).
                 skip.push(optional::JSON_MODE_FIELD);
-                if let Ok(retried) = prepare(&skip, kiro_profile_arn.as_deref()) {
+                if let Ok(PreparedBody {
+                    prepared: retried, ..
+                }) = prepare(&skip, kiro_profile_arn.as_deref(), None)
+                {
                     tracing::info!(
                         provider_id,
                         protocol = protocol.as_str(),
@@ -793,8 +845,12 @@ async fn attempt_stream(
     request_id: &str,
     deadline: std::time::Instant,
 ) -> Result<RelayOutcome, failover::AttemptError> {
-    let (status, response, protocol) =
-        send_attempt(ctx, target_model, request, true, deadline).await?;
+    let Sent {
+        status,
+        response,
+        protocol,
+        cache_read,
+    } = send_attempt(ctx, target_model, request, true, deadline).await?;
     let reader = Box::new(ctx.transport.stream(response, deadline, protocol));
 
     let pump = if request.protocol == protocol {
@@ -812,6 +868,7 @@ async fn attempt_stream(
             upstream: protocol,
             translator,
             context_window: ctx.context_window,
+            cache_read,
         }
     };
     Ok(RelayOutcome::Stream {
@@ -828,8 +885,12 @@ async fn attempt_json(
     request: &RelayRequest,
     deadline: std::time::Instant,
 ) -> Result<RelayOutcome, failover::AttemptError> {
-    let (status, response, protocol) =
-        send_attempt(ctx, target_model, request, false, deadline).await?;
+    let Sent {
+        status,
+        response,
+        protocol,
+        cache_read,
+    } = send_attempt(ctx, target_model, request, false, deadline).await?;
     let body = ctx
         .transport
         .read_body(response, ctx.transport.limits().max_json_bytes, deadline)
@@ -857,6 +918,10 @@ async fn attempt_json(
         if !reported_model {
             ir.model = target_model.to_owned();
         }
+        // The body parsed, so the attempt completed: settle the simulated
+        // cache read. The client body and the ledger read the same split.
+        let cache_hit = cache_read.and_then(prompt_cache::PendingRead::settle);
+        ir.usage = prompt_cache::with_hit(ir.usage.take(), cache_hit);
         let bytes =
             (source_dialect.emit_response_json)(&ir).map_err(failover::AttemptError::Protocol)?;
         if request.payload_log {
@@ -907,11 +972,30 @@ struct WireTweaks<'a> {
     /// have rotated it). `None` for every other target, and also when this
     /// login carried no profile.
     kiro_profile_arn: Option<&'a str>,
+    /// Kiro only: digest the translated prompt for the simulated cache.
+    prompt_scope: Option<prompt_cache::Scope<'a>>,
+}
+
+/// A send the upstream accepted (2xx), still unread.
+struct Sent {
+    status: u16,
+    response: reqwest::Response,
+    protocol: ProtocolId,
+    /// Kiro only: the simulated cache read, settled once the attempt completes.
+    cache_read: Option<prompt_cache::PendingRead>,
+}
+
+/// One prepared upstream body.
+struct PreparedBody {
+    prepared: protocol::Prepared,
+    /// Kiro only: the prompt's prefix digest, when a cache scope was given.
+    prompt_prefix: Option<prompt_cache::Prefix>,
 }
 
 /// Request preparation for the translation path: source to_ir → target from_ir → target prepare.
 /// `skip` passes through to the target kernel (learned refusals, vendor fixups).
 /// `fixups` are the vendor Chat-body adaptations (see [`ChatFixups`]).
+/// With a `prompt_scope`, the IR prompt's prefix digest comes back too.
 fn prepare_translated(
     source_body: &Value,
     source: ProtocolId,
@@ -919,7 +1003,7 @@ fn prepare_translated(
     target: &TargetView<'_>,
     stream: bool,
     tweaks: WireTweaks<'_>,
-) -> Result<protocol::Prepared, ProtocolError> {
+) -> Result<PreparedBody, ProtocolError> {
     let source_dialect = translation::dialect(source)?;
     let upstream_dialect = translation::dialect(upstream)?;
     let (mut ir, _) = (source_dialect.to_ir)(source_body, translation::ir::NO_DECLARED_LIMIT)?;
@@ -946,6 +1030,9 @@ fn prepare_translated(
         }
     }
     let (mut upstream_value, _) = (upstream_dialect.from_ir)(&ir, target.upstream_model)?;
+    let prompt_prefix = tweaks
+        .prompt_scope
+        .map(|scope| prompt_cache::Prefix::of(scope, &ir));
     // Chat 发射器对显式 off 省略字段;按厂商方言注入 off 标记,让"关思考"
     // 在翻译路径真正生效(纯思考模型由方言降级为最低档)。
     if upstream == ProtocolId::OpenAiChat && matches!(ir.effort, Some(Effort::None)) {
@@ -990,6 +1077,10 @@ fn prepare_translated(
         tweaks.skip,
         tweaks.fixups.strip_glm_images,
     )
+    .map(|prepared| PreparedBody {
+        prepared,
+        prompt_prefix,
+    })
 }
 
 /// Model resolution: the client-supplied model string picks the candidate set.
@@ -1590,6 +1681,9 @@ pub struct DispatchDeps<'a> {
     pub exposure: &'a std::sync::Arc<crate::exposure::Exposure>,
     /// Per-key Kiro OIDC token manager (lazy refresh, single-flight, write-back).
     pub kiro_tokens: &'a KiroTokens,
+    /// Simulated Kiro prompt cache: remembered prompt prefixes per account and
+    /// caller (KAS reports no cached-token split of its own).
+    pub prompt_cache: &'a PromptCache,
     /// Per-key OpenCode account bearer manager (lazy refresh, single-flight, CAS
     /// write-back). The same instance backs model and quota probing.
     pub opencode_tokens: &'a OpencodeTokens,
@@ -1737,6 +1831,7 @@ pub async fn dispatch_at(
         failover,
         exposure,
         kiro_tokens,
+        prompt_cache,
         opencode_tokens,
         trace_ring,
         smart_cache,
@@ -2355,6 +2450,12 @@ pub async fn dispatch_at(
                             key: &candidate.key,
                             pool,
                             tokens: kiro_tokens,
+                            prompt_cache,
+                            cache_caller_key_id: request
+                                .principal
+                                .as_ref()
+                                .filter(|_| prompt_cache::prices_cache_reads(price.as_ref()))
+                                .map(|principal| principal.key_id),
                         }),
                         // An OpenCode account row authenticates per attempt. The
                         // key's `auth_kind` decides, not the protocol: one

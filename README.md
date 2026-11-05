@@ -9,7 +9,7 @@ A headless LLM gateway that routes requests across multiple AI providers with fa
 - **Embeddings passthrough** — Serve OpenAI-style `POST /v1/embeddings` (OpenAI, SiliconFlow, Jina, Voyage, Ollama, …) across the same routes, failover and metering as chat; retrieval calls are forwarded verbatim with only the model id rewritten
 - **Failover & cooldown** — Automatic failover to the next candidate on errors, with per-key cooldown tracking; a Kiro account can opt out of the 429 cooldown (account card menu → 429 不冷却), retrying in place and then failing over without resting
 - **Quota monitoring** — Periodic probing of provider quota/balance endpoints; quota-aware routing decisions
-- **Usage metering** — Per-request token counting and cost calculation (USD) with provider/model price tables
+- **Usage metering** — Per-request token counting and cost calculation (USD) with provider/model price tables; Kiro reports no cache split, so the gateway simulates prompt-cache reads (a prefix resent by the same caller to the same account and model within 5 minutes bills at the cache-read price)
 - **Concurrency control** — Per-key concurrency limits with semaphore-based queuing
 - **Availability rules** — Per-route time-window and weekday rules (allow/deny) for route-entry availability
 - **Admin API** — Full HTTP management API (providers, keys, routes, pricing, quotas, activity)

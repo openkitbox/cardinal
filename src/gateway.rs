@@ -96,6 +96,8 @@ struct Core {
     /// the quota prober all share this instance, so a Kiro credential refresh
     /// happens once and its rotated bundle is visible to every caller.
     kiro_tokens: Arc<crate::upstream::KiroTokens>,
+    /// Simulated Kiro prompt cache, read and written only by dispatch.
+    prompt_cache: relay::PromptCache,
     /// The same arrangement for OpenCode account rows: one bearer cache shared
     /// by dispatch, model probing and quota probing.
     opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
@@ -225,6 +227,7 @@ impl Core {
             server_stopped: CancellationToken::new(),
             prober_join: std::sync::Mutex::new(None),
             smart_cache,
+            prompt_cache: relay::PromptCache::new(),
             rotate_cursors: relay::RotateCursors::new(),
             route_cache,
             rest_cache,
@@ -416,6 +419,7 @@ impl Gateway {
             rest_cache: core.rest_cache.clone(),
             price_cache: core.price_cache.clone(),
             kiro_tokens: core.kiro_tokens.clone(),
+            prompt_cache: core.prompt_cache.clone(),
             opencode_tokens: core.opencode_tokens.clone(),
             opencode_client: Arc::clone(&core.opencode_client),
             opencode_logins: core.opencode_logins.clone(),
