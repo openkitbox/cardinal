@@ -3,8 +3,9 @@
 //! Mounted by [`crate::user_usage::router`] inside its auth hoop, so every
 //! handler acts for the one authenticated user and only on keys that user
 //! owns; a key id the caller does not own answers 404, the same as an
-//! unknown id. Terms are validated by [`crate::key_terms`], the same rules
-//! as the admin API.
+//! unknown id. A one-key scope (a built-in owner key) sees and edits only
+//! that key and cannot create keys (403). Terms are validated by
+//! [`crate::key_terms`], the same rules as the admin API.
 //!
 //! Endpoints:
 //! - `GET /user/keys` — the caller's keys, newest first, full plaintext
@@ -49,13 +50,15 @@ fn state_unavailable(response: &mut Response) {
 /// design; nothing here logs it.
 #[handler]
 async fn list_keys(depot: &mut Depot, response: &mut Response) {
-    let (Ok(state), Some(user_id)) = (user_usage::state(depot), user_usage::scoped_user(depot))
-    else {
+    let (Ok(state), Some(scope)) = (user_usage::state(depot), user_usage::scope(depot)) else {
         state_unavailable(response);
         return;
     };
-    match store::list_gateway_keys(&state.pool, Some(user_id)).await {
-        Ok(rows) => user_usage::json_response(response, &json!({ "items": rows })),
+    match store::list_gateway_keys(&state.pool, Some(scope.user_id())).await {
+        Ok(mut rows) => {
+            rows.retain(|row| scope.covers_key(row.id));
+            user_usage::json_response(response, &json!({ "items": rows }));
+        }
         Err(error) => user_usage::internal(response, error),
     }
 }
@@ -74,6 +77,18 @@ struct CreateBody {
 /// `POST /user/keys`: create a key owned by the caller.
 #[handler]
 async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let (Ok(state), Some(scope)) = (user_usage::state(depot), user_usage::scope(depot)) else {
+        state_unavailable(response);
+        return;
+    };
+    if scope.key_id().is_some() {
+        json_error(
+            response,
+            StatusCode::FORBIDDEN,
+            "keys cannot be created when signed in with a single key",
+        );
+        return;
+    }
     let Ok(body) = request.parse_json::<CreateBody>().await else {
         json_error(response, StatusCode::BAD_REQUEST, "invalid JSON body");
         return;
@@ -90,13 +105,14 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
             return;
         }
     };
-    let (Ok(state), Some(user_id)) = (user_usage::state(depot), user_usage::scoped_user(depot))
-    else {
-        state_unavailable(response);
-        return;
-    };
-    match store::create_user_gateway_key(&state.pool, user_id, label, terms, MAX_KEYS_PER_USER)
-        .await
+    match store::create_user_gateway_key(
+        &state.pool,
+        scope.user_id(),
+        label,
+        terms,
+        MAX_KEYS_PER_USER,
+    )
+    .await
     {
         Ok(Some(row)) => user_usage::json_response(response, &row),
         Ok(None) => json_error(
@@ -129,12 +145,15 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
             return;
         }
     };
-    let (Ok(state), Some(user_id)) = (user_usage::state(depot), user_usage::scoped_user(depot))
-    else {
+    let (Ok(state), Some(scope)) = (user_usage::state(depot), user_usage::scope(depot)) else {
         state_unavailable(response);
         return;
     };
-    match store::update_gateway_key(&state.pool, id, Some(user_id), patch).await {
+    if !scope.covers_key(id) {
+        json_error(response, StatusCode::NOT_FOUND, "key not found");
+        return;
+    }
+    match store::update_gateway_key(&state.pool, id, Some(scope.user_id()), patch).await {
         Ok(true) => user_usage::json_response(response, &json!({ "ok": true })),
         Ok(false) => json_error(response, StatusCode::NOT_FOUND, "key not found"),
         Err(error) if store::is_label_taken(&error) => {

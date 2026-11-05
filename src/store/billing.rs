@@ -412,10 +412,12 @@ pub async fn credit(
 }
 
 /// A user's entries, newest first: at most `limit` rows with an id below
-/// `before_id` (keyset pagination; `None` starts from the newest).
+/// `before_id` (keyset pagination; `None` starts from the newest). With
+/// `key_id`, only the entries made through that gateway key.
 pub async fn list_entries(
     pool: &PgPool,
     user_id: i64,
+    key_id: Option<i64>,
     before_id: Option<i64>,
     limit: i64,
 ) -> Result<Vec<EntryRow>, sqlx::Error> {
@@ -424,12 +426,14 @@ pub async fn list_entries(
         entry_columns!(),
         " FROM billing_entries
           WHERE user_id = $1 AND ($2::bigint IS NULL OR id < $2)
+            AND ($4::bigint IS NULL OR gateway_key_id = $4)
           ORDER BY id DESC
           LIMIT $3"
     ))
     .bind(user_id)
     .bind(before_id)
     .bind(limit)
+    .bind(key_id)
     .fetch_all(pool)
     .await
 }

@@ -1556,7 +1556,7 @@ async fn list_user_entries(request: &mut Request, depot: &mut Depot, response: &
         }
     }
     let limit = crate::billing::entry_page_limit(query.limit);
-    match store::list_entries(pool, id, query.before_id, limit).await {
+    match store::list_entries(pool, id, None, query.before_id, limit).await {
         Ok(rows) => json_response(response, &json!({ "items": rows })),
         Err(error) => internal(response, error.into()),
     }

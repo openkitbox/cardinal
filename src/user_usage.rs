@@ -3,8 +3,11 @@
 //! This surface is separate from the admin router. It authenticates one
 //! gateway key that is enabled, unexpired and owned by an enabled user, and
 //! scopes every read to that user — every key the user owns, by `user_id`.
-//! Callers cannot select another scope through query parameters, and the
-//! admin key is never accepted here.
+//! A key of the built-in owner is the exception: the owner is no real user
+//! identity, so such a key sees only itself (its usage, its ledger entries,
+//! itself in the key list) and cannot create keys. Callers cannot select
+//! another scope through query parameters, and the admin key is never
+//! accepted here.
 //!
 //! Endpoints:
 //! - `GET /user/me` — profile, group, effective rate, balance, the user's
@@ -26,9 +29,59 @@ use crate::admin::AdminKey;
 use crate::api::AppState;
 use crate::store::{self, CallerFilter, Principal};
 
-/// The authenticated user's id, injected by [`user_auth`] for the handlers.
+/// What the authenticated key may see, injected by [`user_auth`] for the
+/// handlers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct UserScope(i64);
+pub(crate) enum UserScope {
+    /// Every key of one real user.
+    User(i64),
+    /// One key of the built-in owner, and nothing else.
+    Key { user_id: i64, key_id: i64 },
+}
+
+impl UserScope {
+    /// The scope a principal gets: one key for the built-in owner, else the
+    /// whole user.
+    fn of(principal: &Principal) -> Self {
+        if principal.login == store::OWNER_LOGIN {
+            UserScope::Key {
+                user_id: principal.user_id,
+                key_id: principal.key_id,
+            }
+        } else {
+            UserScope::User(principal.user_id)
+        }
+    }
+
+    /// The owning user's id.
+    pub(crate) fn user_id(self) -> i64 {
+        match self {
+            UserScope::User(user_id) | UserScope::Key { user_id, .. } => user_id,
+        }
+    }
+
+    /// The single key this scope is limited to, if any.
+    pub(crate) fn key_id(self) -> Option<i64> {
+        match self {
+            UserScope::User(_) => None,
+            UserScope::Key { key_id, .. } => Some(key_id),
+        }
+    }
+
+    /// Whether key `key_id` (already known to belong to [`Self::user_id`])
+    /// is visible in this scope.
+    pub(crate) fn covers_key(self, key_id: i64) -> bool {
+        self.key_id().is_none_or(|own| own == key_id)
+    }
+
+    /// The usage-row filter of this scope.
+    fn caller_filter(self) -> CallerFilter {
+        match self {
+            UserScope::User(user_id) => CallerFilter::User(user_id),
+            UserScope::Key { key_id, .. } => CallerFilter::Key(key_id),
+        }
+    }
+}
 
 /// Extract a non-empty Bearer token from an Authorization header.
 fn bearer_token(value: &str) -> Option<&str> {
@@ -55,7 +108,7 @@ fn user_scope(
     }
     match crate::api::refusal(principal, now) {
         Some(reason) => Err(reason),
-        None => Ok(UserScope(principal.user_id)),
+        None => Ok(UserScope::of(principal)),
     }
 }
 
@@ -264,7 +317,7 @@ fn client_scope(request: &Request, depot: &Depot) -> Result<CallerFilter, Status
     }
     depot
         .get_typed::<UserScope>()
-        .map(|scope| CallerFilter::User(scope.0))
+        .map(|scope| scope.caller_filter())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -361,23 +414,23 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
     }
 }
 
-/// The authenticated user's id; `None` only if the auth hoop did not run.
-pub(crate) fn scoped_user(depot: &Depot) -> Option<i64> {
-    depot.get_typed::<UserScope>().ok().map(|scope| scope.0)
+/// The authenticated scope; `None` only if the auth hoop did not run.
+pub(crate) fn scope(depot: &Depot) -> Option<UserScope> {
+    depot.get_typed::<UserScope>().ok().copied()
 }
 
 /// `GET /user/me`: the caller's own account. The response carries the
-/// user's full gateway keys by design (they stay retrievable); nothing here
+/// scope's full gateway keys by design (they stay retrievable); nothing here
 /// logs the body.
 #[handler]
 async fn me(depot: &mut Depot, response: &mut Response) {
-    let (Ok(state), Some(user_id)) = (state(depot), scoped_user(depot)) else {
+    let (Ok(state), Some(scope)) = (state(depot), scope(depot)) else {
         response.status_code(StatusCode::INTERNAL_SERVER_ERROR);
         let _ = response.body("user usage state unavailable");
         return;
     };
     let pool = &state.pool;
-    let user = match store::get_user(pool, user_id).await {
+    let user = match store::get_user(pool, scope.user_id()).await {
         Ok(Some(user)) => user,
         Ok(None) => {
             response.status_code(StatusCode::UNAUTHORIZED);
@@ -391,9 +444,9 @@ async fn me(depot: &mut Depot, response: &mut Response) {
     };
     let until = chrono::Utc::now();
     let since = until - chrono::Duration::days(ME_USAGE_DAYS);
-    let (keys, usage) = match futures::try_join!(
-        store::list_gateway_keys(pool, Some(user_id)),
-        store::usage_window(pool, since, until, Some(CallerFilter::User(user_id))),
+    let (mut keys, usage) = match futures::try_join!(
+        store::list_gateway_keys(pool, Some(scope.user_id())),
+        store::usage_window(pool, since, until, Some(scope.caller_filter())),
     ) {
         Ok(results) => results,
         Err(error) => {
@@ -401,6 +454,7 @@ async fn me(depot: &mut Depot, response: &mut Response) {
             return;
         }
     };
+    keys.retain(|key| scope.covers_key(key.id));
     let rate_bp = crate::billing::effective_rate_bp(user.rate_bp, user.group_rate_bp);
     let view = MeView {
         user: MeUser {
@@ -425,7 +479,8 @@ async fn me(depot: &mut Depot, response: &mut Response) {
     json_response(response, &view);
 }
 
-/// `GET /user/me/entries?before_id&limit`: the caller's ledger, newest first.
+/// `GET /user/me/entries?before_id&limit`: the caller's ledger, newest
+/// first; a one-key scope sees only the entries made through that key.
 #[handler]
 async fn me_entries(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let Ok(query) = request.parse_queries::<EntriesQuery>() else {
@@ -433,13 +488,21 @@ async fn me_entries(request: &mut Request, depot: &mut Depot, response: &mut Res
         let _ = response.body("invalid query (before_id, limit)");
         return;
     };
-    let (Ok(state), Some(user_id)) = (state(depot), scoped_user(depot)) else {
+    let (Ok(state), Some(scope)) = (state(depot), scope(depot)) else {
         response.status_code(StatusCode::INTERNAL_SERVER_ERROR);
         let _ = response.body("user usage state unavailable");
         return;
     };
     let limit = crate::billing::entry_page_limit(query.limit);
-    match store::list_entries(&state.pool, user_id, query.before_id, limit).await {
+    match store::list_entries(
+        &state.pool,
+        scope.user_id(),
+        scope.key_id(),
+        query.before_id,
+        limit,
+    )
+    .await
+    {
         Ok(rows) => json_response(response, &json!({ "items": rows })),
         Err(error) => internal(response, error.into()),
     }
