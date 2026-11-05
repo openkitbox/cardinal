@@ -158,6 +158,11 @@ pub struct EndMetrics {
     /// reported no caching, or never answered).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<i64>,
+    /// The row's HTTP status (the ledger's `status`: the upstream's own code,
+    /// a mapped gateway code, or 499 for a client that hung up), so a failed
+    /// feed row can say `err(429)` instead of a bare error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
 }
 
 /// Why the candidate sits where it does in this request's order (Smart

@@ -1357,6 +1357,7 @@ impl AttemptLog {
             ttft_ms: self.ttft_ms,
             input_tokens: self.input_tokens,
             cached_input_tokens: self.cached_input_tokens,
+            http_status: Some(self.status),
         }
     }
 }
