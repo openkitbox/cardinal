@@ -2232,8 +2232,9 @@ pub async fn dispatch_at(
                 None
             }
         };
-        // In-place retries of the last candidate (Rate ×3, Other ×2) run inside
-        // this loop; the dispatcher slot guard is held across them.
+        // In-place retries (last candidate: Rate ×3, Other ×2; a 429 不冷却
+        // account: Rate ×3 anywhere) run inside this loop; the dispatcher slot
+        // guard is held across them.
         let mut retried = 0u32;
         // Zhipu GLM passthrough fixup: the 5.x always-thinking models reject
         // `thinking: {"type": "disabled"}` (HTTP 400, code 1210 — "该模型始终思考，
@@ -2675,20 +2676,22 @@ pub async fn dispatch_at(
                             retry_after_secs: None,
                         };
                     }
-                    // Last-candidate in-place retry: the final key in
-                    // the chain retries on Rate (up to 3) and Other (up to 2) before the
-                    // request fails. Pause: doubling backoff from `retry_pause`,
+                    // In-place retry: the last candidate retries Rate (up to 3) and
+                    // Other (up to 2) before the request fails; an account set to
+                    // 429 不冷却 (`rest_on_429 = false`) retries Rate at any position
+                    // (`Failure::in_place_retries`). Pause: doubling backoff from `retry_pause`,
                     // overridden by Retry-After when present, never beyond 8s or the
                     // request budget. Each try is its own attempt row; the rest and the
                     // counter bump happen once, after the final failure. The permit is
                     // held across the sleeps — releasing it would break FIFO fairness,
                     // at the cost of a queued waiter on a saturated key possibly timing
                     // out (and logging a spurious Timeout row) during the pause.
-                    let retries_left = match (failure, is_last) {
-                        (failover::Failure::Rate { .. }, true) => 3,
-                        (failover::Failure::Other, true) => 2,
-                        _ => 0,
+                    let rate_policy = if candidate.key.rest_on_429 {
+                        failover::RateLimitPolicy::Rest
+                    } else {
+                        failover::RateLimitPolicy::RetryInPlace
                     };
+                    let retries_left = failure.in_place_retries(is_last, rate_policy);
                     if retried < retries_left {
                         // Total over both failure families: a Kiro OIDC 429
                         // carries its own Retry-After, and the token error's
@@ -2707,7 +2710,7 @@ pub async fn dispatch_at(
                                 key = candidate.key.label.as_str(),
                                 model = target_model,
                                 elapsed_ms = started.elapsed().as_millis() as u64,
-                                "last candidate failed ({}), retrying in {}ms ({retried}/{retries_left})",
+                                "attempt failed ({}), retrying the same account in {}ms ({retried}/{retries_left})",
                                 error.message(),
                                 pause.as_millis()
                             );
@@ -2740,8 +2743,25 @@ pub async fn dispatch_at(
                     } else {
                         1
                     };
-                    let Some(rest_target) = failure.rest_target(consecutive, chrono::Utc::now())
+                    let Some(rest_target) =
+                        failure.rest_target(rate_policy, consecutive, chrono::Utc::now())
                     else {
+                        // Nobody rests: either the class says so (Credit/Quota/Rate all
+                        // rest; Blameless and Request never reach here) or this account's
+                        // 429 switch suppressed its own rate-limit cooldown. Name the
+                        // latter, so the log explains the extra attempts and failover
+                        // instead of reading like a cooldown that got lost.
+                        if matches!(failure, failover::Failure::Rate { .. }) {
+                            tracing::info!(
+                                request_id = %request_id,
+                                provider = provider.name.as_str(),
+                                key = candidate.key.label.as_str(),
+                                model = target_model,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "429: account is set to not cool down, failing over un-rested: {}",
+                                error.message()
+                            );
+                        }
                         index += 1;
                         continue 'candidates;
                     };

@@ -22,6 +22,13 @@ pub struct ProviderKeyRow {
     pub position: i32,
     /// Per-key in-flight cap; NULL = unlimited.
     pub max_concurrency: Option<i32>,
+    /// Whether an upstream 429 short rate limit may cool this account down
+    /// (`rest_on_429`, migrations/0020). TRUE = the cooldown policy every
+    /// account had before the column existed; FALSE = the Kiro "429 不冷却"
+    /// setting: retry the account in place, then fail over un-rested. Only a
+    /// Kiro provider's keys can change it ([`patch_provider_key`]); the relay
+    /// reads it generically.
+    pub rest_on_429: bool,
     /// The key's cached model-list snapshot: what its provider's /models last
     /// answered (NULL until the first successful probe). Feeds the /v1/models
     /// route-object derivation.
@@ -68,6 +75,7 @@ impl std::fmt::Debug for ProviderKeyRow {
             .field("enabled", &self.enabled)
             .field("position", &self.position)
             .field("max_concurrency", &self.max_concurrency)
+            .field("rest_on_429", &self.rest_on_429)
             .field("models", &self.models)
             .field("allowed_models", &self.allowed_models)
             .field("auth_kind", &self.auth_kind)
@@ -136,6 +144,9 @@ pub struct ProviderKeyView {
     pub position: i32,
     pub max_concurrency: Option<i32>,
     pub inflight: Option<i32>,
+    /// Whether a 429 rate limit cools the account down; see
+    /// [`ProviderKeyRow::rest_on_429`].
+    pub rest_on_429: bool,
     /// The key's cached model-list snapshot (None until the first successful
     /// probe). The key editor prefills its model picker from this instead of
     /// re-probing the vendor on open.
@@ -177,6 +188,7 @@ impl ProviderKeyView {
             position: row.position,
             max_concurrency: row.max_concurrency,
             inflight,
+            rest_on_429: row.rest_on_429,
             models: row.models.clone(),
             allowed_models: row.allowed_models.clone(),
             auth_kind: row.auth_kind.clone(),
@@ -199,7 +211,7 @@ pub async fn list_provider_keys(
     provider_id: i64,
 ) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, rest_on_429, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
          WHERE provider_id = $1 ORDER BY position, id",
   )
   .bind(provider_id)
@@ -212,7 +224,7 @@ pub async fn list_provider_keys(
 /// /v1/models route-object derivation resolves route entries against it.
 pub async fn list_all_keys(pool: &PgPool) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, rest_on_429, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
          ORDER BY position, id",
   )
   .fetch_all(pool)
@@ -281,7 +293,7 @@ pub async fn list_enabled_key_models(pool: &PgPool) -> anyhow::Result<Vec<Enable
 /// (`relay::route_cache::RouteCache::keys_by_ids`).
 pub async fn list_keys_by_ids(pool: &PgPool, ids: &[i64]) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, rest_on_429, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
          WHERE id = ANY($1) ORDER BY position, id",
   )
   .bind(ids)
@@ -853,6 +865,10 @@ pub struct KeyPatch<'a> {
     /// Archive state: `None` = untouched, `Some(true)` = archive (keeps the
     /// first archive time), `Some(false)` = unarchive.
     pub archived: Option<bool>,
+    /// 429 cooldown switch: `None` = untouched, `Some(false)` = never cool this
+    /// account down on a rate limit (retry in place, then fail over). Only a
+    /// Kiro provider's keys accept it.
+    pub rest_on_429: Option<bool>,
 }
 
 /// Partial update (PATCH semantics) that may also rotate the credential:
@@ -890,13 +906,22 @@ pub async fn patch_provider_key(
     // Every key mutation takes the provider row lock first. This keeps label
     // uniqueness checks ordered with inserts and avoids a provider/key lock
     // inversion under concurrent admin writes.
-    let provider_exists: Option<(i64,)> =
-        sqlx::query_as("SELECT id FROM gateway_providers WHERE id = $1 FOR UPDATE")
+    let provider_row: Option<(i64, String)> =
+        sqlx::query_as("SELECT id, protocol FROM gateway_providers WHERE id = $1 FOR UPDATE")
             .bind(provider_id)
             .fetch_optional(&mut *tx)
             .await?;
-    if provider_exists.is_none() {
+    let Some((_, protocol)) = provider_row else {
         return Ok(false);
+    };
+    // The 429 switch is a Kiro setting: a Kiro 429 is an account-level rate
+    // limit that clears in seconds, so resting the whole account costs more
+    // than retrying it. Any other protocol keeps the column's default rather
+    // than storing a value whose meaning nothing verified.
+    if patch.rest_on_429.is_some() && protocol != "kiro" {
+        anyhow::bail!(
+            "rest_on_429 is a kiro provider setting; this provider's protocol is {protocol:?}"
+        );
     }
     if let Some(label) = patch.label {
         let duplicate: Option<(i64,)> = sqlx::query_as(
@@ -926,7 +951,8 @@ pub async fn patch_provider_key(
            oauth = CASE WHEN $9 THEN $10 ELSE oauth END,
            archived_at = CASE WHEN $11::boolean IS NULL THEN archived_at
                               WHEN $11 THEN COALESCE(archived_at, now())
-                              ELSE NULL END
+                              ELSE NULL END,
+           rest_on_429 = COALESCE($12, rest_on_429)
          WHERE id = $1 AND provider_id = $2
            AND (NOT $9 OR auth_kind = 'kiro_oidc')",
     )
@@ -946,6 +972,7 @@ pub async fn patch_provider_key(
     .bind(oauth.is_some())
     .bind(oauth)
     .bind(patch.archived)
+    .bind(patch.rest_on_429)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
@@ -998,6 +1025,7 @@ pub async fn update_provider_key(
             oauth: None,
             group_ids: None,
             archived: None,
+            rest_on_429: None,
         },
     )
     .await

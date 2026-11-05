@@ -1811,6 +1811,10 @@ struct PatchKeyBody {
     /// first archive time), false = unarchive.
     #[serde(default)]
     archived: Option<bool>,
+    /// 429 cooldown switch: absent/null = untouched, false = never cool this
+    /// account down on a rate limit. Only a Kiro provider accepts it.
+    #[serde(default)]
+    rest_on_429: Option<bool>,
 }
 
 /// `PUT /api/keys/order` body: positions are assigned sequentially in array order (0, 1, 2, …).
@@ -2172,6 +2176,7 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
             oauth: body.oauth.as_ref(),
             group_ids: body.group_ids.as_deref(),
             archived: body.archived,
+            rest_on_429: body.rest_on_429,
         },
     )
     .await

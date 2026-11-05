@@ -134,6 +134,10 @@ pub struct KeyUpdate<'a> {
     pub group_ids: Option<&'a [i64]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+    /// The 429 cooldown switch (Kiro accounts): `Some(false)` stops a rate
+    /// limit from cooling the account down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rest_on_429: Option<bool>,
 }
 
 /// Which callers the usage endpoints aggregate over. One variant per

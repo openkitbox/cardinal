@@ -171,23 +171,54 @@ pub enum RestTarget {
     KeyModel(chrono::Duration),
 }
 
+/// How one account answers a 429 short rate limit ([`Failure::Rate`]), from
+/// its `gateway_provider_keys.rest_on_429` column (a Kiro-only setting).
+/// Quota-worded 429s classify as [`Failure::Quota`] and are outside this
+/// policy: an exhausted plan still rests until its reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitPolicy {
+    /// Rest the account (Retry-After, else 1min) and fail over. The default.
+    Rest,
+    /// Never rest on a rate limit: retry the same account in place, then fail
+    /// over to the next candidate with the account still eligible.
+    RetryInPlace,
+}
+
 impl Failure {
     /// Transferable = another candidate might succeed: everything but `Request`.
     pub fn transferable(&self) -> bool {
         !matches!(self, Self::Request)
     }
 
+    /// How many in-place retries this failure earns on its candidate. The last
+    /// candidate retries Rate ×3 and Other ×2 (nothing else is left to try); a
+    /// `RetryInPlace` account retries Rate ×3 at any position, because it will
+    /// not rest and failing over at once would make the setting a no-op for
+    /// every candidate but the last.
+    #[must_use]
+    pub fn in_place_retries(&self, is_last: bool, policy: RateLimitPolicy) -> u32 {
+        match (self, is_last, policy) {
+            (Self::Rate { .. }, true, _)
+            | (Self::Rate { .. }, _, RateLimitPolicy::RetryInPlace) => 3,
+            (Self::Other, true, _) => 2,
+            _ => 0,
+        }
+    }
+
     /// The cooldown target; `None` = rest nobody. `consecutive_failures` is the
     /// key's consecutive-failure counter (after this bump) and only `Other` uses
     /// it (the named classes have fixed durations and never bump the counter).
-    /// `now` anchors the Quota reset cap.
+    /// `now` anchors the Quota reset cap. `policy` only changes `Rate`: a
+    /// `RetryInPlace` account rests nobody on a rate limit.
     pub fn rest_target(
         &self,
+        policy: RateLimitPolicy,
         consecutive_failures: u32,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Option<RestTarget> {
         let key = |duration| Some(RestTarget::Key(duration));
         match self {
+            Self::Rate { .. } if policy == RateLimitPolicy::RetryInPlace => None,
             Self::Credit => key(chrono::Duration::minutes(30)),
             Self::Quota { reset_until } => key(match *reset_until {
                 // A vendor-stated reset is trusted up to MAX_QUOTA_REST (a
