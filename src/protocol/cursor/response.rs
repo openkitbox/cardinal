@@ -624,7 +624,9 @@ fn turn_usage(body: &[u8]) -> Result<UsageCounts, CursorError> {
 /// `McpArgs` → the caller's tool call. The model calls `CallDynamicTool`
 /// (`{namespace, toolName, arguments}`), which Cursor hands over as
 /// `tool_name` (`#5`) or `name` (`#1`, possibly namespaced `tools-<name>`) with
-/// the arguments as a `map<string, Value>`.
+/// the arguments as a `map<string, Value>`. Rarely Cursor echoes the envelope
+/// back unchanged — the name is `CallDynamicTool` itself and the real call
+/// sits in the args map — which is unwrapped here, or refused.
 fn decode_mcp_call(body: &[u8]) -> Result<ToolCall, CursorError> {
     let mut name = "";
     let mut tool_name = "";
@@ -655,6 +657,13 @@ fn decode_mcp_call(body: &[u8]) -> Result<ToolCall, CursorError> {
     if name.is_empty() {
         return Err(CursorError::Malformed);
     }
+    // Cursor sometimes hands the envelope back unchanged: the name is the
+    // synthetic tool itself and the real call rides in its arguments.
+    let (name, args) = if name == msg::CALL_TOOL {
+        unwrap_envelope(args)?
+    } else {
+        (name.to_owned(), args)
+    };
     // An OpenAI-style call id can carry a newline between its two halves
     // (`call_…\nfc_…`), which no Chat client accepts: the reference replaces
     // it on the way out and restores it when the result comes back.
@@ -667,9 +676,32 @@ fn decode_mcp_call(body: &[u8]) -> Result<ToolCall, CursorError> {
         serde_json::to_string(&Value::Object(args)).map_err(|_| CursorError::Malformed)?;
     Ok(ToolCall {
         id,
-        name: name.to_owned(),
+        name,
         arguments,
     })
+}
+
+/// The caller's call inside an echoed `CallDynamicTool` envelope, or
+/// [`CursorError::Malformed`] — the shell is not a tool the caller has, so a
+/// shape that cannot be unwrapped is refused rather than passed on.
+fn unwrap_envelope(
+    mut args: serde_json::Map<String, Value>,
+) -> Result<(String, serde_json::Map<String, Value>), CursorError> {
+    let Some(Value::String(name)) = args.remove("toolName") else {
+        return Err(CursorError::Malformed);
+    };
+    if name.is_empty() {
+        return Err(CursorError::Malformed);
+    }
+    // A tool that takes no arguments can echo back without the entry at all,
+    // or with the empty value this decoder reads as `Null`; one of the wrong
+    // shape is still a refusal.
+    let args = match args.remove("arguments") {
+        Some(Value::Object(args)) => args,
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(_) => return Err(CursorError::Malformed),
+    };
+    Ok((name, args))
 }
 
 /// One `map<string, google.protobuf.Value>` entry: `1` key, `2` value.

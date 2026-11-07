@@ -17,9 +17,11 @@
 //!   tool call is a `CallDynamicTool` call whose `arguments` name the caller's
 //!   tool, so the model's later calls take the same shape;
 //! * tool results answer the calls of the assistant turn before them as one
-//!   `tool` message; a call the client never answered is answered for
-//!   ([`NO_RESULT`], marked an error), because the API wants every call to
-//!   have its result;
+//!   `tool` message — the answers of one turn coalesce there however many
+//!   messages they arrived in, so parallel calls keep every result; a call
+//!   the client never answered is answered for ([`NO_RESULT`], marked an
+//!   error) when the turn ends, because the API wants every call to have
+//!   its result;
 //! * a user turn carries text and inline images (a data URL becomes the
 //!   host's `Uint8Array` encoding); a remote image or a document becomes a
 //!   text placeholder.
@@ -77,7 +79,7 @@ pub fn from_ir(request: &IrRequest, model: &str) -> super::Parsed<Value> {
             IrRole::User => staging.user(message, &mut dropped),
         }
     }
-    staging.answer();
+    staging.close_turn();
     for tool in &request.tools {
         staging.size += tool.name.len() + tool.description.len() + tool.schema.to_string().len();
     }
@@ -117,8 +119,12 @@ pub fn from_ir(request: &IrRequest, model: &str) -> super::Parsed<Value> {
 struct Staging {
     messages: Vec<Value>,
     /// Calls of the latest assistant turn not yet answered, by wire id.
+    /// Every one of them produces exactly one result: the client's, or
+    /// [`NO_RESULT`] when the turn ends with the call still unanswered.
     pending: Vec<String>,
-    /// Results collected for the pending calls.
+    /// Results collected for the calls of the current turn, in arrival
+    /// order. Consecutive tool-result messages accumulate here, so the
+    /// answers of one turn leave as a single `tool` message.
     results: Vec<Value>,
     /// The first text of the latest user turn (the Run's `user` blob).
     last_user: Option<String>,
@@ -133,9 +139,10 @@ impl Staging {
         self.messages.push(message);
     }
 
-    /// Flush the tool results: every pending call gets one (the real result
-    /// or [`NO_RESULT`]), as one `tool` message.
-    fn answer(&mut self) {
+    /// End the turn: a call still pending is one the client never answered,
+    /// so it is answered for ([`NO_RESULT`]) before the results go out as one
+    /// `tool` message.
+    fn close_turn(&mut self) {
         for id in std::mem::take(&mut self.pending) {
             self.results.push(tool_result(&id, NO_RESULT, true));
         }
@@ -146,7 +153,7 @@ impl Staging {
     }
 
     fn assistant(&mut self, message: &IrMessage, dropped: &mut Vec<&'static str>) {
-        self.answer();
+        self.close_turn();
         let mut content = Vec::new();
         for part in &message.parts {
             match part {
@@ -245,7 +252,12 @@ impl Staging {
                 IrPart::ToolCall { .. } => dropped.push("user_tool_call"),
             }
         }
-        self.answer();
+        // Real user content ends the assistant turn before it. A message
+        // carrying only tool results just accumulates: the results of one
+        // parallel step arrive as separate messages and leave together.
+        if !content.is_empty() {
+            self.close_turn();
+        }
         if let Some(text) = first_text {
             self.last_user = Some(text);
         }
