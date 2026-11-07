@@ -29,6 +29,7 @@ pub(super) fn parse_kimi_balance(body: &str) -> Option<KeyQuota> {
             amount,
             symbol: "¥".to_string(),
         }),
+        plan: None,
         details: Vec::new(),
     })
 }
@@ -200,6 +201,7 @@ pub(super) fn parse_kimi_code_usages(body: &str) -> Option<KeyQuota> {
         Some(KeyQuota {
             windows,
             balance: None,
+            plan: None,
             details: Vec::new(),
         })
     }

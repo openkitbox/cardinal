@@ -215,6 +215,7 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
     Some(KeyQuota {
         windows,
         balance,
+        plan: None,
         details,
     })
 }

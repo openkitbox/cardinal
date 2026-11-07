@@ -146,6 +146,7 @@ pub(super) fn parse_commandcode_quota(body: &str) -> Option<KeyQuota> {
         Some(KeyQuota {
             windows,
             balance,
+            plan: None,
             details: Vec::new(),
         })
     }

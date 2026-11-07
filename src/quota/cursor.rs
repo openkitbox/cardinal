@@ -215,10 +215,6 @@ pub async fn fetch_cursor_quota(
         .unwrap_or(0.)
         .max(0.);
     let mut details = Vec::new();
-    details.push(format!(
-        "{} 套餐",
-        plan_name.as_deref().unwrap_or("Enterprise")
-    ));
     details.push(format!("本周期消费 ${:.2}", spent / 100.));
     if let Some(resets_at) = epoch_millis(end) {
         details.push(format!("重置 {}", resets_at.format("%m-%d")));
@@ -226,6 +222,7 @@ pub async fn fetch_cursor_quota(
     Some(KeyQuota {
         windows: Vec::new(),
         balance: None,
+        plan: Some(plan_name.unwrap_or_else(|| "Enterprise".to_owned())),
         details,
     })
 }
@@ -435,8 +432,8 @@ fn meter_pct(pct: f64) -> f64 {
 /// / `GetAggregatedUsageEvents`) as a card: the plan's included usage as the
 /// two bucket meters with their spent amounts (one money window when the
 /// backend names no buckets), a fixed on-demand ceiling as another window,
-/// unlimited on-demand spend as a details line, the plan name first in the
-/// details.
+/// unlimited on-demand spend as a details line, and the plan's name as the
+/// reading's `plan` badge.
 fn parse_cursor_quota(
     usage: &Value,
     hard_limit: Option<&Value>,
@@ -478,9 +475,6 @@ fn parse_cursor_quota(
     };
     let mut windows = Vec::new();
     let mut details = Vec::new();
-    if let Some(name) = plan_name {
-        details.push(format!("{name} 套餐"));
-    }
     let included_limit = plan_usage.get("limit").and_then(number).unwrap_or(0.);
     let included_spend = plan_usage
         .get("includedSpend")
@@ -498,7 +492,7 @@ fn parse_cursor_quota(
     if let (Some(auto_pct), Some(api_pct)) = (auto_pct, api_pct) {
         // The backend already split the allowance into the two buckets the
         // usage page shows; it names no per-bucket ceiling, so each meter
-        // carries its spent amount and the plan's total stays a details line.
+        // carries its spent amount alone.
         let buckets = [
             (
                 "Cursor Models",
@@ -520,13 +514,6 @@ fn parse_cursor_quota(
                 total: None,
                 used: spent_cents.map(|cents| format!("${:.2}", cents.max(0.) / 100.)),
             });
-        }
-        if included_limit > 0. {
-            details.push(format!(
-                "本期已用 ${:.2} / ${:.2}",
-                included_spend / 100.,
-                included_limit / 100.
-            ));
         }
     } else {
         // The share and the allowance must be in the same terms, so the two
@@ -588,13 +575,14 @@ fn parse_cursor_quota(
             }
         }
     }
-    if windows.is_empty() && details.is_empty() {
+    if windows.is_empty() && details.is_empty() && plan_name.is_none() {
         return None;
     }
     sort_windows(&mut windows);
     Some(KeyQuota {
         windows,
         balance: None,
+        plan: plan_name,
         details,
     })
 }

@@ -35,6 +35,7 @@ pub(super) fn parse_deepseek_balance(body: &str) -> Option<KeyQuota> {
             amount,
             symbol: symbol.to_string(),
         }),
+        plan: None,
         details: Vec::new(),
     })
 }

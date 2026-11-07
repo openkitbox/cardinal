@@ -63,6 +63,14 @@ pub struct KeyQuota {
     /// Prepaid balance as reported by the vendor (renders as "¥12.34").
     #[serde(default)]
     pub balance: Option<Balance>,
+    /// The vendor's name for the plan the account is on ("Pro"), when it
+    /// names one. A badge beside the account rather than a meter: it says
+    /// which plan the windows below belong to. Only the Cursor probe fills
+    /// it; the sub2api relay keeps its plan, status and expiry as one
+    /// composed details line, where the name alone would read as half a
+    /// sentence.
+    #[serde(default)]
+    pub plan: Option<String>,
     /// Display-ready info lines beyond meters and balance (plan name, expiry,
     /// today's / lifetime usage), rendered verbatim in vendor order. Only
     /// the sub2api relay source fills them today.
