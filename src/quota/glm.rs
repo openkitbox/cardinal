@@ -64,6 +64,7 @@ pub(super) fn parse_glm_quota(body: &str) -> Option<KeyQuota> {
                 resets_at,
                 period_minutes: Some(period_minutes),
                 total: None,
+                used: None,
             })
         })
         .collect::<Vec<_>>();

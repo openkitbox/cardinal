@@ -28,6 +28,12 @@ pub struct QuotaWindow {
     /// is already folded into `used_pct`).
     #[serde(default)]
     pub total: Option<String>,
+    /// The amount already spent ("$0.04"), display-ready, for a money-window
+    /// whose vendor reports what was spent but not the window's own ceiling,
+    /// so the card can show the amount beside the percent. `None` when the
+    /// share already says everything (or `total` does).
+    #[serde(default)]
+    pub used: Option<String>,
 }
 
 /// A prepaid account balance: numeric amount plus its currency symbol.

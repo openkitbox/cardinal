@@ -97,6 +97,7 @@ pub(super) fn parse_commandcode_quota(body: &str) -> Option<KeyQuota> {
                 resets_at: window.reset_at.as_ref().and_then(reset_time),
                 period_minutes: Some(period_minutes),
                 total: None,
+                used: None,
             });
             implied_monthly = Some(cap * fraction);
         }
@@ -126,6 +127,7 @@ pub(super) fn parse_commandcode_quota(body: &str) -> Option<KeyQuota> {
                 resets_at: None, // the vendor never exposes a monthly reset instant
                 period_minutes: Some(30 * 1440),
                 total: Some(format!("${cap:.2}")),
+                used: None,
             }),
             // A depleted pool is a real reading too: record it as $0 so the
             // balance history sees the spend-down, not a missing probe.

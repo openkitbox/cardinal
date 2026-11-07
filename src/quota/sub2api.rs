@@ -99,6 +99,7 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
             resets_at,
             period_minutes,
             total: Some(money(limit)),
+            used: None,
         })
     };
     let mut windows = Vec::new();

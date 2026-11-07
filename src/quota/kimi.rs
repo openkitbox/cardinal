@@ -123,6 +123,7 @@ pub(super) fn parse_kimi_code_usages(body: &str) -> Option<KeyQuota> {
             resets_at,
             period_minutes: Some(period_minutes),
             total: None,
+            used: None,
         })
     }
     /// A span reads as whole days when it divides evenly (≥ 1 天), else whole
@@ -164,6 +165,7 @@ pub(super) fn parse_kimi_code_usages(body: &str) -> Option<KeyQuota> {
             resets_at,
             period_minutes: Some(period_minutes),
             total: None,
+            used: None,
         })
     }
     let response: Response = serde_json::from_str(body).ok()?;

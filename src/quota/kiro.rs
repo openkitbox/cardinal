@@ -243,6 +243,7 @@ fn parse_kiro_quota(body: &str) -> Option<KeyQuota> {
         // No unit suffix: the window name already says Credits, and the card
         // renders "remaining/total", so a suffix would be printed twice.
         total: Some(credit_amount(limit)),
+        used: None,
     }];
     sort_windows(&mut windows);
     Some(KeyQuota {
