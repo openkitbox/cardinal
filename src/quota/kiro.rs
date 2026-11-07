@@ -173,48 +173,102 @@ pub async fn fetch_kiro_quota(
 /// instant comes from the breakdown, then the document-level `nextDateReset`
 /// (Unix seconds, the vendor's only shape); the window itself is a month,
 /// approximated as 30 days for the sort key like every other monthly window.
+/// The wire shapes of one `GetUsageLimits` answer. Only the fields the card
+/// reads are declared; serde ignores the rest.
+#[derive(serde::Deserialize)]
+struct UsageLimits {
+    #[serde(rename = "usageBreakdownList", default)]
+    breakdowns: Vec<Breakdown>,
+    #[serde(rename = "nextDateReset")]
+    next_reset: Option<serde_json::Value>,
+    #[serde(rename = "overageConfiguration")]
+    overage: Option<OverageConfiguration>,
+}
+
+#[derive(serde::Deserialize)]
+struct OverageConfiguration {
+    #[serde(rename = "overageStatus")]
+    status: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct Breakdown {
+    #[serde(rename = "resourceType")]
+    resource_type: Option<String>,
+    #[serde(rename = "currentUsageWithPrecision")]
+    used_precision: Option<f64>,
+    #[serde(rename = "currentUsage")]
+    used: Option<f64>,
+    #[serde(rename = "usageLimitWithPrecision")]
+    limit_precision: Option<f64>,
+    #[serde(rename = "usageLimit")]
+    limit: Option<f64>,
+    #[serde(rename = "nextDateReset")]
+    next_reset: Option<serde_json::Value>,
+    #[serde(rename = "currentOveragesWithPrecision")]
+    overage_used: Option<f64>,
+    #[serde(rename = "overageCapWithPrecision")]
+    overage_cap: Option<f64>,
+    #[serde(rename = "overageCharges")]
+    overage_charges: Option<f64>,
+    #[serde(default)]
+    bonuses: Vec<Bonus>,
+}
+
+/// A bonus credit pool (trial credits and the like), a separate allowance with
+/// its own expiry.
+#[derive(serde::Deserialize)]
+struct Bonus {
+    #[serde(rename = "displayName")]
+    name: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "currentUsage")]
+    used: Option<f64>,
+    #[serde(rename = "usageLimit")]
+    limit: Option<f64>,
+    #[serde(rename = "expiresAt")]
+    expires_at: Option<serde_json::Value>,
+}
+
+/// Precision first, integer second: only an absent precision field falls
+/// back (a genuine `0` is a reading, not a missing value).
+fn amount(precision: Option<f64>, integer: Option<f64>) -> Option<f64> {
+    precision.or(integer).filter(|value| value.is_finite())
+}
+
+/// The vendor's Unix-seconds instant, as a number or a numeric string.
+fn unix_seconds(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let seconds = match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|seconds| seconds as i64))?,
+        serde_json::Value::String(text) => text.trim().parse().ok()?,
+        _ => return None,
+    };
+    (seconds > 0)
+        .then(|| DateTime::from_timestamp(seconds, 0))
+        .flatten()
+}
+
+/// Kiro monthly credits (`POST /?isEmailRequired=false`, target
+/// `AmazonCodeWhispererService.GetUsageLimits`), read into one meter plus
+/// details lines.
+///
+/// Only a `CREDIT` breakdown is the meter (`TOKENS` rows describe the plan's
+/// other unit). The precision fields win over the integers when present — one
+/// credit is a whole invocation, so `currentUsage: 5469` truncates the real
+/// 5469.38 — and a non-positive allowance is no reading at all rather than a
+/// division by zero or a fictional 0% meter. The reset instant comes from the
+/// breakdown, then the document-level `nextDateReset`; the window itself is a
+/// month, approximated as 30 days for the sort key like every other monthly
+/// window.
+///
+/// Bonus pools and the overage switch are NOT meters. A bonus is a separate
+/// allowance with its own expiry, and smart routing takes the minimum over a
+/// key's windows, so a trial pool as a window would change which key gets
+/// traffic. They become details lines instead.
 fn parse_kiro_quota(body: &str) -> Option<KeyQuota> {
-    #[derive(serde::Deserialize)]
-    struct Response {
-        #[serde(rename = "usageBreakdownList", default)]
-        breakdowns: Vec<Breakdown>,
-        #[serde(rename = "nextDateReset")]
-        next_reset: Option<serde_json::Value>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Breakdown {
-        #[serde(rename = "resourceType")]
-        resource_type: Option<String>,
-        #[serde(rename = "currentUsageWithPrecision")]
-        used_precision: Option<f64>,
-        #[serde(rename = "currentUsage")]
-        used: Option<f64>,
-        #[serde(rename = "usageLimitWithPrecision")]
-        limit_precision: Option<f64>,
-        #[serde(rename = "usageLimit")]
-        limit: Option<f64>,
-        #[serde(rename = "nextDateReset")]
-        next_reset: Option<serde_json::Value>,
-    }
-    /// Precision first, integer second: only an absent precision field falls
-    /// back (a genuine `0` is a reading, not a missing value).
-    fn amount(precision: Option<f64>, integer: Option<f64>) -> Option<f64> {
-        precision.or(integer).filter(|value| value.is_finite())
-    }
-    /// The vendor's reset instant: Unix seconds as a number or a numeric string.
-    fn unix_seconds(value: &serde_json::Value) -> Option<DateTime<Utc>> {
-        let seconds = match value {
-            serde_json::Value::Number(number) => number
-                .as_i64()
-                .or_else(|| number.as_f64().map(|seconds| seconds as i64))?,
-            serde_json::Value::String(text) => text.trim().parse().ok()?,
-            _ => return None,
-        };
-        (seconds > 0)
-            .then(|| DateTime::from_timestamp(seconds, 0))
-            .flatten()
-    }
-    let response: Response = serde_json::from_str(body).ok()?;
+    let response: UsageLimits = serde_json::from_str(body).ok()?;
     let credit = response.breakdowns.iter().find_map(|breakdown| {
         if breakdown.resource_type.as_deref() != Some("CREDIT") {
             return None;
@@ -246,14 +300,60 @@ fn parse_kiro_quota(body: &str) -> Option<KeyQuota> {
         used: None,
     }];
     sort_windows(&mut windows);
+    let details = bonus_details(&credit.bonuses)
+        .into_iter()
+        .chain(overage_detail(response.overage.as_ref(), credit))
+        .collect();
     Some(KeyQuota {
         windows,
         balance: None,
         plan: None,
-        details: Vec::new(),
+        details,
     })
 }
 
+/// One line per ACTIVE bonus pool: its used and total credits, and its expiry
+/// date when the vendor gives one.
+fn bonus_details(bonuses: &[Bonus]) -> Vec<String> {
+    bonuses
+        .iter()
+        .filter(|bonus| bonus.status.as_deref() == Some("ACTIVE"))
+        .filter_map(|bonus| {
+            let limit = bonus
+                .limit
+                .filter(|limit| limit.is_finite() && *limit > 0.)?;
+            let used = bonus.used.filter(|used| used.is_finite()).unwrap_or(0.);
+            let name = bonus.name.as_deref().unwrap_or("赠送 Credits");
+            let mut line = format!(
+                "{name} {}/{}",
+                credit_amount(used.min(limit)),
+                credit_amount(limit)
+            );
+            if let Some(expiry) = bonus.expires_at.as_ref().and_then(unix_seconds) {
+                line.push_str(&format!(" · {} 到期", expiry.format("%Y-%m-%d")));
+            }
+            Some(line)
+        })
+        .collect()
+}
+
+/// Overage: a disabled switch is stated plainly; an enabled one shows the
+/// charges so far and the credits used against the cap. Overage bills
+/// separately, so it never folds into the meter.
+fn overage_detail(overage: Option<&OverageConfiguration>, credit: &Breakdown) -> Option<String> {
+    let status = overage?.status.as_deref()?;
+    if status != "ENABLED" {
+        return Some("超额计费未开启".to_string());
+    }
+    let cap = credit.overage_cap.filter(|cap| *cap > 0.)?;
+    let used = credit.overage_used.unwrap_or(0.);
+    let charges = credit.overage_charges.unwrap_or(0.);
+    Some(format!(
+        "超额 ${charges:.2} · {}/{} credits",
+        credit_amount(used),
+        credit_amount(cap)
+    ))
+}
 /// A credit count as the card shows it: whole credits without a decimal tail
 /// ("10000"), a fractional allowance as the vendor gave it ("500.5").
 fn credit_amount(amount: f64) -> String {
