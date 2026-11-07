@@ -2728,14 +2728,9 @@ pub async fn dispatch_at(
                 client_protocol: Some(request.protocol.as_str()),
                 effort: effort.as_deref(),
                 caller: caller_key,
+                caller_key_id: principal.map(|principal| principal.key_id),
+                caller_user_id: principal.map(|principal| principal.user_id),
                 agent: request.agent.as_deref(),
-                // The verdict computed at dispatch-prep time, read by POSITION in
-                // the dispatch order (empty without quota data and for the resting tail —
-                // serialized as null on the wire). Never recomputed here, and never
-                // inherited from a ready sibling of the same key: the ready list is a
-                // prefix of the dispatch order, so a resting candidate reads past the
-                // end and has nothing to inherit.
-                reason: reasons.get(index).map_or("", String::as_str),
                 key_id: Some(candidate.key.id),
                 stream: request.stream,
             });

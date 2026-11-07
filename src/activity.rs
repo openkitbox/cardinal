@@ -24,10 +24,10 @@
 //!   attempt per 500ms allocates an event.
 //!
 //! Wire shape (internally tagged, abbreviated):
-//! - start: `{"t":"start","origin":2147483647,"seq":42,"client_model":"…","route":"…","account":"…","served_model":"…","protocol":"openai_chat","client_protocol":"…","effort":null,"reason":null,"caller":null,"agent":null,"key_id":7,"stream":true}`
-//!   (`reason` = the Smart routing verdict for this candidate; `null` on
-//!   ordered routes and resting candidates — a client treats null as "no
-//!   reason", and the wire shape of pre-reason payloads is unchanged)
+//! - start: `{"t":"start","origin":2147483647,"seq":42,"client_model":"…","route":"…","account":"…","served_model":"…","protocol":"openai_chat","client_protocol":"…","effort":null,"caller":null,"caller_key_id":null,"caller_user_id":null,"agent":null,"key_id":7,"stream":true}`
+//!   (`caller_key_id` / `caller_user_id` identify the calling gateway key and
+//!   its owner, so a listener can scope the feed to one client; both `null`
+//!   for a loopback or in-process call)
 //! - first: `{"t":"first","origin":…,"seq":…}` · progress: `{"t":"progress","origin":…,"seq":…,"bytes":…,"frames":…}`
 //! - end: `{"t":"end","origin":…,"seq":…,"status":"ok"}` — `status` is `"ok"`
 //!   only for a genuine success; `"error"` for pre-commit failures/aborts/
@@ -165,53 +165,6 @@ pub struct EndMetrics {
     pub http_status: Option<u16>,
 }
 
-/// Why the candidate sits where it does in this request's order (Smart
-/// routing verdict), `""` for ordered routes and resting candidates. Empty
-/// strings serialize as `null` so pre-reason payloads stay byte-identical;
-/// both `""` and `null` deserialize back to the empty reason.
-///
-/// A newtype with hand-written serde, not an `Option`-with-
-/// `skip_serializing_if` like [`EndMetrics`]: a pre-reason payload carries the
-/// field as `null`, so "absent" must decode to the empty reason rather than to
-/// a missing field.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct VerdictReason(String);
-
-impl VerdictReason {
-    fn new(reason: String) -> Self {
-        Self(reason)
-    }
-
-    /// The wire value (`""` = no reason); what a listener reads.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// The wire value, moved out — for the one consumer that must own it (the
-    /// GUI's Start handler hands it to its feed state).
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl Serialize for VerdictReason {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.0.is_empty() {
-            serializer.serialize_none()
-        } else {
-            serializer.serialize_str(&self.0)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for VerdictReason {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self(
-            Option::<String>::deserialize(deserializer)?.unwrap_or_default(),
-        ))
-    }
-}
-
 /// The payload of an [`ActivityEvent::Start`] (the old struct variant, boxed
 /// so the whole enum stays small).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,15 +185,19 @@ pub struct StartEvent {
     pub client_protocol: Option<String>,
     /// The reasoning effort the client asked for.
     pub effort: Option<String>,
-    /// Why the candidate sits where it does in this request's order — the
-    /// Smart routing verdict reason, `""` for ordered routes / resting
-    /// candidates (see [`AttemptStart::reason`]). Absent on the wire decodes to
-    /// the empty reason like an explicit `null` does.
-    #[serde(default)]
-    pub reason: VerdictReason,
     /// The caller's identity (the gateway key's label); None for a loopback
     /// or in-process call.
     pub caller: Option<String>,
+    /// The gateway key the caller authenticated with, by id — the identity a
+    /// listener filters on (labels are only unique per user, and the wire
+    /// value is clipped). None for a loopback or in-process call; absent on
+    /// the wire reads the same, like [`Self::caller`].
+    #[serde(default)]
+    pub caller_key_id: Option<i64>,
+    /// The user owning [`Self::caller_key_id`], so a listener can filter by
+    /// user without resolving the key. None for a loopback or in-process call.
+    #[serde(default)]
+    pub caller_user_id: Option<i64>,
     /// Which client the request's User-Agent named (None = no header or an
     /// in-process call).
     pub agent: Option<String>,
@@ -248,13 +205,6 @@ pub struct StartEvent {
     /// labels are clipped display strings, ids are not).
     pub key_id: Option<i64>,
     pub stream: bool,
-}
-
-impl StartEvent {
-    /// The wire value's reason string (`""` = no reason).
-    pub fn reason(&self) -> &str {
-        self.reason.as_str()
-    }
 }
 
 /// Publisher handle. Cheap to clone (Arc inside), shared by the dispatch
@@ -297,13 +247,13 @@ pub struct AttemptStart<'a> {
     /// The caller's identity (the gateway key's label); None for a loopback or
     /// in-process call.
     pub caller: Option<&'a str>,
+    /// The gateway key the caller authenticated with, and the user owning it
+    /// (None for a loopback or in-process call) — the identity a listener
+    /// filters the feed on.
+    pub caller_key_id: Option<i64>,
+    pub caller_user_id: Option<i64>,
     /// Which client the request's User-Agent named.
     pub agent: Option<&'a str>,
-    /// Why the candidate sits where it does in this request's order — the
-    /// Smart routing verdict ([`crate::relay::SmartVerdict::reason`]).
-    /// Empty for ordered routes and for resting candidates; serialized as
-    /// `null` on the wire (a listener treats null/`""` as "no reason").
-    pub reason: &'a str,
     /// The provider key serving the attempt (identity for GUI-side matching).
     pub key_id: Option<i64>,
     pub stream: bool,
@@ -354,8 +304,9 @@ impl ActivitySink {
             client_protocol: attempt.client_protocol.map(clip),
             effort: attempt.effort.map(clip),
             caller: attempt.caller.map(clip),
+            caller_key_id: attempt.caller_key_id,
+            caller_user_id: attempt.caller_user_id,
             agent: attempt.agent.map(clip),
-            reason: VerdictReason::new(clip(attempt.reason)),
             key_id: attempt.key_id,
             stream: attempt.stream,
         })));
