@@ -64,7 +64,60 @@ pub(super) enum RelayOutcome {
         reader: Box<StreamReader>,
         /// Passthrough observer (same protocol) or translation synthesizer (cross-protocol).
         pump: StreamPump,
+        /// Cursor only: what the settlement needs to reconcile the usage of
+        /// a Run that reported none inline.
+        cursor: Option<CursorHandle>,
     },
+}
+
+/// A Cursor Run's settlement handle: the Run's report (delivered once the Run
+/// closes), the bearer it ran under (the dashboard is read as that account)
+/// and the process's reconciler. Carried from the attempt to the settlement
+/// task so the ledger row of a tool step can take the dashboard's count.
+pub(super) struct CursorHandle {
+    pub(super) report: tokio::sync::oneshot::Receiver<crate::upstream::cursor_run::RunReport>,
+    pub(super) bearer: std::sync::Arc<crate::upstream::cursor_tokens::CursorBearer>,
+    pub(super) usage: std::sync::Arc<crate::upstream::CursorUsage>,
+    pub(super) key_id: i64,
+}
+
+impl CursorHandle {
+    /// The Run's usage when the stream carried none: the dashboard's count
+    /// when it shows in time, else the reference's estimate from the Run's
+    /// sizes. `None` only when the Run's driver died without a report.
+    pub(super) async fn settle(self) -> Option<crate::protocol::usage::UsageCounts> {
+        use crate::upstream::cursor_usage::{self, Resolved};
+        // The report follows the last frame by microseconds; the bound only
+        // guards a driver that never got to send it.
+        let report = tokio::time::timeout(std::time::Duration::from_secs(10), self.report)
+            .await
+            .ok()?
+            .ok()?;
+        if let Some(usage) = report.inline_usage {
+            return Some(usage);
+        }
+        let resolved = self
+            .usage
+            .resolve(
+                self.key_id,
+                &self.bearer,
+                &report.conversation_id,
+                report.started_at,
+            )
+            .await;
+        Some(match resolved {
+            Resolved::Dashboard(counts) => counts,
+            Resolved::Missing | Resolved::Unreadable => {
+                tracing::debug!(
+                    key_id = self.key_id,
+                    conversation_id = %report.conversation_id,
+                    verdict = ?resolved,
+                    "Cursor dashboard gave no count for the Run; estimating"
+                );
+                cursor_usage::estimate(report.prompt_chars, report.output_chars)
+            }
+        })
+    }
 }
 
 /// What one attempt settled into before post-processing. Unlike
@@ -83,6 +136,8 @@ pub(super) enum AttemptSuccess {
         status: u16,
         frames: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
         usage_rx: tokio::sync::oneshot::Receiver<StreamOutcome>,
+        /// Cursor only: the settlement's reconciliation handle.
+        cursor: Option<CursorHandle>,
     },
 }
 
@@ -329,6 +384,18 @@ pub(super) struct StreamUsage {
     pub(super) cache_creation_1h_input_tokens: Option<i64>,
 }
 
+impl From<crate::protocol::usage::UsageCounts> for StreamUsage {
+    fn from(counts: crate::protocol::usage::UsageCounts) -> Self {
+        Self {
+            input_tokens: counts.input_tokens as i64,
+            output_tokens: counts.output_tokens as i64,
+            cached_input_tokens: counts.cached_input_tokens.map(|v| v as i64),
+            cache_creation_input_tokens: counts.cache_creation_input_tokens.map(|v| v as i64),
+            cache_creation_1h_input_tokens: counts.cache_creation_1h_input_tokens.map(|v| v as i64),
+        }
+    }
+}
+
 /// What the pump hands back when the stream ends: the observed usage plus the
 /// captured response body (`Some` only when payload capture is on). An
 /// aborted attempt's outcome is dropped unread with its receiver.
@@ -518,13 +585,17 @@ async fn drive_stream(
                     () = server_stopped.cancelled() => PumpRead::ServerStopped,
                     read = read_frame(reader.next_wire_frame(), hold.as_ref()) => read,
                 };
-                // Passthrough only ever serves SSE protocols (Kiro has no client
-                // endpoint), so an AWS frame here is a wire mismatch. It is a
-                // terminal framing failure, not a frame to skip: dropping it and
-                // continuing would dress the corruption up as a clean EOF.
-                if matches!(&read, PumpRead::Frame(WireFrame::Aws(_))) {
+                // Passthrough only ever serves SSE protocols (Kiro and Cursor
+                // have no client endpoint), so a non-SSE frame here is a wire
+                // mismatch. It is a terminal framing failure, not a frame to
+                // skip: dropping it and continuing would dress the corruption
+                // up as a clean EOF.
+                if matches!(
+                    &read,
+                    PumpRead::Frame(WireFrame::Aws(_) | WireFrame::Connect(_))
+                ) {
                     tracing::warn!(
-                        "passthrough stream received an AWS frame; failing the upstream wire"
+                        "passthrough stream received a non-SSE frame; failing the upstream wire"
                     );
                     read = PumpRead::Transport(transport::TransportError::InvalidBody);
                 }
@@ -554,7 +625,9 @@ async fn drive_stream(
                             WireFrame::Sse(frame) => frame,
                             // Normalized above; stop rather than panic if that
                             // invariant ever changes.
-                            WireFrame::Aws(_) => return (None, ttft_ms, captured, None),
+                            WireFrame::Aws(_) | WireFrame::Connect(_) => {
+                                return (None, ttft_ms, captured, None);
+                            }
                         };
                         if payload_log {
                             tracing::debug!(
@@ -715,20 +788,22 @@ async fn drive_stream(
                     () = server_stopped.cancelled() => PumpRead::ServerStopped,
                     read = read_frame(reader.next_wire_frame(), hold.as_ref()) => read,
                 };
-                // AWS framing/event failures are terminal: a malformed KAS frame
-                // means the wire cannot be trusted, so it takes the same path as a
-                // broken socket (pre-commit abort for failover; post-commit
-                // interrupted + Incomplete close). SSE keeps its historical
-                // leniency below: a bad payload is skipped, never fatal.
+                // AWS/Connect framing and event failures are terminal: a
+                // malformed KAS or Cursor frame means the wire cannot be
+                // trusted, so it takes the same path as a broken socket
+                // (pre-commit abort for failover; post-commit interrupted +
+                // Incomplete close). SSE keeps its historical leniency below: a
+                // bad payload is skipped, never fatal.
                 let mut decoded: Option<Vec<protocol::StreamEvent>> = None;
-                if let PumpRead::Frame(frame @ WireFrame::Aws(_)) = &read {
+                if let PumpRead::Frame(frame @ (WireFrame::Aws(_) | WireFrame::Connect(_))) = &read
+                {
                     match upstream.observe_wire(frame) {
                         Ok(events) => decoded = Some(events),
                         Err(error) => {
                             tracing::warn!(
                                 request_id = %request_id,
                                 error = %error,
-                                "translated stream: AWS frame failed to decode; failing the upstream wire"
+                                "translated stream: binary frame failed to decode; failing the upstream wire"
                             );
                             read = PumpRead::Transport(transport::TransportError::InvalidBody);
                         }
@@ -766,6 +841,13 @@ async fn drive_stream(
                                     direction = "upstream_frame",
                                     event = "",
                                     data = %truncate_payload(&String::from_utf8_lossy(&message.payload), message.payload.len()),
+                                ),
+                                // Protobuf: the bytes are not text; log the shape only.
+                                WireFrame::Connect(frame) => tracing::debug!(
+                                    target: PAYLOAD_TARGET,
+                                    direction = "upstream_frame",
+                                    event = if frame.is_end() { "end" } else { "message" },
+                                    data = %frame.payload.len(),
                                 ),
                             }
                         }
@@ -1028,13 +1110,7 @@ async fn drive_stream(
     if client_gone {
         interrupted = None;
     }
-    let usage = usage.map(|counts| StreamUsage {
-        input_tokens: counts.input_tokens as i64,
-        output_tokens: counts.output_tokens as i64,
-        cached_input_tokens: counts.cached_input_tokens.map(|v| v as i64),
-        cache_creation_input_tokens: counts.cache_creation_input_tokens.map(|v| v as i64),
-        cache_creation_1h_input_tokens: counts.cache_creation_1h_input_tokens.map(|v| v as i64),
-    });
+    let usage = usage.map(StreamUsage::from);
     (usage, ttft_ms, captured, interrupted)
 }
 

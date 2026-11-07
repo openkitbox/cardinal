@@ -46,12 +46,16 @@ use serde_json::Value;
 use crate::activity::{ActivitySink, EndMetrics, EndStatus};
 use crate::billing;
 use crate::body_log::{BodyLog, CapturedBodies, CapturedBody};
+use crate::credentials::KeyCredential;
 use crate::metering::UsageCertainty;
 use crate::opencode::OpencodeOAuth;
 use crate::protocol::{self, ProtocolError, TargetView};
 use crate::store::{self, AttemptLog};
 use crate::translation;
 use crate::translation::ir::Effort;
+use crate::upstream::cursor_run;
+use crate::upstream::cursor_tokens::{CursorBearer, CursorTokenError, CursorTokens};
+use crate::upstream::cursor_usage::CursorUsage;
 use crate::upstream::kiro_tokens::{self, KiroCallContext, KiroTokens};
 use crate::upstream::opencode_tokens::OpencodeTokens;
 use crate::upstream::transport::{self, Transport};
@@ -73,8 +77,8 @@ use dialects::{
     join_split_tool_call_turns_pending, opencode_headers, vendor_thinking_off_fields,
 };
 use streaming::{
-    AttemptSuccess, HoldSignal, OnClientGone, PumpSide, RelayOutcome, StreamFrames, StreamPump,
-    spawn_stream_pump,
+    AttemptSuccess, CursorHandle, HoldSignal, OnClientGone, PumpSide, RelayOutcome, StreamFrames,
+    StreamPump, StreamUsage, spawn_stream_pump,
 };
 
 /// Full context of one client request.
@@ -162,8 +166,11 @@ pub fn extract_effort(protocol: ProtocolId, body: &Value) -> Option<String> {
         }
         // Neither carries an effort dial: Gemini's effort lives in
         // `generationConfig`, and a retrieval call generates nothing at all.
-        // Kiro never arrives inbound — it is a translation target only.
-        ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => None,
+        // Kiro and Cursor never arrive inbound — translation targets only.
+        ProtocolId::Gemini
+        | ProtocolId::OpenAiEmbeddings
+        | ProtocolId::Kiro
+        | ProtocolId::Cursor => None,
     }
 }
 
@@ -364,6 +371,22 @@ struct OpencodeDeps<'a> {
     key_id: i64,
 }
 
+/// Everything the Cursor credential plane needs for one candidate: the
+/// manager, the gateway database (bundle rereads and write-back), the key's id
+/// and the credential the row holds — a browser-login bundle, or a static API
+/// key the manager exchanges for a bearer. Selected by the upstream protocol:
+/// every Cursor Run authenticates through the manager, never with the row's
+/// secret on the wire.
+#[derive(Clone, Copy)]
+struct CursorDeps<'a> {
+    tokens: &'a CursorTokens,
+    pool: &'a sqlx::PgPool,
+    key_id: i64,
+    credential: &'a KeyCredential<'a>,
+    /// The usage reconciler the settlement reads the dashboard with.
+    usage: &'a std::sync::Arc<CursorUsage>,
+}
+
 /// The unchanging surroundings of one dispatch attempt: transport, the chosen
 /// upstream capability, credential material, the learned-refusal registry, the
 /// vendor fixup fields this candidate's upstream must never see, and — for
@@ -400,6 +423,34 @@ struct AttemptContext<'a> {
     /// OpenCode account rows only: this candidate's bearer plumbing. `None` for
     /// every static key, so those never touch the token manager or PG.
     opencode: Option<OpencodeDeps<'a>>,
+    /// Cursor upstreams only: this candidate's bearer plumbing. `None` for
+    /// every other protocol.
+    cursor: Option<CursorDeps<'a>>,
+}
+
+/// The Cursor Run's auth headers: the resolved bearer plus, for a team
+/// account, the team the console bound the login to.
+fn cursor_auth_headers(bearer: &CursorBearer) -> Vec<(&'static str, String)> {
+    let mut headers = vec![("authorization", format!("Bearer {}", bearer.access_token()))];
+    if let Some(team_id) = bearer.team_id() {
+        headers.push(("x-cursor-team-id", team_id.to_owned()));
+    }
+    headers
+}
+
+/// Whether Cursor refused the Run because the model needs Max Mode (the
+/// reference retries once with the flag set).
+fn cursor_requires_max_mode(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    [
+        "max mode required",
+        "max_mode_required",
+        "max mode_required",
+        "max_mode required",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+        || text.contains("requires max mode")
 }
 
 /// The OpenCode account's auth headers: the resolved bearer plus, for an
@@ -449,10 +500,30 @@ async fn send_attempt(
         dial,
         kiro,
         opencode,
+        cursor,
     } = *ctx;
     // The selected capability IS the upstream protocol: passthrough when it
     // matches the client protocol, translation target otherwise.
     let protocol = capability.protocol;
+    // A Cursor Run authenticates with a bearer the manager produced from the
+    // row's credential (a login bundle refreshed under the key's gate, or an
+    // API key exchanged once and cached); the row's own secret never goes on
+    // the wire. A missing plumbing for a Cursor upstream is a wiring fault,
+    // reported as a missing credential rather than sent unauthenticated.
+    let cursor_bearer = match (protocol, cursor) {
+        (ProtocolId::Cursor, Some(deps)) => Some(
+            deps.tokens
+                .resolve(deps.pool, deps.key_id, deps.credential)
+                .await
+                .map_err(failover::AttemptError::CursorTokenError)?,
+        ),
+        (ProtocolId::Cursor, None) => {
+            return Err(failover::AttemptError::CursorTokenError(
+                CursorTokenError::Missing,
+            ));
+        }
+        _ => None,
+    };
     // Kiro: one logical call per dispatch attempt (the reference's one
     // `execute()`). The invocation id and attempt counter live here, outside
     // the send/re-prepare loop, so an optional-field strip re-prepare advances
@@ -591,7 +662,8 @@ async fn send_attempt(
     // passes no scope and skips the hashing.
     let mut prepare = |fields: &[&str],
                        profile_arn: Option<&str>,
-                       prompt_scope: Option<prompt_cache::Scope<'_>>| {
+                       prompt_scope: Option<prompt_cache::Scope<'_>>,
+                       cursor_max_mode: bool| {
         if request.protocol == protocol {
             protocol::prepare(
                 protocol,
@@ -621,6 +693,7 @@ async fn send_attempt(
                     dial,
                     kiro_profile_arn: profile_arn,
                     prompt_scope,
+                    cursor_max_mode,
                 },
             )
         }
@@ -628,8 +701,26 @@ async fn send_attempt(
     let PreparedBody {
         mut prepared,
         prompt_prefix,
-    } = prepare(&skip, kiro_profile_arn.as_deref(), prompt_scope)
+    } = prepare(&skip, kiro_profile_arn.as_deref(), prompt_scope, false)
         .map_err(failover::AttemptError::Protocol)?;
+    // Cursor: two HTTP legs driven as one Run, with its own retry rules (no
+    // optional-field strips — the body is protobuf the kernel wrote), so it
+    // leaves the HTTP loop below.
+    if let (Some(bearer), Some(deps)) = (cursor_bearer, cursor) {
+        return send_cursor(
+            transport,
+            deps,
+            bearer,
+            prepared,
+            |max_mode| {
+                prepare(&skip, None, None, max_mode)
+                    .map(|body| body.prepared)
+                    .map_err(failover::AttemptError::Protocol)
+            },
+            deadline,
+        )
+        .await;
+    }
     // OpenCode's gateway (Zen or Go) refuses requests that name no conversation
     // (400 MissingSessionID), so its header family rides beside the credential.
     // The session seed derives from the first user message — top-level field
@@ -674,7 +765,7 @@ async fn send_attempt(
             };
             return Ok(Sent {
                 status,
-                response,
+                upstream: Upstream::Http(response),
                 protocol,
                 cache_read,
             });
@@ -746,7 +837,7 @@ async fn send_attempt(
             // identity (`profileArn`), and `prepare` advances the shared
             // `KasCall` itself, so the retry headers are replaced wholesale —
             // same invocation id, one attempt later — with no second writer.
-            prepared = prepare(&skip, kiro_profile_arn.as_deref(), None)
+            prepared = prepare(&skip, kiro_profile_arn.as_deref(), None, false)
                 .map_err(failover::AttemptError::Protocol)?
                 .prepared;
             tracing::warn!(
@@ -773,7 +864,7 @@ async fn send_attempt(
                 skip.extend(refused.iter().copied());
                 if let Ok(PreparedBody {
                     prepared: retried, ..
-                }) = prepare(&skip, kiro_profile_arn.as_deref(), None)
+                }) = prepare(&skip, kiro_profile_arn.as_deref(), None, false)
                 {
                     for field in &refused {
                         unfit.record(provider_id, protocol, field);
@@ -797,7 +888,7 @@ async fn send_attempt(
                 skip.push(optional::JSON_MODE_FIELD);
                 if let Ok(PreparedBody {
                     prepared: retried, ..
-                }) = prepare(&skip, kiro_profile_arn.as_deref(), None)
+                }) = prepare(&skip, kiro_profile_arn.as_deref(), None, false)
                 {
                     tracing::info!(
                         provider_id,
@@ -840,6 +931,87 @@ async fn send_attempt(
     }
 }
 
+/// The Cursor leg of [`send_attempt`]: open the Run and apply the two retries
+/// the reference allows — one refresh-and-resend after Cursor rejects the
+/// bearer (401, either as the downlink's status or as the Run's first frame),
+/// and one re-prepare with Max Mode when the model demands it. Every other
+/// refusal is the attempt's error, with the bearer excised from Cursor's words.
+async fn send_cursor(
+    transport: &Transport,
+    deps: CursorDeps<'_>,
+    mut bearer: std::sync::Arc<CursorBearer>,
+    mut prepared: protocol::Prepared,
+    mut reprepare: impl FnMut(bool) -> Result<protocol::Prepared, failover::AttemptError>,
+    deadline: std::time::Instant,
+) -> Result<Sent, failover::AttemptError> {
+    let mut headers = cursor_auth_headers(&bearer);
+    let mut refreshed = false;
+    let mut max_mode = false;
+    loop {
+        let error = match cursor_run::open(transport, &prepared, &headers, deadline).await {
+            Ok(run) => {
+                return Ok(Sent {
+                    status: run.status,
+                    upstream: Upstream::Cursor {
+                        run: Box::new(run),
+                        bearer: std::sync::Arc::clone(&bearer),
+                    },
+                    protocol: ProtocolId::Cursor,
+                    cache_read: None,
+                });
+            }
+            Err(error) => error,
+        };
+        let transport::TransportError::Status { status, body, .. } = &error else {
+            return Err(failover::AttemptError::Transport(error));
+        };
+        if !refreshed && *status == 401 {
+            refreshed = true;
+            bearer = deps
+                .tokens
+                .resolve_forced(
+                    deps.pool,
+                    deps.key_id,
+                    deps.credential,
+                    bearer.access_token(),
+                )
+                .await
+                .map_err(failover::AttemptError::CursorTokenError)?;
+            headers = cursor_auth_headers(&bearer);
+            tracing::warn!(
+                key_id = deps.key_id,
+                "Cursor rejected the bearer; refreshed once, opening the Run again"
+            );
+            continue;
+        }
+        if !max_mode && cursor_requires_max_mode(body) {
+            max_mode = true;
+            prepared = reprepare(true)?;
+            tracing::info!(
+                key_id = deps.key_id,
+                "Cursor requires Max Mode for this model; asking again with it"
+            );
+            continue;
+        }
+        // Cursor's words may echo the bearer it rejected; excise it before the
+        // body becomes the attempt's error.
+        let redacted = crate::providers::AuthSchemeMaterial::new(
+            crate::providers::AuthScheme::Bearer,
+            bearer.access_token(),
+        )
+        .redact(body);
+        return Err(failover::AttemptError::Transport(match redacted {
+            Some(redacted) => transport::TransportError::Status {
+                status: *status,
+                retry_after: None,
+                reset_header: None,
+                body: bytes::Bytes::from(redacted),
+            },
+            None => error,
+        }));
+    }
+}
+
 // Price per request is computed at the attempt sites; the model-level price
 // row carries every unit the formula needs (see store::ModelPrice::cost_split).
 
@@ -854,11 +1026,23 @@ async fn attempt_stream(
 ) -> Result<RelayOutcome, failover::AttemptError> {
     let Sent {
         status,
-        response,
+        upstream,
         protocol,
         cache_read,
     } = send_attempt(ctx, target_model, request, client_ir, true, deadline).await?;
-    let reader = Box::new(ctx.transport.stream(response, deadline, protocol));
+    let (reader, cursor) = match upstream {
+        Upstream::Http(response) => (ctx.transport.stream(response, deadline, protocol), None),
+        // The Run's driver already split the downlink into frames; the reader
+        // takes them with the same idle/total bounds as an HTTP body.
+        Upstream::Cursor { run, bearer } => {
+            let cursor_run::Run { frames, report, .. } = *run;
+            (
+                ctx.transport.stream_frames(frames, deadline),
+                cursor_handle(ctx, report, bearer),
+            )
+        }
+    };
+    let reader = Box::new(reader);
 
     let pump = if request.protocol == protocol {
         StreamPump::PassThrough {
@@ -882,6 +1066,22 @@ async fn attempt_stream(
         status,
         reader,
         pump,
+        cursor,
+    })
+}
+
+/// The settlement handle of a Cursor Run, from the attempt's plumbing.
+fn cursor_handle(
+    ctx: &AttemptContext<'_>,
+    report: tokio::sync::oneshot::Receiver<cursor_run::RunReport>,
+    bearer: std::sync::Arc<CursorBearer>,
+) -> Option<CursorHandle> {
+    let deps = ctx.cursor?;
+    Some(CursorHandle {
+        report,
+        bearer,
+        usage: std::sync::Arc::clone(deps.usage),
+        key_id: deps.key_id,
     })
 }
 
@@ -895,17 +1095,31 @@ async fn attempt_json(
 ) -> Result<RelayOutcome, failover::AttemptError> {
     let Sent {
         status,
-        response,
+        upstream,
         protocol,
         cache_read,
     } = send_attempt(ctx, target_model, request, client_ir, false, deadline).await?;
-    let body = ctx
-        .transport
-        .read_body(response, ctx.transport.limits().max_json_bytes, deadline)
-        .await
-        .map_err(failover::AttemptError::Transport)?;
+    let limit = ctx.transport.limits().max_json_bytes;
+    let (body, cursor) = match upstream {
+        Upstream::Http(response) => (
+            ctx.transport
+                .read_body(response, limit, deadline)
+                .await
+                .map_err(failover::AttemptError::Transport)?,
+            None,
+        ),
+        // The whole Run as one Connect-framed body: the kernel's aggregate
+        // decode reads it exactly as it would read a streamed one.
+        Upstream::Cursor { mut run, bearer } => {
+            let body = run
+                .collect(limit, deadline)
+                .await
+                .map_err(failover::AttemptError::Transport)?;
+            (body, cursor_handle(ctx, run.report, bearer))
+        }
+    };
 
-    let observed = if request.protocol == protocol {
+    let mut observed = if request.protocol == protocol {
         // Passthrough: observe per the target protocol.
         protocol::parse_json(protocol, &body, ctx.context_window)
             .map_err(failover::AttemptError::Protocol)?
@@ -925,6 +1139,13 @@ async fn attempt_json(
         let reported_model = !ir.model.is_empty();
         if !reported_model {
             ir.model = target_model.to_owned();
+        }
+        // A Cursor tool step reports no usage inline: the dashboard's count
+        // (or the estimate) goes into the client body and the ledger alike.
+        if ir.usage.is_none()
+            && let Some(handle) = cursor
+        {
+            ir.usage = handle.settle().await;
         }
         // The body parsed, so the attempt completed: settle the simulated
         // cache read. The client body and the ledger read the same split.
@@ -952,6 +1173,11 @@ async fn attempt_json(
             },
         });
     };
+    if observed.usage.is_none()
+        && let Some(handle) = cursor
+    {
+        observed.usage = handle.settle().await;
+    }
     if request.payload_log {
         tracing::debug!(target: PAYLOAD_TARGET, direction = "upstream_response", translated = false, body = %truncate_payload(&String::from_utf8_lossy(&body), body.len()));
     }
@@ -982,15 +1208,31 @@ struct WireTweaks<'a> {
     kiro_profile_arn: Option<&'a str>,
     /// Kiro only: digest the translated prompt for the simulated cache.
     prompt_scope: Option<prompt_cache::Scope<'a>>,
+    /// Cursor only: ask for Max Mode (set on the one retry after Cursor said
+    /// the model requires it).
+    cursor_max_mode: bool,
 }
 
 /// A send the upstream accepted (2xx), still unread.
 struct Sent {
     status: u16,
-    response: reqwest::Response,
+    upstream: Upstream,
     protocol: ProtocolId,
     /// Kiro only: the simulated cache read, settled once the attempt completes.
     cache_read: Option<prompt_cache::PendingRead>,
+}
+
+/// The accepted upstream, in the shape its protocol delivers it: one HTTP
+/// response body for every protocol but Cursor, whose Run hands over the
+/// downlink frames (and a report for the settlement) instead.
+enum Upstream {
+    Http(reqwest::Response),
+    Cursor {
+        run: Box<cursor_run::Run>,
+        /// The bearer the Run opened with: the settlement reads the
+        /// dashboard as the same account.
+        bearer: std::sync::Arc<CursorBearer>,
+    },
 }
 
 /// One prepared upstream body.
@@ -1110,6 +1352,13 @@ fn prepare_translated(
         if upstream_value.get("stream").is_some() {
             return Err(ProtocolError::InvalidRequest);
         }
+    } else if upstream == ProtocolId::Cursor {
+        // A Cursor Run is always a stream on the wire (the relay aggregates
+        // for a non-streaming client), so the Chat `stream` field is never
+        // injected; the Max Mode flag is the only per-attempt knob.
+        if tweaks.cursor_max_mode {
+            upstream_value["max_mode"] = Value::Bool(true);
+        }
     } else if stream {
         // The IR has no stream concept, so `from_ir` never emits it; the client
         // asked for a stream, and both kernels whitelist the field — inject it
@@ -1181,7 +1430,10 @@ enum Resolution {
 ///   attempt by [`crate::upstream::KiroTokens`], not carried in the candidate:
 ///   the candidate's placeholder secret is empty and never reaches the wire;
 /// * `opencode_oauth` — the same shape, resolved per attempt by
-///   [`crate::upstream::OpencodeTokens`].
+///   [`crate::upstream::OpencodeTokens`];
+/// * `cursor_oauth` — the same shape, resolved per attempt by
+///   [`crate::upstream::CursorTokens`] (a `static` key on a Cursor provider is
+///   exchanged for a bearer by the same manager).
 ///
 /// A row missing the credential its `auth_kind` requires is dropped from
 /// candidacy with a warning — never cooled, since a missing credential is not an
@@ -1219,6 +1471,18 @@ fn fetch_key_secrets(
                 tracing::warn!(
                     key_id = key.id,
                     "OpenCode provider key has no OAuth bundle; skipped"
+                );
+            }
+            continue;
+        }
+        if key.auth_kind == "cursor_oauth" {
+            if key.cursor_oauth().is_some() {
+                resolved.push((key, SecretString::from(String::new())));
+            } else {
+                skipped += 1;
+                tracing::warn!(
+                    key_id = key.id,
+                    "Cursor provider key has no OAuth bundle; skipped"
                 );
             }
             continue;
@@ -1737,6 +2001,13 @@ pub struct DispatchDeps<'a> {
     /// Per-key OpenCode account bearer manager (lazy refresh, single-flight, CAS
     /// write-back). The same instance backs model and quota probing.
     pub opencode_tokens: &'a OpencodeTokens,
+    /// Per-key Cursor bearer manager (login-bundle refresh or API-key exchange,
+    /// single-flight, write-back). The same instance backs model probing.
+    pub cursor_tokens: &'a CursorTokens,
+    /// The Cursor usage reconciler (dashboard events, claimed-event table,
+    /// unreadable accounts). `Arc`: the streaming settlement task outlives
+    /// this call.
+    pub cursor_usage: &'a std::sync::Arc<CursorUsage>,
     /// Routing trace ring: each dispatch pushes its decision record here.
     pub trace_ring: &'a trace::TraceRing,
     /// In-memory quota snapshots for Smart ordering — no PG read on the
@@ -1883,6 +2154,8 @@ pub async fn dispatch_at(
         kiro_tokens,
         prompt_cache,
         opencode_tokens,
+        cursor_tokens,
+        cursor_usage,
         trace_ring,
         smart_cache,
         rotate_cursors,
@@ -2368,6 +2641,15 @@ pub async fn dispatch_at(
             capability.auth_scheme,
             candidate.credential().expose_secret(),
         );
+        // A Cursor candidate's credential in the shape the bearer manager
+        // takes: the row's login bundle, or its API key for the exchange.
+        let cursor_credential =
+            (capability.protocol == ProtocolId::Cursor).then(|| {
+                match candidate.key.cursor_oauth() {
+                    Some(bundle) => KeyCredential::CursorOauth(bundle),
+                    None => KeyCredential::Static(candidate.credential().expose_secret()),
+                }
+            });
         let key_id = candidate.rest_key();
         let price = match price_cache.get(provider.id, target_model) {
             Some(price) => Some(price),
@@ -2520,6 +2802,14 @@ pub async fn dispatch_at(
                                 key_id: candidate.key.id,
                             },
                         ),
+                        // Every Cursor Run authenticates through the manager.
+                        cursor: cursor_credential.as_ref().map(|credential| CursorDeps {
+                            tokens: cursor_tokens,
+                            pool,
+                            key_id: candidate.key.id,
+                            credential,
+                            usage: cursor_usage,
+                        }),
                     },
                     target_model,
                     request,
@@ -2552,6 +2842,7 @@ pub async fn dispatch_at(
                     status,
                     reader,
                     pump,
+                    cursor,
                 }) => {
                     let (usage_tx, usage_rx) = tokio::sync::oneshot::channel();
                     let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
@@ -2597,6 +2888,7 @@ pub async fn dispatch_at(
                                 status,
                                 frames,
                                 usage_rx,
+                                cursor,
                             })
                         }
                         // A dropped verdict channel means the pump panicked: nothing
@@ -2667,6 +2959,7 @@ pub async fn dispatch_at(
                     status,
                     frames,
                     usage_rx,
+                    cursor,
                 }) => {
                     let (finalize_tx, finalize_rx) = tokio::sync::oneshot::channel();
                     // Streaming post-processing: after the pump ends, take usage → account → clear the rest → queue the ledger rows, all in a background task,
@@ -2701,7 +2994,15 @@ pub async fn dispatch_at(
                         let _exposure_claim = exposure_claim;
                         let outcome = usage_rx.await.ok();
                         let ttft_ms = outcome.as_ref().and_then(|outcome| outcome.ttft_ms);
-                        let usage = outcome.as_ref().and_then(|outcome| outcome.usage);
+                        let mut usage = outcome.as_ref().and_then(|outcome| outcome.usage);
+                        // A Cursor tool step reports no usage inline: wait for
+                        // the dashboard's count (≤6s), else estimate (D9). The
+                        // client's stream is already over; this is the ledger's.
+                        if usage.is_none()
+                            && let Some(handle) = cursor
+                        {
+                            usage = handle.settle().await.map(StreamUsage::from);
+                        }
                         let cost_usd = price.as_ref().map(|price| {
                             let (input, output, cached, written, written_1h) = usage
                                 .map(|u| {

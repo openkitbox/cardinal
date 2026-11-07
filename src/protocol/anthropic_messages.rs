@@ -84,6 +84,7 @@ pub fn prepare(
         stream,
         // Required by every Messages upstream (B §6.6).
         headers: vec![("anthropic-version", "2023-06-01".to_owned())],
+        cursor: None,
     })
 }
 

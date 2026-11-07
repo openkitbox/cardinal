@@ -155,6 +155,7 @@ pub fn prepare(
         body: bytes::Bytes::from(out),
         stream,
         headers,
+        cursor: None,
     })
 }
 

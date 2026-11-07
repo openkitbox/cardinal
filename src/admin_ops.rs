@@ -21,7 +21,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::credentials::AuthKind;
+use crate::credentials::CursorOAuth;
 use crate::credentials::KeyCredential;
+use crate::cursor;
 use crate::kiro::KiroOAuth;
 use crate::opencode::OpencodeOAuth;
 use crate::opencode::auth;
@@ -242,6 +244,17 @@ pub async fn create_key(
             )
             .await
         }
+        KeyCredential::CursorOauth(oauth) => {
+            store::insert_cursor_provider_key(
+                pool,
+                provider_id,
+                label,
+                oauth,
+                max_concurrency,
+                allowed_models,
+            )
+            .await
+        }
     }
 }
 
@@ -284,6 +297,7 @@ pub async fn probe_all_quotas(
     smart_cache: Option<&crate::relay::SmartCache>,
     kiro_tokens: Option<&Arc<crate::upstream::KiroTokens>>,
     opencode_tokens: Option<&Arc<crate::upstream::OpencodeTokens>>,
+    cursor_tokens: Option<&Arc<crate::upstream::CursorTokens>>,
 ) -> Vec<KeyQuotaRow> {
     /// Which credential a key's probe uses.
     enum QuotaSource {
@@ -294,6 +308,8 @@ pub async fn probe_all_quotas(
         /// The shared OpenCode token manager: the account's bearer, with the
         /// workspace header an organization-scoped login requires.
         Opencode(Arc<crate::upstream::OpencodeTokens>),
+        /// The shared Cursor bearer cache, at the Cursor dashboard.
+        Cursor(Arc<crate::upstream::CursorTokens>),
     }
     let providers = match store::list_providers(pool).await {
         Ok(providers) => providers,
@@ -324,10 +340,19 @@ pub async fn probe_all_quotas(
         let keys: Vec<_> = keys.into_iter().filter(|key| key.active()).collect();
         for mut key in keys {
             let key_id = key.id;
-            // Kiro's quota source is decided by the provider's protocol, not by
-            // the presence of an api_key (a Kiro row never carries one). Every
-            // other provider keeps the credential-or-nothing rule.
-            let source = if provider.protocol == "kiro" {
+            // Kiro's and Cursor's quota sources are decided by the provider's
+            // protocol, not by the presence of an api_key (an account row
+            // never carries one). Every other provider keeps the
+            // credential-or-nothing rule.
+            let source = if provider.protocol == "cursor" {
+                // Same rule as Kiro: the bearer must come from the one live
+                // manager, or a second cache would race dispatch's refreshes.
+                let Some(tokens) = cursor_tokens else {
+                    tracing::warn!(provider = %provider.name, "quota probe: no Cursor token manager wired; skipping its keys");
+                    break;
+                };
+                QuotaSource::Cursor(Arc::clone(tokens))
+            } else if provider.protocol == "kiro" {
                 let Some(tokens) = kiro_tokens else {
                     // Without the live manager there is no bearer to reuse, and
                     // minting a second cache would race dispatch's refreshes.
@@ -360,6 +385,9 @@ pub async fn probe_all_quotas(
             tasks.spawn(async move {
                 let mut quota = match &source {
                     QuotaSource::Kiro(tokens) => quota::fetch_kiro_quota(&pool, tokens, &key).await,
+                    QuotaSource::Cursor(tokens) => {
+                        quota::fetch_cursor_quota(&pool, tokens, &key).await
+                    }
                     QuotaSource::Opencode(tokens) => match tokens.resolve(&pool, key_id).await {
                         Ok(bundle) => {
                             quota::fetch_quota(
@@ -466,10 +494,18 @@ pub struct Admin {
     /// [`Self::with_opencode_tokens`] wires it): model probing and quota probing
     /// resolve their bearer through dispatch's cache.
     opencode_tokens: Option<Arc<crate::upstream::OpencodeTokens>>,
+    /// The same arrangement for Cursor rows (None until
+    /// [`Self::with_cursor_tokens`] wires it): model probing and save-time key
+    /// validation resolve their bearer through dispatch's cache.
+    cursor_tokens: Option<Arc<crate::upstream::CursorTokens>>,
     /// The OpenCode device-login flow's dependencies (None until
     /// [`Self::with_opencode_login`] wires them): the same stateless console
     /// client dispatch uses, plus the process's session registry.
     opencode_login: Option<OpencodeLogin>,
+    /// The Cursor browser-login flow's dependencies (None until
+    /// [`Self::with_cursor_login`] wires them): the login client and the
+    /// process's session registry.
+    cursor_login: Option<CursorLogin>,
     /// Centralized dispatcher: queried for live slot occupancy (None until
     /// [`Self::with_dispatcher`] wires it).
     dispatcher: Option<tokio::sync::mpsc::UnboundedSender<crate::relay::dispatcher::DispatchEvent>>,
@@ -499,9 +535,19 @@ impl Admin {
             activity,
             kiro_tokens: None,
             opencode_tokens: None,
+            cursor_tokens: None,
             opencode_login: None,
+            cursor_login: None,
             dispatcher: None,
         }
+    }
+
+    /// Wire the live Cursor token manager so its model probes and key
+    /// validation share dispatch's bearer cache. Called once by the admin
+    /// surface which owns the same instance.
+    pub fn with_cursor_tokens(mut self, cursor_tokens: Arc<crate::upstream::CursorTokens>) -> Self {
+        self.cursor_tokens = Some(cursor_tokens);
+        self
     }
 
     /// Wire the live Kiro token manager so Kiro quota probes share dispatch's
@@ -532,6 +578,17 @@ impl Admin {
         logins: login::OpencodeLogins,
     ) -> Self {
         self.opencode_login = Some(OpencodeLogin { client, logins });
+        self
+    }
+
+    /// Wire the Cursor login flow: the login client and the process's session
+    /// registry. Called once by the admin surface.
+    pub fn with_cursor_login(
+        mut self,
+        client: Arc<cursor::Client>,
+        logins: cursor::CursorLogins,
+    ) -> Self {
+        self.cursor_login = Some(CursorLogin { client, logins });
         self
     }
 
@@ -701,6 +758,7 @@ impl Admin {
             Some(&self.smart_cache),
             self.kiro_tokens.as_ref(),
             self.opencode_tokens.as_ref(),
+            self.cursor_tokens.as_ref(),
         )
         .await;
         if !rows.is_empty() {
@@ -749,6 +807,21 @@ impl Admin {
         api_key: &str,
     ) -> anyhow::Result<Vec<probe::ProbeModel>> {
         self.validate_endpoint(input.name, input.base_url)?;
+        if input.protocol == "cursor" {
+            // A Cursor API key never authenticates a request itself: it is
+            // exchanged for a bearer, and the usable-models list proves both
+            // the exchange and the account.
+            let Some(tokens) = &self.cursor_tokens else {
+                anyhow::bail!("Cursor 模型列表需要已接线的 token 管理器")
+            };
+            let bearer = tokens
+                .probe_static(api_key)
+                .await
+                .map_err(|error| ProbeError::Regular(error.into()))?;
+            return probe::fetch_cursor_models(tokens.transport(), &bearer)
+                .await
+                .map_err(|error| ProbeError::Regular(error).into());
+        }
         Ok(probe::fetch_models(
             input.base_url,
             input.protocol,
@@ -781,6 +854,8 @@ impl Admin {
         };
         let models = if provider.protocol == "kiro" {
             self.probe_kiro_models(&key).await?
+        } else if provider.protocol == "cursor" {
+            self.probe_cursor_models(&key).await?
         } else if key.auth_kind == AuthKind::OpencodeOauth.as_str() {
             self.probe_opencode_models(&provider, &key).await?
         } else {
@@ -863,6 +938,33 @@ impl Admin {
         )
         .await
         .map_err(|error| ProbeError::Regular(error).into())
+    }
+
+    /// One Cursor key's usable-models list, authenticated with the account's
+    /// resolved bearer: the row's login bundle refreshed, or its API key
+    /// exchanged, by the shared [`crate::upstream::CursorTokens`] instance.
+    /// The protocol decides (every Cursor row goes through the manager), not
+    /// the credential kind.
+    async fn probe_cursor_models(
+        &self,
+        key: &store::ProviderKeyRow,
+    ) -> anyhow::Result<Vec<ProbeModel>> {
+        let Some(tokens) = &self.cursor_tokens else {
+            anyhow::bail!("Cursor 模型列表需要已接线的 token 管理器")
+        };
+        let credential = match key.cursor_oauth() {
+            Some(bundle) => KeyCredential::CursorOauth(bundle),
+            None => KeyCredential::Static(key.api_key.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("key {} has no credential to probe with", key.id)
+            })?),
+        };
+        let bearer = tokens
+            .resolve(&self.pool, key.id, &credential)
+            .await
+            .map_err(|error| ProbeError::Regular(error.into()))?;
+        probe::fetch_cursor_models(tokens.transport(), &bearer)
+            .await
+            .map_err(|error| ProbeError::Regular(error).into())
     }
 
     /// Persist a key's model-list snapshot. The add-account flow already holds
@@ -1468,6 +1570,370 @@ impl Admin {
             .ok_or_else(|| anyhow::anyhow!("OpenCode 登录需要已接线的 console 客户端与会话注册表"))
     }
 
+    /// Start a Cursor browser login for `provider_id` (plan §2.1.2).
+    ///
+    /// Mints the challenge pair, registers the session, spawns the poller and
+    /// returns the URL the operator opens. Same contract as
+    /// [`Self::start_opencode_login`] for labels, re-logins (`key_id` must name
+    /// an existing `cursor_oauth` row) and groups. Nothing here touches the
+    /// local Cursor app's stores (D5): the operator's browser signs in.
+    pub async fn start_cursor_login(
+        &self,
+        provider_id: i64,
+        label: &str,
+        key_id: Option<i64>,
+        group_ids: &[i64],
+        max_concurrency: Option<i32>,
+    ) -> Result<CursorLoginStarted, CursorLoginError> {
+        let wiring = self.cursor_login()?;
+        let Some(provider) = store::get_provider(&self.pool, provider_id).await? else {
+            return Err(CursorLoginError::ProviderNotFound(provider_id));
+        };
+        ensure_cursor_provider(&provider)?;
+        if max_concurrency.is_some_and(|limit| limit <= 0) {
+            return Err(CursorLoginError::Invalid(
+                "max_concurrency must be positive".to_owned(),
+            ));
+        }
+        let keys = store::list_provider_keys(&self.pool, provider_id).await?;
+        let (label, key_id, group_ids) = match key_id {
+            Some(key_id) => {
+                let Some(existing) = keys.iter().find(|row| row.id == key_id) else {
+                    return Err(CursorLoginError::KeyNotFound(key_id));
+                };
+                if existing.auth_kind != AuthKind::CursorOauth.as_str() {
+                    return Err(CursorLoginError::KeyNotFound(key_id));
+                }
+                (existing.label.clone(), Some(key_id), Vec::new())
+            }
+            None => {
+                let label = label.trim();
+                if label.is_empty() {
+                    return Err(CursorLoginError::Invalid(
+                        "label must not be empty".to_owned(),
+                    ));
+                }
+                if keys.iter().any(|row| row.label == label) {
+                    return Err(CursorLoginError::LabelConflict(label.to_owned()));
+                }
+                if !store::key_groups_exist(&self.pool, group_ids).await? {
+                    return Err(CursorLoginError::Invalid("unknown group id".to_owned()));
+                }
+                (label.to_owned(), None, group_ids.to_vec())
+            }
+        };
+        let challenge = cursor::auth::Challenge::new();
+        let login_url = challenge.login_url();
+        let now = Utc::now();
+        let session = cursor::login::Session::new(
+            challenge,
+            now + Duration::seconds(CURSOR_LOGIN_LIFETIME_SECS),
+            key_id,
+        );
+        let (id, session) = wiring.logins.insert(session, now);
+        let poll = CursorLoginPoll {
+            session,
+            client: Arc::clone(&wiring.client),
+            provider,
+            label,
+            group_ids,
+            max_concurrency,
+        };
+        tokio::spawn(self.clone().drive_cursor_login(poll));
+        Ok(CursorLoginStarted {
+            session: id.to_string(),
+            login_url,
+            expires_in: CURSOR_LOGIN_LIFETIME_SECS.unsigned_abs(),
+        })
+    }
+
+    /// Drive one started Cursor login to its verdict: poll every 500ms, keep
+    /// going on 404 and on transient failures, stop at the deadline, end on a
+    /// policy refusal, and on `Ready` commit the account.
+    async fn drive_cursor_login(self, poll: CursorLoginPoll) {
+        let CursorLoginPoll {
+            session,
+            client,
+            provider,
+            label,
+            group_ids,
+            max_concurrency,
+        } = poll;
+        let wait = std::time::Duration::from_millis(CURSOR_LOGIN_POLL_MS);
+        loop {
+            tokio::time::sleep(wait).await;
+            if session.is_terminal() {
+                return;
+            }
+            let now = Utc::now();
+            if now >= session.expires_at() {
+                session.finish(cursor::login::SessionState::Expired, now);
+                return;
+            }
+            match client.poll(session.challenge()).await {
+                Ok(cursor::auth::PollVerdict::Waiting) => {}
+                Ok(cursor::auth::PollVerdict::PolicyRefused) => {
+                    tracing::warn!(
+                        provider = %provider.name,
+                        key_id = ?session.key_id(),
+                        "Cursor login was refused by the account's sign-in policy"
+                    );
+                    session.finish(
+                        cursor::login::SessionState::Failed {
+                            message: CURSOR_LOGIN_POLICY_MESSAGE.to_owned(),
+                        },
+                        Utc::now(),
+                    );
+                    return;
+                }
+                Ok(cursor::auth::PollVerdict::Ready(token)) => {
+                    let landed_at = Utc::now();
+                    if landed_at >= session.expires_at() {
+                        tracing::warn!(
+                            provider = %provider.name,
+                            key_id = ?session.key_id(),
+                            "Cursor login landed after its deadline; discarding the issued tokens"
+                        );
+                        session.finish(cursor::login::SessionState::Expired, landed_at);
+                        return;
+                    }
+                    let verdict = match self
+                        .finish_cursor_login(
+                            &provider,
+                            &label,
+                            session.key_id(),
+                            &group_ids,
+                            max_concurrency,
+                            token,
+                        )
+                        .await
+                    {
+                        Ok(landed) => landed,
+                        Err(error) => {
+                            // Fixed GUI text; the detail (which may quote the
+                            // row) goes to the log only.
+                            tracing::warn!(
+                                provider = %provider.name,
+                                error = %format!("{error:#}"),
+                                "Cursor account login could not be committed"
+                            );
+                            cursor::login::SessionState::Failed {
+                                message: login_failure_message(&error),
+                            }
+                        }
+                    };
+                    session.finish(verdict, Utc::now());
+                    return;
+                }
+                Err(error) if error.is_transient() => {
+                    tracing::warn!(
+                        %error,
+                        "Cursor login poll failed transiently; retrying until the deadline"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Cursor login poll failed");
+                    session.finish(
+                        cursor::login::SessionState::Failed {
+                            message: CURSOR_LOGIN_BACKEND_MESSAGE.to_owned(),
+                        },
+                        Utc::now(),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Commit one landed login: expiry from the access token's JWT `exp`
+    /// (fail closed when unreadable), the account email (best effort), the
+    /// bundle validated and persisted (insert, or CAS replace for a re-login),
+    /// then the usable-models snapshot, the bearer-cache adoption, the route
+    /// cache and the GUI signal — all best effort once the row is committed.
+    async fn finish_cursor_login(
+        &self,
+        provider: &store::ProviderRow,
+        label: &str,
+        key_id: Option<i64>,
+        group_ids: &[i64],
+        max_concurrency: Option<i32>,
+        token: cursor::auth::ReadyToken,
+    ) -> anyhow::Result<cursor::login::SessionState> {
+        let wiring = self.cursor_login()?;
+        let cursor::auth::ReadyToken {
+            access_token,
+            refresh_token,
+            team_id,
+        } = token;
+        let Some(expires_at) = crate::upstream::cursor_tokens::jwt_expiry(&access_token) else {
+            anyhow::bail!("the issued Cursor access token carries no readable expiry");
+        };
+        let email = wiring.client.email(&access_token, team_id.as_deref()).await;
+        let bundle = CursorOAuth {
+            access_token,
+            refresh_token,
+            expires_at,
+            email,
+            team_id,
+        };
+        bundle.validate()?;
+        let key_id = match key_id {
+            Some(key_id) => {
+                self.replace_cursor_bundle(key_id, &bundle).await?;
+                key_id
+            }
+            None => {
+                self.insert_cursor_bundle(provider, label, group_ids, max_concurrency, &bundle)
+                    .await?
+            }
+        };
+        match &self.cursor_tokens {
+            Some(tokens) => {
+                let bearer = tokens.adopt(key_id, &bundle);
+                match probe::fetch_cursor_models(tokens.transport(), &bearer).await {
+                    Ok(models) => {
+                        if let Err(error) =
+                            store::update_key_models(&self.pool, key_id, &models).await
+                        {
+                            tracing::warn!(
+                                key_id,
+                                error = %format!("{error:#}"),
+                                "model snapshot persistence failed after a successful Cursor login"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        key_id,
+                        error = %format!("{error:#}"),
+                        "model probe failed after a successful Cursor login; the key keeps its old snapshot"
+                    ),
+                }
+            }
+            None => tracing::warn!(
+                key_id,
+                "Cursor token manager is not wired; the first dispatch will read the row instead of this cache"
+            ),
+        }
+        if let Err(error) = self.refresh_route_cache().await {
+            tracing::warn!(
+                key_id,
+                error = %format!("{error:#}"),
+                "route cache refresh after a Cursor login failed"
+            );
+        }
+        self.activity.quota_refreshed();
+        Ok(cursor::login::SessionState::Succeeded {
+            key_id,
+            email: bundle.email,
+            team_id: bundle.team_id,
+        })
+    }
+
+    /// Create the account key a fresh Cursor login lands on (`api_key IS
+    /// NULL`, the bundle plus email/team on the row), attaching the form's
+    /// groups the way [`Self::insert_opencode_bundle`] does.
+    async fn insert_cursor_bundle(
+        &self,
+        provider: &store::ProviderRow,
+        label: &str,
+        group_ids: &[i64],
+        max_concurrency: Option<i32>,
+        bundle: &CursorOAuth,
+    ) -> anyhow::Result<i64> {
+        let key_id = store::insert_cursor_provider_key(
+            &self.pool,
+            provider.id,
+            label,
+            bundle.clone(),
+            max_concurrency,
+            None,
+        )
+        .await?;
+        if !group_ids.is_empty()
+            && let Err(error) = store::patch_provider_key(
+                &self.pool,
+                provider.id,
+                key_id,
+                store::KeyPatch {
+                    group_ids: Some(group_ids),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                key_id,
+                provider = provider.id,
+                groups = group_ids.len(),
+                error = %format!("{error:#}"),
+                "Cursor account key was created, but attaching its groups failed; attach them from the key editor"
+            );
+        }
+        Ok(key_id)
+    }
+
+    /// Write a re-login's bundle over the pinned row with one retry when a
+    /// concurrent writer (a dispatch-time refresh) wins the compare-and-swap.
+    async fn replace_cursor_bundle(&self, key_id: i64, bundle: &CursorOAuth) -> anyhow::Result<()> {
+        for _ in 0..LOGIN_CAS_ATTEMPTS {
+            let Some(stored) = store::cursor_oauth(&self.pool, key_id).await? else {
+                anyhow::bail!(
+                    "account key {key_id} no longer exists or is no longer a Cursor account"
+                );
+            };
+            if store::replace_cursor_oauth(&self.pool, key_id, &stored, bundle).await? {
+                return Ok(());
+            }
+            tracing::warn!(
+                key_id,
+                "Cursor login write lost the compare-and-swap; rereading the row"
+            );
+        }
+        anyhow::bail!(
+            "account key {key_id} was rewritten concurrently, so the login's bundle was not stored"
+        )
+    }
+
+    /// One Cursor login's current state; `Ok(None)` when the id is unknown. A
+    /// login past its deadline is marked `Expired` here.
+    pub fn cursor_login_status(
+        &self,
+        session: &str,
+    ) -> anyhow::Result<Option<cursor::login::SessionState>> {
+        let wiring = self.cursor_login()?;
+        let id: Uuid = match session.parse() {
+            Ok(id) => id,
+            Err(_) => return Ok(None),
+        };
+        let now = Utc::now();
+        let Some(session) = wiring.logins.get(&id, now) else {
+            return Ok(None);
+        };
+        let state = session.state();
+        if state == cursor::login::SessionState::Waiting && now >= session.expires_at() {
+            session.finish(cursor::login::SessionState::Expired, now);
+            return Ok(Some(cursor::login::SessionState::Expired));
+        }
+        Ok(Some(state))
+    }
+
+    /// Cancel a waiting Cursor login; `Ok(false)` when the id is unknown or
+    /// the login already has a verdict.
+    pub fn cancel_cursor_login(&self, session: &str) -> anyhow::Result<bool> {
+        let wiring = self.cursor_login()?;
+        let id: Uuid = match session.parse() {
+            Ok(id) => id,
+            Err(_) => return Ok(false),
+        };
+        Ok(wiring.logins.cancel(&id, Utc::now()))
+    }
+
+    fn cursor_login(&self) -> anyhow::Result<&CursorLogin> {
+        self.cursor_login
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Cursor 登录需要已接线的登录客户端与会话注册表"))
+    }
+
     /// Add a named key to a provider; returns the new key id.
     /// `credential`: the validated credential shape — a static api_key or an
     /// OAuth bundle (see [`crate::credentials::resolve_key_credential`]).
@@ -1665,4 +2131,83 @@ fn is_transient_poll_failure(error: &auth::AuthError) -> bool {
         }
         _ => false,
     }
+}
+
+// ---------- Cursor account login ----------
+
+/// The poll cadence (plan §2.1.2: 500ms).
+const CURSOR_LOGIN_POLL_MS: u64 = 500;
+
+/// How long a login may wait for the browser (plan §2.1.2: 180s).
+const CURSOR_LOGIN_LIFETIME_SECS: i64 = 180;
+
+/// The fixed operator text for a device-policy refusal (403
+/// `sign_in_policy_violation`); the vendor's words stay in the log.
+const CURSOR_LOGIN_POLICY_MESSAGE: &str =
+    "Cursor refused this sign-in under the account's device policy; ask the team admin";
+
+/// The fixed operator text for an unexpected backend answer during the poll.
+const CURSOR_LOGIN_BACKEND_MESSAGE: &str =
+    "the Cursor backend answered the login poll unexpectedly; see the server log";
+
+/// The wiring a Cursor login needs. Grouped so one `None` covers both, and
+/// [`Admin::with_cursor_login`] is the single place that supplies them.
+#[derive(Clone)]
+struct CursorLogin {
+    client: Arc<cursor::Client>,
+    logins: cursor::CursorLogins,
+}
+
+/// Everything one spawned Cursor login needs to reach its verdict.
+struct CursorLoginPoll {
+    session: Arc<cursor::login::Session>,
+    client: Arc<cursor::Client>,
+    provider: store::ProviderRow,
+    label: String,
+    group_ids: Vec<i64>,
+    max_concurrency: Option<i32>,
+}
+
+/// A started Cursor login: what `POST /api/providers/{id}/cursor-login`
+/// answers with. The GUI opens `login_url`, then polls `session`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CursorLoginStarted {
+    /// The registry id to poll and to cancel.
+    pub session: String,
+    /// The `cursor.com` URL the operator signs in on.
+    pub login_url: String,
+    /// Seconds the gateway keeps polling.
+    pub expires_in: u64,
+}
+
+/// Why a Cursor login could not be started (404 / 400 / 409 / 500).
+#[derive(Debug, thiserror::Error)]
+pub enum CursorLoginError {
+    #[error("provider {0} does not exist")]
+    ProviderNotFound(i64),
+    /// The provider does not speak the Cursor protocol.
+    #[error("provider {provider_id} is not a Cursor provider (protocol {protocol:?})")]
+    NotCursorProvider { provider_id: i64, protocol: String },
+    /// A re-login named a row that is absent, or is not a Cursor account.
+    #[error("key {0} does not exist on this provider or is not a Cursor account")]
+    KeyNotFound(i64),
+    #[error("{0}")]
+    Invalid(String),
+    #[error("a key with label {0:?} already exists on this provider")]
+    LabelConflict(String),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Whether the login may mint Cursor tokens for this provider: its protocol
+/// must be `cursor` (the base URL is not consulted — the Cursor backend origin
+/// is fixed in code, not per provider).
+fn ensure_cursor_provider(provider: &store::ProviderRow) -> Result<(), CursorLoginError> {
+    if provider.protocol == "cursor" {
+        return Ok(());
+    }
+    Err(CursorLoginError::NotCursorProvider {
+        provider_id: provider.id,
+        protocol: provider.protocol.clone(),
+    })
 }

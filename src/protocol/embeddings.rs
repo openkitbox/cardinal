@@ -79,6 +79,7 @@ pub fn prepare(
         body: bytes::Bytes::from(out),
         stream: false,
         headers: Vec::new(),
+        cursor: None,
     })
 }
 

@@ -505,6 +505,7 @@ pub async fn fetch_kiro_models(
         body: bytes::Bytes::from(serde_json::Value::Object(body).to_string()),
         stream: false,
         headers: crate::kiro::profile::models_static_headers(),
+        cursor: None,
     };
     let auth = [("authorization", format!("Bearer {}", context.bearer()))];
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
@@ -589,5 +590,83 @@ fn parse_kiro_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
         !models.is_empty(),
         "Kiro model catalogue has no usable models"
     );
+    Ok(models)
+}
+
+/// The models a Cursor account may run, from the agent API's
+/// `GetUsableModels` (what `cursor-agent models` shows). The ids are Cursor's
+/// own, verbatim — `claude-opus-5-5-high`, `claude-opus-5-5-low-fast`, … —
+/// because the Run names the model by exactly that id; the effort and the
+/// fast tier are words inside it, not knobs of ours. The bearer is the
+/// account's resolved one (login bundle or exchanged API key), so a probe's
+/// refresh is a chat's refresh.
+///
+/// The picker catalogue (`AvailableModels`) and its `@300k`/`@1m` synthesis
+/// are not asked for: the usable list is the authority on what a Run may
+/// name, and every entry of it runs as listed.
+pub async fn fetch_cursor_models(
+    transport: &crate::upstream::transport::Transport,
+    bearer: &crate::upstream::cursor_tokens::CursorBearer,
+) -> anyhow::Result<Vec<ProbeModel>> {
+    use crate::protocol::cursor::request as cursor_request;
+    let prepared = cursor_request::unary_json(
+        cursor_request::USABLE_MODELS_PATH,
+        bytes::Bytes::from_static(b"{}"),
+    );
+    let headers = cursor_request::unary_headers(bearer.access_token(), bearer.team_id());
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let response = transport
+        .send_with_headers(&prepared, &headers, &[], deadline)
+        .await
+        .map_err(|_| anyhow::anyhow!("模型目录服务请求失败"))?;
+    let status = response.status();
+    let body = transport
+        .read_body(response, MAX_BODY, deadline)
+        .await
+        .map_err(|_| anyhow::anyhow!("模型目录响应不可读"))?;
+    if !status.is_success() {
+        // The vendor's error body may quote request context; the fixed
+        // message is all that crosses the admin API.
+        anyhow::bail!("模型目录服务拒绝请求");
+    }
+    parse_cursor_models(&String::from_utf8_lossy(&body))
+        .map_err(|_| anyhow::anyhow!("模型目录响应无效"))
+}
+
+/// Parse `GetUsableModels`' `{"models": [{modelId, displayName, maxMode}]}`
+/// into [`ProbeModel`]s. Only the id is required; the display name and the
+/// Max Mode flag are informational (the relay asks for Max Mode when Cursor
+/// says the model needs it). Cursor lists no context window here, so it
+/// stays unknown rather than guessed.
+fn parse_cursor_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
+    #[derive(serde::Deserialize)]
+    struct List {
+        #[serde(default)]
+        models: Vec<Entry>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        model_id: Option<String>,
+    }
+    let list: List = serde_json::from_str(body)?;
+    let mut seen = std::collections::HashSet::new();
+    let models: Vec<_> = list
+        .models
+        .into_iter()
+        .filter_map(|entry| entry.model_id)
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+        .map(|id| ProbeModel {
+            id,
+            rate_multiplier: None,
+            context: None,
+            max_output: None,
+            input_modalities: vec!["image".to_owned()],
+            effort_levels: Vec::new(),
+            default_effort: None,
+        })
+        .collect();
+    anyhow::ensure!(!models.is_empty(), "Cursor listed no usable models");
     Ok(models)
 }

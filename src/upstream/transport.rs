@@ -181,9 +181,24 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// Per-destination clients keyed by validated address and proxy. A proxy is
-/// part of the pool identity so connections are never reused across egresses.
-type ClientKey = (String, String, u16, Vec<IpAddr>);
+/// The HTTP version a pooled client speaks.
+///
+/// Every ordinary upstream stays on HTTP/1.1 (the behaviour the gateway had
+/// before HTTP/2 was compiled in: one request per connection turn, bodies sent
+/// before the response is read). [`Http::H2`] is the full-duplex client a
+/// Connect bidi stream needs: the request body keeps flowing while the
+/// response streams back, which HTTP/1.1 cannot do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Http {
+    H1,
+    H2,
+}
+
+/// Per-destination clients keyed by validated address and HTTP version. The
+/// address is part of the pool identity so connections are never reused across
+/// a re-resolved host; the version, so a bidi stream never lands on an HTTP/1.1
+/// connection.
+type ClientKey = (String, String, u16, Vec<IpAddr>, Http);
 /// Process-wide outbound transport.
 #[derive(Clone)]
 pub struct Transport {
@@ -441,18 +456,11 @@ impl Transport {
             self.limits.allow_private_destinations,
         )
         .await?;
-        let client = self.client_for(&prepared.url, &destination)?;
+        let client = self.client_for(&prepared.url, &destination, Http::H1)?;
         let mut request = client
             .post(&prepared.url)
             .header(CONTENT_TYPE, prepared.content_type)
-            .header(
-                "accept",
-                if prepared.stream {
-                    "text/event-stream"
-                } else {
-                    "application/json"
-                },
-            )
+            .header("accept", accept_for(prepared))
             .body(prepared.body.clone());
         for (name, value) in &prepared.headers {
             request = request.header(*name, value.clone());
@@ -468,6 +476,66 @@ impl Transport {
                     .collect::<Vec<_>>(),
             );
         }
+        self.await_headers(request, &destination, remaining).await
+    }
+
+    /// Open one full-duplex HTTP/2 request: `body` is streamed up for as long
+    /// as it yields while the response streams back. Returns at the response
+    /// headers, like [`Self::send_with_headers`]; the body stream keeps being
+    /// polled by the connection task after that, and ends the request when it
+    /// ends. The client is HTTP/2 prior-knowledge: a destination that cannot
+    /// speak it fails at the connection ([`TransportError::Connect`]) instead
+    /// of an HTTP/1.1 exchange that would wait for the whole body first.
+    pub async fn send_bidi(
+        &self,
+        prepared: &Prepared,
+        headers: &[(&'static str, String)],
+        body: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+        deadline: Instant,
+    ) -> Result<reqwest::Response, TransportError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TransportError::Timeout);
+        }
+        let destination = validate_destination(
+            &prepared.url,
+            &self.resolvers,
+            self.limits.allow_plaintext_loopback,
+            &self.limits.allowed_ports,
+            self.limits.allow_private_destinations,
+        )
+        .await?;
+        let client = self.client_for(&prepared.url, &destination, Http::H2)?;
+        let mut request = client
+            .post(&prepared.url)
+            .header(CONTENT_TYPE, prepared.content_type)
+            .header("accept", accept_for(prepared))
+            .body(reqwest::Body::wrap_stream(body));
+        for (name, value) in &prepared.headers {
+            request = request.header(*name, value.clone());
+        }
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+        let response = self.await_headers(request, &destination, remaining).await?;
+        if response.version() != reqwest::Version::HTTP_2 {
+            // Cannot happen with a prior-knowledge client; refused all the same
+            // rather than letting a half-duplex exchange pose as a stream.
+            tracing::warn!(host = %destination.host, "upstream answered a bidi stream below HTTP/2");
+            return Err(TransportError::Connect);
+        }
+        Ok(response)
+    }
+
+    /// Send `request` and wait for its response headers within `remaining`,
+    /// mapping reqwest's failure to the transport's categories without ever
+    /// rendering the error (its Display can carry the URL).
+    async fn await_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        destination: &Destination,
+        remaining: Duration,
+    ) -> Result<reqwest::Response, TransportError> {
         // The opening deadline (`opening`, capped by the dispatch budget) is the
         // only bound on the wait for response headers: `connect_timeout` ends at
         // the socket and `idle` starts at the first frame, so without it a silent
@@ -513,12 +581,14 @@ impl Transport {
     }
 
     /// Client pinned to the validated address for one destination. The pool key
-    /// is `(scheme, host, port, validated address)`, so a re-resolved host gets a
-    /// different client instead of reusing an already-authorized connection.
+    /// is `(scheme, host, port, validated address, HTTP version)`, so a
+    /// re-resolved host gets a different client instead of reusing an
+    /// already-authorized connection.
     fn client_for(
         &self,
         url: &str,
         destination: &Destination,
+        http: Http,
     ) -> Result<reqwest::Client, TransportError> {
         let parsed = reqwest::Url::parse(url).map_err(|_| TransportError::Connect)?;
         let key: ClientKey = (
@@ -526,6 +596,7 @@ impl Transport {
             destination.host.clone(),
             destination.port,
             destination.addresses.clone(),
+            http,
         );
         if let Some(client) = self
             .clients
@@ -553,6 +624,17 @@ impl Transport {
                     .collect::<Vec<_>>(),
             );
         builder = builder.no_proxy();
+        builder = match http {
+            Http::H1 => builder.http1_only(),
+            // Keep-alive pings on the stream's connection, at the cadence the
+            // vendor's own HTTP/2 client uses (10s interval, 20s timeout), so a
+            // long silent turn is told apart from a dead connection.
+            Http::H2 => builder
+                .http2_prior_knowledge()
+                .http2_keep_alive_interval(Duration::from_secs(10))
+                .http2_keep_alive_timeout(Duration::from_secs(20))
+                .http2_keep_alive_while_idle(true),
+        };
         let client = builder.build().map_err(|_| TransportError::Connect)?;
         let mut clients = self
             .clients
@@ -604,14 +686,47 @@ impl Transport {
         protocol: ProtocolId,
     ) -> StreamReader {
         StreamReader {
-            response,
-            framer: WireFramer::for_protocol(protocol),
+            source: Source::Http(Box::new(HttpSource {
+                response,
+                framer: WireFramer::for_protocol(protocol),
+            })),
             idle: self.limits.idle,
             deadline,
             pending: VecDeque::new(),
             finished: false,
             broken: false,
         }
+    }
+
+    /// Wrap an already-framed stream (a Cursor Run's downlink, framed and
+    /// observed by its driver) in the same bounded, deadline-aware reader, so
+    /// the relay pump reads it exactly like an HTTP response body.
+    pub fn stream_frames(
+        &self,
+        frames: tokio::sync::mpsc::Receiver<Result<WireFrame, TransportError>>,
+        deadline: Instant,
+    ) -> StreamReader {
+        StreamReader {
+            source: Source::Frames(frames),
+            idle: self.limits.idle,
+            deadline,
+            pending: VecDeque::new(),
+            finished: false,
+            broken: false,
+        }
+    }
+}
+
+/// The `accept` header for one prepared request: a Connect endpoint answers in
+/// the request's own content type; an SSE stream and a JSON body each in
+/// theirs.
+fn accept_for(prepared: &Prepared) -> &'static str {
+    if prepared.protocol == ProtocolId::Cursor {
+        prepared.content_type
+    } else if prepared.stream {
+        "text/event-stream"
+    } else {
+        "application/json"
     }
 }
 
@@ -660,11 +775,25 @@ fn body_snippet(body: &[u8]) -> String {
     text.trim().chars().take(200).collect()
 }
 
-/// Incremental wire reader (SSE or AWS Event Stream) with an idle ceiling and
-/// the request deadline.
-pub struct StreamReader {
+/// Where a [`StreamReader`]'s frames come from.
+enum Source {
+    /// An HTTP response body, framed here by the protocol's wire framer.
+    Http(Box<HttpSource>),
+    /// Frames another task already split (and may have failed): a closed
+    /// channel is the EOF, an `Err` item is the terminal failure.
+    Frames(tokio::sync::mpsc::Receiver<Result<WireFrame, TransportError>>),
+}
+
+/// The HTTP body and the framer that splits it.
+struct HttpSource {
     response: reqwest::Response,
     framer: WireFramer,
+}
+
+/// Incremental wire reader (SSE, AWS Event Stream or pre-framed) with an idle
+/// ceiling and the request deadline.
+pub struct StreamReader {
+    source: Source,
     idle: Duration,
     deadline: Instant,
     pending: VecDeque<WireFrame>,
@@ -693,7 +822,24 @@ impl StreamReader {
                 return Err(TransportError::Timeout);
             }
             let wait = self.idle.min(remaining);
-            match tokio::time::timeout(wait, self.response.chunk()).await {
+            let (response, framer) = match &mut self.source {
+                Source::Http(http) => (&mut http.response, &mut http.framer),
+                Source::Frames(frames) => {
+                    return match tokio::time::timeout(wait, frames.recv()).await {
+                        Err(_) => Err(TransportError::Timeout),
+                        Ok(None) => {
+                            self.finished = true;
+                            Ok(None)
+                        }
+                        Ok(Some(Ok(frame))) => Ok(Some(frame)),
+                        Ok(Some(Err(error))) => {
+                            self.broken = true;
+                            Err(error)
+                        }
+                    };
+                }
+            };
+            match tokio::time::timeout(wait, response.chunk()).await {
                 Err(_) => return Err(TransportError::Timeout),
                 Ok(Err(error)) if error.is_timeout() => return Err(TransportError::Timeout),
                 Ok(Err(_)) => return Err(TransportError::InvalidBody),
@@ -701,7 +847,7 @@ impl StreamReader {
                     // Mark the stream finished only after the framer accepted the
                     // end: a frame cut short by EOF is a terminal error, and a
                     // later read must not degrade it into a clean EOF.
-                    let frames = match self.framer.finish() {
+                    let frames = match framer.finish() {
                         Ok(frames) => frames,
                         Err(error) => {
                             self.broken = true;
@@ -717,7 +863,7 @@ impl StreamReader {
                     return Ok(self.pending.pop_front());
                 }
                 Ok(Ok(Some(chunk))) => {
-                    let frames = match self.framer.push(&chunk) {
+                    let frames = match framer.push(&chunk) {
                         Ok(frames) => frames,
                         Err(error) => {
                             self.broken = true;

@@ -114,6 +114,15 @@ pub fn effort_dial(provider_name: &str, model: &str) -> EffortDial {
         ("deepseek", _) => deepseek::effort_dial(),
         ("opencode", _) => opencode::effort_dial(model),
         ("commandcode", _) => commandcode::effort_dial(model),
+        // Cursor: the effort is a word inside the model id the account's
+        // usable list gives (`claude-opus-5-5-high`), never a request knob.
+        // The kernel drops the client's level (recorded as a translation
+        // loss), so nothing here may rewrite or clamp it — and an explicit
+        // off has no wire form either.
+        ("cursor", _) => EffortDial {
+            accepted: Accepted::Unknown,
+            off: OffPolicy::Wire("none"),
+        },
         _ => EffortDial {
             accepted: Accepted::Permissive,
             off: OffPolicy::Wire("none"),
@@ -153,6 +162,9 @@ fn protocol_suffix(protocol: ProtocolId) -> &'static str {
         // (`https://runtime.{region}.kiro.dev/`), so the capability endpoint is
         // the base_url plus a single trailing '/'.
         ProtocolId::Kiro => "",
+        // Cursor likewise: the base_url is the agent API origin
+        // (`https://api2.cursor.sh/`); the kernel appends the service paths.
+        ProtocolId::Cursor => "",
     }
 }
 
@@ -223,9 +235,10 @@ pub fn capabilities(
 /// Single-protocol rows (standard glm included): the row's protocol at the
 /// version root plus its canonical leaf, with the row's auth scheme.
 ///
-/// Kiro takes this arm too, with an empty leaf: its endpoint is the provider's
-/// `base_url` root. The row's static auth scheme is only a placeholder for Kiro
-/// — the OIDC token manager replaces the Authorization header on the wire.
+/// Kiro and Cursor take this arm too, with an empty leaf: their endpoint is
+/// the provider's `base_url` root. The row's static auth scheme is only a
+/// placeholder for them — the token managers set the Authorization header on
+/// the wire.
 fn single_protocol(row_protocol: &str, row_auth_scheme: &str, base: &str) -> Vec<Capability> {
     let (Some(protocol), Ok(auth_scheme)) = (
         ProtocolId::parse(row_protocol),

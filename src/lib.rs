@@ -26,6 +26,7 @@ pub mod body_log;
 pub mod client;
 pub mod config;
 pub mod credentials;
+pub mod cursor;
 pub mod db;
 pub mod exposure;
 pub mod gateway;

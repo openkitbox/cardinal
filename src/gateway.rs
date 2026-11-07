@@ -101,12 +101,22 @@ struct Core {
     /// The same arrangement for OpenCode account rows: one bearer cache shared
     /// by dispatch, model probing and quota probing.
     opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
+    /// And for Cursor account rows: one bearer cache shared by dispatch and
+    /// model probing (login-bundle refresh or API-key exchange).
+    cursor_tokens: Arc<crate::upstream::CursorTokens>,
+    /// The Cursor usage reconciler (dashboard events), shared by every
+    /// settlement so an event is counted once process-wide.
+    cursor_usage: Arc<crate::upstream::CursorUsage>,
     /// The OpenCode Console client (stateless: tokens are per-call arguments), so
     /// one instance serves login, dispatch and probing.
     opencode_client: Arc<crate::opencode::auth::Client>,
     /// The process's in-flight OpenCode device logins: the admin surface starts,
     /// polls and cancels them through the shared registry.
     opencode_logins: crate::opencode::login::OpencodeLogins,
+    /// The Cursor browser-login client (stateless) and the process's in-flight
+    /// Cursor logins, for the admin surface.
+    cursor_client: Arc<crate::cursor::Client>,
+    cursor_logins: crate::cursor::CursorLogins,
     /// Per-alias round-robin cursors for Rotate ordering — one atomic
     /// increment per dispatch, no lock, no allocation.
     rotate_cursors: relay::RotateCursors,
@@ -208,13 +218,19 @@ impl Core {
         let opencode_tokens = Arc::new(crate::upstream::OpencodeTokens::new(Arc::clone(
             &opencode_client,
         )));
+        let cursor_tokens = Arc::new(crate::upstream::CursorTokens::new(transport.clone()));
+        let cursor_usage = Arc::new(crate::upstream::CursorUsage::new(transport.clone()));
         Ok(Self {
             pool,
             transport,
             kiro_tokens,
             opencode_tokens,
+            cursor_tokens,
+            cursor_usage,
             opencode_client,
             opencode_logins: crate::opencode::login::OpencodeLogins::new(),
+            cursor_client: Arc::new(crate::cursor::Client::new()),
+            cursor_logins: crate::cursor::CursorLogins::new(),
             queue_timeout,
             failover: relay::Failover::new(),
             exposure: Arc::new(crate::exposure::Exposure::new()),
@@ -261,6 +277,7 @@ async fn quota_prober(
     smart_cache: relay::SmartCache,
     kiro_tokens: Arc<crate::upstream::KiroTokens>,
     opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
+    cursor_tokens: Arc<crate::upstream::CursorTokens>,
     activity: crate::activity::ActivitySink,
     cancel: CancellationToken,
 ) {
@@ -277,6 +294,7 @@ async fn quota_prober(
                 Some(&smart_cache),
                 Some(&kiro_tokens),
                 Some(&opencode_tokens),
+                Some(&cursor_tokens),
             )
             .await;
             if !rows.is_empty() {
@@ -388,6 +406,7 @@ impl Gateway {
             core.smart_cache.clone(),
             Arc::clone(&core.kiro_tokens),
             Arc::clone(&core.opencode_tokens),
+            Arc::clone(&core.cursor_tokens),
             core.activity.clone(),
             core.prober_cancel.clone(),
         ));
@@ -421,8 +440,12 @@ impl Gateway {
             kiro_tokens: core.kiro_tokens.clone(),
             prompt_cache: core.prompt_cache.clone(),
             opencode_tokens: core.opencode_tokens.clone(),
+            cursor_tokens: Arc::clone(&core.cursor_tokens),
+            cursor_usage: Arc::clone(&core.cursor_usage),
             opencode_client: Arc::clone(&core.opencode_client),
             opencode_logins: core.opencode_logins.clone(),
+            cursor_client: Arc::clone(&core.cursor_client),
+            cursor_logins: core.cursor_logins.clone(),
             ledger: core.ledger.clone(),
             server_stopped: core.server_stopped.clone(),
             payload_log: core.payload_log,

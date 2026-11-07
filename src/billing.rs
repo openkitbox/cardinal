@@ -243,7 +243,10 @@ pub fn certainty(usage_observed: bool, upstream: ProtocolId) -> UsageCertainty {
         return UsageCertainty::Unknown;
     }
     match upstream {
-        ProtocolId::Kiro => UsageCertainty::Estimated,
+        // Cursor reports exact counts only for a turn without tool calls; a
+        // tool step's usage is reconciled from the dashboard or estimated.
+        // Classified at the protocol level as Estimated (plan D10).
+        ProtocolId::Kiro | ProtocolId::Cursor => UsageCertainty::Estimated,
         ProtocolId::OpenAiChat
         | ProtocolId::OpenAiResponses
         | ProtocolId::AnthropicMessages

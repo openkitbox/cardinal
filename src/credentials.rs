@@ -1,6 +1,7 @@
 //! The credential kinds a `gateway_provider_keys` row may carry: `static` (a
-//! plaintext api_key), `kiro_oidc` (a Kiro AWS SSO OIDC bundle) and
-//! `opencode_oauth` (an OpenCode Console device-flow bundle).
+//! plaintext api_key), `kiro_oidc` (a Kiro AWS SSO OIDC bundle),
+//! `opencode_oauth` (an OpenCode Console device-flow bundle) and `cursor_oauth`
+//! (a Cursor browser-login bundle).
 //!
 //! This is the create-time decision point shared by the admin surface, the
 //! store and the relay. Nothing here performs I/O: it decides which of the two
@@ -8,13 +9,23 @@
 //! the declared kind, so a mismatched pair never reaches the store.
 //!
 //! The kinds mirror the `auth_kind` CHECK constraint one to one
-//! (migrations/0007, migrations/0017): adding a kind is a schema change plus a
-//! variant here, never an inference from the row's other columns.
+//! (migrations/0007, migrations/0017, migrations/0021): adding a kind is a
+//! schema change plus a variant here, never an inference from the row's other
+//! columns.
 
 use anyhow::anyhow;
+use chrono::DateTime;
+use chrono::Duration;
+use chrono::Utc;
 
 use crate::kiro::KiroOAuth;
 use crate::opencode::OpencodeOAuth;
+
+/// The longest access-token lifetime a stored Cursor bundle may claim. Cursor
+/// publishes no metadata, so a bundle's `expires_at` is decoded from the access
+/// token's JWT `exp` claim; a claim further out than this is a misread token,
+/// not a credential to keep, and would never be refreshed.
+const MAX_CURSOR_TOKEN_LIFETIME: Duration = Duration::days(730);
 
 /// How a `gateway_provider_keys` row authenticates upstream, mirroring the
 /// `auth_kind` CHECK constraint.
@@ -26,6 +37,8 @@ pub enum AuthKind {
     KiroOidc,
     /// The row's `oauth` bundle: OpenCode Console device-flow tokens.
     OpencodeOauth,
+    /// The row's `oauth` bundle: Cursor browser-login tokens.
+    CursorOauth,
 }
 
 impl AuthKind {
@@ -36,6 +49,7 @@ impl AuthKind {
             Self::Static => "static",
             Self::KiroOidc => "kiro_oidc",
             Self::OpencodeOauth => "opencode_oauth",
+            Self::CursorOauth => "cursor_oauth",
         }
     }
 
@@ -46,10 +60,78 @@ impl AuthKind {
             "static" => Ok(Self::Static),
             "kiro_oidc" => Ok(Self::KiroOidc),
             "opencode_oauth" => Ok(Self::OpencodeOauth),
+            "cursor_oauth" => Ok(Self::CursorOauth),
             other => Err(anyhow!(
-                "unknown auth_kind {other:?} (expected \"static\", \"kiro_oidc\" or \"opencode_oauth\")"
+                "unknown auth_kind {other:?} (expected \"static\", \"kiro_oidc\", \"opencode_oauth\" or \"cursor_oauth\")"
             )),
         }
+    }
+}
+
+/// One Cursor account's OAuth bundle, persisted as snake_case JSON with an
+/// RFC3339 `expires_at`.
+///
+/// The vendor's login and refresh answers carry no lifetime at all, so
+/// `expires_at` is decoded from the access token's JWT `exp` claim by whoever
+/// writes the bundle; the token manager only compares it against the clock.
+/// Cursor does not rotate the refresh token, so `refresh_token` outlives every
+/// refresh of `access_token` and is only replaced by a new login.
+///
+/// `email` and `team_id` are display/auth-decoration taken from the login
+/// answer (`selectedTeamId`); `team_id` is the value the dispatch path sends as
+/// `x-cursor-team-id`. Both tokens are secrets, so Debug redacts them.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CursorOAuth {
+    /// Bearer for the Cursor backend (secret).
+    pub access_token: String,
+    /// Refresh token the `/oauth/token` grant redeems (secret; never rotated).
+    pub refresh_token: String,
+    /// UTC instant at which `access_token` stops being accepted, decoded from
+    /// its JWT `exp`.
+    pub expires_at: DateTime<Utc>,
+    /// Account email as the login answer reported it (decoration only).
+    pub email: Option<String>,
+    /// Selected team id, sent as `x-cursor-team-id` on dispatch (never a
+    /// credential on its own).
+    pub team_id: Option<String>,
+}
+
+impl CursorOAuth {
+    /// Every stored bundle must be usable: both tokens present, and an expiry
+    /// the vendor's own token shape could produce. An already-expired bundle is
+    /// accepted — the token manager refreshes it — but one claiming a lifetime
+    /// beyond [`MAX_CURSOR_TOKEN_LIFETIME`] means the `exp` claim was misread.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.access_token.trim().is_empty(),
+            "Cursor OAuth access_token must not be empty"
+        );
+        anyhow::ensure!(
+            !self.refresh_token.trim().is_empty(),
+            "Cursor OAuth refresh_token must not be empty"
+        );
+        anyhow::ensure!(
+            self.expires_at <= Utc::now() + MAX_CURSOR_TOKEN_LIFETIME,
+            "Cursor OAuth expires_at {} is beyond the {MAX_CURSOR_TOKEN_LIFETIME} lifetime bound",
+            self.expires_at
+        );
+        Ok(())
+    }
+}
+
+/// Debug redacts both tokens: either one keeps the account alive, and this value
+/// travels through logs and error paths.
+impl std::fmt::Debug for CursorOAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CursorOAuth")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("email", &self.email)
+            .field("team_id", &self.team_id)
+            .finish()
     }
 }
 
@@ -72,6 +154,8 @@ pub enum KeyCredential<'a> {
     KiroOidc(KiroOAuth),
     /// An OpenCode Console bundle; the row stores no api_key.
     OpencodeOauth(OpencodeOAuth),
+    /// A Cursor browser-login bundle; the row stores no api_key.
+    CursorOauth(CursorOAuth),
 }
 
 impl std::fmt::Debug for KeyCredential<'_> {
@@ -82,6 +166,7 @@ impl std::fmt::Debug for KeyCredential<'_> {
             Self::OpencodeOauth(oauth) => {
                 formatter.debug_tuple("OpencodeOauth").field(oauth).finish()
             }
+            Self::CursorOauth(oauth) => formatter.debug_tuple("CursorOauth").field(oauth).finish(),
         }
     }
 }
@@ -94,6 +179,8 @@ impl std::fmt::Debug for KeyCredential<'_> {
 /// - a `kiro` provider only ever authenticates with `kiro_oidc` (its relay path
 ///   speaks AWS SSO OIDC, so a static row there could never dispatch), and a
 ///   `kiro_oidc` credential only ever belongs to a `kiro` provider;
+/// - a `cursor_oauth` credential only ever belongs to a `cursor` provider, the
+///   only kernel that speaks the Cursor backend;
 /// - a static key needs a non-empty `api_key` and must NOT carry `oauth`;
 /// - an OAuth kind needs no api_key and a complete bundle of its own shape: the
 ///   raw `oauth` payload is decoded as that kind's bundle, never sniffed;
@@ -149,6 +236,24 @@ pub fn resolve_key_credential<'a>(
             let oauth: OpencodeOAuth = decode_bundle(oauth, auth_kind)?;
             oauth.validate()?;
             Ok(KeyCredential::OpencodeOauth(oauth))
+        }
+        AuthKind::CursorOauth => {
+            // The Cursor kernel owns `protocol = "cursor"`; the bundle is only
+            // ever sent to the Cursor backend, so a foreign provider must not
+            // hold one.
+            anyhow::ensure!(
+                protocol == "cursor",
+                "auth_kind \"cursor_oauth\" requires a provider with protocol \"cursor\" (got {protocol:?})"
+            );
+            anyhow::ensure!(
+                api_key.is_none_or(|key| key.trim().is_empty()),
+                "a Cursor OAuth key must not carry an api_key"
+            );
+            let oauth =
+                oauth.ok_or_else(|| anyhow!("auth_kind \"cursor_oauth\" requires oauth"))?;
+            let oauth: CursorOAuth = decode_bundle(oauth, auth_kind)?;
+            oauth.validate()?;
+            Ok(KeyCredential::CursorOauth(oauth))
         }
     }
 }

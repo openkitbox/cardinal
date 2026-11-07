@@ -7,10 +7,11 @@
 //! knowledge. "glm" (either variant) exposes plan quota windows, "deepseek"
 //! and the kimi platform expose a prepaid balance, kimi Code exposes its
 //! weekly quota plus short-rate windows, opencode Go its rolling/weekly/
-//! monthly plan usage (Zen is pay-as-you-go — no source); any other name has
-//! no vendor source and falls back to a speculative sub2api relay probe
-//! (`/v1/usage`) — except the official vendors (anthropic, openai, gemini,
-//! kiro), whose APIs expose no key balance.
+//! monthly plan usage (Zen is pay-as-you-go — no source), a Cursor account
+//! its plan's included usage and on-demand spend (by protocol, like Kiro);
+//! any other name has no vendor source and falls back to a speculative
+//! sub2api relay probe (`/v1/usage`) — except the official vendors
+//! (anthropic, openai, gemini, kiro), whose APIs expose no key balance.
 //! The endpoint URL is derived from the provider row's base_url (scheme +
 //! host + port) plus the table's fixed path, so a row pointing at a mock
 //! server is probed there.
@@ -21,6 +22,7 @@
 
 mod balance;
 mod commandcode;
+mod cursor;
 mod deepseek;
 mod endpoint;
 mod glm;
@@ -33,6 +35,7 @@ mod sub2api;
 
 pub use balance::BalanceStep;
 pub use balance::classify;
+pub use cursor::fetch_cursor_quota;
 pub use endpoint::fetch_quota;
 pub use key_quota::Balance;
 pub use key_quota::KeyQuota;

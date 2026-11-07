@@ -71,6 +71,7 @@ fn kiro_usage_request(
             body: bytes::Bytes::from(serde_json::Value::Object(body).to_string()),
             stream: false,
             headers,
+            cursor: None,
         },
         auth: vec![("authorization", format!("Bearer {bearer}"))],
         query,

@@ -16,6 +16,7 @@
 
 pub mod anthropic_messages;
 pub mod awseventstream;
+pub mod cursor;
 pub mod embeddings;
 pub mod gemini;
 pub mod kiro;
@@ -46,16 +47,21 @@ pub enum ProtocolId {
     /// endpoint, no `client_paths`, and takes part in the IR matrix in one
     /// direction (`OpenAiChat → Kiro`).
     Kiro,
+    /// Cursor's private agent protocol (Connect + protobuf over a split
+    /// HTTP/1.1 bidi stream): a translation target only, like Kiro, opened
+    /// in one direction (`OpenAiChat → Cursor`).
+    Cursor,
 }
 
 impl ProtocolId {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::OpenAiChat,
         Self::OpenAiResponses,
         Self::AnthropicMessages,
         Self::Gemini,
         Self::OpenAiEmbeddings,
         Self::Kiro,
+        Self::Cursor,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -66,6 +72,7 @@ impl ProtocolId {
             Self::Gemini => "gemini",
             Self::OpenAiEmbeddings => "openai_embeddings",
             Self::Kiro => "kiro",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -89,8 +96,8 @@ impl ProtocolId {
             // Dynamic routing: the model and method are path segments, matched by
             // the `/v1beta/models/<**call>` handler in `gateway::api`.
             Self::Gemini => &[],
-            // Upstream-only protocol: the gateway never serves Kiro's wire.
-            Self::Kiro => &[],
+            // Upstream-only protocols: the gateway never serves their wire.
+            Self::Kiro | Self::Cursor => &[],
         }
     }
 
@@ -99,8 +106,13 @@ impl ProtocolId {
     /// `TargetView::url(stream)` routes through `stream_endpoint`.
     pub const fn streaming_shares_endpoint(self) -> bool {
         match self {
-            // KAS streams at the same runtime-host root as its non-streaming call.
-            Self::OpenAiChat | Self::OpenAiResponses | Self::AnthropicMessages | Self::Kiro => true,
+            // KAS streams at the same runtime-host root as its non-streaming
+            // call; a Cursor Run is one bidi stream whatever the client asked.
+            Self::OpenAiChat
+            | Self::OpenAiResponses
+            | Self::AnthropicMessages
+            | Self::Kiro
+            | Self::Cursor => true,
             // Neither has an SSE wire: Gemini puts the stream on its own path,
             // embeddings has none at all (`TargetView::url(true)` refuses).
             Self::Gemini | Self::OpenAiEmbeddings => false,
@@ -394,6 +406,9 @@ pub fn prepare(
         // Inbound Kiro never happens (no client path). As a translation target
         // the KAS kernel prepares the AWS Event Stream request.
         ProtocolId::Kiro => kiro::prepare(client_body, target, stream, skip, strip_images),
+        // Cursor's body is cardinal's own staging JSON (see `cursor::request`):
+        // no learned field strips or vendor fixups apply to it.
+        ProtocolId::Cursor => cursor::request::prepare(client_body, target, stream),
     }
 }
 
@@ -413,6 +428,15 @@ pub fn parse_json(
         ProtocolId::Gemini => gemini::parse_json(body),
         ProtocolId::OpenAiEmbeddings => embeddings::parse_json(body),
         ProtocolId::Kiro => kiro::parse_json(body, context_window),
+        ProtocolId::Cursor => {
+            let decoder = cursor::response::aggregate(body)?;
+            Ok(ObservedResponse {
+                usage: decoder.usage(),
+                terminal: decoder.finish(),
+                // Cursor's updates carry no model identity.
+                upstream_model: None,
+            })
+        }
     }
 }
 
@@ -423,8 +447,12 @@ pub enum Decoder {
     Responses(openai_responses::StreamDecoder),
     Messages(anthropic_messages::StreamDecoder),
     Gemini(gemini::StreamDecoder),
-    /// KAS's AWS Event Stream. The only decoder that never reads SSE.
+    /// KAS's AWS Event Stream. Never reads SSE.
     Kiro(kiro::StreamDecoder),
+    /// Cursor's Connect frame stream. Never reads SSE.
+    /// Boxed: the Connect decoder keeps per-call sets the other decoders
+    /// have no counterpart for, and the enum rides inside the pump.
+    Cursor(Box<cursor::StreamDecoder>),
     /// No streaming wire exists for this protocol. Construction is
     /// unconditional (the relay builds a decoder by protocol alone), so the
     /// variant exists to refuse every frame instead of panicking later.
@@ -447,6 +475,9 @@ impl Decoder {
                 context_window,
                 kiro::Retention::CountsOnly,
             )),
+            ProtocolId::Cursor => Self::Cursor(Box::new(cursor::StreamDecoder::new(
+                cursor::Retention::CountsOnly,
+            ))),
         }
     }
 
@@ -456,9 +487,9 @@ impl Decoder {
             Self::Responses(decoder) => decoder.observe(frame),
             Self::Messages(decoder) => decoder.observe(frame),
             Self::Gemini(decoder) => decoder.observe(frame),
-            // Kiro's response is never SSE: a text frame here is a wire
-            // mismatch, not a frame to skip.
-            Self::Kiro(_) => Err(ProtocolError::InvalidUpstreamResponse),
+            // Kiro's and Cursor's responses are never SSE: a text frame here
+            // is a wire mismatch, not a frame to skip.
+            Self::Kiro(_) | Self::Cursor(_) => Err(ProtocolError::InvalidUpstreamResponse),
             Self::Unstreamed => Err(ProtocolError::UnsupportedApi),
         }
     }
@@ -475,7 +506,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.observe_raw(&frame.data),
             Self::Messages(decoder) => decoder.observe_raw(frame.event.as_deref(), &frame.data),
             Self::Gemini(decoder) => decoder.observe_raw(&frame.data),
-            Self::Kiro(_) => Err(ProtocolError::InvalidUpstreamResponse),
+            Self::Kiro(_) | Self::Cursor(_) => Err(ProtocolError::InvalidUpstreamResponse),
             Self::Unstreamed => Err(ProtocolError::UnsupportedApi),
         }
     }
@@ -499,15 +530,26 @@ impl Decoder {
                 decoder.observe_raw(&frame.data)
             }
             (Self::Kiro(decoder), wire::WireFrame::Aws(message)) => decoder.observe(message),
-            (Self::Unstreamed, wire::WireFrame::Sse(_))
-            | (Self::Unstreamed, wire::WireFrame::Aws(_))
-            | (Self::Kiro(_), wire::WireFrame::Sse(_))
-            | (Self::Chat(_), wire::WireFrame::Aws(_))
-            | (Self::Responses(_), wire::WireFrame::Aws(_))
-            | (Self::Messages(_), wire::WireFrame::Aws(_))
-            | (Self::Gemini(_), wire::WireFrame::Aws(_)) => {
-                Err(ProtocolError::InvalidUpstreamResponse)
-            }
+            (Self::Cursor(decoder), wire::WireFrame::Connect(frame)) => decoder.observe(frame),
+            (Self::Unstreamed | Self::Kiro(_) | Self::Cursor(_), wire::WireFrame::Sse(_))
+            | (
+                Self::Unstreamed
+                | Self::Cursor(_)
+                | Self::Chat(_)
+                | Self::Responses(_)
+                | Self::Messages(_)
+                | Self::Gemini(_),
+                wire::WireFrame::Aws(_),
+            )
+            | (
+                Self::Unstreamed
+                | Self::Kiro(_)
+                | Self::Chat(_)
+                | Self::Responses(_)
+                | Self::Messages(_)
+                | Self::Gemini(_),
+                wire::WireFrame::Connect(_),
+            ) => Err(ProtocolError::InvalidUpstreamResponse),
         }
     }
     /// Validate and observe a relay frame without constructing unused events.
@@ -517,7 +559,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.observe_for_relay(frame),
             Self::Messages(decoder) => decoder.observe(frame).map(|_| ()),
             Self::Gemini(decoder) => decoder.observe(frame).map(|_| ()),
-            Self::Kiro(_) => Err(ProtocolError::InvalidUpstreamResponse),
+            Self::Kiro(_) | Self::Cursor(_) => Err(ProtocolError::InvalidUpstreamResponse),
             Self::Unstreamed => Err(ProtocolError::UnsupportedApi),
         }
     }
@@ -527,7 +569,7 @@ impl Decoder {
             Self::Responses(decoder) => decoder.observe_raw_frame_for_relay(frame),
             Self::Messages(decoder) => decoder.observe_raw_for_relay(frame),
             Self::Gemini(decoder) => decoder.observe_raw_for_relay(frame),
-            Self::Kiro(_) => Err(ProtocolError::InvalidUpstreamResponse),
+            Self::Kiro(_) | Self::Cursor(_) => Err(ProtocolError::InvalidUpstreamResponse),
             Self::Unstreamed => Err(ProtocolError::UnsupportedApi),
         }
     }
@@ -539,6 +581,7 @@ impl Decoder {
             Self::Messages(decoder) => decoder.finish(),
             Self::Gemini(decoder) => decoder.finish(),
             Self::Kiro(decoder) => decoder.finish(),
+            Self::Cursor(decoder) => decoder.finish(),
             // A stream that cannot exist never completed.
             Self::Unstreamed => Terminal::Failed,
         }
@@ -551,6 +594,7 @@ impl Decoder {
             Self::Messages(decoder) => decoder.usage(),
             Self::Gemini(decoder) => decoder.usage(),
             Self::Kiro(decoder) => decoder.usage(),
+            Self::Cursor(decoder) => decoder.usage(),
             Self::Unstreamed => None,
         }
     }
@@ -561,6 +605,7 @@ impl Decoder {
             Self::Messages(decoder) => decoder.terminal_seen(),
             Self::Gemini(decoder) => decoder.terminal_seen(),
             Self::Kiro(decoder) => decoder.terminal_seen(),
+            Self::Cursor(decoder) => decoder.terminal_seen(),
             Self::Unstreamed => false,
         }
     }
@@ -577,6 +622,7 @@ impl Decoder {
             | Self::Responses(_)
             | Self::Messages(_)
             | Self::Gemini(_)
+            | Self::Cursor(_)
             | Self::Unstreamed => false,
         }
     }
@@ -597,8 +643,10 @@ impl Decoder {
             Self::Responses(decoder) => decoder.terminal_seen(),
             Self::Messages(decoder) => decoder.terminal_seen(),
             Self::Gemini(decoder) => decoder.terminal_seen(),
-            // KAS's only closing signal is the metadata frame.
+            // KAS's only closing signal is the metadata frame; Cursor's is
+            // the step's terminal (turn end, calls complete, or end frame).
             Self::Kiro(decoder) => decoder.terminal_seen(),
+            Self::Cursor(decoder) => decoder.terminal_seen(),
             Self::Unstreamed => false,
         }
     }
@@ -621,7 +669,7 @@ impl Decoder {
             // Kiro is never a client wire: a truncated KAS stream is closed by
             // the translated pump's own client-protocol frames, never by KAS
             // frames the client could not read.
-            Self::Kiro(_) => Vec::new(),
+            Self::Kiro(_) | Self::Cursor(_) => Vec::new(),
             // A stream that cannot exist never carried content to truncate.
             Self::Unstreamed => Vec::new(),
         }
@@ -637,6 +685,7 @@ impl Decoder {
             Self::Messages(decoder) => decoder.content_seen(),
             Self::Gemini(decoder) => decoder.content_seen(),
             Self::Kiro(decoder) => decoder.content_seen(),
+            Self::Cursor(decoder) => decoder.content_seen(),
             Self::Unstreamed => false,
         }
     }
@@ -677,6 +726,10 @@ pub struct Prepared {
     /// Protocol-required, non-secret upstream headers (for example the Anthropic
     /// API version). Credentials are never placed here.
     pub headers: Vec<(&'static str, String)>,
+    /// Cursor only: the Run's uplink plan (first message, blobs, answers).
+    /// `None` for every other protocol. Non-secret: the conversation's own
+    /// content, which the body of any other protocol carries just the same.
+    pub cursor: Option<std::sync::Arc<cursor::RunPlan>>,
 }
 
 /// One decoded stream event, used for observation only. The relay forwards the

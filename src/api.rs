@@ -52,12 +52,22 @@ pub struct AppState {
     /// Per-key OpenCode account bearer manager, same contract; shared with model
     /// and quota probing.
     pub opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
+    /// Per-key Cursor bearer manager, same contract; shared with model probing.
+    pub cursor_tokens: Arc<crate::upstream::CursorTokens>,
+    /// The Cursor usage reconciler, shared with every settlement task.
+    pub cursor_usage: Arc<crate::upstream::CursorUsage>,
     /// The stateless OpenCode Console client: one instance serves the login
     /// flow, dispatch and probing (tokens are per-call arguments).
     pub opencode_client: Arc<crate::opencode::auth::Client>,
     /// In-flight OpenCode device logins: the admin surface starts one, the GUI
     /// polls it, an operator can cancel it.
     pub opencode_logins: crate::opencode::login::OpencodeLogins,
+    /// The Cursor browser-login client (stateless; the admin surface's login
+    /// flow is its only caller).
+    pub cursor_client: Arc<crate::cursor::Client>,
+    /// In-flight Cursor browser logins: started, polled and cancelled by the
+    /// admin surface.
+    pub cursor_logins: crate::cursor::CursorLogins,
     /// Batch ledger writer: relay dispatch queues attempt rows here.
     pub ledger: relay::LedgerWriter,
     /// Cancelled once graceful shutdown has stopped the HTTP surface (shared
@@ -221,6 +231,8 @@ async fn relay_dispatch(
         kiro_tokens: state.kiro_tokens.as_ref(),
         prompt_cache: &state.prompt_cache,
         opencode_tokens: state.opencode_tokens.as_ref(),
+        cursor_tokens: state.cursor_tokens.as_ref(),
+        cursor_usage: &state.cursor_usage,
         trace_ring: &state.trace_ring,
         smart_cache: &state.smart_cache,
         rotate_cursors: &state.rotate_cursors,

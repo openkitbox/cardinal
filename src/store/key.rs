@@ -1,6 +1,6 @@
 use sqlx::PgPool;
 
-use crate::credentials::{AuthKind, KeyCredential};
+use crate::credentials::{AuthKind, CursorOAuth, KeyCredential};
 use crate::kiro::KiroOAuth;
 use crate::opencode::OpencodeOAuth;
 use crate::probe::ProbeModel;
@@ -115,6 +115,16 @@ impl ProviderKeyRow {
         }
         decode_stored_bundle(self.oauth.as_ref()?)
     }
+
+    /// The row's Cursor browser-login bundle in its typed form; same contract
+    /// as [`Self::kiro_oauth`].
+    #[must_use]
+    pub fn cursor_oauth(&self) -> Option<CursorOAuth> {
+        if self.auth_kind != AuthKind::CursorOauth.as_str() {
+            return None;
+        }
+        decode_stored_bundle(self.oauth.as_ref()?)
+    }
 }
 
 /// Decode one stored bundle straight from the borrowed JSON (serde_json drives
@@ -153,17 +163,20 @@ pub struct ProviderKeyView {
     pub models: Option<Vec<ProbeModel>>,
     /// The key's model whitelist (None = unrestricted).
     pub allowed_models: Option<Vec<String>>,
-    /// How the row authenticates upstream: `static`, `kiro_oidc` or
-    /// `opencode_oauth`. Defaults to `static` for a payload that predates the
-    /// field (an older gateway never had anything else to report).
+    /// How the row authenticates upstream: `static`, `kiro_oidc`,
+    /// `opencode_oauth` or `cursor_oauth`. Defaults to `static` for a payload
+    /// that predates the field (an older gateway never had anything else to
+    /// report).
     #[serde(default = "static_auth_kind")]
     pub auth_kind: String,
-    /// The OpenCode account's e-mail, when its bundle carries one. None for
-    /// every other credential kind — and for an account whose login could not
-    /// read it, so a card falls back to the label rather than to a blank.
+    /// The OpenCode or Cursor account's e-mail, when its bundle carries one.
+    /// None for every other credential kind — and for an account whose login
+    /// could not read it, so a card falls back to the label rather than to a
+    /// blank.
     #[serde(default)]
     pub account: Option<String>,
-    /// The OpenCode account's organization name, when it belongs to one.
+    /// The OpenCode account's organization name, when it belongs to one; the
+    /// Cursor account's team (by id — the login records no team name).
     #[serde(default)]
     pub organization: Option<String>,
     /// When the account was archived (None = not archived).
@@ -176,9 +189,16 @@ impl ProviderKeyView {
         // The bundle is decoded once per row; only the display projection is
         // kept, so the tokens never reach the view (and the decode's String
         // fields are moved out, not cloned).
-        let (account, organization) = match row.opencode_oauth() {
-            Some(bundle) => (bundle.email, bundle.org_name),
-            None => (None, None),
+        // Each accessor answers only for its own auth_kind.
+        let (account, organization) = if let Some(bundle) = row.opencode_oauth() {
+            (bundle.email, bundle.org_name)
+        } else if let Some(bundle) = row.cursor_oauth() {
+            (
+                bundle.email,
+                bundle.team_id.map(|team_id| format!("团队 {team_id}")),
+            )
+        } else {
+            (None, None)
         };
         Self {
             id: row.id,
@@ -419,6 +439,31 @@ pub async fn insert_opencode_provider_key(
     .await
 }
 
+/// Insert a Cursor account key: no api_key, the browser-login bundle stored
+/// under `auth_kind = "cursor_oauth"`, validated here as well. The bundle is the
+/// one the login flow received (that flow writes the row through
+/// [`insert_key_row`] directly); this entry point exists for an admin who pastes
+/// an already-extracted bundle.
+pub async fn insert_cursor_provider_key(
+    pool: &PgPool,
+    provider_id: i64,
+    label: &str,
+    oauth: CursorOAuth,
+    max_concurrency: Option<i32>,
+    allowed_models: Option<Vec<String>>,
+) -> anyhow::Result<i64> {
+    oauth.validate()?;
+    insert_key_row(
+        pool,
+        provider_id,
+        label,
+        KeyCredential::CursorOauth(oauth),
+        max_concurrency,
+        allowed_models,
+    )
+    .await
+}
+
 /// Find a Kiro OIDC key by provider and label, or create it atomically.
 ///
 /// The provider row lock serializes this operation with provider-scoped key
@@ -628,6 +673,11 @@ async fn insert_key_row(
             AuthKind::OpencodeOauth,
             Some(serde_json::to_value(oauth)?),
         ),
+        KeyCredential::CursorOauth(oauth) => (
+            None,
+            AuthKind::CursorOauth,
+            Some(serde_json::to_value(oauth)?),
+        ),
     };
     anyhow::ensure!(!label.is_empty(), "label must not be empty");
     ensure_valid_max_concurrency(max_concurrency)?;
@@ -655,6 +705,12 @@ async fn insert_key_row(
         AuthKind::OpencodeOauth => anyhow::ensure!(
             protocol != "kiro",
             "auth_kind \"opencode_oauth\" is not a Kiro credential (got provider protocol {protocol:?})"
+        ),
+        // The Cursor bundle is only ever sent to the Cursor backend, which the
+        // `cursor` protocol kernel owns.
+        AuthKind::CursorOauth => anyhow::ensure!(
+            protocol == "cursor",
+            "auth_kind \"cursor_oauth\" requires a provider with protocol \"cursor\" (got {protocol:?})"
         ),
     }
     let duplicate: (bool,) = sqlx::query_as(
@@ -808,6 +864,60 @@ pub async fn replace_opencode_oauth(
     let result = sqlx::query(
         "UPDATE gateway_provider_keys SET oauth = $3
          WHERE id = $1 AND auth_kind = 'opencode_oauth' AND oauth = $2",
+    )
+    .bind(key_id)
+    .bind(serde_json::to_value(expected)?)
+    .bind(serde_json::to_value(next)?)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// One Cursor account's stored bundle, read fresh from the row; same contract
+/// as [`opencode_oauth`] (the token manager rereads under its per-key gate
+/// before refreshing, and the login flow before a re-login's write).
+pub async fn cursor_oauth(pool: &PgPool, key_id: i64) -> anyhow::Result<Option<CursorOAuth>> {
+    let stored: Option<(String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT auth_kind, oauth FROM gateway_provider_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((auth_kind, oauth)) = stored else {
+        return Ok(None);
+    };
+    if auth_kind != AuthKind::CursorOauth.as_str() {
+        return Ok(None);
+    }
+    let Some(value) = oauth else {
+        return Ok(None);
+    };
+    match serde_json::from_value(value) {
+        Ok(bundle) => Ok(Some(bundle)),
+        Err(_) => {
+            // The payload is never printed: it carries the account's tokens.
+            tracing::warn!(
+                key_id,
+                "stored Cursor bundle does not decode; the account has no usable credential"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Replace one Cursor account's bundle when the stored one is still
+/// `expected` (compare-and-swap); same contract as [`replace_opencode_oauth`].
+/// The guard also pins `auth_kind`, so a row whose credential was replaced by
+/// another kind is never overwritten with a Cursor bundle.
+pub async fn replace_cursor_oauth(
+    pool: &PgPool,
+    key_id: i64,
+    expected: &CursorOAuth,
+    next: &CursorOAuth,
+) -> anyhow::Result<bool> {
+    next.validate()?;
+    let result = sqlx::query(
+        "UPDATE gateway_provider_keys SET oauth = $3
+         WHERE id = $1 AND auth_kind = 'cursor_oauth' AND oauth = $2",
     )
     .bind(key_id)
     .bind(serde_json::to_value(expected)?)

@@ -1051,6 +1051,7 @@ impl KiroTokens {
             body: bytes::Bytes::from(body),
             stream: false,
             headers,
+            cursor: None,
         };
         let deadline = Instant::now() + TOKEN_TIMEOUT;
         let response = self

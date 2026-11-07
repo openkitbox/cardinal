@@ -16,6 +16,7 @@ use regex::Regex;
 
 use super::optional;
 use crate::protocol::ProtocolError;
+use crate::upstream::cursor_tokens::CursorTokenError;
 use crate::upstream::kiro_tokens::KiroTokenError;
 use crate::upstream::opencode_tokens::OpencodeTokenError;
 use crate::upstream::transport::TransportError;
@@ -57,6 +58,9 @@ pub enum AttemptError {
     /// (a lazily refreshed token pair, or the row itself). Same contract as
     /// [`Self::KiroTokenError`]: the token module's own verdict — never a token.
     OpencodeTokenError(OpencodeTokenError),
+    /// The candidate's Cursor credential could not produce a bearer. Same
+    /// contract as [`Self::KiroTokenError`]: a verdict, never a token.
+    CursorTokenError(CursorTokenError),
     Protocol(ProtocolError),
 }
 
@@ -81,6 +85,7 @@ impl AttemptError {
             Self::AbortedStream => ProtocolError::UpstreamError.status(),
             Self::KiroTokenError(error) => error.client_status(),
             Self::OpencodeTokenError(error) => error.client_status(),
+            Self::CursorTokenError(error) => error.client_status(),
             Self::Protocol(error) => error.status(),
         }
     }
@@ -104,6 +109,7 @@ impl AttemptError {
             Self::AbortedStream => ProtocolError::UpstreamError.code(),
             Self::KiroTokenError(error) => error.code(),
             Self::OpencodeTokenError(error) => error.code(),
+            Self::CursorTokenError(error) => error.code(),
             Self::Protocol(error) => error.code(),
         }
     }
@@ -115,6 +121,7 @@ impl AttemptError {
             // Safe to surface: the token error carries no OAuth material.
             Self::KiroTokenError(error) => error.to_string(),
             Self::OpencodeTokenError(error) => error.to_string(),
+            Self::CursorTokenError(error) => error.to_string(),
             Self::Protocol(error) => format!("{error:?}"),
         }
     }
@@ -348,6 +355,15 @@ pub fn classify(error: &AttemptError) -> Failure {
                 OpencodeTokenError::Store
                 | OpencodeTokenError::Transport
                 | OpencodeTokenError::Client => Failure::Other,
+            };
+        }
+        // Same policy for a Cursor account: a dead credential is permanent and
+        // blameless; everything else is a transient credential-plane failure.
+        AttemptError::CursorTokenError(error) => {
+            return if error.is_permanent() {
+                Failure::Blameless
+            } else {
+                Failure::Other
             };
         }
         // Request-shape problems: the request itself is at fault.

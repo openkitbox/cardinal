@@ -32,7 +32,7 @@ hex = "0.4"
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "https-ring", "webpki-roots"] }
 nanoid = "0.5"
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "query", "http2"] }
 # mimalloc as the global allocator: frees pages back to the OS ~1s after a
 # burst (glibc retains them for the process lifetime). `no_thp` makes it
 # prctl(PR_SET_THP_DISABLE) itself — under a THP=[always] kernel (Debian 13)

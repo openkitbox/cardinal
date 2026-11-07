@@ -237,9 +237,12 @@ impl StreamTranslator {
                     None,
                 ));
             }
-            ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
-                // Kiro is an upstream-only target: it is never a translating
-                // client.
+            ProtocolId::Gemini
+            | ProtocolId::OpenAiEmbeddings
+            | ProtocolId::Kiro
+            | ProtocolId::Cursor => {
+                // Kiro and Cursor are upstream-only targets: never a
+                // translating client.
                 unreachable!("only the three chat protocols are translation clients")
             }
         }
@@ -318,7 +321,10 @@ impl StreamTranslator {
                     ProtocolId::OpenAiChat => {
                         out.push(chat_delta_chunk(&self.model, ChatDelta::Content(&delta)));
                     }
-                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
+                    ProtocolId::Gemini
+                    | ProtocolId::OpenAiEmbeddings
+                    | ProtocolId::Kiro
+                    | ProtocolId::Cursor => {
                         unreachable!("only the three chat protocols are translation clients")
                     }
                 }
@@ -392,7 +398,10 @@ impl StreamTranslator {
                     ProtocolId::OpenAiChat => {
                         out.push(chat_delta_chunk(&self.model, ChatDelta::Reasoning(&delta)));
                     }
-                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
+                    ProtocolId::Gemini
+                    | ProtocolId::OpenAiEmbeddings
+                    | ProtocolId::Kiro
+                    | ProtocolId::Cursor => {
                         unreachable!("only the three chat protocols are translation clients")
                     }
                 }
@@ -529,7 +538,10 @@ impl StreamTranslator {
                             }),
                         ));
                     }
-                    ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
+                    ProtocolId::Gemini
+                    | ProtocolId::OpenAiEmbeddings
+                    | ProtocolId::Kiro
+                    | ProtocolId::Cursor => {
                         unreachable!("only the three chat protocols are translation clients")
                     }
                 }
@@ -710,7 +722,10 @@ impl StreamTranslator {
                     data: Bytes::from_static(b"[DONE]"),
                 });
             }
-            ProtocolId::Gemini | ProtocolId::OpenAiEmbeddings | ProtocolId::Kiro => {
+            ProtocolId::Gemini
+            | ProtocolId::OpenAiEmbeddings
+            | ProtocolId::Kiro
+            | ProtocolId::Cursor => {
                 unreachable!("only the three chat protocols are translation clients")
             }
         }

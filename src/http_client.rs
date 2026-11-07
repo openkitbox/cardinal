@@ -300,6 +300,39 @@ pub struct OpencodeLoginStatus {
     pub message: Option<String>,
 }
 
+/// The body of `POST /api/providers/{id}/cursor-login`: the same shape as
+/// [`OpencodeLoginRequest`] (`key_id` re-authenticates an existing
+/// `cursor_oauth` account instead of creating one).
+pub type CursorLoginRequest = OpencodeLoginRequest;
+
+/// The answer of `POST /api/providers/{id}/cursor-login`: the URL the operator
+/// signs in on plus the session id to poll. There is no user code — the
+/// challenge travels inside the URL.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CursorLoginStart {
+    /// The login's registry id.
+    pub session: String,
+    /// Absolute `cursor.com` URL to open in a browser.
+    pub login_url: String,
+    /// Seconds the gateway keeps polling for the sign-in.
+    pub expires_in: u64,
+}
+
+/// The answer of `GET /api/cursor-logins/{session}`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CursorLoginStatus {
+    /// `waiting`, `succeeded`, `failed`, `expired` or `cancelled`.
+    pub state: String,
+    /// The account key a successful login landed on.
+    pub key_id: Option<i64>,
+    /// The signed-in account's email, when the gateway could read it.
+    pub email: Option<String>,
+    /// The selected team, when the account signed in as a team member.
+    pub team_id: Option<String>,
+    /// Why a login failed; the server's wording is already display-safe.
+    pub message: Option<String>,
+}
+
 /// HTTP client of the gateway's loopback admin API. Cheap to clone (the
 /// reqwest clients are shared).
 #[derive(Clone)]
@@ -1030,6 +1063,38 @@ impl GatewayHttpClient {
     /// cancellable: the server answers 404 and this returns an error.
     pub async fn cancel_opencode_login(&self, session: &str) -> Result<(), ClientError> {
         ok(self.delete(&format!("/api/opencode-logins/{session}"))).await
+    }
+
+    // ---------- Cursor account login ----------
+
+    /// Start a Cursor browser login. The gateway polls Cursor in the
+    /// background: follow it with [`Self::cursor_login_status`] and abandon a
+    /// waiting one with [`Self::cancel_cursor_login`].
+    pub async fn start_cursor_login(
+        &self,
+        provider_id: i64,
+        body: &CursorLoginRequest,
+    ) -> Result<CursorLoginStart, ClientError> {
+        json(
+            self.post(&format!("/api/providers/{provider_id}/cursor-login"))
+                .json(body),
+        )
+        .await
+    }
+
+    /// One browser login's state (never a token). An unknown session, or one
+    /// whose verdict aged out of the registry, answers 404.
+    pub async fn cursor_login_status(
+        &self,
+        session: &str,
+    ) -> Result<CursorLoginStatus, ClientError> {
+        json(self.get(&format!("/api/cursor-logins/{session}"))).await
+    }
+
+    /// Cancel a waiting browser login (204). A finished login is not
+    /// cancellable: the server answers 404 and this returns an error.
+    pub async fn cancel_cursor_login(&self, session: &str) -> Result<(), ClientError> {
+        ok(self.delete(&format!("/api/cursor-logins/{session}"))).await
     }
 
     /// Patch a key. Every unset field is left out of the body, so the server

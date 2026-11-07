@@ -105,6 +105,7 @@ pub fn prepare(
         body,
         stream,
         headers: Vec::new(),
+        cursor: None,
     })
 }
 

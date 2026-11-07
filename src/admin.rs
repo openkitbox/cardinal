@@ -16,6 +16,11 @@
 //!   a taken label → 409, a non-OpenCode provider or unknown group → 400)
 //! - `GET /api/opencode-logins/:session` → `{state, key_id, message}` (`waiting|succeeded|failed|expired|cancelled`, 404 once
 //!   the session is unknown or its verdict aged out) / `DELETE` cancels a waiting login (204; 404 when unknown or finished)
+//! - `POST /api/providers/:id/cursor-login` `{label, key_id?, group_ids?, max_concurrency?}` → 201 `{session, login_url,
+//!   expires_in}` — start a Cursor browser login (the operator opens `login_url`; `key_id` re-authenticates that account;
+//!   a taken label → 409, a non-Cursor provider or unknown group → 400)
+//! - `GET /api/cursor-logins/:session` → `{state, key_id, email, team_id, message}` (same states as OpenCode; never a
+//!   token) / `DELETE` cancels a waiting login (204; 404 when unknown or finished)
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
 //!   plaintext-serving endpoint; the list shape stays masked)
 //! - `POST /api/key-groups` `{name}` → `{id}`, `PATCH/DELETE /api/key-groups/:id` — account groups (409 on a taken name, 400 on an invalid one,
@@ -65,6 +70,7 @@ use salvo::sse::SseEvent;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::admin_ops::CursorLoginError;
 use crate::admin_ops::OpencodeLoginError;
 use crate::agent;
 use crate::credentials::{AuthKind, KeyCredential, resolve_key_credential};
@@ -186,9 +192,14 @@ fn admin(depot: &Depot) -> crate::admin_ops::Admin {
     )
     .with_kiro_tokens(Arc::clone(&state.kiro_tokens))
     .with_opencode_tokens(Arc::clone(&state.opencode_tokens))
+    .with_cursor_tokens(Arc::clone(&state.cursor_tokens))
     .with_opencode_login(
         Arc::clone(&state.opencode_client),
         state.opencode_logins.clone(),
+    )
+    .with_cursor_login(
+        Arc::clone(&state.cursor_client),
+        state.cursor_logins.clone(),
     )
     .with_dispatcher(state.dispatcher.clone())
 }
@@ -1657,6 +1668,12 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
                 .get(opencode_login_status)
                 .delete(cancel_opencode_login),
         )
+        .push(Router::with_path("providers/{id}/cursor-login").post(start_cursor_login))
+        .push(
+            Router::with_path("cursor-logins/{session}")
+                .get(cursor_login_status)
+                .delete(cancel_cursor_login),
+        )
         .push(
             Router::with_path("providers/{id}/keys/{key_id}")
                 .patch(patch_key)
@@ -1891,14 +1908,18 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
     // in-memory refresh under the key lock before the first dispatch.
     let created_kiro = match &credential {
         KeyCredential::KiroOidc(oauth) => Some(oauth.clone()),
-        KeyCredential::Static(_) | KeyCredential::OpencodeOauth(_) => None,
+        KeyCredential::Static(_)
+        | KeyCredential::OpencodeOauth(_)
+        | KeyCredential::CursorOauth(_) => None,
     };
     // The OpenCode bundle is adopted as imported: it came from this very
     // request, so there is no newer row to reconcile with and the first
     // dispatch needs no row read.
     let created_opencode = match &credential {
         KeyCredential::OpencodeOauth(oauth) => Some(oauth.clone()),
-        KeyCredential::Static(_) | KeyCredential::KiroOidc(_) => None,
+        KeyCredential::Static(_) | KeyCredential::KiroOidc(_) | KeyCredential::CursorOauth(_) => {
+            None
+        }
     };
     match crate::admin_ops::create_key(
         pool,
@@ -2090,6 +2111,100 @@ async fn cancel_opencode_login(request: &mut Request, depot: &mut Depot, respons
     }
 }
 
+/// `POST /api/providers/{id}/cursor-login` body: same shape as the OpenCode
+/// login body (`label`, optional `key_id` for a re-login, `group_ids`,
+/// `max_concurrency`).
+#[derive(serde::Deserialize)]
+struct CursorLoginBody {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    key_id: Option<i64>,
+    #[serde(default)]
+    group_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    max_concurrency: Option<i32>,
+}
+
+/// `POST /api/providers/{id}/cursor-login`: start a browser login and answer
+/// with the URL the operator opens. The login continues in the background.
+#[handler]
+async fn start_cursor_login(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(provider_id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid provider id");
+        return;
+    };
+    let Ok(body) = request.parse_json::<CursorLoginBody>().await else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid Cursor login body");
+        return;
+    };
+    let group_ids = body.group_ids.unwrap_or_default();
+    match admin(depot)
+        .start_cursor_login(
+            provider_id,
+            &body.label,
+            body.key_id,
+            &group_ids,
+            body.max_concurrency,
+        )
+        .await
+    {
+        Ok(started) => {
+            response.status_code(StatusCode::CREATED);
+            json_response(response, &started);
+        }
+        Err(
+            error @ (CursorLoginError::NotCursorProvider { .. } | CursorLoginError::Invalid(_)),
+        ) => {
+            bad_request(response, anyhow::Error::new(error));
+        }
+        Err(CursorLoginError::ProviderNotFound(_)) => not_found(response, "provider"),
+        Err(CursorLoginError::KeyNotFound(_)) => not_found(response, "Cursor account key"),
+        Err(CursorLoginError::LabelConflict(label)) => {
+            response.status_code(StatusCode::CONFLICT);
+            let _ = response.body(format!(
+                "a key with label {label:?} already exists on this provider"
+            ));
+        }
+        Err(CursorLoginError::Internal(error)) => internal(response, error),
+    }
+}
+
+/// `GET /api/cursor-logins/{session}`: the login's state (never a token).
+#[handler]
+async fn cursor_login_status(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(session) = request.param::<String>("session") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid login session");
+        return;
+    };
+    match admin(depot).cursor_login_status(&session) {
+        Ok(Some(state)) => json_response(response, &state.status()),
+        Ok(None) => not_found(response, "Cursor login session"),
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `DELETE /api/cursor-logins/{session}`: cancel a waiting login. A finished
+/// login is not cancellable and reads as unknown (404).
+#[handler]
+async fn cancel_cursor_login(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(session) = request.param::<String>("session") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid login session");
+        return;
+    };
+    match admin(depot).cancel_cursor_login(&session) {
+        Ok(true) => {
+            response.status_code(StatusCode::NO_CONTENT);
+        }
+        Ok(false) => not_found(response, "Cursor login session"),
+        Err(error) => internal(response, error),
+    }
+}
+
 #[handler]
 async fn upsert_kiro_key(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let Some(provider_id) = request.param::<i64>("id") else {
@@ -2195,6 +2310,10 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
             // serving a bearer the row no longer authorizes. One cache miss
             // afterwards costs a single row read, never a refresh.
             state(depot).opencode_tokens.forget(key_id);
+            // Same for a Cursor row: its cached bearer came from the credential
+            // the patch may just have replaced (a static key's exchanged
+            // token included).
+            state(depot).cursor_tokens.forget(key_id);
             let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
@@ -2315,6 +2434,10 @@ async fn delete_key(request: &mut Request, depot: &mut Depot, response: &mut Res
                 // and a deleted row must never authenticate again.
                 state(depot).opencode_tokens.forget(key_id);
             }
+            // A Cursor bearer may be cached for a `cursor_oauth` row or for a
+            // `static` key on a Cursor provider; the cache is keyed by row, so
+            // forgetting an id that was never cached is a no-op.
+            state(depot).cursor_tokens.forget(key_id);
             let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }

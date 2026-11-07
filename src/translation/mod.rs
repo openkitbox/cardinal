@@ -10,9 +10,11 @@
 //! Chat, and Responses → Anthropic Messages (Responses as a *client* only —
 //! nothing translates into a Responses upstream; the kimi arm routes every
 //! upstream connection over Anthropic, so a Responses client on kimi needs
-//! this pair). Kiro opens one more: Chat → Kiro, an upstream-only dialect.
+//! this pair). Kiro opens one more: Chat → Kiro, an upstream-only dialect;
+//! Cursor the same: Chat → Cursor.
 
 pub mod anthropic_messages;
+pub mod cursor;
 pub mod effort_clamp;
 pub mod ir;
 pub mod kiro;
@@ -35,6 +37,8 @@ const OPENED: &[(ProtocolId, ProtocolId)] = &[
     // Kiro is a translation target only: nothing serves Kiro's wire inbound,
     // so it never appears as the `from` side of a pair.
     (ProtocolId::OpenAiChat, ProtocolId::Kiro),
+    // Cursor likewise: a target only, reached from Chat.
+    (ProtocolId::OpenAiChat, ProtocolId::Cursor),
 ];
 
 pub fn translatable(from: ProtocolId, to: ProtocolId) -> bool {
@@ -45,11 +49,12 @@ pub fn translatable(from: ProtocolId, to: ProtocolId) -> bool {
 }
 
 /// The dialects that take part in translation.
-pub const MATRIX_DIALECTS: [ProtocolId; 4] = [
+pub const MATRIX_DIALECTS: [ProtocolId; 5] = [
     ProtocolId::OpenAiChat,
     ProtocolId::AnthropicMessages,
     ProtocolId::OpenAiResponses,
     ProtocolId::Kiro,
+    ProtocolId::Cursor,
 ];
 
 /// Parse result: the IR plus structured notes on concepts that did not survive.
@@ -106,6 +111,15 @@ pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
             from_ir: kiro::from_ir,
             emit_response_json: kiro::emit_response_json,
             response_to_ir: kiro::response_to_ir,
+        }),
+        // Target-only as well: `from_ir` stages the Run's conversation and
+        // `response_to_ir` decodes its Connect frames; the ingress half
+        // refuses.
+        ProtocolId::Cursor => Some(Dialect {
+            to_ir: cursor::to_ir,
+            from_ir: cursor::from_ir,
+            emit_response_json: cursor::emit_response_json,
+            response_to_ir: cursor::response_to_ir,
         }),
     }
 }
