@@ -1357,6 +1357,11 @@ fn prepare_translated(
         // A Cursor Run is always a stream on the wire (the relay aggregates
         // for a non-streaming client), so the Chat `stream` field is never
         // injected; the Max Mode flag is the only per-attempt knob.
+        //
+        // This is Max Mode's only writer: the retry loop decides to ask for
+        // it when Cursor refuses a model without it, `from_ir` leaves the
+        // field out of the staged body, and the kernel's `unwrap_or(false)`
+        // reads that absence as off, so the default needs no writing.
         if tweaks.cursor_max_mode {
             upstream_value["max_mode"] = Value::Bool(true);
         }

@@ -1,11 +1,18 @@
 //! The Cursor downlink: `AgentServerMessage` frames → [`StreamEvent`]s, usage
 //! and the Run's terminal verdict.
 //!
-//! One [`StreamDecoder`] observes every Connect frame of one Run. Two readers
-//! share it: the translated relay pump (`Decoder::Cursor`), which forwards the
-//! events to the client, and the Run driver (`upstream::cursor_run`), which
-//! only needs to know when the Run is over so it can close both HTTP legs.
-//! Both see the same bytes, so both reach the same verdict.
+//! Each reader of a Run has a [`StreamDecoder`] of its own: the translated
+//! relay pump (`Decoder::Cursor`), which turns the frames into the events the
+//! client sees; the Run driver (`upstream::cursor_run`), which needs to know
+//! when the Run is over so it can close both HTTP legs and report the sizes
+//! it produced; and [`aggregate`], which decodes a whole buffered body for the
+//! non-streaming path. The pump and the driver read the same live frames
+//! through two instances rather than one shared decoder deliberately: the
+//! driver must reach its verdict whether or not anyone is still reading, and
+//! the two have different lifetimes. Both see the same bytes, so both reach
+//! the same verdict. Only the pump reads events; the driver's decoder and
+//! [`aggregate`]'s run under [`Emission::Silent`], which keeps the state and
+//! skips the events.
 //!
 //! A stateless Run (plan D2) ends in exactly one of these ways:
 //!
@@ -46,6 +53,24 @@ pub enum Retention {
     CountsOnly,
     /// Buffered ([`aggregate`]): the text and reasoning are kept for the IR.
     Full,
+}
+
+/// Whether a [`StreamDecoder`] builds the [`StreamEvent`]s its state implies.
+///
+/// A reader that consults only the decoder's state — whether the Run is over,
+/// how it failed, what it counted and collected — would otherwise allocate a
+/// `String` per text and reasoning delta, and copies per tool call, and drop
+/// them unread. Under [`Emission::Silent`] no event is built: the counters,
+/// the retained content, the tool tracking and every state transition happen
+/// as they do under [`Emission::Events`], and [`StreamDecoder::observe`]
+/// returns no events.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Emission {
+    /// The events are read (the relay pump turns them into client frames).
+    #[default]
+    Events,
+    /// Only the decoder's state is read: no event is built.
+    Silent,
 }
 
 /// One tool call the model made: a `CallDynamicTool` exec, decoded to the
@@ -91,6 +116,7 @@ enum ExecKind {
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     retention: Retention,
+    emission: Emission,
     text: String,
     reasoning: String,
     text_chars: usize,
@@ -133,6 +159,24 @@ impl StreamDecoder {
             retention,
             ..Self::default()
         }
+    }
+
+    /// A decoder for a reader that only consults the state: the Run driver
+    /// (the terminal verdict, the failure, the report's counts) and
+    /// [`aggregate`] (the buffered body's content, tool calls and usage).
+    /// Neither looks at an event.
+    #[must_use]
+    pub fn silent(retention: Retention) -> Self {
+        Self {
+            retention,
+            emission: Emission::Silent,
+            ..Self::default()
+        }
+    }
+
+    /// Whether this decoder builds events at all.
+    fn emits(&self) -> bool {
+        self.emission == Emission::Events
     }
 
     /// Observe one Connect frame.
@@ -242,7 +286,9 @@ impl StreamDecoder {
                         if self.retention == Retention::Full {
                             self.text.push_str(text);
                         }
-                        events.push(StreamEvent::TextDelta(text.to_owned()));
+                        if self.emits() {
+                            events.push(StreamEvent::TextDelta(text.to_owned()));
+                        }
                     }
                 }
                 msg::UPDATE_THINKING_DELTA => {
@@ -252,7 +298,9 @@ impl StreamDecoder {
                         if self.retention == Retention::Full {
                             self.reasoning.push_str(text);
                         }
-                        events.push(StreamEvent::ReasoningDelta(text.to_owned()));
+                        if self.emits() {
+                            events.push(StreamEvent::ReasoningDelta(text.to_owned()));
+                        }
                     }
                 }
                 msg::UPDATE_TURN_ENDED => {
@@ -315,7 +363,10 @@ impl StreamDecoder {
                 false
             }
             msg::UPDATE_PARTIAL_TOOL_CALL => {
-                self.partial.insert(id.to_owned());
+                // One update per streamed argument chunk: own the id once.
+                if !self.partial.contains(id) {
+                    self.partial.insert(id.to_owned());
+                }
                 false
             }
             _ => {
@@ -369,12 +420,14 @@ impl StreamDecoder {
                 let call = call.ok_or(CursorError::Malformed)?;
                 let index = u32::try_from(self.tools.len()).map_err(|_| CursorError::Malformed)?;
                 self.argument_chars += call.arguments.chars().count();
-                events.push(StreamEvent::ToolCallDelta {
-                    index,
-                    id: Some(call.id.clone()),
-                    name: Some(call.name.clone()),
-                    arguments: call.arguments.clone(),
-                });
+                if self.emits() {
+                    events.push(StreamEvent::ToolCallDelta {
+                        index,
+                        id: Some(call.id.clone()),
+                        name: Some(call.name.clone()),
+                        arguments: call.arguments.clone(),
+                    });
+                }
                 self.tools.push(call);
             }
             ExecKind::Answered => self.answered += 1,
@@ -430,12 +483,17 @@ impl StreamDecoder {
     }
 
     /// Mark the Run done and produce its finish event, preceded by the
-    /// turn's inline usage (`#14`) when the turn ended with counters.
+    /// turn's inline usage (`#14`) when the turn ended with counters. Under
+    /// [`Emission::Silent`] the step is marked done just the same and no
+    /// event is built.
     fn finish_step(&mut self) -> Vec<StreamEvent> {
         if self.done {
             return Vec::new();
         }
         self.done = true;
+        if !self.emits() {
+            return Vec::new();
+        }
         let mut events = Vec::with_capacity(2);
         if let Some(usage) = self.usage() {
             events.push(StreamEvent::Usage(usage));
@@ -893,7 +951,7 @@ pub fn aggregate(body: &[u8]) -> Result<StreamDecoder, ProtocolError> {
     let mut framer = super::connect::Framer::new();
     let frames = framer.push(body)?;
     framer.finish()?;
-    let mut decoder = StreamDecoder::new(Retention::Full);
+    let mut decoder = StreamDecoder::silent(Retention::Full);
     for frame in &frames {
         decoder.observe(frame)?;
     }

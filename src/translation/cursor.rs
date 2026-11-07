@@ -30,8 +30,19 @@
 //! is one of Cursor's own usable ids (`claude-opus-5-5-high`,
 //! `gpt-5.6-fast`, …), which already name their effort and speed, so the
 //! client's `reasoning_effort` is dropped (recorded) rather than re-derived
-//! without the catalog. Max Mode is off by default; the relay retries once
-//! with it on when Cursor says the model requires it.
+//! without the catalog. Max Mode is not staged here at all: whether an
+//! attempt asks for it is the relay's decision, taken when Cursor refuses a
+//! model without it, and an unstaged flag reads as off.
+//!
+//! The staged prompt is measured in characters (`prompt_chars`), the size the
+//! relay divides into the token estimate a Run without reported usage is
+//! billed by. Deliberate deviation: the reference measures UTF-16 code units
+//! (JavaScript's `String.length`) where this measures Unicode scalar values,
+//! so a character outside the Basic Multilingual Plane (most emoji, and the
+//! rarer supplementary-plane ideographs) counts one here and two there.
+//! Everything in the plane — the common CJK that actually moves the
+//! estimate, all Latin, Cyrillic, Greek, Hangul and kana — counts the same
+//! in both.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -70,7 +81,7 @@ pub fn from_ir(request: &IrRequest, model: &str) -> super::Parsed<Value> {
         text
     };
     if !system.is_empty() {
-        staging.size += system.len();
+        staging.size += system.chars().count();
         staging.push(json!({"role": "system", "content": system}));
     }
     for message in &request.messages {
@@ -81,7 +92,8 @@ pub fn from_ir(request: &IrRequest, model: &str) -> super::Parsed<Value> {
     }
     staging.close_turn();
     for tool in &request.tools {
-        staging.size += tool.name.len() + tool.description.len() + tool.schema.to_string().len();
+        staging.size +=
+            tool.name.chars().count() + tool.description.chars().count() + json_chars(&tool.schema);
     }
 
     let key = request
@@ -115,7 +127,6 @@ pub fn from_ir(request: &IrRequest, model: &str) -> super::Parsed<Value> {
         .collect();
     let staged = json!({
         "model": model,
-        "max_mode": false,
         "params": [],
         "messages": staging.messages,
         "last_user": staging.last_user.unwrap_or_else(|| ".".to_owned()),
@@ -143,7 +154,9 @@ struct Staging {
     /// Index in `messages` of the first user message, which salts the
     /// conversation id. `messages` is append-only, so the index stays valid.
     first_user: Option<usize>,
-    /// Characters of prompt content, for the usage estimate.
+    /// Characters of staged prompt content (Unicode scalar values), the size
+    /// the relay turns into the token estimate for a Run Cursor reports no
+    /// usage for.
     size: usize,
 }
 
@@ -171,12 +184,12 @@ impl Staging {
         for part in &message.parts {
             match part {
                 IrPart::Thinking { text } if !text.is_empty() => {
-                    self.size += text.len();
+                    self.size += text.chars().count();
                     content.push(json!({"type": "reasoning", "text": text}));
                 }
                 IrPart::Thinking { .. } => {}
                 IrPart::Text(text) if !text.is_empty() => {
-                    self.size += text.len();
+                    self.size += text.chars().count();
                     content.push(json!({"type": "text", "text": text}));
                 }
                 IrPart::Text(_) => {}
@@ -185,7 +198,7 @@ impl Staging {
                         .clone()
                         .filter(|id| !id.is_empty())
                         .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
-                    self.size += name.len() + args.to_string().len();
+                    self.size += name.chars().count() + json_chars(args);
                     content.push(json!({
                         "type": "tool-call",
                         "toolCallId": call_id(&wire_id),
@@ -216,7 +229,7 @@ impl Staging {
             {
                 if let Some(position) = self.pending.iter().position(|pending| pending == id) {
                     self.pending.remove(position);
-                    self.size += text.len();
+                    self.size += text.chars().count();
                     self.results.push(tool_result(id, text, *is_error));
                 } else {
                     dropped.push("unpaired_tool_result");
@@ -231,7 +244,7 @@ impl Staging {
         for part in &message.parts {
             match part {
                 IrPart::Text(text) if !text.is_empty() => {
-                    self.size += text.len();
+                    self.size += text.chars().count();
                     first_text.get_or_insert_with(|| text.clone());
                     content.push(json!({"type": "text", "text": text}));
                 }
@@ -397,6 +410,34 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Characters of a value's JSON encoding, counted as it is serialized:
+/// `serde_json::to_writer(&mut CountChars, ..)` measures the text the Run
+/// will carry with no intermediate `String`.
+#[derive(Default)]
+struct CountChars(usize);
+
+impl std::io::Write for CountChars {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        // Every UTF-8 character starts with a byte that is not a
+        // continuation byte, so the leading bytes are the characters.
+        self.0 += bytes.iter().filter(|b| *b & 0xC0 != 0x80).count();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The character length of `value`'s JSON encoding. The writer is
+/// infallible and a `Value` always serializes, so the discarded error can
+/// never be produced.
+fn json_chars(value: &Value) -> usize {
+    let mut counter = CountChars::default();
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
 }
 
 fn record_request_losses(request: &IrRequest, dropped: &mut Vec<&'static str>) {

@@ -9,7 +9,6 @@
 //! ```json
 //! {
 //!   "model": "<legacy slug Cursor accepts>",
-//!   "max_mode": false,
 //!   "params": [{"id": "effort", "value": "high"}],
 //!   "messages": [ <AI SDK messages, one blob each> ],
 //!   "last_user": "<the last user message's first text>",
@@ -18,6 +17,29 @@
 //!   "prompt_chars": 1234
 //! }
 //! ```
+//!
+//! Three of those fields are the contract and a body missing one of them is
+//! refused: `model` (non-empty), `messages`, and `prompt_chars`.
+//! `prompt_chars` is required because it is the sole basis of the usage
+//! estimate a Run whose usage the backend never reports is billed by —
+//! treating an absent count as zero would bill the whole request as having
+//! had no input, and say nothing. The rest are tolerated when absent:
+//! `params` and `tools` empty, `last_user` a lone `.`, and an absent or
+//! empty `conversation_id` mints a fresh one.
+//!
+//! One optional field is not `from_ir`'s to emit: `max_mode`. Whether a Run
+//! asks for Max Mode is a per-attempt decision — the relay learns the model
+//! needs it from Cursor's refusal and repeats the attempt with the flag set —
+//! so the relay is the field's only writer and only ever writes `true`.
+//! Absence is the ordinary case and means off, which is what the
+//! `unwrap_or(false)` below stands for.
+//!
+//! The body is read field by field off a borrowed [`Value`] rather than
+//! deserialized into a struct: [`prepare`] is handed a `&Value`, so
+//! `serde_json::from_value` would have to own it and deep-copy the entire
+//! conversation — every message and every blob — once per request. Reading
+//! through [`Value::get`] borrows it in place, and only what reaches the
+//! wire is copied.
 //!
 //! [`prepare`] renders the `AgentRunRequest` (plan §2.4), content-addresses
 //! every message blob (`sha256`), and returns a [`Prepared`] addressed at the
@@ -232,7 +254,7 @@ pub fn prepare(
     let prompt_chars = body
         .get("prompt_chars")
         .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .ok_or(ProtocolError::InvalidRequest)?;
 
     let mut blobs: Vec<(Vec<u8>, Bytes)> = Vec::with_capacity(messages.len() + 2);
     let mut put = |content: Vec<u8>| -> Vec<u8> {

@@ -404,7 +404,7 @@ async fn finish_open(
     let heard = Arc::new(AtomicBool::new(false));
     let driver = Driver {
         plan: Arc::clone(plan),
-        decoder: StreamDecoder::new(Retention::CountsOnly),
+        decoder: StreamDecoder::silent(Retention::CountsOnly),
         frames_tx,
         uplink_tx,
         first_tx: Some(first_tx),
@@ -470,6 +470,13 @@ fn append_headers(
 /// The downlink side of one Run.
 struct Driver {
     plan: Arc<RunPlan>,
+    /// The driver's own state machine, separate from the relay pump's
+    /// (`protocol::Decoder::Cursor`) even though both read the same frames.
+    /// The driver must decide when to close both legs whether or not the
+    /// relay is still reading, and it outlives the pump when the client goes
+    /// away mid-Run, so the verdict cannot be borrowed from the other side.
+    /// It reads only the state — the terminal, the failure, the report's
+    /// counts — so it runs silent: no event is built for it to drop.
     decoder: StreamDecoder,
     frames_tx: mpsc::Sender<Result<WireFrame, TransportError>>,
     uplink_tx: mpsc::Sender<Outbound>,
@@ -645,7 +652,9 @@ impl Driver {
                 tracing::warn!(request_id = %self.plan.request_id, %error, "Cursor server message could not be answered");
             }
         }
-        // The driver's own copy of the state machine: termination only.
+        // The driver's own copy of the state machine. Its outcome — done,
+        // broken, failure — lives in the decoder's state and is read below;
+        // running silent, it returns no events, so nothing is dropped here.
         let _ = self.decoder.observe(&frame);
         if frame.is_end()
             && let Some(failure) = self.decoder.failure()
