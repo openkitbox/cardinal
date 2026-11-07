@@ -115,7 +115,8 @@ pub struct StreamDecoder {
     /// Calls completed by Cursor itself (`#3` with no exec and no start).
     by_cursor: HashSet<String>,
     turn_ended: bool,
-    usage: Option<UsageCounts>,
+    /// `#14`: the turn's total, and the only inline usage Cursor sends.
+    turn_usage: Option<UsageCounts>,
     /// The step is over (any of the module-level terminal conditions).
     done: bool,
     /// The end frame arrived cleanly after (or as) the terminal.
@@ -255,7 +256,12 @@ impl StreamDecoder {
                     }
                 }
                 msg::UPDATE_TURN_ENDED => {
-                    self.usage = Some(turn_usage(update)?);
+                    // A turn that ends without counters leaves `turn_usage`
+                    // unset, so the dashboard (or an estimate) still speaks
+                    // for the Run.
+                    if let Some(usage) = decode_turn_usage(update)? {
+                        self.turn_usage = Some(usage);
+                    }
                     self.turn_ended = true;
                     if self.tools.is_empty() {
                         if self.empty_reply() {
@@ -423,16 +429,16 @@ impl StreamDecoder {
         false
     }
 
-    /// Mark the Run done and produce its finish event (plus the inline usage
-    /// when the turn ended with one).
+    /// Mark the Run done and produce its finish event, preceded by the
+    /// turn's inline usage (`#14`) when the turn ended with counters.
     fn finish_step(&mut self) -> Vec<StreamEvent> {
         if self.done {
             return Vec::new();
         }
         self.done = true;
         let mut events = Vec::with_capacity(2);
-        if let Some(usage) = &self.usage {
-            events.push(StreamEvent::Usage(usage.clone()));
+        if let Some(usage) = self.usage() {
+            events.push(StreamEvent::Usage(usage));
         }
         events.push(StreamEvent::Finish {
             reason: self.finish_reason().to_owned(),
@@ -499,11 +505,12 @@ impl StreamDecoder {
             .count()
     }
 
-    /// The inline usage of a turn that ended; `None` for a tool step (its
-    /// usage comes from the dashboard, or an estimate — never from here).
+    /// The inline usage of a turn that ended with counters; `None` for a tool
+    /// step and for a counter-less turn (the dashboard, or an estimate, then
+    /// stands in — never this).
     #[must_use]
     pub fn usage(&self) -> Option<UsageCounts> {
-        self.usage.clone()
+        self.turn_usage.clone()
     }
 
     #[must_use]
@@ -585,40 +592,55 @@ pub fn is_heartbeat(frame: &Frame) -> bool {
     any
 }
 
-/// `TurnEndedUpdate` → usage. `input_tokens` is the uncached rest
-/// (`input − cache_read − cache_write`, floored at zero), the cache quantities
-/// ride as evidence, and reasoning is a sub-item of output.
-fn turn_usage(body: &[u8]) -> Result<UsageCounts, CursorError> {
-    let mut input = 0u64;
-    let mut output = 0u64;
-    let mut cache_read = 0u64;
-    let mut cache_write = 0u64;
-    let mut reasoning = 0u64;
+/// `TurnEndedUpdate` → usage. `input_tokens` is Cursor's whole prompt, the
+/// cache read and the cache write included — exactly the kernel's prompt
+/// total; the two cache quantities are listed beside it and never subtracted
+/// (the price splits the total). Reasoning is a sub-item of output.
+///
+/// `None` unless the update reports a billable total. `input_tokens` and
+/// `output_tokens` are what the ledger prices (`ModelPrice::cost_split`);
+/// every field is `optional` in the schema, and a turn that ends without
+/// both of them reports nothing rather than zero — the vendor CLI skips its
+/// own usage record on exactly this condition. A zero total would read as
+/// "observed, and free", which charges nothing *and* hides the Run from the
+/// dashboard and the estimate, so a turn carrying only a cache or reasoning
+/// counter is reconciled rather than believed. A counter the update omits
+/// beside a real total stays `None`: the ledger records "not reported",
+/// never a measured zero (`protocol::usage`).
+fn decode_turn_usage(body: &[u8]) -> Result<Option<UsageCounts>, CursorError> {
+    let mut input = None;
+    let mut output = None;
+    let mut cache_read = None;
+    let mut cache_write = None;
+    let mut reasoning = None;
     for field in Reader::new(body) {
         let field = field?;
         let FieldValue::Varint(value) = field.value else {
             continue;
         };
         match field.number {
-            msg::TURN_INPUT => input = value,
-            msg::TURN_OUTPUT => output = value,
-            msg::TURN_CACHE_READ => cache_read = value,
-            msg::TURN_CACHE_WRITE => cache_write = value,
-            msg::TURN_REASONING => reasoning = value,
+            msg::TURN_INPUT => input = Some(value),
+            msg::TURN_OUTPUT => output = Some(value),
+            msg::TURN_CACHE_READ => cache_read = Some(value),
+            msg::TURN_CACHE_WRITE => cache_write = Some(value),
+            msg::TURN_REASONING => reasoning = Some(value),
             _ => {}
         }
+    }
+    if input.is_none() && output.is_none() {
+        return Ok(None);
     }
     // `TurnEndedUpdate.input` already counts the cache read and the cache
     // write, which is exactly the kernel's prompt total; the two cache parts
     // are listed beside it, never subtracted (the price splits the total).
-    Ok(UsageCounts {
-        input_tokens: input,
-        output_tokens: output,
-        cached_input_tokens: Some(cache_read),
-        cache_creation_input_tokens: Some(cache_write),
-        reasoning_output_tokens: (reasoning > 0).then_some(reasoning),
+    Ok(Some(UsageCounts {
+        input_tokens: input.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+        cached_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_write,
+        reasoning_output_tokens: reasoning,
         ..UsageCounts::default()
-    })
+    }))
 }
 
 /// `McpArgs` → the caller's tool call. The model calls `CallDynamicTool`

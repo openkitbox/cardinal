@@ -84,12 +84,24 @@ pub fn from_ir(request: &IrRequest, model: &str) -> super::Parsed<Value> {
         staging.size += tool.name.len() + tool.description.len() + tool.schema.to_string().len();
     }
 
-    let conversation_id = request
+    let key = request
         .prompt_cache_key
         .as_deref()
-        .filter(|key| !key.trim().is_empty())
-        .map(|key| conversation_id(key.trim(), staging.first_user.as_ref()))
-        .unwrap_or_default();
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    let first_user = staging
+        .first_user
+        .and_then(|index| staging.messages.get(index));
+    // A seed needs something of the conversation in it. With no key, no
+    // system prompt and no user content there is nothing to group by, and a
+    // constant hash would put every such Run under one id; leaving the id
+    // empty lets the kernel mint a fresh one instead.
+    let seed = key.unwrap_or(&system);
+    let conversation_id = if seed.is_empty() && first_user.is_none() {
+        String::new()
+    } else {
+        conversation_id(seed, first_user)
+    };
     let tools: Vec<Value> = request
         .tools
         .iter()
@@ -128,8 +140,9 @@ struct Staging {
     results: Vec<Value>,
     /// The first text of the latest user turn (the Run's `user` blob).
     last_user: Option<String>,
-    /// The first user message as staged (the conversation id's salt).
-    first_user: Option<Value>,
+    /// Index in `messages` of the first user message, which salts the
+    /// conversation id. `messages` is append-only, so the index stays valid.
+    first_user: Option<usize>,
     /// Characters of prompt content, for the usage estimate.
     size: usize,
 }
@@ -262,11 +275,10 @@ impl Staging {
             self.last_user = Some(text);
         }
         if !content.is_empty() {
-            let message = json!({"role": "user", "content": content});
             if self.first_user.is_none() {
-                self.first_user = Some(message.clone());
+                self.first_user = Some(self.messages.len());
             }
-            self.push(message);
+            self.push(json!({"role": "user", "content": content}));
         }
     }
 }
@@ -319,15 +331,35 @@ fn catalog(tools: &[IrTool]) -> String {
     text
 }
 
-/// The Run's `conversation_id` for a prompt-cache key: stable across the
-/// requests of one conversation, so Cursor's backend keeps routing it to the
-/// machine holding its prompt cache (reference `conversationID`). A version-4
-/// UUID made of `sha256("cursor conversation\0" + key + "\0" + first user
-/// message)`.
-fn conversation_id(key: &str, first_user: Option<&Value>) -> String {
+/// The Run's `conversation_id`: stable across the requests of one
+/// conversation, so Cursor's backend keeps routing it to the machine holding
+/// its prompt cache (reference `conversationID`). A version-4 UUID made of
+/// `sha256("cursor conversation\0" + seed + "\0" + first user message)`,
+/// where the seed is the client's prompt-cache key.
+///
+/// Without a key the system prompt (system text plus tool catalog) is the
+/// seed: a best-effort grouping, under which conversations on one Cursor
+/// account with an identical opening (system text, tool catalog and first
+/// user message) share an id. It never shares content — every Run carries
+/// its whole history and blobs are content-addressed — the trade-off Kiro's
+/// fallback makes too. The id changes when the client changes its tools or
+/// rewrites the opening (history compaction), but then the cached prefix
+/// changes as well.
+///
+/// The id is also the key the dashboard reconciliation matches on
+/// (`upstream::cursor_usage`), which claims the oldest unclaimed event of a
+/// conversation. Two Runs sharing a derived id and overlapping in the
+/// window can therefore take each other's event; the `claimed` map still
+/// bounds the error to one step's tokens, and no event is counted twice.
+///
+/// Deliberate deviation: the reference leaves the id empty without a key,
+/// since a first message alone ("hi") would put strangers' conversations
+/// under one id. Here the whole system prompt seeds it too, and clients such
+/// as ox send no key, so one is derived.
+fn conversation_id(seed: &str, first_user: Option<&Value>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"cursor conversation\0");
-    hasher.update(key.as_bytes());
+    hasher.update(seed.as_bytes());
     hasher.update(b"\0");
     if let Some(first) = first_user {
         hasher.update(first.to_string().as_bytes());

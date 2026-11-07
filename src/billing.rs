@@ -18,7 +18,7 @@
 //! Certainty: [`UsageCertainty::Unknown`] is never treated as zero. Callers
 //! do not charge an unknown attempt, but they must warn about it. There is
 //! no stored "estimated" flag: a charge on estimated usage is recognisable
-//! from the ledger row's upstream `protocol = 'kiro'`.
+//! from the ledger row's upstream `protocol` (`'kiro'` or `'cursor'`).
 //!
 //! Division of labour with `api::refusal`: authentication decides whether an
 //! identity is valid (key/user enabled, not expired); [`admit`] decides
@@ -215,8 +215,8 @@ pub fn charge_microus(cost_microus: i64, rate_bp: i64) -> i64 {
 
 /// Amount to debit for one successful attempt, or `None` for "do not
 /// charge": unknown usage, no cost (unpriced model), or a cost that cannot
-/// be converted. Estimated usage (Kiro) is charged like known usage. A zero
-/// rate yields `Some(0)` — a charged-at-zero row, not an unbilled one.
+/// be converted. Estimated usage (Kiro, Cursor) is charged like known usage.
+/// A zero rate yields `Some(0)` — a charged-at-zero row, not an unbilled one.
 #[must_use]
 pub fn attempt_charge(
     cost_usd: Option<f64>,
@@ -233,7 +233,9 @@ pub fn attempt_charge(
 }
 
 /// How far the observed usage can be trusted. No usage is `Unknown`; Kiro
-/// token counts are local estimates (see `protocol::kiro`), so `Estimated`.
+/// and Cursor are `Estimated` at the protocol level (Kiro's token counts are
+/// local estimates, see `protocol::kiro`; a Cursor Run that reports nothing
+/// inline falls back to the dashboard or an estimate).
 /// Takes whether usage was observed rather than the counts themselves: the
 /// non-streaming path holds `UsageCounts`, the streaming path its own
 /// `StreamUsage` summary, and only presence matters here.
@@ -243,9 +245,10 @@ pub fn certainty(usage_observed: bool, upstream: ProtocolId) -> UsageCertainty {
         return UsageCertainty::Unknown;
     }
     match upstream {
-        // Cursor reports exact counts only for a turn without tool calls; a
-        // tool step's usage is reconciled from the dashboard or estimated.
-        // Classified at the protocol level as Estimated (plan D10).
+        // Cursor reports exact counts inline when a turn ends with them
+        // (`#14`); a tool step has none, so its usage is reconciled from the
+        // dashboard or estimated.
+        // Classified at the protocol level as Estimated (plan D4).
         ProtocolId::Kiro | ProtocolId::Cursor => UsageCertainty::Estimated,
         ProtocolId::OpenAiChat
         | ProtocolId::OpenAiResponses

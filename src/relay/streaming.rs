@@ -73,7 +73,8 @@ pub(super) enum RelayOutcome {
 /// A Cursor Run's settlement handle: the Run's report (delivered once the Run
 /// closes), the bearer it ran under (the dashboard is read as that account)
 /// and the process's reconciler. Carried from the attempt to the settlement
-/// task so the ledger row of a tool step can take the dashboard's count.
+/// task so the ledger row of a Run that carried no usage inline can take the
+/// dashboard's count.
 pub(super) struct CursorHandle {
     pub(super) report: tokio::sync::oneshot::Receiver<crate::upstream::cursor_run::RunReport>,
     pub(super) bearer: std::sync::Arc<crate::upstream::cursor_tokens::CursorBearer>,
@@ -82,9 +83,11 @@ pub(super) struct CursorHandle {
 }
 
 impl CursorHandle {
-    /// The Run's usage when the stream carried none: the dashboard's count
-    /// when it shows in time, else the reference's estimate from the Run's
-    /// sizes. `None` only when the Run's driver died without a report.
+    /// The Run's usage: what it reported inline (`#14` when the turn ended
+    /// with counters),
+    /// else the dashboard's count when it shows in time, else the reference's
+    /// estimate from the Run's sizes. `None` only when the Run's driver died
+    /// without a report.
     pub(super) async fn settle(self) -> Option<crate::protocol::usage::UsageCounts> {
         use crate::upstream::cursor_usage::{self, Resolved};
         // The report follows the last frame by microseconds; the bound only

@@ -92,9 +92,12 @@ pub struct RunReport {
     pub prompt_chars: u64,
     /// Characters the model produced (text, reasoning, tool arguments).
     pub output_chars: u64,
-    /// The turn's inline usage, when Cursor sent one (no tool calls).
+    /// The Run's inline usage, when Cursor sent any: the turn total (`#14`)
+    /// for a turn that ended with counters. `None` for a tool step and for a
+    /// counter-less turn — then the settlement reconciles from the dashboard
+    /// or estimates.
     pub inline_usage: Option<UsageCounts>,
-    /// Whether the step called tools (its usage is not inline).
+    /// Whether the step called tools.
     pub called_tools: bool,
 }
 

@@ -19,6 +19,11 @@ pub const CLIENT_KV: u32 = 3;
 pub const CLIENT_EXEC_CONTROL: u32 = 5;
 pub const CLIENT_HEARTBEAT: u32 = 7;
 
+// ---- AgentRunRequest ---------------------------------------------------------
+
+/// `AgentRunRequest.client_supports_inline_images`.
+pub const RUN_CLIENT_SUPPORTS_INLINE_IMAGES: u32 = 19;
+
 // ---- AgentServerMessage ------------------------------------------------------
 
 pub const SERVER_INTERACTION_UPDATE: u32 = 1;

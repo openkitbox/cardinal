@@ -311,7 +311,7 @@ pub fn prepare(
     run_request.message(4, mcp_tools);
     run_request.string(5, &conversation_id);
     run_request.message(9, requested);
-    run_request.varint(19, 1); // client_supports_inline_images
+    run_request.varint(msg::RUN_CLIENT_SUPPORTS_INLINE_IMAGES, 1);
     let mut first = Writer::new();
     first.message(msg::CLIENT_RUN_REQUEST, run_request);
     let run_request = first.into_bytes();

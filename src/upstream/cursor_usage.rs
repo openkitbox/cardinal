@@ -2,7 +2,10 @@
 //!
 //! A Run that calls the caller's tools ends without a `TurnEndedUpdate`:
 //! Cursor counts the turn only after the tools ran, and the relay closes the
-//! Run before that. The account's dashboard still counts every Run, by its
+//! Run before that. Such a step has no inline usage at all — Cursor reports
+//! nothing for a leg it has not billed yet (T3) — so this reconciler is its
+//! only source besides the estimate.
+//! The account's dashboard still counts every Run, by its
 //! `conversation_id`, about 2.5 s after the Run closes. [`CursorUsage::resolve`]
 //! asks the dashboard for that event — first after [`FIRST_WAIT`], then every
 //! [`EVERY_WAIT`] until [`UNTIL`] — and hands back its token counts; when none

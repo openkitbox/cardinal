@@ -1140,7 +1140,8 @@ async fn attempt_json(
         if !reported_model {
             ir.model = target_model.to_owned();
         }
-        // A Cursor tool step reports no usage inline: the dashboard's count
+        // A Cursor Run that reported no usage inline (a tool step, or a turn
+        // that ended without counters): the dashboard's count
         // (or the estimate) goes into the client body and the ledger alike.
         if ir.usage.is_none()
             && let Some(handle) = cursor
@@ -2990,8 +2991,9 @@ pub async fn dispatch_at(
                         let outcome = usage_rx.await.ok();
                         let ttft_ms = outcome.as_ref().and_then(|outcome| outcome.ttft_ms);
                         let mut usage = outcome.as_ref().and_then(|outcome| outcome.usage);
-                        // A Cursor tool step reports no usage inline: wait for
-                        // the dashboard's count (≤6s), else estimate (D9). The
+                        // A Cursor Run that carried no usage inline (a tool
+                        // step, or a turn with no counters): wait for the
+                        // dashboard's count (≤6s), else estimate (D9). The
                         // client's stream is already over; this is the ledger's.
                         if usage.is_none()
                             && let Some(handle) = cursor
