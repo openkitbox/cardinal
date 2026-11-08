@@ -436,12 +436,12 @@ impl CursorTokens {
         let outcome = match credential {
             KeyCredential::CursorOauth(bundle) => self.refresh_oauth(pool, key_id, bundle).await,
             KeyCredential::Static(api_key) => self.exchange_static(key_id, api_key).await,
-            // A Kiro or OpenCode bundle never authenticates a Cursor row: the
-            // credential module refuses to store one, and a caller that hands
-            // one over has the wrong key.
-            KeyCredential::KiroOidc(_) | KeyCredential::OpencodeOauth(_) => {
-                Err(CursorTokenError::Missing)
-            }
+            // A Kiro, OpenCode or OpenAI bundle never authenticates a Cursor
+            // row: the credential module refuses to store one, and a caller
+            // that hands one over has the wrong key.
+            KeyCredential::KiroOidc(_)
+            | KeyCredential::OpencodeOauth(_)
+            | KeyCredential::OpenaiOauth(_) => Err(CursorTokenError::Missing),
         };
         match outcome {
             Ok(bearer) => Ok(bearer),

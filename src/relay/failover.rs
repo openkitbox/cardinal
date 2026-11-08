@@ -18,6 +18,7 @@ use super::optional;
 use crate::protocol::ProtocolError;
 use crate::upstream::cursor_tokens::CursorTokenError;
 use crate::upstream::kiro_tokens::KiroTokenError;
+use crate::upstream::openai_tokens::OpenaiTokenError;
 use crate::upstream::opencode_tokens::OpencodeTokenError;
 use crate::upstream::transport::TransportError;
 
@@ -61,6 +62,10 @@ pub enum AttemptError {
     /// The candidate's Cursor credential could not produce a bearer. Same
     /// contract as [`Self::KiroTokenError`]: a verdict, never a token.
     CursorTokenError(CursorTokenError),
+    /// The candidate's OpenAI Codex account credential could not produce a
+    /// bearer. Same contract as [`Self::KiroTokenError`]: a verdict, never a
+    /// token.
+    OpenaiTokenError(OpenaiTokenError),
     Protocol(ProtocolError),
 }
 
@@ -86,6 +91,7 @@ impl AttemptError {
             Self::KiroTokenError(error) => error.client_status(),
             Self::OpencodeTokenError(error) => error.client_status(),
             Self::CursorTokenError(error) => error.client_status(),
+            Self::OpenaiTokenError(error) => error.client_status(),
             Self::Protocol(error) => error.status(),
         }
     }
@@ -110,6 +116,7 @@ impl AttemptError {
             Self::KiroTokenError(error) => error.code(),
             Self::OpencodeTokenError(error) => error.code(),
             Self::CursorTokenError(error) => error.code(),
+            Self::OpenaiTokenError(error) => error.code(),
             Self::Protocol(error) => error.code(),
         }
     }
@@ -122,6 +129,7 @@ impl AttemptError {
             Self::KiroTokenError(error) => error.to_string(),
             Self::OpencodeTokenError(error) => error.to_string(),
             Self::CursorTokenError(error) => error.to_string(),
+            Self::OpenaiTokenError(error) => error.to_string(),
             Self::Protocol(error) => format!("{error:?}"),
         }
     }
@@ -364,6 +372,16 @@ pub fn classify(error: &AttemptError) -> Failure {
                 Failure::Blameless
             } else {
                 Failure::Other
+            };
+        }
+        // Same policy for an OpenAI Codex account: a dead grant (or a missing
+        // row) needs a new login; storage and issuer hiccups are transient.
+        AttemptError::OpenaiTokenError(error) => {
+            return match error {
+                OpenaiTokenError::Missing | OpenaiTokenError::Expired => Failure::Blameless,
+                OpenaiTokenError::Store
+                | OpenaiTokenError::Transport
+                | OpenaiTokenError::Client => Failure::Other,
             };
         }
         // Request-shape problems: the request itself is at fault.

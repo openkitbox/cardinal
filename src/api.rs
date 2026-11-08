@@ -52,6 +52,14 @@ pub struct AppState {
     /// Per-key OpenCode account bearer manager, same contract; shared with model
     /// and quota probing.
     pub opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
+    /// Per-key OpenAI Codex account bearer manager, same contract.
+    pub openai_tokens: Arc<crate::upstream::OpenaiTokens>,
+    /// The stateless OpenAI issuer client shared by the token manager and the
+    /// admin surface's device-login flow.
+    pub openai_client: Arc<crate::openai::auth::Client>,
+    /// In-flight OpenAI device logins: the admin surface starts one, the GUI
+    /// polls it, an operator can cancel it.
+    pub openai_logins: crate::openai::login::OpenaiLogins,
     /// Per-key Cursor bearer manager, same contract; shared with model probing.
     pub cursor_tokens: Arc<crate::upstream::CursorTokens>,
     /// The Cursor usage reconciler, shared with every settlement task.
@@ -231,6 +239,7 @@ async fn relay_dispatch(
         kiro_tokens: state.kiro_tokens.as_ref(),
         prompt_cache: &state.prompt_cache,
         opencode_tokens: state.opencode_tokens.as_ref(),
+        openai_tokens: state.openai_tokens.as_ref(),
         cursor_tokens: state.cursor_tokens.as_ref(),
         cursor_usage: &state.cursor_usage,
         trace_ring: &state.trace_ring,

@@ -1,7 +1,8 @@
 //! The credential kinds a `gateway_provider_keys` row may carry: `static` (a
 //! plaintext api_key), `kiro_oidc` (a Kiro AWS SSO OIDC bundle),
-//! `opencode_oauth` (an OpenCode Console device-flow bundle) and `cursor_oauth`
-//! (a Cursor browser-login bundle).
+//! `opencode_oauth` (an OpenCode Console device-flow bundle), `cursor_oauth`
+//! (a Cursor browser-login bundle) and `openai_oauth` (an OpenAI Codex /
+//! ChatGPT-subscription device-flow bundle).
 //!
 //! This is the create-time decision point shared by the admin surface, the
 //! store and the relay. Nothing here performs I/O: it decides which of the two
@@ -9,7 +10,7 @@
 //! the declared kind, so a mismatched pair never reaches the store.
 //!
 //! The kinds mirror the `auth_kind` CHECK constraint one to one
-//! (migrations/0007, migrations/0017, migrations/0021): adding a kind is a
+//! (migrations/0007, migrations/0017, migrations/0021, migrations/0022): adding a kind is a
 //! schema change plus a variant here, never an inference from the row's other
 //! columns.
 
@@ -19,6 +20,7 @@ use chrono::Duration;
 use chrono::Utc;
 
 use crate::kiro::KiroOAuth;
+use crate::openai::OpenaiOAuth;
 use crate::opencode::OpencodeOAuth;
 
 /// The longest access-token lifetime a stored Cursor bundle may claim. Cursor
@@ -39,6 +41,8 @@ pub enum AuthKind {
     OpencodeOauth,
     /// The row's `oauth` bundle: Cursor browser-login tokens.
     CursorOauth,
+    /// The row's `oauth` bundle: OpenAI Codex (ChatGPT subscription) tokens.
+    OpenaiOauth,
 }
 
 impl AuthKind {
@@ -50,6 +54,7 @@ impl AuthKind {
             Self::KiroOidc => "kiro_oidc",
             Self::OpencodeOauth => "opencode_oauth",
             Self::CursorOauth => "cursor_oauth",
+            Self::OpenaiOauth => "openai_oauth",
         }
     }
 
@@ -61,8 +66,9 @@ impl AuthKind {
             "kiro_oidc" => Ok(Self::KiroOidc),
             "opencode_oauth" => Ok(Self::OpencodeOauth),
             "cursor_oauth" => Ok(Self::CursorOauth),
+            "openai_oauth" => Ok(Self::OpenaiOauth),
             other => Err(anyhow!(
-                "unknown auth_kind {other:?} (expected \"static\", \"kiro_oidc\", \"opencode_oauth\" or \"cursor_oauth\")"
+                "unknown auth_kind {other:?} (expected \"static\", \"kiro_oidc\", \"opencode_oauth\", \"cursor_oauth\" or \"openai_oauth\")"
             )),
         }
     }
@@ -156,6 +162,9 @@ pub enum KeyCredential<'a> {
     OpencodeOauth(OpencodeOAuth),
     /// A Cursor browser-login bundle; the row stores no api_key.
     CursorOauth(CursorOAuth),
+    /// An OpenAI Codex (ChatGPT subscription) bundle; the row stores no
+    /// api_key.
+    OpenaiOauth(OpenaiOAuth),
 }
 
 impl std::fmt::Debug for KeyCredential<'_> {
@@ -167,6 +176,7 @@ impl std::fmt::Debug for KeyCredential<'_> {
                 formatter.debug_tuple("OpencodeOauth").field(oauth).finish()
             }
             Self::CursorOauth(oauth) => formatter.debug_tuple("CursorOauth").field(oauth).finish(),
+            Self::OpenaiOauth(oauth) => formatter.debug_tuple("OpenaiOauth").field(oauth).finish(),
         }
     }
 }
@@ -181,6 +191,9 @@ impl std::fmt::Debug for KeyCredential<'_> {
 ///   `kiro_oidc` credential only ever belongs to a `kiro` provider;
 /// - a `cursor_oauth` credential only ever belongs to a `cursor` provider, the
 ///   only kernel that speaks the Cursor backend;
+/// - an `openai_oauth` credential only ever belongs to an `openai_responses`
+///   provider (the Codex backend speaks the Responses dialect; migrations/0022
+///   adds no protocol, the kind alone marks the account login);
 /// - a static key needs a non-empty `api_key` and must NOT carry `oauth`;
 /// - an OAuth kind needs no api_key and a complete bundle of its own shape: the
 ///   raw `oauth` payload is decoded as that kind's bundle, never sniffed;
@@ -254,6 +267,24 @@ pub fn resolve_key_credential<'a>(
             let oauth: CursorOAuth = decode_bundle(oauth, auth_kind)?;
             oauth.validate()?;
             Ok(KeyCredential::CursorOauth(oauth))
+        }
+        AuthKind::OpenaiOauth => {
+            // The Codex backend speaks the Responses dialect, so the bundle only
+            // belongs to a provider of that protocol; any other kernel would
+            // send the bearer somewhere that cannot use it.
+            anyhow::ensure!(
+                protocol == "openai_responses",
+                "auth_kind \"openai_oauth\" requires a provider with protocol \"openai_responses\" (got {protocol:?})"
+            );
+            anyhow::ensure!(
+                api_key.is_none_or(|key| key.trim().is_empty()),
+                "an OpenAI OAuth key must not carry an api_key"
+            );
+            let oauth =
+                oauth.ok_or_else(|| anyhow!("auth_kind \"openai_oauth\" requires oauth"))?;
+            let oauth: OpenaiOAuth = decode_bundle(oauth, auth_kind)?;
+            oauth.validate()?;
+            Ok(KeyCredential::OpenaiOauth(oauth))
         }
     }
 }

@@ -2,6 +2,7 @@ use sqlx::PgPool;
 
 use crate::credentials::{AuthKind, CursorOAuth, KeyCredential};
 use crate::kiro::KiroOAuth;
+use crate::openai::OpenaiOAuth;
 use crate::opencode::OpencodeOAuth;
 use crate::probe::ProbeModel;
 
@@ -13,7 +14,8 @@ pub struct ProviderKeyRow {
     pub provider_id: i64,
     pub label: String,
     /// The row-stored plaintext credential, for `auth_kind = 'static'` rows.
-    /// NULL on an OAuth row (`kiro_oidc`, `opencode_oauth`) by constraint — its
+    /// NULL on an OAuth row (`kiro_oidc`, `opencode_oauth`, `cursor_oauth`,
+    /// `openai_oauth`) by constraint — its
     /// credential lives in `oauth`, and the relay resolves it by `auth_kind`
     /// instead; only a `static` row with no key is skipped with a warning.
     pub api_key: Option<String>,
@@ -40,13 +42,15 @@ pub struct ProviderKeyRow {
     #[sqlx(json(nullable))]
     pub allowed_models: Option<Vec<String>>,
     /// How the row authenticates upstream: `static` (the plaintext api_key
-    /// above), `kiro_oidc` or `opencode_oauth` (the OAuth bundle below).
-    /// Mirrors the column's CHECK constraint (migrations/0007, 0017).
+    /// above), `kiro_oidc`, `opencode_oauth`, `cursor_oauth` or `openai_oauth`
+    /// (the OAuth bundle below). Mirrors the column's CHECK constraint
+    /// (migrations/0007, 0017, 0021, 0022).
     pub auth_kind: String,
     /// The OAuth bundle of the row's `auth_kind`; NULL for every static key
     /// (the DB keeps the two credential shapes disjoint). Deliberately untyped:
     /// `auth_kind` alone says which bundle a row holds, so the typed accessors
-    /// ([`ProviderKeyRow::kiro_oauth`], [`ProviderKeyRow::opencode_oauth`])
+    /// ([`ProviderKeyRow::kiro_oauth`], [`ProviderKeyRow::opencode_oauth`],
+    /// [`ProviderKeyRow::cursor_oauth`], [`ProviderKeyRow::openai_oauth`])
     /// decode it and a payload that does not decode is a missing credential,
     /// never a guess. Never serialized: this row is an internal read shape and
     /// the tokens must not reach any JSON surface (the bootstrap/reveal views
@@ -125,6 +129,16 @@ impl ProviderKeyRow {
         }
         decode_stored_bundle(self.oauth.as_ref()?)
     }
+
+    /// The row's OpenAI Codex (ChatGPT subscription) bundle in its typed form;
+    /// same contract as [`Self::kiro_oauth`].
+    #[must_use]
+    pub fn openai_oauth(&self) -> Option<OpenaiOAuth> {
+        if self.auth_kind != AuthKind::OpenaiOauth.as_str() {
+            return None;
+        }
+        decode_stored_bundle(self.oauth.as_ref()?)
+    }
 }
 
 /// Decode one stored bundle straight from the borrowed JSON (serde_json drives
@@ -164,7 +178,7 @@ pub struct ProviderKeyView {
     /// The key's model whitelist (None = unrestricted).
     pub allowed_models: Option<Vec<String>>,
     /// How the row authenticates upstream: `static`, `kiro_oidc`,
-    /// `opencode_oauth` or `cursor_oauth`. Defaults to `static` for a payload
+    /// `opencode_oauth`, `cursor_oauth` or `openai_oauth`. Defaults to `static` for a payload
     /// that predates the field (an older gateway never had anything else to
     /// report).
     #[serde(default = "static_auth_kind")]
@@ -464,6 +478,30 @@ pub async fn insert_cursor_provider_key(
     .await
 }
 
+/// Insert an OpenAI Codex account key: no api_key, the device-flow bundle
+/// stored under `auth_kind = \"openai_oauth\"`, validated here as well. The
+/// login flow writes the row through [`insert_key_row`] directly; this entry
+/// point exists for an admin who pastes an already-extracted bundle.
+pub async fn insert_openai_provider_key(
+    pool: &PgPool,
+    provider_id: i64,
+    label: &str,
+    oauth: OpenaiOAuth,
+    max_concurrency: Option<i32>,
+    allowed_models: Option<Vec<String>>,
+) -> anyhow::Result<i64> {
+    oauth.validate()?;
+    insert_key_row(
+        pool,
+        provider_id,
+        label,
+        KeyCredential::OpenaiOauth(oauth),
+        max_concurrency,
+        allowed_models,
+    )
+    .await
+}
+
 /// Find a Kiro OIDC key by provider and label, or create it atomically.
 ///
 /// The provider row lock serializes this operation with provider-scoped key
@@ -678,6 +716,11 @@ async fn insert_key_row(
             AuthKind::CursorOauth,
             Some(serde_json::to_value(oauth)?),
         ),
+        KeyCredential::OpenaiOauth(oauth) => (
+            None,
+            AuthKind::OpenaiOauth,
+            Some(serde_json::to_value(oauth)?),
+        ),
     };
     anyhow::ensure!(!label.is_empty(), "label must not be empty");
     ensure_valid_max_concurrency(max_concurrency)?;
@@ -711,6 +754,12 @@ async fn insert_key_row(
         AuthKind::CursorOauth => anyhow::ensure!(
             protocol == "cursor",
             "auth_kind \"cursor_oauth\" requires a provider with protocol \"cursor\" (got {protocol:?})"
+        ),
+        // The Codex backend speaks the Responses dialect; migrations/0022 adds
+        // no protocol, so the provider's protocol is the only guard.
+        AuthKind::OpenaiOauth => anyhow::ensure!(
+            protocol == "openai_responses",
+            "auth_kind \"openai_oauth\" requires a provider with protocol \"openai_responses\" (got {protocol:?})"
         ),
     }
     let duplicate: (bool,) = sqlx::query_as(
@@ -918,6 +967,60 @@ pub async fn replace_cursor_oauth(
     let result = sqlx::query(
         "UPDATE gateway_provider_keys SET oauth = $3
          WHERE id = $1 AND auth_kind = 'cursor_oauth' AND oauth = $2",
+    )
+    .bind(key_id)
+    .bind(serde_json::to_value(expected)?)
+    .bind(serde_json::to_value(next)?)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// One OpenAI Codex account's stored bundle, read fresh from the row; same
+/// contract as [`opencode_oauth`] (the token manager rereads under its per-key
+/// gate before refreshing, because the refresh token rotates).
+pub async fn openai_oauth(pool: &PgPool, key_id: i64) -> anyhow::Result<Option<OpenaiOAuth>> {
+    let stored: Option<(String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT auth_kind, oauth FROM gateway_provider_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((auth_kind, oauth)) = stored else {
+        return Ok(None);
+    };
+    if auth_kind != AuthKind::OpenaiOauth.as_str() {
+        return Ok(None);
+    }
+    let Some(value) = oauth else {
+        return Ok(None);
+    };
+    match serde_json::from_value(value) {
+        Ok(bundle) => Ok(Some(bundle)),
+        Err(_) => {
+            // The payload is never printed: it carries the account's tokens.
+            tracing::warn!(
+                key_id,
+                "stored OpenAI bundle does not decode; the account has no usable credential"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Replace one OpenAI Codex account's bundle when the stored one is still
+/// `expected` (compare-and-swap); same contract as [`replace_opencode_oauth`].
+/// The guard also pins `auth_kind`, so a row whose credential was replaced by
+/// another kind is never overwritten with an OpenAI bundle.
+pub async fn replace_openai_oauth(
+    pool: &PgPool,
+    key_id: i64,
+    expected: &OpenaiOAuth,
+    next: &OpenaiOAuth,
+) -> anyhow::Result<bool> {
+    next.validate()?;
+    let result = sqlx::query(
+        "UPDATE gateway_provider_keys SET oauth = $3
+         WHERE id = $1 AND auth_kind = 'openai_oauth' AND oauth = $2",
     )
     .bind(key_id)
     .bind(serde_json::to_value(expected)?)

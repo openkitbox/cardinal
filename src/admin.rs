@@ -21,6 +21,12 @@
 //!   a taken label → 409, a non-Cursor provider or unknown group → 400)
 //! - `GET /api/cursor-logins/:session` → `{state, key_id, email, team_id, message}` (same states as OpenCode; never a
 //!   token) / `DELETE` cancels a waiting login (204; 404 when unknown or finished)
+//! - `POST /api/openai-logins` `{provider_id, label, key_id?, group_ids?, max_concurrency?}` → 201 `{session, user_code,
+//!   verification_url, expires_in, interval}` — start an OpenAI Codex device login (`key_id` alone re-authenticates that
+//!   account; a taken label → 409, a non-Codex provider or unknown group → 400)
+//! - `GET /api/openai-logins/:session` → `{state, key_id, email, plan_type, user_code, verification_url, message}`
+//!   (same states as OpenCode; never a token or the device grant id) / `DELETE` cancels a waiting login (204; 404 when
+//!   unknown or finished)
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
 //!   plaintext-serving endpoint; the list shape stays masked)
 //! - `POST /api/key-groups` `{name}` → `{id}`, `PATCH/DELETE /api/key-groups/:id` — account groups (409 on a taken name, 400 on an invalid one,
@@ -71,6 +77,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::admin_ops::CursorLoginError;
+use crate::admin_ops::OpenaiLoginError;
+use crate::admin_ops::OpenaiLoginRequest;
 use crate::admin_ops::OpencodeLoginError;
 use crate::agent;
 use crate::credentials::{AuthKind, KeyCredential, resolve_key_credential};
@@ -193,6 +201,11 @@ fn admin(depot: &Depot) -> crate::admin_ops::Admin {
     .with_kiro_tokens(Arc::clone(&state.kiro_tokens))
     .with_opencode_tokens(Arc::clone(&state.opencode_tokens))
     .with_cursor_tokens(Arc::clone(&state.cursor_tokens))
+    .with_openai_tokens(Arc::clone(&state.openai_tokens))
+    .with_openai_login(
+        Arc::clone(&state.openai_client),
+        state.openai_logins.clone(),
+    )
     .with_opencode_login(
         Arc::clone(&state.opencode_client),
         state.opencode_logins.clone(),
@@ -1668,6 +1681,12 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
                 .get(opencode_login_status)
                 .delete(cancel_opencode_login),
         )
+        .push(Router::with_path("openai-logins").post(start_openai_login))
+        .push(
+            Router::with_path("openai-logins/{session}")
+                .get(openai_login_status)
+                .delete(cancel_openai_login),
+        )
         .push(Router::with_path("providers/{id}/cursor-login").post(start_cursor_login))
         .push(
             Router::with_path("cursor-logins/{session}")
@@ -1910,16 +1929,26 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         KeyCredential::KiroOidc(oauth) => Some(oauth.clone()),
         KeyCredential::Static(_)
         | KeyCredential::OpencodeOauth(_)
-        | KeyCredential::CursorOauth(_) => None,
+        | KeyCredential::CursorOauth(_)
+        | KeyCredential::OpenaiOauth(_) => None,
     };
     // The OpenCode bundle is adopted as imported: it came from this very
     // request, so there is no newer row to reconcile with and the first
     // dispatch needs no row read.
     let created_opencode = match &credential {
         KeyCredential::OpencodeOauth(oauth) => Some(oauth.clone()),
-        KeyCredential::Static(_) | KeyCredential::KiroOidc(_) | KeyCredential::CursorOauth(_) => {
-            None
-        }
+        KeyCredential::Static(_)
+        | KeyCredential::KiroOidc(_)
+        | KeyCredential::CursorOauth(_)
+        | KeyCredential::OpenaiOauth(_) => None,
+    };
+    // The OpenAI bundle is adopted as imported, for the same reason.
+    let created_openai = match &credential {
+        KeyCredential::OpenaiOauth(oauth) => Some(oauth.clone()),
+        KeyCredential::Static(_)
+        | KeyCredential::KiroOidc(_)
+        | KeyCredential::OpencodeOauth(_)
+        | KeyCredential::CursorOauth(_) => None,
     };
     match crate::admin_ops::create_key(
         pool,
@@ -1942,6 +1971,9 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
             }
             if let Some(oauth) = created_opencode {
                 state(depot).opencode_tokens.adopt(id, oauth);
+            }
+            if let Some(oauth) = created_openai {
+                state(depot).openai_tokens.adopt(id, oauth);
             }
             let _ = admin(depot).refresh_route_cache().await;
             response.status_code(StatusCode::CREATED);
@@ -2107,6 +2139,77 @@ async fn cancel_opencode_login(request: &mut Request, depot: &mut Depot, respons
             response.status_code(StatusCode::NO_CONTENT);
         }
         Ok(false) => not_found(response, "OpenCode login session"),
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `POST /api/openai-logins`: start a device login and answer with the code the
+/// operator types at OpenAI. The login continues in the background; this
+/// response does not wait for it.
+#[handler]
+async fn start_openai_login(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Ok(body) = request.parse_json::<OpenaiLoginRequest>().await else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid OpenAI login body");
+        return;
+    };
+    let target = match body.into_target() {
+        Ok(target) => target,
+        Err(error) => {
+            bad_request(response, anyhow::Error::new(error));
+            return;
+        }
+    };
+    match admin(depot).start_openai_login(target).await {
+        Ok(started) => {
+            response.status_code(StatusCode::CREATED);
+            json_response(response, &started);
+        }
+        Err(
+            error @ (OpenaiLoginError::NotOpenaiProvider { .. } | OpenaiLoginError::Invalid(_)),
+        ) => bad_request(response, anyhow::Error::new(error)),
+        Err(OpenaiLoginError::ProviderNotFound(_)) => not_found(response, "provider"),
+        Err(OpenaiLoginError::KeyNotFound(_)) => not_found(response, "OpenAI account key"),
+        Err(OpenaiLoginError::LabelConflict(label)) => {
+            response.status_code(StatusCode::CONFLICT);
+            let _ = response.body(format!(
+                "a key with label {label:?} already exists on this provider"
+            ));
+        }
+        Err(OpenaiLoginError::Internal(error)) => internal(response, error),
+    }
+}
+
+/// `GET /api/openai-logins/{session}`: the login's state. Unknown ids (and ids
+/// whose verdict aged out of the registry) are a 404, the GUI's "start over".
+#[handler]
+async fn openai_login_status(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(session) = request.param::<String>("session") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid login session");
+        return;
+    };
+    match admin(depot).openai_login_status(&session) {
+        Ok(Some(status)) => json_response(response, &status),
+        Ok(None) => not_found(response, "OpenAI login session"),
+        Err(error) => internal(response, error),
+    }
+}
+
+/// `DELETE /api/openai-logins/{session}`: cancel a waiting login. A finished
+/// login is not cancellable and reads as unknown (404).
+#[handler]
+async fn cancel_openai_login(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(session) = request.param::<String>("session") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid login session");
+        return;
+    };
+    match admin(depot).cancel_openai_login(&session) {
+        Ok(true) => {
+            response.status_code(StatusCode::NO_CONTENT);
+        }
+        Ok(false) => not_found(response, "OpenAI login session"),
         Err(error) => internal(response, error),
     }
 }
@@ -2314,6 +2417,9 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
             // the patch may just have replaced (a static key's exchanged
             // token included).
             state(depot).cursor_tokens.forget(key_id);
+            // And an OpenAI row's cached bundle: the next resolve rereads the
+            // row instead of serving tokens the patch may have replaced.
+            state(depot).openai_tokens.forget(key_id);
             let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
@@ -2438,6 +2544,11 @@ async fn delete_key(request: &mut Request, depot: &mut Depot, response: &mut Res
             // `static` key on a Cursor provider; the cache is keyed by row, so
             // forgetting an id that was never cached is a no-op.
             state(depot).cursor_tokens.forget(key_id);
+            if auth_kind == AuthKind::OpenaiOauth.as_str() {
+                // A deleted account must never authenticate again, and a
+                // cached bundle would keep serving it.
+                state(depot).openai_tokens.forget(key_id);
+            }
             let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }

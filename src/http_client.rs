@@ -300,6 +300,61 @@ pub struct OpencodeLoginStatus {
     pub message: Option<String>,
 }
 
+/// The body of `POST /api/openai-logins`. `key_id` alone re-authenticates an
+/// existing `openai_oauth` account (the server then ignores the rest, which the
+/// row already owns); otherwise `provider_id` and `label` create one.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpenaiLoginRequest {
+    /// The provider a new account belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<i64>,
+    /// The label of the account a fresh login creates.
+    pub label: String,
+    /// An existing `openai_oauth` key to replace the credential of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<i64>,
+    /// Groups to attach to the new account (ignored for a re-login).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub group_ids: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<i32>,
+}
+
+/// The answer of `POST /api/openai-logins`: the code to type plus the session
+/// id to poll.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpenaiLoginStart {
+    /// The login's registry id.
+    pub session: String,
+    /// The short code the operator types.
+    pub user_code: String,
+    /// Where the operator types it.
+    pub verification_url: String,
+    /// Seconds the server keeps polling.
+    pub expires_in: u64,
+    /// Seconds between the server's polls.
+    pub interval: u64,
+}
+
+/// The answer of `GET /api/openai-logins/{session}`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpenaiLoginStatus {
+    /// `waiting`, `succeeded`, `failed`, `expired` or `cancelled`.
+    pub state: String,
+    /// The account key a successful login landed on.
+    pub key_id: Option<i64>,
+    /// The account's email, when known.
+    pub email: Option<String>,
+    /// The subscription plan, when known.
+    pub plan_type: Option<String>,
+    /// The code to type (only while `waiting`).
+    pub user_code: Option<String>,
+    /// Where to type it (only while `waiting`).
+    pub verification_url: Option<String>,
+    /// Why a login failed; the server's wording is already display-safe.
+    pub message: Option<String>,
+}
+
 /// The body of `POST /api/providers/{id}/cursor-login`: the same shape as
 /// [`OpencodeLoginRequest`] (`key_id` re-authenticates an existing
 /// `cursor_oauth` account instead of creating one).
@@ -1063,6 +1118,34 @@ impl GatewayHttpClient {
     /// cancellable: the server answers 404 and this returns an error.
     pub async fn cancel_opencode_login(&self, session: &str) -> Result<(), ClientError> {
         ok(self.delete(&format!("/api/opencode-logins/{session}"))).await
+    }
+
+    // ---------- OpenAI account login ----------
+
+    /// Start an OpenAI Codex device login. The login continues server-side:
+    /// poll it with [`Self::openai_login_status`] and abandon a waiting one
+    /// with [`Self::cancel_openai_login`].
+    pub async fn start_openai_login(
+        &self,
+        body: &OpenaiLoginRequest,
+    ) -> Result<OpenaiLoginStart, ClientError> {
+        json(self.post("/api/openai-logins").json(body)).await
+    }
+
+    /// One device login's state. An unknown session, or one whose verdict aged
+    /// out of the registry, answers 404 — an error like any other; the caller
+    /// starts the flow over.
+    pub async fn openai_login_status(
+        &self,
+        session: &str,
+    ) -> Result<OpenaiLoginStatus, ClientError> {
+        json(self.get(&format!("/api/openai-logins/{session}"))).await
+    }
+
+    /// Cancel a waiting device login (204). A finished login is not
+    /// cancellable: the server answers 404 and this returns an error.
+    pub async fn cancel_openai_login(&self, session: &str) -> Result<(), ClientError> {
+        ok(self.delete(&format!("/api/openai-logins/{session}"))).await
     }
 
     // ---------- Cursor account login ----------

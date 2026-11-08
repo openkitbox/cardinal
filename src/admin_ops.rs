@@ -25,6 +25,9 @@ use crate::credentials::CursorOAuth;
 use crate::credentials::KeyCredential;
 use crate::cursor;
 use crate::kiro::KiroOAuth;
+use crate::openai::OpenaiOAuth;
+use crate::openai::auth as openai_auth;
+use crate::openai::login as openai_login;
 use crate::opencode::OpencodeOAuth;
 use crate::opencode::auth;
 use crate::opencode::auth::TokenGrant;
@@ -255,6 +258,17 @@ pub async fn create_key(
             )
             .await
         }
+        KeyCredential::OpenaiOauth(oauth) => {
+            store::insert_openai_provider_key(
+                pool,
+                provider_id,
+                label,
+                oauth,
+                max_concurrency,
+                allowed_models,
+            )
+            .await
+        }
     }
 }
 
@@ -298,6 +312,7 @@ pub async fn probe_all_quotas(
     kiro_tokens: Option<&Arc<crate::upstream::KiroTokens>>,
     opencode_tokens: Option<&Arc<crate::upstream::OpencodeTokens>>,
     cursor_tokens: Option<&Arc<crate::upstream::CursorTokens>>,
+    openai_tokens: Option<&Arc<crate::upstream::OpenaiTokens>>,
 ) -> Vec<KeyQuotaRow> {
     /// Which credential a key's probe uses.
     enum QuotaSource {
@@ -310,6 +325,9 @@ pub async fn probe_all_quotas(
         Opencode(Arc<crate::upstream::OpencodeTokens>),
         /// The shared Cursor bearer cache, at the Cursor dashboard.
         Cursor(Arc<crate::upstream::CursorTokens>),
+        /// The shared OpenAI token manager: the account's bearer, at the
+        /// ChatGPT usage endpoint.
+        Openai(Arc<crate::upstream::OpenaiTokens>),
     }
     let providers = match store::list_providers(pool).await {
         Ok(providers) => providers,
@@ -372,6 +390,14 @@ pub async fn probe_all_quotas(
                     break;
                 };
                 QuotaSource::Opencode(Arc::clone(tokens))
+            } else if key.auth_kind == AuthKind::OpenaiOauth.as_str() {
+                // Same rule for an OpenAI account row: no api_key, and the
+                // refresh token rotates, so only the shared manager may refresh.
+                let Some(tokens) = openai_tokens else {
+                    tracing::warn!(provider = %provider.name, "quota probe: no OpenAI token manager wired; skipping its keys");
+                    break;
+                };
+                QuotaSource::Openai(Arc::clone(tokens))
             } else {
                 match key.api_key.take() {
                     Some(api_key) => QuotaSource::Static(api_key),
@@ -402,6 +428,15 @@ pub async fn probe_all_quotas(
                             // Quota is decorative: a credential-plane failure
                             // only costs this round's reading.
                             tracing::warn!(key_id, error = %error, "quota probe: OpenCode bearer unavailable");
+                            None
+                        }
+                    },
+                    QuotaSource::Openai(tokens) => match tokens.resolve(&pool, key_id).await {
+                        Ok(bearer) => quota::fetch_openai_codex_quota(&bearer, key_id).await,
+                        Err(error) => {
+                            // Quota is decorative: a credential-plane failure
+                            // only costs this round's reading.
+                            tracing::warn!(key_id, error = %error, "quota probe: OpenAI bearer unavailable");
                             None
                         }
                     },
@@ -506,6 +541,13 @@ pub struct Admin {
     /// [`Self::with_cursor_login`] wires them): the login client and the
     /// process's session registry.
     cursor_login: Option<CursorLogin>,
+    /// The same arrangement for OpenAI Codex rows (None until
+    /// [`Self::with_openai_tokens`] wires it): model probing and quota probing
+    /// resolve their bearer through dispatch's cache.
+    openai_tokens: Option<Arc<crate::upstream::OpenaiTokens>>,
+    /// The OpenAI Codex device-login flow's dependencies (None until
+    /// [`Self::with_openai_login`] wires them).
+    openai_login: Option<OpenaiLogin>,
     /// Centralized dispatcher: queried for live slot occupancy (None until
     /// [`Self::with_dispatcher`] wires it).
     dispatcher: Option<tokio::sync::mpsc::UnboundedSender<crate::relay::dispatcher::DispatchEvent>>,
@@ -538,6 +580,8 @@ impl Admin {
             cursor_tokens: None,
             opencode_login: None,
             cursor_login: None,
+            openai_tokens: None,
+            openai_login: None,
             dispatcher: None,
         }
     }
@@ -566,6 +610,24 @@ impl Admin {
         opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
     ) -> Self {
         self.opencode_tokens = Some(opencode_tokens);
+        self
+    }
+
+    /// Wire the live OpenAI token manager so its model and quota probes share
+    /// dispatch's bearer cache and a finished login installs its bundle there.
+    pub fn with_openai_tokens(mut self, openai_tokens: Arc<crate::upstream::OpenaiTokens>) -> Self {
+        self.openai_tokens = Some(openai_tokens);
+        self
+    }
+
+    /// Wire the OpenAI Codex login flow: the issuer client and the process's
+    /// session registry.
+    pub fn with_openai_login(
+        mut self,
+        client: Arc<openai_auth::Client>,
+        logins: openai_login::OpenaiLogins,
+    ) -> Self {
+        self.openai_login = Some(OpenaiLogin { client, logins });
         self
     }
 
@@ -759,6 +821,7 @@ impl Admin {
             self.kiro_tokens.as_ref(),
             self.opencode_tokens.as_ref(),
             self.cursor_tokens.as_ref(),
+            self.openai_tokens.as_ref(),
         )
         .await;
         if !rows.is_empty() {
@@ -858,6 +921,8 @@ impl Admin {
             self.probe_cursor_models(&key).await?
         } else if key.auth_kind == AuthKind::OpencodeOauth.as_str() {
             self.probe_opencode_models(&provider, &key).await?
+        } else if key.auth_kind == AuthKind::OpenaiOauth.as_str() {
+            self.probe_openai_models(&key).await?
         } else {
             let api_key = key
                 .api_key
@@ -938,6 +1003,26 @@ impl Admin {
         )
         .await
         .map_err(|error| ProbeError::Regular(error).into())
+    }
+
+    /// One OpenAI Codex account's model catalogue, authenticated with its
+    /// resolved bearer from the shared [`crate::upstream::OpenaiTokens`]
+    /// instance (a probe's refresh is a chat's refresh, never a second rotation
+    /// of the account's refresh token).
+    async fn probe_openai_models(
+        &self,
+        key: &store::ProviderKeyRow,
+    ) -> anyhow::Result<Vec<ProbeModel>> {
+        let Some(tokens) = &self.openai_tokens else {
+            anyhow::bail!("OpenAI 模型列表需要已接线的 token 管理器")
+        };
+        let bearer = tokens
+            .resolve(&self.pool, key.id)
+            .await
+            .map_err(|error| ProbeError::Regular(error.into()))?;
+        probe::fetch_openai_codex_models(&bearer)
+            .await
+            .map_err(|error| ProbeError::Regular(error).into())
     }
 
     /// One Cursor key's usable-models list, authenticated with the account's
@@ -1568,6 +1653,348 @@ impl Admin {
         self.opencode_login
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("OpenCode 登录需要已接线的 console 客户端与会话注册表"))
+    }
+
+    /// Start an OpenAI Codex device login. A fresh login creates an account on
+    /// `provider_id`; a re-login replaces the credential of an existing
+    /// `openai_oauth` key and leaves its label, groups and cap alone.
+    ///
+    /// Every check runs before the issuer is dialed, so a rejected request leaves
+    /// no session behind. The poller is spawned here and owns everything after
+    /// this call, because a login outlives the HTTP request that started it.
+    pub async fn start_openai_login(
+        &self,
+        target: OpenaiLoginTarget,
+    ) -> Result<OpenaiLoginStarted, OpenaiLoginError> {
+        let wiring = self.openai_login()?;
+        let (provider, label, key_id, group_ids, max_concurrency) = match target {
+            OpenaiLoginTarget::Relogin { key_id } => {
+                let existing = store::list_keys_by_ids(&self.pool, &[key_id]).await?;
+                let Some(existing) = existing
+                    .into_iter()
+                    .find(|row| row.auth_kind == AuthKind::OpenaiOauth.as_str())
+                else {
+                    return Err(OpenaiLoginError::KeyNotFound(key_id));
+                };
+                let Some(provider) = store::get_provider(&self.pool, existing.provider_id).await?
+                else {
+                    return Err(OpenaiLoginError::ProviderNotFound(existing.provider_id));
+                };
+                (provider, existing.label, Some(key_id), Vec::new(), None)
+            }
+            OpenaiLoginTarget::New {
+                provider_id,
+                label,
+                group_ids,
+                max_concurrency,
+            } => {
+                let Some(provider) = store::get_provider(&self.pool, provider_id).await? else {
+                    return Err(OpenaiLoginError::ProviderNotFound(provider_id));
+                };
+                let keys = store::list_provider_keys(&self.pool, provider_id).await?;
+                if keys.iter().any(|row| row.label == label) {
+                    return Err(OpenaiLoginError::LabelConflict(label));
+                }
+                if !store::key_groups_exist(&self.pool, &group_ids).await? {
+                    return Err(OpenaiLoginError::Invalid("unknown group id".to_owned()));
+                }
+                (provider, label, None, group_ids, max_concurrency)
+            }
+        };
+        ensure_openai_provider(&provider)?;
+        let grant = wiring
+            .client
+            .start_device()
+            .await
+            .context("starting an OpenAI device login")?;
+        let openai_auth::DeviceGrant {
+            device_auth_id,
+            user_code,
+            interval,
+        } = grant;
+        let now = Utc::now();
+        let session = openai_login::Session::new(
+            device_auth_id,
+            user_code.clone(),
+            interval,
+            now + Duration::seconds(OPENAI_LOGIN_LIFETIME_SECS),
+            key_id,
+        );
+        let (id, session) = wiring.logins.insert(session, now);
+        let poll = OpenaiLoginPoll {
+            session,
+            client: Arc::clone(&wiring.client),
+            provider,
+            label,
+            group_ids,
+            max_concurrency,
+        };
+        tokio::spawn(self.clone().drive_openai_login(poll));
+        Ok(OpenaiLoginStarted {
+            session: id.to_string(),
+            user_code,
+            verification_url: openai_login::VERIFICATION_URL,
+            expires_in: OPENAI_LOGIN_LIFETIME_SECS.unsigned_abs(),
+            interval: interval.as_secs(),
+        })
+    }
+
+    /// Drive one started login to its verdict: wait, ask the issuer whether the
+    /// operator approved, and on approval trade the code and commit the account.
+    /// What each poll result means is [`decide_poll`]'s call; a transient issuer
+    /// failure only skips a round, since the grant still lives.
+    async fn drive_openai_login(self, poll: OpenaiLoginPoll) {
+        let session = Arc::clone(&poll.session);
+        let wait = openai_poll_wait(session.interval());
+        let mut polls: u32 = 0;
+        loop {
+            tokio::time::sleep(wait).await;
+            // Cancelled between ticks: the cancel already wrote the verdict.
+            if session.is_terminal() {
+                return;
+            }
+            polls += 1;
+            let observation = match poll
+                .client
+                .poll_device(session.device_auth_id(), session.user_code())
+                .await
+            {
+                Ok(openai_auth::PollVerdict::Pending) => PollObservation::Pending,
+                Ok(openai_auth::PollVerdict::Approved(approval)) => {
+                    // The poll's own round trip may have outlived the grant: a
+                    // session the registry will report `expired` must not leave
+                    // a key behind.
+                    let approved_at = Utc::now();
+                    if approved_at >= session.expires_at() {
+                        tracing::warn!(
+                            provider = %poll.provider.name,
+                            key_id = ?session.key_id(),
+                            "OpenAI login was approved after its grant deadline; discarding the approval"
+                        );
+                        session.finish(openai_login::SessionState::Expired, approved_at);
+                        return;
+                    }
+                    let verdict = self.finish_openai_login(&poll, approval).await;
+                    session.finish(verdict, Utc::now());
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "OpenAI device poll failed");
+                    observe_openai_failure(&error)
+                }
+            };
+            match decide_poll(observation, Utc::now(), session.expires_at(), polls) {
+                PollDecision::Continue => {}
+                PollDecision::Expire => {
+                    session.finish(openai_login::SessionState::Expired, Utc::now());
+                    return;
+                }
+                PollDecision::Fail(message) => {
+                    session.finish(
+                        openai_login::SessionState::Failed {
+                            message: message.to_owned(),
+                        },
+                        Utc::now(),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Commit one approved login and return its verdict: trade the approval
+    /// for tokens, build the bundle, persist it, install it in the bearer
+    /// cache, probe the model catalogue and refresh the route cache.
+    ///
+    /// Only the exchange and persistence can fail the login. A failed catalogue
+    /// probe or cache refresh degrades to a warning: the credential is already
+    /// committed and the first dispatch refreshes what this step missed. Every
+    /// failure text is fixed; details go to the log (no token among them).
+    async fn finish_openai_login(
+        &self,
+        poll: &OpenaiLoginPoll,
+        approval: openai_auth::DeviceApproval,
+    ) -> openai_login::SessionState {
+        let provider = &poll.provider;
+        let failed = |message: &str| openai_login::SessionState::Failed {
+            message: message.to_owned(),
+        };
+        let tokens = match poll.client.exchange_code(&approval, Utc::now()).await {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                tracing::warn!(provider = %provider.name, %error, "OpenAI code exchange failed");
+                return failed(openai_exchange_failure_message(&error));
+            }
+        };
+        let bundle = match tokens.into_bundle() {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                tracing::warn!(provider = %provider.name, %error, "OpenAI login produced no usable bundle");
+                return failed(OPENAI_LOGIN_NO_WORKSPACE_MESSAGE);
+            }
+        };
+        // Cancelled while the code exchange was in flight: no key may appear.
+        if poll.session.is_terminal() {
+            return poll.session.state();
+        }
+        let (email, plan_type) = (bundle.email.clone(), bundle.plan_type.clone());
+        let key_id = match self.commit_openai_bundle(poll, &bundle).await {
+            Ok(key_id) => key_id,
+            Err(error) => {
+                tracing::warn!(
+                    provider = %provider.name,
+                    error = %format!("{error:#}"),
+                    "OpenAI account login could not be committed"
+                );
+                return failed(&openai_commit_failure_message(&error));
+            }
+        };
+        // The credential is committed: everything below is best effort.
+        if let Some(tokens) = &self.openai_tokens {
+            let bearer = tokens.adopt(key_id, bundle);
+            match probe::fetch_openai_codex_models(&bearer).await {
+                Ok(models) => {
+                    if let Err(error) = store::update_key_models(&self.pool, key_id, &models).await
+                    {
+                        tracing::warn!(
+                            key_id,
+                            error = %format!("{error:#}"),
+                            "model snapshot persistence failed after a successful OpenAI login"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    key_id,
+                    error = %format!("{error:#}"),
+                    "model probe failed after a successful OpenAI login; the key keeps its old snapshot"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                key_id,
+                "OpenAI token manager is not wired; the first dispatch will read the row instead of this cache"
+            );
+        }
+        if let Err(error) = self.refresh_route_cache().await {
+            tracing::warn!(
+                key_id,
+                error = %format!("{error:#}"),
+                "route cache refresh after an OpenAI login failed"
+            );
+        }
+        // The account list changed: an open GUI re-reads its account cards.
+        self.activity.quota_refreshed();
+        openai_login::SessionState::Succeeded {
+            key_id,
+            email,
+            plan_type,
+        }
+    }
+
+    /// Write the bundle: a new key row (with the form's group memberships) or
+    /// the pinned row of a re-login. Returns the account key id.
+    async fn commit_openai_bundle(
+        &self,
+        poll: &OpenaiLoginPoll,
+        bundle: &OpenaiOAuth,
+    ) -> anyhow::Result<i64> {
+        let provider = &poll.provider;
+        let group_ids = poll.group_ids.as_slice();
+        if let Some(key_id) = poll.session.key_id() {
+            self.replace_openai_bundle(key_id, bundle).await?;
+            return Ok(key_id);
+        }
+        // One clone for the row: the caller still needs the bundle for the
+        // cache adoption, and this runs once per manual login.
+        let key_id = store::insert_openai_provider_key(
+            &self.pool,
+            provider.id,
+            &poll.label,
+            bundle.clone(),
+            poll.max_concurrency,
+            None,
+        )
+        .await?;
+        if !group_ids.is_empty()
+            && let Err(error) = store::patch_provider_key(
+                &self.pool,
+                provider.id,
+                key_id,
+                store::KeyPatch {
+                    group_ids: Some(group_ids),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            // The key row is committed: failing the login would report a dead
+            // account that exists, so the memberships degrade to a warning.
+            tracing::warn!(
+                key_id,
+                provider = provider.id,
+                groups = group_ids.len(),
+                error = %format!("{error:#}"),
+                "OpenAI account key was created, but attaching its groups failed; attach them from the key editor"
+            );
+        }
+        Ok(key_id)
+    }
+
+    /// Write a re-login's bundle over the pinned row, retrying once when a
+    /// dispatch-time refresh of the same account wins the compare-and-swap.
+    async fn replace_openai_bundle(&self, key_id: i64, bundle: &OpenaiOAuth) -> anyhow::Result<()> {
+        for _ in 0..OPENAI_LOGIN_CAS_ATTEMPTS {
+            let Some(stored) = store::openai_oauth(&self.pool, key_id).await? else {
+                anyhow::bail!(
+                    "account key {key_id} no longer exists or is no longer an OpenAI account"
+                );
+            };
+            if store::replace_openai_oauth(&self.pool, key_id, &stored, bundle).await? {
+                return Ok(());
+            }
+            tracing::warn!(
+                key_id,
+                "OpenAI login write lost the compare-and-swap; rereading the row"
+            );
+        }
+        anyhow::bail!(
+            "account key {key_id} was rewritten concurrently, so the login's bundle was not stored"
+        )
+    }
+
+    /// One login's current state; `Ok(None)` when the id is unknown (never
+    /// issued, or pruned after its verdict aged out). The registry expires a
+    /// waiting login past its deadline on read.
+    pub fn openai_login_status(
+        &self,
+        session: &str,
+    ) -> anyhow::Result<Option<openai_login::LoginStatus>> {
+        let wiring = self.openai_login()?;
+        let Ok(id) = session.parse::<Uuid>() else {
+            return Ok(None);
+        };
+        Ok(wiring
+            .logins
+            .get(&id, Utc::now())
+            .map(|session| session.status()))
+    }
+
+    /// Cancel a waiting login; `Ok(false)` when the id is unknown or the login
+    /// already has a verdict (the admin API answers 404 for both).
+    pub fn cancel_openai_login(&self, session: &str) -> anyhow::Result<bool> {
+        let wiring = self.openai_login()?;
+        let Ok(id) = session.parse::<Uuid>() else {
+            return Ok(false);
+        };
+        Ok(wiring.logins.cancel(&id, Utc::now()))
+    }
+
+    /// The wired login dependencies, or a configuration error: every login
+    /// endpoint fails closed when the surface was built without them.
+    fn openai_login(&self) -> anyhow::Result<&OpenaiLogin> {
+        self.openai_login
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenAI 登录需要已接线的 issuer 客户端与会话注册表"))
     }
 
     /// Start a Cursor browser login for `provider_id` (plan §2.1.2).
@@ -2207,6 +2634,270 @@ fn ensure_cursor_provider(provider: &store::ProviderRow) -> Result<(), CursorLog
         return Ok(());
     }
     Err(CursorLoginError::NotCursorProvider {
+        provider_id: provider.id,
+        protocol: provider.protocol.clone(),
+    })
+}
+
+// ---------- OpenAI Codex account login ----------
+
+/// Ceiling on a login's lifetime. The issuer reports no grant lifetime, so the
+/// session is bounded here (the Codex CLI waits the same 15 minutes).
+const OPENAI_LOGIN_LIFETIME_SECS: i64 = 15 * 60;
+
+/// Polls after which a login gives up even when the deadline is still ahead.
+const OPENAI_LOGIN_MAX_POLLS: u32 = 120;
+
+/// Added to the issuer's poll interval, so a clock that runs a little fast
+/// never polls earlier than the issuer allows.
+const OPENAI_LOGIN_POLL_MARGIN_SECS: u64 = 3;
+
+/// The operator text for a device grant or code exchange the issuer refused.
+const OPENAI_LOGIN_REJECTED_MESSAGE: &str =
+    "OpenAI refused the login; start it again and re-enter the code";
+
+/// The operator text for tokens that name no ChatGPT workspace.
+const OPENAI_LOGIN_NO_WORKSPACE_MESSAGE: &str =
+    "OpenAI's tokens did not identify a ChatGPT workspace, so this account cannot be used";
+
+/// The operator text for a code exchange that failed without a refusal
+/// (issuer unreachable or answering unusably); the approval is single-use, so
+/// the login cannot retry it.
+const OPENAI_LOGIN_EXCHANGE_MESSAGE: &str =
+    "OpenAI approved the login but the token exchange failed; start it again";
+
+/// Ceiling on the pause between polls, so a bogus issuer `interval` cannot
+/// park the poller far past the grant.
+const OPENAI_LOGIN_MAX_INTERVAL_SECS: u64 = 60;
+
+/// Compare-and-swap attempts for a re-login's write.
+const OPENAI_LOGIN_CAS_ATTEMPTS: usize = 2;
+
+/// The operator text for an approved login that could not be stored.
+const OPENAI_LOGIN_STORE_MESSAGE: &str =
+    "the account could not be stored after OpenAI approved the login; see the server log";
+
+/// `POST /api/openai-logins` body: the account to create, or (with `key_id`) the
+/// existing account to re-authenticate.
+#[derive(Debug, serde::Deserialize)]
+pub struct OpenaiLoginRequest {
+    /// The provider a new account belongs to. Ignored for a re-login, whose
+    /// key row already names its provider.
+    #[serde(default)]
+    pub provider_id: Option<i64>,
+    /// The label of the account a fresh login creates (ignored for a re-login).
+    #[serde(default)]
+    pub label: String,
+    /// The existing `openai_oauth` key to replace the credential of.
+    #[serde(default)]
+    pub key_id: Option<i64>,
+    /// Groups to attach to the new account (ignored for a re-login).
+    #[serde(default)]
+    pub group_ids: Vec<i64>,
+    #[serde(default)]
+    pub max_concurrency: Option<i32>,
+}
+
+/// What a validated start request asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpenaiLoginTarget {
+    /// Create an account on `provider_id`.
+    New {
+        provider_id: i64,
+        label: String,
+        group_ids: Vec<i64>,
+        max_concurrency: Option<i32>,
+    },
+    /// Replace the credential of an existing account; its label, groups and
+    /// cap stay as the key editor left them.
+    Relogin { key_id: i64 },
+}
+
+impl OpenaiLoginRequest {
+    /// Check the request's shape (no I/O): which of the two flows it asks for
+    /// and that the inputs of that flow are usable.
+    pub fn into_target(self) -> Result<OpenaiLoginTarget, OpenaiLoginError> {
+        if let Some(key_id) = self.key_id {
+            return Ok(OpenaiLoginTarget::Relogin { key_id });
+        }
+        let Some(provider_id) = self.provider_id else {
+            return Err(OpenaiLoginError::Invalid(
+                "provider_id is required for a new login".to_owned(),
+            ));
+        };
+        let label = self.label.trim();
+        if label.is_empty() {
+            return Err(OpenaiLoginError::Invalid(
+                "label must not be empty".to_owned(),
+            ));
+        }
+        if self.max_concurrency.is_some_and(|limit| limit <= 0) {
+            return Err(OpenaiLoginError::Invalid(
+                "max_concurrency must be positive".to_owned(),
+            ));
+        }
+        Ok(OpenaiLoginTarget::New {
+            provider_id,
+            label: label.to_owned(),
+            group_ids: self.group_ids,
+            max_concurrency: self.max_concurrency,
+        })
+    }
+}
+
+/// What one issuer round told the poller, reduced to what the decision needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollObservation {
+    /// Not approved yet.
+    Pending,
+    /// The issuer could not be reached or answered 5xx/429 (asking again can
+    /// still work).
+    Transient,
+    /// The issuer refused the grant or the code (only a new login helps).
+    Rejected,
+}
+
+/// The poller's next move.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PollDecision {
+    /// Wait and ask again.
+    Continue,
+    /// The grant ran out before the human approved it.
+    Expire,
+    /// End the login with this operator text.
+    Fail(&'static str),
+}
+
+/// Classify an issuer failure for [`decide_poll`].
+fn observe_openai_failure(error: &openai_auth::AuthError) -> PollObservation {
+    if error.is_rejection() {
+        PollObservation::Rejected
+    } else {
+        PollObservation::Transient
+    }
+}
+
+/// The pause before each poll.
+fn openai_poll_wait(interval: std::time::Duration) -> std::time::Duration {
+    interval.min(std::time::Duration::from_secs(
+        OPENAI_LOGIN_MAX_INTERVAL_SECS,
+    )) + std::time::Duration::from_secs(OPENAI_LOGIN_POLL_MARGIN_SECS)
+}
+
+/// One poll result plus the clock decides what happens next. A refusal ends
+/// the login; otherwise the deadline and the poll budget end it as expired.
+fn decide_poll(
+    observation: PollObservation,
+    now: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+    polls: u32,
+) -> PollDecision {
+    if observation == PollObservation::Rejected {
+        return PollDecision::Fail(OPENAI_LOGIN_REJECTED_MESSAGE);
+    }
+    if now >= expires_at || polls >= OPENAI_LOGIN_MAX_POLLS {
+        return PollDecision::Expire;
+    }
+    PollDecision::Continue
+}
+
+/// The operator text for a failed code exchange.
+fn openai_exchange_failure_message(error: &openai_auth::AuthError) -> &'static str {
+    if error.is_rejection() {
+        OPENAI_LOGIN_REJECTED_MESSAGE
+    } else {
+        OPENAI_LOGIN_EXCHANGE_MESSAGE
+    }
+}
+
+/// The operator-facing reason an approved login could not be committed. Never
+/// the raw error: a store failure's detail can quote the row, tokens included.
+fn openai_commit_failure_message(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<store::LabelTaken>() {
+        // The label passed the pre-check and was taken before the commit.
+        Some(taken) => format!(
+            "a key with label {:?} already exists on this provider; log in again with another label",
+            taken.label
+        ),
+        None => OPENAI_LOGIN_STORE_MESSAGE.to_owned(),
+    }
+}
+
+/// The wiring an OpenAI login needs: the stateless issuer client and the
+/// process's session registry. Grouped so one `None` covers both, and
+/// [`Admin::with_openai_login`] is the single place that supplies them.
+#[derive(Clone)]
+struct OpenaiLogin {
+    client: Arc<openai_auth::Client>,
+    logins: openai_login::OpenaiLogins,
+}
+
+/// Everything one spawned OpenAI login needs to reach its verdict.
+struct OpenaiLoginPoll {
+    session: Arc<openai_login::Session>,
+    client: Arc<openai_auth::Client>,
+    provider: store::ProviderRow,
+    /// The label of the key to create (ignored by a re-login).
+    label: String,
+    /// Groups to attach to a newly created key (ignored by a re-login).
+    group_ids: Vec<i64>,
+    max_concurrency: Option<i32>,
+}
+
+/// A started OpenAI device login: what `POST /api/openai-logins` answers with.
+/// The grant handle the poller redeems stays server-side.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct OpenaiLoginStarted {
+    /// The registry id to poll and to cancel.
+    pub session: String,
+    /// The short code the operator types.
+    pub user_code: String,
+    /// Where the operator types it.
+    pub verification_url: &'static str,
+    /// Seconds the gateway keeps polling.
+    pub expires_in: u64,
+    /// Seconds between polls, as the issuer asked for them.
+    pub interval: u64,
+}
+
+/// Why an OpenAI login could not be started. The variants mirror the admin
+/// API's status codes (404 / 400 / 409 / 500).
+#[derive(Debug, thiserror::Error)]
+pub enum OpenaiLoginError {
+    /// No such provider row.
+    #[error("provider {0} does not exist")]
+    ProviderNotFound(i64),
+    /// The provider does not speak the Responses protocol the Codex backend
+    /// serves.
+    #[error("provider {provider_id} is not an OpenAI Codex provider (protocol {protocol:?})")]
+    NotOpenaiProvider { provider_id: i64, protocol: String },
+    /// A re-login named a row that is absent, or is not an OpenAI account.
+    #[error("key {0} does not exist or is not an OpenAI Codex account")]
+    KeyNotFound(i64),
+    /// Caller input: an empty label, a non-positive cap, an unknown group id.
+    #[error("{0}")]
+    Invalid(String),
+    /// The label already names another key of this provider.
+    #[error("a key with label {0:?} already exists on this provider")]
+    LabelConflict(String),
+    /// Wiring or storage failed. Never raised for caller input.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Whether the login may mint ChatGPT tokens for this provider: its protocol
+/// is `openai_responses` (the only one an `openai_oauth` key is accepted on,
+/// see `credentials`) and its endpoint is the ChatGPT backend, so a credential
+/// is never attached to some other host.
+fn ensure_openai_provider(provider: &store::ProviderRow) -> Result<(), OpenaiLoginError> {
+    let on_chatgpt = reqwest::Url::parse(&provider.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host == "chatgpt.com"))
+        .unwrap_or(false);
+    if provider.protocol == "openai_responses" && on_chatgpt {
+        return Ok(());
+    }
+    Err(OpenaiLoginError::NotOpenaiProvider {
         provider_id: provider.id,
         protocol: provider.protocol.clone(),
     })

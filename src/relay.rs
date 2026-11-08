@@ -57,6 +57,7 @@ use crate::upstream::cursor_run;
 use crate::upstream::cursor_tokens::{CursorBearer, CursorTokenError, CursorTokens};
 use crate::upstream::cursor_usage::CursorUsage;
 use crate::upstream::kiro_tokens::{self, KiroCallContext, KiroTokens};
+use crate::upstream::openai_tokens::OpenaiTokens;
 use crate::upstream::opencode_tokens::OpencodeTokens;
 use crate::upstream::transport::{self, Transport};
 
@@ -371,6 +372,19 @@ struct OpencodeDeps<'a> {
     key_id: i64,
 }
 
+/// Everything the OpenAI Codex token plane needs for one candidate: the key's
+/// id (the cache and gate key), the gateway database (rereads and the CAS
+/// write-back) and the manager itself.
+///
+/// Selected by the key's `auth_kind`, like [`OpencodeDeps`]. Bundled as one
+/// optional field so a static candidate pays nothing for it.
+#[derive(Clone, Copy)]
+struct OpenaiDeps<'a> {
+    tokens: &'a OpenaiTokens,
+    pool: &'a sqlx::PgPool,
+    key_id: i64,
+}
+
 /// Everything the Cursor credential plane needs for one candidate: the
 /// manager, the gateway database (bundle rereads and write-back), the key's id
 /// and the credential the row holds — a browser-login bundle, or a static API
@@ -423,6 +437,10 @@ struct AttemptContext<'a> {
     /// OpenCode account rows only: this candidate's bearer plumbing. `None` for
     /// every static key, so those never touch the token manager or PG.
     opencode: Option<OpencodeDeps<'a>>,
+    /// OpenAI Codex account rows only: this candidate's bearer plumbing. `None`
+    /// for every static key. Its presence also selects the Codex body
+    /// adaptation (forced `store`/`stream`, defaulted `instructions`).
+    openai: Option<OpenaiDeps<'a>>,
     /// Cursor upstreams only: this candidate's bearer plumbing. `None` for
     /// every other protocol.
     cursor: Option<CursorDeps<'a>>,
@@ -500,6 +518,7 @@ async fn send_attempt(
         dial,
         kiro,
         opencode,
+        openai,
         cursor,
     } = *ctx;
     // The selected capability IS the upstream protocol: passthrough when it
@@ -571,12 +590,32 @@ async fn send_attempt(
         ),
         None => None,
     };
+    // An OpenAI Codex account bearer is resolved per attempt the same way.
+    let mut openai_bundle = match openai {
+        Some(deps) => Some(
+            deps.tokens
+                .resolve(deps.pool, deps.key_id)
+                .await
+                .map_err(failover::AttemptError::OpenaiTokenError)?,
+        ),
+        None => None,
+    };
     let target = TargetView {
         protocol,
         endpoint: &capability.endpoint,
         stream_endpoint: capability.stream_endpoint.as_deref(),
         upstream_model: target_model,
         kas_call: kas_call.as_ref(),
+        forced: if openai.is_some() {
+            capabilities::codex::FORCED_FIELDS
+        } else {
+            &[]
+        },
+        required: if openai.is_some() {
+            capabilities::codex::REQUIRED_FIELDS
+        } else {
+            &[]
+        },
     };
 
     // Fields the wire must not carry, all known before the send: the vendor
@@ -729,15 +768,19 @@ async fn send_attempt(
     // (the static-scheme placeholder, or a secret an operator typed on a Kiro
     // row) never goes upstream. The same holds for an OpenCode account row, whose
     // bearer is the resolved bundle's access token.
-    let mut headers = match (&kiro_call, &opencode_bundle) {
-        (_, Some(bundle)) => opencode_auth_headers(bundle),
-        (Some(call), None) => vec![("authorization", format!("Bearer {}", call.bearer()))],
-        (None, None) => credential.headers(),
+    let mut headers = match (&kiro_call, &opencode_bundle, &openai_bundle) {
+        (_, _, Some(bundle)) => capabilities::codex::headers(bundle),
+        (_, Some(bundle), None) => opencode_auth_headers(bundle),
+        (Some(call), None, None) => {
+            vec![("authorization", format!("Bearer {}", call.bearer()))]
+        }
+        (None, None, None) => credential.headers(),
     };
     if let Some(seed) = opencode_seed {
         headers.extend(opencode_headers(seed));
     }
-    let query_pairs = if kiro_call.is_some() || opencode_bundle.is_some() {
+    let query_pairs = if kiro_call.is_some() || opencode_bundle.is_some() || openai_bundle.is_some()
+    {
         Vec::new()
     } else {
         credential.query_pairs()
@@ -746,6 +789,7 @@ async fn send_attempt(
     let mut rounds = 0u32;
     let mut kiro_retried = false;
     let mut opencode_retried = false;
+    let mut openai_retried = false;
     loop {
         let response = transport
             .send_with_headers(&prepared, &headers, &query_pairs, deadline)
@@ -804,6 +848,28 @@ async fn send_attempt(
                 key_id = deps.key_id,
                 status,
                 "OpenCode rejected the bearer; refreshed once, resending the same call"
+            );
+            continue;
+        }
+        // OpenAI Codex: same contract as OpenCode above, one refresh-and-resend
+        // after a 401.
+        if !openai_retried
+            && status == 401
+            && let Some(deps) = openai
+            && let Some(presented) = openai_bundle.as_deref()
+        {
+            openai_retried = true;
+            let bundle = deps
+                .tokens
+                .resolve_forced(deps.pool, deps.key_id, &presented.access_token)
+                .await
+                .map_err(failover::AttemptError::OpenaiTokenError)?;
+            headers = capabilities::codex::headers(&bundle);
+            openai_bundle = Some(bundle);
+            tracing::warn!(
+                key_id = deps.key_id,
+                status,
+                "Codex backend rejected the bearer; refreshed once, resending the same call"
             );
             continue;
         }
@@ -904,10 +970,18 @@ async fn send_attempt(
         // A vendor error body can echo the credential it just rejected; excise it
         // before the body becomes the attempt's error — that error is what the
         // caller reads, what the attempt log prints, and what the request row keeps.
-        let redacted = match (&kiro_call, &opencode_bundle) {
-            (_, Some(bundle)) => crate::providers::AuthSchemeMaterial::new(
+        let account_token = opencode_bundle
+            .as_deref()
+            .map(|bundle| bundle.access_token.as_str())
+            .or_else(|| {
+                openai_bundle
+                    .as_deref()
+                    .map(|bundle| bundle.access_token.as_str())
+            });
+        let redacted = match (&kiro_call, account_token) {
+            (_, Some(token)) => crate::providers::AuthSchemeMaterial::new(
                 crate::providers::AuthScheme::Bearer,
-                &bundle.access_token,
+                token,
             )
             .redact(&body),
             (Some(call), None) => crate::providers::AuthSchemeMaterial::new(
@@ -1445,6 +1519,8 @@ enum Resolution {
 ///   the candidate's placeholder secret is empty and never reaches the wire;
 /// * `opencode_oauth` — the same shape, resolved per attempt by
 ///   [`crate::upstream::OpencodeTokens`];
+/// * `openai_oauth` — the same shape, resolved per attempt by
+///   [`crate::upstream::OpenaiTokens`];
 /// * `cursor_oauth` — the same shape, resolved per attempt by
 ///   [`crate::upstream::CursorTokens`] (a `static` key on a Cursor provider is
 ///   exchanged for a bearer by the same manager).
@@ -1485,6 +1561,18 @@ fn fetch_key_secrets(
                 tracing::warn!(
                     key_id = key.id,
                     "OpenCode provider key has no OAuth bundle; skipped"
+                );
+            }
+            continue;
+        }
+        if key.auth_kind == "openai_oauth" {
+            if key.openai_oauth().is_some() {
+                resolved.push((key, SecretString::from(String::new())));
+            } else {
+                skipped += 1;
+                tracing::warn!(
+                    key_id = key.id,
+                    "OpenAI provider key has no OAuth bundle; skipped"
                 );
             }
             continue;
@@ -2015,6 +2103,9 @@ pub struct DispatchDeps<'a> {
     /// Per-key OpenCode account bearer manager (lazy refresh, single-flight, CAS
     /// write-back). The same instance backs model and quota probing.
     pub opencode_tokens: &'a OpencodeTokens,
+    /// Per-key OpenAI Codex account bearer manager (lazy refresh, single-flight,
+    /// CAS write-back).
+    pub openai_tokens: &'a OpenaiTokens,
     /// Per-key Cursor bearer manager (login-bundle refresh or API-key exchange,
     /// single-flight, write-back). The same instance backs model probing.
     pub cursor_tokens: &'a CursorTokens,
@@ -2168,6 +2259,7 @@ pub async fn dispatch_at(
         kiro_tokens,
         prompt_cache,
         opencode_tokens,
+        openai_tokens,
         cursor_tokens,
         cursor_usage,
         trace_ring,
@@ -2443,6 +2535,9 @@ pub async fn dispatch_at(
     // Set when at least one candidate was skipped because none of its
     // capabilities can serve the client protocol (shapes the final error).
     let mut unserved = false;
+    // Set when a streaming-only candidate (the Codex backend) was skipped for a
+    // non-streaming request (shapes the final error like `unserved`).
+    let mut stream_required = false;
     // Set when a billed caller's candidate lost its price after admission
     // (shapes the final error like the admission refusal).
     let mut unpriced = false;
@@ -2646,6 +2741,34 @@ pub async fn dispatch_at(
         // `{model}` placeholder now that the candidate's target model is known.
         let capability = capabilities::resolve_for_model(capability, target_model);
         let capability = &capability;
+        // A ChatGPT Codex account's key kind decides (one provider row can hold
+        // many accounts). The backend only streams, and the gateway does not
+        // aggregate its SSE into a JSON reply: a non-streaming client cannot be
+        // served here, so this candidate is skipped like any unservable one.
+        let codex = candidate.key.auth_kind == "openai_oauth";
+        if codex && !request.stream {
+            stream_required = true;
+            tracing::info!(
+                provider = provider.name.as_str(),
+                key = candidate.key.label.as_str(),
+                "the Codex backend only streams; skipping candidate for a non-streaming request"
+            );
+            drop(slot.take()); // Release the slot before failing over.
+            index += 1;
+            continue 'candidates;
+        }
+        if codex && !capabilities::codex::is_backend_endpoint(&capability.endpoint) {
+            // Fail closed: the bearer is minted for ChatGPT and goes nowhere else.
+            tracing::warn!(
+                provider = provider.name.as_str(),
+                key = candidate.key.label.as_str(),
+                "an OpenAI OAuth key is attached to a provider outside the ChatGPT backend; skipping candidate"
+            );
+            unserved = true;
+            drop(slot.take()); // Release the slot before failing over.
+            index += 1;
+            continue 'candidates;
+        }
         if opencode_seed.is_none() && is_opencode_upstream(&capability.endpoint) {
             opencode_seed = Some(conversation_seed(&request.body));
         }
@@ -2699,14 +2822,19 @@ pub async fn dispatch_at(
         // wire: prepare omits it for this candidate via the skip list (no body
         // copy). Per candidate: a later non-glm candidate must see the client's
         // original body — it does; the tree is never touched.
-        let vendor_skip = vendor_thinking_off_fields(
-            &provider.name,
-            &provider.base_url,
-            target_model,
-            protocol,
-            capability.protocol,
-            &request.body,
-        );
+        let vendor_skip = if codex {
+            // The Codex backend refuses sampling controls and output caps.
+            capabilities::codex::SKIP_FIELDS
+        } else {
+            vendor_thinking_off_fields(
+                &provider.name,
+                &provider.base_url,
+                target_model,
+                protocol,
+                capability.protocol,
+                &request.body,
+            )
+        };
         if !vendor_skip.is_empty() {
             tracing::info!(
                 provider = provider.name.as_str(),
@@ -2811,6 +2939,12 @@ pub async fn dispatch_at(
                                 key_id: candidate.key.id,
                             },
                         ),
+                        // An OpenAI Codex account authenticates per attempt too.
+                        openai: codex.then_some(OpenaiDeps {
+                            tokens: openai_tokens,
+                            pool,
+                            key_id: candidate.key.id,
+                        }),
                         // Every Cursor Run authenticates through the manager.
                         cursor: cursor_credential.as_ref().map(|credential| CursorDeps {
                             tokens: cursor_tokens,
@@ -3311,6 +3445,13 @@ pub async fn dispatch_at(
         None if unpriced => DispatchOutcome::Failed {
             status: 503,
             message: format!("model {model} is not priced yet; try again later"),
+            retry_after_secs: None,
+        },
+        None if stream_required && !unserved => DispatchOutcome::Failed {
+            status: 400,
+            message: "this model is served by a ChatGPT Codex account, which only streams; \
+                      set \"stream\": true"
+                .into(),
             retry_after_secs: None,
         },
         None if unserved => DispatchOutcome::Failed {

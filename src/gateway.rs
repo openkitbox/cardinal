@@ -101,6 +101,14 @@ struct Core {
     /// The same arrangement for OpenCode account rows: one bearer cache shared
     /// by dispatch, model probing and quota probing.
     opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
+    /// And for OpenAI Codex account rows: one bearer cache shared by dispatch
+    /// (the refresh client is stateless, so the manager owns its own).
+    openai_tokens: Arc<crate::upstream::OpenaiTokens>,
+    /// The OpenAI issuer client (stateless): the token manager refreshes
+    /// through it and the device-login flow starts and polls through it.
+    openai_client: Arc<crate::openai::auth::Client>,
+    /// The process's in-flight OpenAI device logins, for the admin surface.
+    openai_logins: crate::openai::login::OpenaiLogins,
     /// And for Cursor account rows: one bearer cache shared by dispatch and
     /// model probing (login-bundle refresh or API-key exchange).
     cursor_tokens: Arc<crate::upstream::CursorTokens>,
@@ -218,6 +226,10 @@ impl Core {
         let opencode_tokens = Arc::new(crate::upstream::OpencodeTokens::new(Arc::clone(
             &opencode_client,
         )));
+        let openai_client = Arc::new(crate::openai::auth::Client::new());
+        let openai_tokens = Arc::new(crate::upstream::OpenaiTokens::new(Arc::clone(
+            &openai_client,
+        )));
         let cursor_tokens = Arc::new(crate::upstream::CursorTokens::new(transport.clone()));
         let cursor_usage = Arc::new(crate::upstream::CursorUsage::new(transport.clone()));
         Ok(Self {
@@ -225,6 +237,9 @@ impl Core {
             transport,
             kiro_tokens,
             opencode_tokens,
+            openai_tokens,
+            openai_client,
+            openai_logins: crate::openai::login::OpenaiLogins::new(),
             cursor_tokens,
             cursor_usage,
             opencode_client,
@@ -253,6 +268,15 @@ impl Core {
     }
 }
 
+/// The shared bearer managers the quota prober reads credentials from: the
+/// same instances dispatch uses, so a probe's refresh is a chat's refresh.
+struct QuotaTokens {
+    kiro: Arc<crate::upstream::KiroTokens>,
+    opencode: Arc<crate::upstream::OpencodeTokens>,
+    cursor: Arc<crate::upstream::CursorTokens>,
+    openai: Arc<crate::upstream::OpenaiTokens>,
+}
+
 /// Background vendor-quota prober: every [`QUOTA_PROBE_INTERVAL`], run the
 /// [`admin_ops::probe_all_quotas`] fan-out, which probes each enabled, unarchived key that
 /// has a quota source and persists its snapshot. `tokio::time::interval`'s
@@ -275,9 +299,7 @@ impl Core {
 async fn quota_prober(
     pool: sqlx::PgPool,
     smart_cache: relay::SmartCache,
-    kiro_tokens: Arc<crate::upstream::KiroTokens>,
-    opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
-    cursor_tokens: Arc<crate::upstream::CursorTokens>,
+    tokens: QuotaTokens,
     activity: crate::activity::ActivitySink,
     cancel: CancellationToken,
 ) {
@@ -292,9 +314,10 @@ async fn quota_prober(
             let rows = admin_ops::probe_all_quotas(
                 &pool,
                 Some(&smart_cache),
-                Some(&kiro_tokens),
-                Some(&opencode_tokens),
-                Some(&cursor_tokens),
+                Some(&tokens.kiro),
+                Some(&tokens.opencode),
+                Some(&tokens.cursor),
+                Some(&tokens.openai),
             )
             .await;
             if !rows.is_empty() {
@@ -404,9 +427,12 @@ impl Gateway {
         let prober_handle = tokio::spawn(quota_prober(
             core.pool.clone(),
             core.smart_cache.clone(),
-            Arc::clone(&core.kiro_tokens),
-            Arc::clone(&core.opencode_tokens),
-            Arc::clone(&core.cursor_tokens),
+            QuotaTokens {
+                kiro: Arc::clone(&core.kiro_tokens),
+                opencode: Arc::clone(&core.opencode_tokens),
+                cursor: Arc::clone(&core.cursor_tokens),
+                openai: Arc::clone(&core.openai_tokens),
+            },
             core.activity.clone(),
             core.prober_cancel.clone(),
         ));
@@ -440,6 +466,9 @@ impl Gateway {
             kiro_tokens: core.kiro_tokens.clone(),
             prompt_cache: core.prompt_cache.clone(),
             opencode_tokens: core.opencode_tokens.clone(),
+            openai_tokens: Arc::clone(&core.openai_tokens),
+            openai_client: Arc::clone(&core.openai_client),
+            openai_logins: core.openai_logins.clone(),
             cursor_tokens: Arc::clone(&core.cursor_tokens),
             cursor_usage: Arc::clone(&core.cursor_usage),
             opencode_client: Arc::clone(&core.opencode_client),

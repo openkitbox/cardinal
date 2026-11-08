@@ -702,6 +702,14 @@ pub struct TargetView<'a> {
     /// (fail closed, never an attempt header with a made-up identity). It is
     /// non-secret — the ARN and tokens stay in the relay.
     pub kas_call: Option<&'a crate::kiro::KasCall>,
+    /// Responses kernel only: fields the upstream requires with a fixed value,
+    /// as `(name, raw JSON literal)`. The client's own value of the same name
+    /// is dropped and the literal is written in its place, so the client tree
+    /// is never edited. Empty for every candidate without such a demand.
+    pub forced: &'a [(&'static str, &'static str)],
+    /// Responses kernel only: fields the upstream requires but the client may
+    /// omit, written with this literal only when the client sent none.
+    pub required: &'a [(&'static str, &'static str)],
 }
 
 impl TargetView<'_> {

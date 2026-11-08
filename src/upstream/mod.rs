@@ -17,10 +17,12 @@ pub mod cursor_tokens;
 pub mod cursor_usage;
 pub(crate) mod dns;
 pub mod kiro_tokens;
+pub mod openai_tokens;
 pub mod opencode_tokens;
 pub mod transport;
 
 pub use cursor_tokens::{CursorTokenError, CursorTokens};
 pub use cursor_usage::CursorUsage;
 pub use kiro_tokens::{KiroCallContext, KiroProbeCredential, KiroTokenError, KiroTokens};
+pub use openai_tokens::{OpenaiBearer, OpenaiTokenError, OpenaiTokens};
 pub use opencode_tokens::{OpencodeTokenError, OpencodeTokens};

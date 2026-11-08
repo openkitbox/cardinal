@@ -12,6 +12,8 @@
 
 use anyhow::Context as _;
 
+use crate::relay::capabilities::codex::CLIENT_VERSION as CODEX_CLIENT_VERSION;
+
 /// One probe attempt's budget (matches the magnitude the relay allows for
 /// opening a response).
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
@@ -668,5 +670,142 @@ fn parse_cursor_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
         })
         .collect();
     anyhow::ensure!(!models.is_empty(), "Cursor listed no usable models");
+    Ok(models)
+}
+
+// ---------- OpenAI Codex (ChatGPT subscription catalogue) ----------
+
+/// The model list shapes its answer by the `client_version` query value.
+const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+
+/// GET a Codex backend URL with the account's bearer and return the status
+/// and body text.
+///
+/// Shared by the model list and the quota probe (`quota::openai_codex`). The
+/// client refuses redirects, so the bearer and `chatgpt-account-id` never
+/// follow a `Location` to another authority. Error messages are fixed text:
+/// reqwest's Display can render the URL, and nothing here may echo the bearer.
+pub(crate) async fn codex_get(
+    url: &str,
+    bearer: &crate::openai::OpenaiOAuth,
+) -> anyhow::Result<(u16, String)> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| anyhow::anyhow!("Codex probe client unavailable"))?;
+    let response = client
+        .get(url)
+        .timeout(PROBE_TIMEOUT)
+        .bearer_auth(&bearer.access_token)
+        .header("chatgpt-account-id", &bearer.account_id)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header("originator", "cardinal")
+        .header("version", CODEX_CLIENT_VERSION)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("Codex backend request failed"))?;
+    let status = response.status().as_u16();
+    let body = read_bounded(response)
+        .await
+        .map_err(|_| anyhow::anyhow!("Codex backend response unreadable"))?;
+    Ok((status, body))
+}
+
+/// Fetch a ChatGPT-subscription account's Codex model catalogue
+/// (`GET /codex/models`). The bearer comes from the caller
+/// (`OpenaiTokens::resolve`), so this stays free of the credential store.
+pub async fn fetch_openai_codex_models(
+    bearer: &crate::upstream::OpenaiBearer,
+) -> anyhow::Result<Vec<ProbeModel>> {
+    let (status, body) = codex_get(
+        &format!("{CODEX_MODELS_URL}?client_version={CODEX_CLIENT_VERSION}"),
+        bearer,
+    )
+    .await?;
+    if !(200..300).contains(&status) {
+        // The error body is upstream-controlled; the fixed message is all that
+        // crosses the admin API.
+        anyhow::bail!("模型目录服务拒绝请求 (HTTP {status})");
+    }
+    parse_codex_models(&body).map_err(|_| anyhow::anyhow!("模型目录响应无效"))
+}
+
+/// Parse the Codex catalogue: `{"models": [...]}` (a `data` array is read too).
+///
+/// The id is `slug`, else `id`. An entry whose `visibility` is `hide`/`hidden`
+/// is dropped, as oh-my-pi's discovery does. `context_window` and
+/// `input_modalities` are kept when present; the effort levels come from
+/// `supported_reasoning_levels[].effort` and the default from
+/// `default_reasoning_level`, both through the canonical vocabulary.
+fn parse_codex_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
+    #[derive(serde::Deserialize)]
+    struct List {
+        models: Option<Vec<serde_json::Value>>,
+        data: Option<Vec<serde_json::Value>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        slug: Option<String>,
+        id: Option<String>,
+        visibility: Option<String>,
+        context_window: Option<u64>,
+        input_modalities: Option<Vec<String>>,
+        default_reasoning_level: Option<String>,
+        supported_reasoning_levels: Option<Vec<Level>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Level {
+        effort: Option<String>,
+    }
+    use crate::translation::ir::Effort;
+    let list: List = serde_json::from_str(body)?;
+    let entries = list
+        .models
+        .or(list.data)
+        .ok_or_else(|| anyhow::anyhow!("Codex model list has neither models nor data"))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut models = Vec::new();
+    for raw in entries {
+        // One malformed entry must not discard the rest of the catalogue.
+        let Ok(entry) = serde_json::from_value::<Entry>(raw) else {
+            continue;
+        };
+        let hidden = entry
+            .visibility
+            .as_deref()
+            .map(|visibility| visibility.trim().to_ascii_lowercase())
+            .is_some_and(|visibility| visibility == "hide" || visibility == "hidden");
+        let id = [entry.slug, entry.id]
+            .into_iter()
+            .flatten()
+            .map(|id| id.trim().to_owned())
+            .find(|id| !id.is_empty());
+        let Some(id) = id else { continue };
+        if hidden || !seen.insert(id.clone()) {
+            continue;
+        }
+        let levels: Vec<String> = entry
+            .supported_reasoning_levels
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|level| level.effort)
+            .collect();
+        let default_effort = entry
+            .default_reasoning_level
+            .as_deref()
+            .and_then(Effort::parse_name)
+            .filter(|level| !matches!(level, Effort::None))
+            .map(Effort::chat_name)
+            .map(str::to_owned);
+        models.push(ProbeModel {
+            id,
+            rate_multiplier: None,
+            context: entry.context_window.filter(|window| *window > 0),
+            max_output: None,
+            input_modalities: normalize_modalities(entry.input_modalities.unwrap_or_default()),
+            effort_levels: Effort::canonical_levels(&levels),
+            default_effort,
+        });
+    }
     Ok(models)
 }

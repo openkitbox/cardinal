@@ -32,11 +32,12 @@ pub use key::{
     ActiveWindow, AvailabilityRule, EnabledKeyModels, KeyModels, KeyPatch, KiroUpsertError,
     KiroUpsertExpectation, LabelTaken, LimitedKeyRow, ProviderKeyRow, ProviderKeyView, RouteEntry,
     RouteRow, RouteStrategy, RuleEffect, cursor_oauth, delete_provider_key,
-    insert_cursor_provider_key, insert_kiro_provider_key, insert_opencode_provider_key,
-    insert_provider_key, key_api_key, kiro_oauth, kiro_upsert_expectation, list_all_key_models,
-    list_all_keys, list_enabled_key_models, list_keys_by_ids, list_limited_keys,
-    list_provider_keys, list_quota_reset_anchors, opencode_oauth, patch_provider_key, reorder_keys,
-    replace_cursor_oauth, replace_kiro_oauth, replace_opencode_oauth, update_key_models,
+    insert_cursor_provider_key, insert_kiro_provider_key, insert_openai_provider_key,
+    insert_opencode_provider_key, insert_provider_key, key_api_key, kiro_oauth,
+    kiro_upsert_expectation, list_all_key_models, list_all_keys, list_enabled_key_models,
+    list_keys_by_ids, list_limited_keys, list_provider_keys, list_quota_reset_anchors,
+    openai_oauth, opencode_oauth, patch_provider_key, reorder_keys, replace_cursor_oauth,
+    replace_kiro_oauth, replace_openai_oauth, replace_opencode_oauth, update_key_models,
     update_key_models_for_oauth, update_provider_key, upsert_kiro_key_by_label,
 };
 pub use key_group::{

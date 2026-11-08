@@ -35,6 +35,7 @@ pub mod key_terms;
 pub mod kiro;
 pub mod metering;
 pub mod models;
+pub mod openai;
 pub mod opencode;
 pub mod prices;
 pub mod probe;

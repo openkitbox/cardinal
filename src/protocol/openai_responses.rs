@@ -43,12 +43,13 @@ pub fn prepare(
         .as_object()
         .ok_or(ProtocolError::InvalidRequest)?;
     let url = target.url(stream)?;
-    let pin_store = !skip.contains(&"store");
+    let forces = |name: &str| target.forced.iter().any(|(forced, _)| *forced == name);
+    let pin_store = !skip.contains(&"store") && !forces("store");
     let mut out = Vec::new();
     out.push(b'{');
     let mut first = true;
     for (field, value) in object {
-        if skip.contains(&field.as_str()) {
+        if skip.contains(&field.as_str()) || forces(field) {
             continue;
         }
         if !first {
@@ -71,6 +72,20 @@ pub fn prepare(
             out.push(b',');
         }
         out.extend_from_slice(b"\"store\":false");
+        first = false;
+    }
+    let missing = target
+        .required
+        .iter()
+        .filter(|(field, _)| !object.contains_key(*field) && !skip.contains(field));
+    for (field, literal) in target.forced.iter().chain(missing) {
+        if !first {
+            out.push(b',');
+        }
+        first = false;
+        super::write_json(&mut out, field)?;
+        out.push(b':');
+        out.extend_from_slice(literal.as_bytes());
     }
     out.push(b'}');
     let body = bytes::Bytes::from(out);

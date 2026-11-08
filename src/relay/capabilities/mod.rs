@@ -14,11 +14,12 @@
 //! their base_url contract and their per-row facts; this file owns only the
 //! generic contract ([`Capability`], [`select`], [`resolve_for_model`]) and
 //! the single-protocol fallback. Vendor modules: [`kimi`], [`glm`],
-//! [`gemini`], [`opencode`], [`commandcode`], [`deepseek`].
+//! [`gemini`], [`opencode`], [`commandcode`], [`deepseek`], [`codex`].
 //!
 //! Endpoints are FULL request URLs: the protocol kernels use
 //! `TargetView.endpoint` verbatim.
 
+pub(crate) mod codex;
 mod commandcode;
 mod deepseek;
 mod gemini;
@@ -173,7 +174,7 @@ fn protocol_suffix(protocol: ProtocolId) -> &'static str {
 /// itself). Vendors with a pinned path keep that contract in their own
 /// module (hardcoded: kimi platform = host root, kimi code = `/coding/v1`,
 /// glm code = `/api/coding/paas/v4`, opencode = `/zen/go` | `/zen`,
-/// commandcode = `/provider`).
+/// commandcode = `/provider`, openai-codex = `/backend-api`).
 pub fn validate_base_url(provider_name: &str, base_url: &str) -> anyhow::Result<()> {
     let path = reqwest::Url::parse(base_url)
         .map(|url| url.path().to_owned())
@@ -196,6 +197,7 @@ pub fn validate_base_url(provider_name: &str, base_url: &str) -> anyhow::Result<
         ("deepseek", _) => deepseek::validate_base_url(path),
         ("opencode", _) => opencode::validate_base_url(path),
         ("commandcode", _) => commandcode::validate_base_url(path),
+        ("openai", _) if codex::is_codex(provider_name) => codex::validate_base_url(path),
         _ => Ok(()),
     }
 }
@@ -228,6 +230,8 @@ pub fn capabilities(
         ("opencode", _) => opencode::capabilities(base),
         ("commandcode", _) => commandcode::capabilities(base),
         ("deepseek", _) => deepseek::capabilities(base),
+        // `openai-codex` only: plain `openai` keeps the generic row.
+        ("openai", _) if codex::is_codex(provider_name) => codex::capabilities(base),
         _ => single_protocol(row_protocol, row_auth_scheme, base),
     }
 }
