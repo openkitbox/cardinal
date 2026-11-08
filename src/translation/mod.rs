@@ -6,12 +6,12 @@
 //! N². Same-protocol calls never touch this module — they stay on the
 //! byte-faithful pass-through path.
 //!
-//! beaver opens four directed pairs: Chat ↔ Anthropic Messages, Responses →
-//! Chat, and Responses → Anthropic Messages (Responses as a *client* only —
-//! nothing translates into a Responses upstream; the kimi arm routes every
-//! upstream connection over Anthropic, so a Responses client on kimi needs
-//! this pair). Kiro opens one more: Chat → Kiro, an upstream-only dialect;
-//! Cursor the same: Chat → Cursor.
+//! beaver opens five directed pairs: Chat ↔ Anthropic Messages, Responses →
+//! Chat, Responses → Anthropic Messages (the kimi arm routes every upstream
+//! connection over Anthropic, so a Responses client on kimi needs this pair)
+//! and Chat → Responses (an OpenAI-only upstream serving a Chat client; the
+//! `responses_upstream` module owns that half). Kiro opens one more: Chat →
+//! Kiro, an upstream-only dialect; Cursor the same: Chat → Cursor.
 
 pub mod anthropic_messages;
 pub mod cursor;
@@ -20,6 +20,7 @@ pub mod ir;
 pub mod kiro;
 pub mod openai_chat;
 pub mod openai_responses;
+pub mod responses_upstream;
 pub mod stream;
 
 use crate::protocol::ProtocolId;
@@ -34,6 +35,7 @@ const OPENED: &[(ProtocolId, ProtocolId)] = &[
     (ProtocolId::AnthropicMessages, ProtocolId::OpenAiChat),
     (ProtocolId::OpenAiResponses, ProtocolId::OpenAiChat),
     (ProtocolId::OpenAiResponses, ProtocolId::AnthropicMessages),
+    (ProtocolId::OpenAiChat, ProtocolId::OpenAiResponses),
     // Kiro is a translation target only: nothing serves Kiro's wire inbound,
     // so it never appears as the `from` side of a pair.
     (ProtocolId::OpenAiChat, ProtocolId::Kiro),
@@ -90,13 +92,14 @@ pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
             emit_response_json: anthropic_messages::emit_response_json,
             response_to_ir: anthropic_messages::response_to_ir,
         }),
-        // Client-side half only: to_ir/emit_response_json are live, while
-        // from_ir/response_to_ir refuse — nothing translates *into* Responses.
+        // The client half (`to_ir`/`emit_response_json`) lives in
+        // `openai_responses`; the upstream half (`from_ir`/`response_to_ir`)
+        // in `responses_upstream`.
         ProtocolId::OpenAiResponses => Some(Dialect {
             to_ir: openai_responses::to_ir,
-            from_ir: openai_responses::from_ir,
+            from_ir: responses_upstream::from_ir,
             emit_response_json: openai_responses::emit_response_json,
-            response_to_ir: openai_responses::response_to_ir,
+            response_to_ir: responses_upstream::response_to_ir,
         }),
         // Gemini is passthrough-only: it takes part in no IR translation in
         // either direction (the OPENED matrix is untouched by design).
@@ -127,4 +130,27 @@ pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
 /// anyhow-flavored version of `for_protocol`: the relay loop can use `?` directly.
 pub fn dialect(protocol: ProtocolId) -> Result<Dialect, crate::protocol::ProtocolError> {
     for_protocol(protocol).ok_or(crate::protocol::ProtocolError::UnsupportedApi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_client_may_be_served_by_a_responses_upstream() {
+        assert!(translatable(
+            ProtocolId::OpenAiChat,
+            ProtocolId::OpenAiResponses
+        ));
+        // The reverse hop was already open and stays so; Messages → Responses
+        // is deliberately not opened.
+        assert!(translatable(
+            ProtocolId::OpenAiResponses,
+            ProtocolId::OpenAiChat
+        ));
+        assert!(!translatable(
+            ProtocolId::AnthropicMessages,
+            ProtocolId::OpenAiResponses
+        ));
+    }
 }

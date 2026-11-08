@@ -1329,6 +1329,14 @@ fn prepare_translated(
         upstream_value["reasoning_effort"] =
             Value::String(translation::effort_clamp::off_wire_name(tweaks.dial).to_owned());
     }
+    // Same for a Responses upstream, where the dial lives under `reasoning`;
+    // `from_ir` already wrote `summary` when it wrote an effort, and an off
+    // request carries neither, so the nested object is created here.
+    if upstream == ProtocolId::OpenAiResponses && effort_off {
+        upstream_value["reasoning"] = serde_json::json!({
+            "effort": translation::effort_clamp::off_wire_name(tweaks.dial),
+        });
+    }
     // The rebuilt tree is already owned, so the DeepSeek dialect edits land in
     // place: a calling assistant turn must be followed straight away by its
     // tool results, and a partially-reasoning history still needs the gaps
@@ -3298,8 +3306,8 @@ pub async fn dispatch_at(
             }
         }
         // No attempt ran and at least one candidate was skipped for capability
-        // reasons: nobody can serve this protocol (e.g. a responses client with
-        // only chat-capable candidates — responses has no translation path).
+        // reasons: nobody can serve this protocol (e.g. an Anthropic client with
+        // only Responses-capable candidates — that pair is not translatable).
         None if unpriced => DispatchOutcome::Failed {
             status: 503,
             message: format!("model {model} is not priced yet; try again later"),

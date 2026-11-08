@@ -345,3 +345,24 @@ fn path_escape(value: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_only_row_serves_a_chat_client_by_translation() {
+        let caps = capabilities(
+            "openai",
+            ProtocolId::OpenAiResponses.as_str(),
+            "https://api.openai.com/v1",
+            "bearer",
+        );
+        let picked = select(&caps, ProtocolId::OpenAiChat, "gpt-5.4")
+            .expect("a Chat client reaches a Responses-only row through the opened hop");
+        assert_eq!(picked.protocol, ProtocolId::OpenAiResponses);
+        assert_eq!(picked.endpoint, "https://api.openai.com/v1/responses");
+        // Messages → Responses is not opened, so that client is still refused.
+        assert!(select(&caps, ProtocolId::AnthropicMessages, "gpt-5.4").is_none());
+    }
+}

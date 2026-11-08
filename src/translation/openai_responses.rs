@@ -2,10 +2,9 @@
 //!
 //! `to_ir` parses a Responses request envelope into the IR and
 //! `emit_response_json` rebuilds a Responses response body from it; the pair
-//! serves the single open directed hop Responses → Chat. Nothing translates
-//! *into* a Responses upstream (`OPENED` has no `* → OpenAiResponses` pair),
-//! so `from_ir`/`response_to_ir` exist only to fill the `Dialect` vtable and
-//! refuse defensively.
+//! serves the open directed hops Responses → Chat and Responses → Messages.
+//! The opposite half, Responses as an *upstream*, lives in
+//! `responses_upstream.rs`.
 
 use super::ir::{
     Effort, IrMessage, IrPart, IrRequest, IrResponse, IrRole, IrStop, IrTool, IrToolChoice,
@@ -511,22 +510,4 @@ fn flush_reasoning(output: &mut Vec<Value>, thinking: &mut String, seq: &mut u64
     });
     item["summary"] = Value::Array(vec![Value::Object(part)]);
     output.push(item);
-}
-
-/// Responses is never the translation *target* (`OPENED` carries only the
-/// Responses → Chat direction), so the relay never calls this; the refusal
-/// exists because the `Dialect` vtable is total.
-pub fn from_ir(
-    _request: &IrRequest,
-    _model: &str,
-) -> Result<(Value, Vec<&'static str>), ProtocolError> {
-    Err(ProtocolError::UnsupportedApi)
-}
-
-/// No upstream ever speaks Responses on a translated hop (see [`from_ir`]).
-pub fn response_to_ir(
-    _raw: &[u8],
-    _context_window: Option<u64>,
-) -> Result<IrResponse, ProtocolError> {
-    Err(ProtocolError::UnsupportedApi)
 }

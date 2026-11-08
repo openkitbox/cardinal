@@ -12,6 +12,9 @@
 //! rewriting it — the relay forwards the original bytes because the client
 //! protocol equals the upstream protocol. Responses terminal events always
 //! carry usage, so no `stream_options` injection is needed.
+//!
+//! The translated path additionally decodes text, reasoning and function-call
+//! deltas into [`StreamEvent`]s (see [`StreamDecoder::observe_raw`]).
 
 use super::sse::{Frame, RawFrame};
 use super::usage::UsageCounts;
@@ -211,16 +214,20 @@ fn usage_counts(usage: &Value) -> Option<UsageCounts> {
 
 /// Streaming observer: accumulates usage and detects the terminal event.
 ///
-/// No per-delta events are emitted: the relay forwards the original bytes on
-/// the pass-through path and never consumes deltas there, and no Responses
-/// translation exists that would need them (the chat decoder emits deltas only
-/// because the Chat↔Messages translation consumes them). Terminal and usage
-/// accounting is the whole contract here.
+/// The translated path (`observe_raw`) decodes deltas into events because the
+/// Chat↔Responses translation consumes them. The pass-through path
+/// (`observe_raw_for_relay`) forwards the original bytes, never materializes
+/// events, and keeps only the terminal, usage and `content_seen` observation.
 #[derive(Default)]
 pub struct StreamDecoder {
     usage: Option<UsageCounts>,
     terminal: Option<Terminal>,
     content_seen: bool,
+    /// `(output_index, dense tool index)` per function_call item seen so far.
+    /// Responses addresses argument deltas by output position, which also
+    /// counts reasoning and message items; Chat clients need 0-based tool
+    /// slots. Grows only on `output_item.added` of a function_call.
+    tool_slots: Vec<(u64, u32)>,
 }
 
 impl StreamDecoder {
@@ -250,15 +257,108 @@ impl StreamDecoder {
         }
         let value: Value =
             serde_json::from_str(data).map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
-        if let Some(terminal) = self.observe_event(&value)? {
+        let terminal = self.observe_event(&value)?;
+        self.decode_delta(&value, &mut events)?;
+        if let Some(terminal) = terminal {
             if let Some(usage) = self.usage.clone() {
                 events.push(StreamEvent::Usage(usage));
             }
-            events.push(StreamEvent::Finish {
-                reason: terminal_reason(terminal).to_owned(),
-            });
+            // A failed or cancelled response emits no Finish: the pump's EOF
+            // verdict then closes the Chat stream with a null finish_reason
+            // instead of a clean `stop`.
+            if let Some(reason) = self.finish_reason(terminal, &value) {
+                events.push(StreamEvent::Finish {
+                    reason: reason.to_owned(),
+                });
+            }
         }
         Ok(events)
+    }
+
+    /// Map one incremental event to its `StreamEvent`. Every other event type
+    /// yields nothing; the observation state is `observe_event`'s alone.
+    fn decode_delta(
+        &mut self,
+        value: &Value,
+        events: &mut Vec<StreamEvent>,
+    ) -> Result<(), ProtocolError> {
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(text) = non_empty_delta(value) {
+                    events.push(StreamEvent::TextDelta(text.to_owned()));
+                }
+            }
+            Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
+                if let Some(text) = non_empty_delta(value) {
+                    events.push(StreamEvent::ReasoningDelta(text.to_owned()));
+                }
+            }
+            Some("response.output_item.added") => {
+                let Some(item) = value.get("item") else {
+                    return Ok(());
+                };
+                if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                    return Ok(());
+                }
+                let output_index = output_index(value)?;
+                let call_id = item.get("call_id").and_then(Value::as_str);
+                let name = item.get("name").and_then(Value::as_str);
+                let (Some(call_id), Some(name)) = (call_id, name) else {
+                    return Err(ProtocolError::InvalidUpstreamResponse);
+                };
+                let index = u32::try_from(self.tool_slots.len())
+                    .map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
+                self.tool_slots.push((output_index, index));
+                events.push(StreamEvent::ToolCallDelta {
+                    index,
+                    id: Some(call_id.to_owned()),
+                    name: Some(name.to_owned()),
+                    arguments: String::new(),
+                });
+            }
+            Some("response.function_call_arguments.delta") => {
+                let output_index = output_index(value)?;
+                let index = self
+                    .tool_slots
+                    .iter()
+                    .find(|(slot, _)| *slot == output_index)
+                    .map(|(_, index)| *index)
+                    .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+                if let Some(arguments) = non_empty_delta(value) {
+                    events.push(StreamEvent::ToolCallDelta {
+                        index,
+                        id: None,
+                        name: None,
+                        arguments: arguments.to_owned(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The Chat-vocabulary finish reason for a terminal event: tool use and
+    /// output-token truncation are the two outcomes a Chat client can act on.
+    /// Failure and cancellation have no Chat finish reason, hence `None`.
+    fn finish_reason(&self, terminal: Terminal, value: &Value) -> Option<&'static str> {
+        match terminal {
+            Terminal::Completed if !self.tool_slots.is_empty() => Some("tool_calls"),
+            Terminal::Completed => Some("stop"),
+            Terminal::Incomplete => {
+                let reason = value
+                    .get("response")
+                    .and_then(|response| response.get("incomplete_details"))
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str);
+                if reason == Some("max_output_tokens") {
+                    Some("length")
+                } else {
+                    Some("stop")
+                }
+            }
+            Terminal::Failed | Terminal::Cancelled => None,
+        }
     }
 
     /// Observe a relay frame without materializing unused customer events.
@@ -385,11 +485,247 @@ const TERMINAL_SNIFF: &[&str] = &[
     "response.cancelled",
 ];
 
-fn terminal_reason(terminal: Terminal) -> &'static str {
-    match terminal {
-        Terminal::Completed => "completed",
-        Terminal::Incomplete => "incomplete",
-        Terminal::Failed => "failed",
-        Terminal::Cancelled => "cancelled",
+fn non_empty_delta(value: &Value) -> Option<&str> {
+    value
+        .get("delta")
+        .and_then(Value::as_str)
+        .filter(|delta| !delta.is_empty())
+}
+
+fn output_index(value: &Value) -> Result<u64, ProtocolError> {
+    value
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .ok_or(ProtocolError::InvalidUpstreamResponse)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(decoder: &mut StreamDecoder, frames: &[&str]) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        for frame in frames {
+            events.extend(
+                decoder
+                    .observe_raw(frame.as_bytes())
+                    .expect("frame decodes"),
+            );
+        }
+        events
+    }
+
+    fn tool_added(output_index: u32, call_id: &str, name: &str) -> String {
+        format!(
+            r#"{{"type":"response.output_item.added","output_index":{output_index},"item":{{"type":"function_call","call_id":"{call_id}","name":"{name}","arguments":""}}}}"#
+        )
+    }
+
+    fn args_delta(output_index: u32, delta: &str) -> String {
+        format!(
+            r#"{{"type":"response.function_call_arguments.delta","output_index":{output_index},"delta":"{delta}"}}"#
+        )
+    }
+
+    const COMPLETED: &str = r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":3}}}}"#;
+
+    #[test]
+    fn text_and_reasoning_deltas_become_events() {
+        let mut decoder = StreamDecoder::new();
+        let events = feed(
+            &mut decoder,
+            &[
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#,
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":""}"#,
+                r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"think"}"#,
+                r#"{"type":"response.reasoning_text.delta","output_index":0,"delta":"more"}"#,
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("hi".to_owned()),
+                StreamEvent::ReasoningDelta("think".to_owned()),
+                StreamEvent::ReasoningDelta("more".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_calls_get_dense_indexes_by_output_index() {
+        let mut decoder = StreamDecoder::new();
+        let frames = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#.to_owned(),
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1"}}"#.to_owned(),
+            tool_added(2, "call_a", "alpha"),
+            tool_added(3, "call_b", "beta"),
+            args_delta(3, "{\\\"b\\\""),
+            args_delta(2, "{}"),
+        ];
+        let refs: Vec<&str> = frames.iter().map(String::as_str).collect();
+        let events = feed(&mut decoder, &refs);
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_a".to_owned()),
+                    name: Some("alpha".to_owned()),
+                    arguments: String::new(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 1,
+                    id: Some("call_b".to_owned()),
+                    name: Some("beta".to_owned()),
+                    arguments: String::new(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: "{\"b\"".to_owned(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: "{}".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_reason_depends_on_tool_calls() {
+        let mut with_tool = StreamDecoder::new();
+        let added = tool_added(0, "call_a", "alpha");
+        let events = feed(&mut with_tool, &[&added, COMPLETED]);
+        let usage = UsageCounts {
+            input_tokens: 10,
+            output_tokens: 4,
+            cached_input_tokens: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(
+            events[1..],
+            [
+                StreamEvent::Usage(usage.clone()),
+                StreamEvent::Finish {
+                    reason: "tool_calls".to_owned()
+                },
+            ]
+        );
+
+        let mut plain = StreamDecoder::new();
+        let events = feed(&mut plain, &[COMPLETED]);
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Usage(usage),
+                StreamEvent::Finish {
+                    reason: "stop".to_owned()
+                },
+            ]
+        );
+        assert_eq!(plain.finish(), Terminal::Completed);
+    }
+
+    #[test]
+    fn incomplete_and_failed_reasons() {
+        let mut length = StreamDecoder::new();
+        let events = feed(
+            &mut length,
+            &[
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![StreamEvent::Finish {
+                reason: "length".to_owned()
+            }]
+        );
+        assert_eq!(length.finish(), Terminal::Incomplete);
+
+        let mut other = StreamDecoder::new();
+        let events = feed(
+            &mut other,
+            &[
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![StreamEvent::Finish {
+                reason: "stop".to_owned()
+            }]
+        );
+
+        let mut failed = StreamDecoder::new();
+        let events = feed(
+            &mut failed,
+            &[r#"{"type":"response.failed","response":{}}"#],
+        );
+        // No Finish: the relay's EOF verdict owns failure, not a Chat reason.
+        assert!(
+            events.is_empty(),
+            "failed must not yield a finish: {events:?}"
+        );
+        let mut cancelled = StreamDecoder::new();
+        let events = feed(
+            &mut cancelled,
+            &[r#"{"type":"response.cancelled","response":{}}"#],
+        );
+        assert!(
+            events.is_empty(),
+            "cancelled must not yield a finish: {events:?}"
+        );
+    }
+
+    #[test]
+    fn bad_frames_fail() {
+        let mut decoder = StreamDecoder::new();
+        assert!(matches!(
+            decoder.observe_raw(args_delta(9, "x").as_bytes()),
+            Err(ProtocolError::InvalidUpstreamResponse)
+        ));
+        let no_call_id = r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"n"}}"#;
+        assert!(matches!(
+            decoder.observe_raw(no_call_id.as_bytes()),
+            Err(ProtocolError::InvalidUpstreamResponse)
+        ));
+        assert!(matches!(
+            decoder.observe_raw(br#"{"type":"error","message":"boom"}"#),
+            Err(ProtocolError::UpstreamError)
+        ));
+        assert!(
+            decoder
+                .observe_raw(b"  ")
+                .expect("empty payload is ignored")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn relay_observation_is_unchanged() {
+        let added = tool_added(0, "call_a", "alpha");
+        let args = args_delta(0, "{}");
+        let mut relay = StreamDecoder::new();
+        relay
+            .observe_raw_for_relay(added.as_bytes())
+            .expect("added observed");
+        assert!(!relay.content_seen(), "item.added is not content");
+        relay
+            .observe_raw_for_relay(args.as_bytes())
+            .expect("delta observed");
+        assert!(relay.content_seen(), "*.delta flips content_seen");
+        relay
+            .observe_raw_for_relay(COMPLETED.as_bytes())
+            .expect("terminal observed");
+        assert_eq!(relay.finish(), Terminal::Completed);
+        assert!(relay.terminal_seen());
+        let usage = relay.usage().expect("usage observed");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (10, 4));
+        assert_eq!(usage.cached_input_tokens, Some(3));
     }
 }
