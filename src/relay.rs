@@ -413,9 +413,10 @@ struct AttemptContext<'a> {
     unfit: &'a optional::Unfit,
     provider_id: i64,
     vendor_skip: &'a [&'static str],
-    /// The OpenCode session seed (the serialized first user message), computed
-    /// once per dispatch; `None` when no OpenCode upstream is in play.
-    opencode_seed: Option<&'a str>,
+    /// The conversation seed (the serialized first user message), computed once
+    /// per dispatch; `None` when no OpenCode or Codex upstream is in play.
+    /// OpenCode derives `x-opencode-session` from it, Codex its session headers.
+    session_seed: Option<&'a str>,
     /// This candidate's Chat-body adaptations (none for the common request).
     fixups: ChatFixups,
     /// This candidate model's supported effort levels (ascending, named only);
@@ -508,7 +509,7 @@ async fn send_attempt(
         unfit,
         provider_id,
         vendor_skip,
-        opencode_seed,
+        session_seed,
         fixups,
         supported_efforts,
         default_effort,
@@ -769,14 +770,16 @@ async fn send_attempt(
     // row) never goes upstream. The same holds for an OpenCode account row, whose
     // bearer is the resolved bundle's access token.
     let mut headers = match (&kiro_call, &opencode_bundle, &openai_bundle) {
-        (_, _, Some(bundle)) => capabilities::codex::headers(bundle),
+        (_, _, Some(bundle)) => capabilities::codex::headers(bundle, session_seed),
         (_, Some(bundle), None) => opencode_auth_headers(bundle),
         (Some(call), None, None) => {
             vec![("authorization", format!("Bearer {}", call.bearer()))]
         }
         (None, None, None) => credential.headers(),
     };
-    if let Some(seed) = opencode_seed {
+    if let Some(seed) = session_seed
+        && is_opencode_upstream(&capability.endpoint)
+    {
         headers.extend(opencode_headers(seed));
     }
     let query_pairs = if kiro_call.is_some() || opencode_bundle.is_some() || openai_bundle.is_some()
@@ -840,7 +843,7 @@ async fn send_attempt(
                 .await
                 .map_err(failover::AttemptError::OpencodeTokenError)?;
             headers = opencode_auth_headers(&bundle);
-            if let Some(seed) = opencode_seed {
+            if let Some(seed) = session_seed {
                 headers.extend(opencode_headers(seed));
             }
             opencode_bundle = Some(bundle);
@@ -864,7 +867,7 @@ async fn send_attempt(
                 .resolve_forced(deps.pool, deps.key_id, &presented.access_token)
                 .await
                 .map_err(failover::AttemptError::OpenaiTokenError)?;
-            headers = capabilities::codex::headers(&bundle);
+            headers = capabilities::codex::headers(&bundle, session_seed);
             openai_bundle = Some(bundle);
             tracing::warn!(
                 key_id = deps.key_id,
@@ -2541,12 +2544,12 @@ pub async fn dispatch_at(
     // Set when a billed caller's candidate lost its price after admission
     // (shapes the final error like the admission refusal).
     let mut unpriced = false;
-    // OpenCode session identity: derived from the request body alone, so it is
-    // computed at most once per dispatch and reused by every attempt (the
-    // sha256 input must stay byte-identical — opencode's session headers depend
-    // on its stability across attempts and processes). `None` while no OpenCode
-    // upstream has appeared.
-    let mut opencode_seed: Option<String> = None;
+    // Conversation identity for OpenCode and Codex session headers: derived
+    // from the request body alone, so it is computed at most once per dispatch
+    // and reused by every attempt (the input must stay byte-identical — both
+    // upstreams' cache affinity depends on its stability across attempts and
+    // processes). `None` while neither upstream has appeared.
+    let mut session_seed: Option<String> = None;
     // The client body's IR, shared by every translated attempt of this
     // dispatch (see [`ClientIr`]).
     let mut client_ir = ClientIr::default();
@@ -2769,8 +2772,8 @@ pub async fn dispatch_at(
             index += 1;
             continue 'candidates;
         }
-        if opencode_seed.is_none() && is_opencode_upstream(&capability.endpoint) {
-            opencode_seed = Some(conversation_seed(&request.body));
+        if session_seed.is_none() && (codex || is_opencode_upstream(&capability.endpoint)) {
+            session_seed = Some(conversation_seed(&request.body));
         }
         // The secret is exposed only here, at the injection point; AuthSchemeMaterial
         // never logs it.
@@ -2910,7 +2913,7 @@ pub async fn dispatch_at(
                         unfit: failover.unfit(),
                         provider_id: provider.id,
                         vendor_skip,
-                        opencode_seed: opencode_seed.as_deref(),
+                        session_seed: session_seed.as_deref(),
                         fixups,
                         supported_efforts: candidate.supported_efforts.as_deref(),
                         default_effort: candidate.default_effort,

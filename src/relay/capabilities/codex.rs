@@ -82,9 +82,24 @@ pub(crate) const REQUIRED_FIELDS: &[(&str, &str)] = &[("instructions", "\"\"")];
 const ORIGINATOR: &str = "cardinal";
 pub(crate) const CLIENT_VERSION: &str = "0.159.0";
 
-/// The account's request headers: bearer, workspace, and client identity.
-pub(crate) fn headers(bundle: &OpenaiOAuth) -> Vec<(&'static str, String)> {
-    vec![
+/// Namespace of the session ids derived from a conversation seed.
+const SESSION_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6361_7264_696e_616c_636f_6465_7873_6573);
+
+/// The account's request headers: bearer, workspace, client identity and, when
+/// the conversation has a seed, its session.
+///
+/// The backend ties prompt-cache affinity to the `session_id` /
+/// `conversation_id` headers; a body `prompt_cache_key` alone never produces a
+/// cache read (measured 2026-11-08: same 10.5k-token prompt twice, key only →
+/// `cached_tokens` 0 both times; with the session headers → 10368 the second
+/// time). The id is a UUID derived from the seed, so one conversation keeps one
+/// session across turns, accounts and processes.
+pub(crate) fn headers(
+    bundle: &OpenaiOAuth,
+    session_seed: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut headers = vec![
         ("authorization", format!("Bearer {}", bundle.access_token)),
         ("chatgpt-account-id", bundle.account_id.clone()),
         ("originator", ORIGINATOR.to_owned()),
@@ -93,5 +108,11 @@ pub(crate) fn headers(bundle: &OpenaiOAuth) -> Vec<(&'static str, String)> {
             "user-agent",
             format!("cardinal/{}", env!("CARGO_PKG_VERSION")),
         ),
-    ]
+    ];
+    if let Some(seed) = session_seed {
+        let session = uuid::Uuid::new_v5(&SESSION_NAMESPACE, seed.as_bytes()).to_string();
+        headers.push(("conversation_id", session.clone()));
+        headers.push(("session_id", session));
+    }
+    headers
 }
