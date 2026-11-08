@@ -13,10 +13,16 @@
 
 use bytes::{Bytes, BytesMut};
 
-/// Maximum bytes in one SSE line, including the trailing newline.
-pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Maximum bytes accumulated for one dispatched event.
 pub const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum bytes in one SSE line, including the trailing newline.
+///
+/// A `data:` line carries a whole JSON payload, and a Responses upstream echoes
+/// the full request (instructions, tools, input) inside `response.created` and
+/// `response.completed`, so a long prompt makes one line as large as the
+/// event. The line cap therefore equals the event cap: a smaller one fails
+/// every request whose prompt passes it.
+pub const MAX_LINE_BYTES: usize = MAX_EVENT_BYTES;
 /// A parsed SSE event whose data remains in its reference-counted byte buffer.
 ///
 /// This is intentionally a framing-level type: protocol kernels decide how to
