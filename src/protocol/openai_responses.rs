@@ -238,11 +238,16 @@ pub struct StreamDecoder {
     usage: Option<UsageCounts>,
     terminal: Option<Terminal>,
     content_seen: bool,
-    /// `(output_index, dense tool index)` per function_call item seen so far.
-    /// Responses addresses argument deltas by output position, which also
-    /// counts reasoning and message items; Chat clients need 0-based tool
-    /// slots. Grows only on `output_item.added` of a function_call.
-    tool_slots: Vec<(u64, u32)>,
+    /// Responses output positions include non-tool items; Chat needs dense
+    /// tool indexes. Grows only on `output_item.added` of a function_call.
+    tool_slots: Vec<ToolSlot>,
+}
+
+struct ToolSlot {
+    output_index: u64,
+    index: u32,
+    /// Arguments already emitted, retained to reconcile completion snapshots.
+    arguments: String,
 }
 
 impl StreamDecoder {
@@ -323,7 +328,11 @@ impl StreamDecoder {
                 };
                 let index = u32::try_from(self.tool_slots.len())
                     .map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
-                self.tool_slots.push((output_index, index));
+                self.tool_slots.push(ToolSlot {
+                    output_index,
+                    index,
+                    arguments: String::new(),
+                });
                 events.push(StreamEvent::ToolCallDelta {
                     index,
                     id: Some(call_id.to_owned()),
@@ -332,23 +341,64 @@ impl StreamDecoder {
                 });
             }
             Some("response.function_call_arguments.delta") => {
-                let output_index = output_index(value)?;
-                let index = self
-                    .tool_slots
-                    .iter()
-                    .find(|(slot, _)| *slot == output_index)
-                    .map(|(_, index)| *index)
-                    .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+                let slot = self.tool_slot(value)?;
                 if let Some(arguments) = non_empty_delta(value) {
+                    slot.arguments.push_str(arguments);
                     events.push(StreamEvent::ToolCallDelta {
-                        index,
+                        index: slot.index,
                         id: None,
                         name: None,
                         arguments: arguments.to_owned(),
                     });
                 }
             }
+            Some("response.function_call_arguments.done") => {
+                self.complete_arguments(value, value, events)?;
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = value.get("item")
+                    && item.get("type").and_then(Value::as_str) == Some("function_call")
+                {
+                    self.complete_arguments(value, item, events)?;
+                }
+            }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn tool_slot(&mut self, value: &Value) -> Result<&mut ToolSlot, ProtocolError> {
+        let output_index = output_index(value)?;
+        self.tool_slots
+            .iter_mut()
+            .find(|slot| slot.output_index == output_index)
+            .ok_or(ProtocolError::InvalidUpstreamResponse)
+    }
+
+    /// Completion events carry the full arguments, sometimes without deltas.
+    /// Reconcile against what was emitted so both done forms are idempotent.
+    fn complete_arguments(
+        &mut self,
+        value: &Value,
+        snapshot: &Value,
+        events: &mut Vec<StreamEvent>,
+    ) -> Result<(), ProtocolError> {
+        let arguments = snapshot
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+        let slot = self.tool_slot(value)?;
+        let suffix = arguments
+            .strip_prefix(slot.arguments.as_str())
+            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+        if !suffix.is_empty() {
+            events.push(StreamEvent::ToolCallDelta {
+                index: slot.index,
+                id: None,
+                name: None,
+                arguments: suffix.to_owned(),
+            });
+            slot.arguments.push_str(suffix);
         }
         Ok(())
     }
