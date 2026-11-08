@@ -100,13 +100,11 @@ fn window(value: &Value, fallback_name: &str, now: DateTime<Utc>) -> Option<Quot
         .get("limit_window_seconds")
         .and_then(Value::as_f64)
         .filter(|seconds| *seconds > 0.);
-    // 待实测: whether an idle (0%) account reports a real reset or a fake
-    // now-plus-period one like opencode Go; dropped until verified (MEMORY #111).
-    let resets_at = if used_pct > 0. {
-        reset_time(value, now)
-    } else {
-        None
-    };
+    // Unlike opencode Go, an idle account reports its real reset: `reset_at`
+    // stayed fixed across probes at 0% while `reset_after_seconds` counted
+    // down (live pro account, 2026-11-08). Keeping it gives Smart routing its
+    // time anchor and the card its trend chart.
+    let resets_at = reset_time(value, now);
     Some(QuotaWindow {
         name: period_seconds.map_or_else(|| fallback_name.to_owned(), window_name),
         used_pct,
