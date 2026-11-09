@@ -13,6 +13,8 @@
 //! stay informative.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 
 use anyhow::Context;
 use chrono::Duration;
@@ -284,6 +286,52 @@ pub async fn delete_key(
     store::delete_provider_key(pool, provider_id, key_id).await
 }
 
+/// How rarely quota history is pruned of rows no chart can show. Probe rounds
+/// keep the trend series fresh every few minutes, but retention only has to
+/// stay bounded — a table-wide DELETE per round would be exactly the write
+/// amplification this gate exists to remove.
+const QUOTA_HISTORY_PRUNE_INTERVAL_MS: i64 = 60 * 60 * 1000;
+
+/// Low-frequency gate for the quota-history prune: the instant (unix millis)
+/// from which the next prune may run. This is scheduling, not data — the rows,
+/// the 45-day cutoff and the delete count all stay in PostgreSQL, so there is
+/// no second copy of anything here.
+struct HistoryPruneGate {
+    due_ms: AtomicI64,
+}
+
+impl HistoryPruneGate {
+    const fn new() -> Self {
+        Self {
+            due_ms: AtomicI64::new(0),
+        }
+    }
+
+    /// Whether the caller may prune now; a `true` answer moves the next allowed
+    /// instant one interval ahead, so whoever wins the race prunes and later
+    /// rounds skip. Two rounds passing the gate together would both prune the
+    /// same idempotent rows — harmless, and the compare-exchange keeps that to
+    /// a lost update rather than a drift.
+    fn claim(&self, now_ms: i64) -> bool {
+        let due_ms = self.due_ms.load(Ordering::Relaxed);
+        if now_ms < due_ms || due_ms == i64::MAX {
+            return false;
+        }
+        self.due_ms
+            .compare_exchange(
+                due_ms,
+                now_ms.saturating_add(QUOTA_HISTORY_PRUNE_INTERVAL_MS),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+}
+
+/// The process's gate: one prune an hour at most, however often (and by
+/// whomever) the probe fan-out is triggered.
+static QUOTA_HISTORY_PRUNE: HistoryPruneGate = HistoryPruneGate::new();
+
 /// Probe every enabled, unarchived key of every enabled provider that has a
 /// quota source,
 /// persist each successful reading as that key's snapshot
@@ -306,6 +354,10 @@ pub async fn delete_key(
 /// The relay reads snapshots from the database, never from this call, so the
 /// prober holds no request-path state; the prober's rounds are sequential —
 /// the join set drains before the next tick.
+///
+/// History retention is enforced here, at most hourly, rather than inside the
+/// per-key insert: the trend series only needs to stay bounded, so one
+/// table-wide delete an hour costs far less than one delete per key per round.
 pub async fn probe_all_quotas(
     pool: &PgPool,
     smart_cache: Option<&crate::relay::SmartCache>,
@@ -466,9 +518,9 @@ pub async fn probe_all_quotas(
                 {
                     tracing::warn!(key_id, error = %format!("{error:#}"), "quota snapshot upsert failed");
                 }
-                // The trend chart's series: one row per window per probe. A
-                // failure never loses the reading itself (the snapshot above
-                // and the in-memory cache below still carry it).
+                // The trend chart's series: one row per window, in one statement
+                // per probe. A failure never loses the reading itself (the
+                // snapshot above and the in-memory cache below still carry it).
                 if let Err(error) = store::quota_history_insert(pool, key_id, &quota).await {
                     tracing::warn!(key_id, error = %format!("{error:#}"), "quota history insert failed");
                 }
@@ -484,6 +536,20 @@ pub async fn probe_all_quotas(
             }
             Ok((key_id, _, None)) => tracing::debug!(key_id, "quota probe: no reading"),
             Err(error) => tracing::warn!(%error, "quota probe task panicked"),
+        }
+    }
+    // Retention rides the round but not every round: the per-key DELETE that
+    // used to accompany each insert is gone, and one table-wide prune an hour
+    // keeps the series bounded whoever triggered the probe (background prober
+    // or admin refresh). A failure only means the rows outlive 45 days by one
+    // interval — the chart never reads past 35.
+    if QUOTA_HISTORY_PRUNE.claim(Utc::now().timestamp_millis()) {
+        match store::quota_history_prune(pool).await {
+            Ok(0) => {}
+            Ok(deleted) => tracing::debug!(deleted, "quota history: rows past retention pruned"),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "quota history prune failed");
+            }
         }
     }
     // Feed the in-memory cache so Smart routes see the fresh readings on the
@@ -2901,4 +2967,33 @@ fn ensure_openai_provider(provider: &store::ProviderRow) -> Result<(), OpenaiLog
         provider_id: provider.id,
         protocol: provider.protocol.clone(),
     })
+}
+
+#[cfg(test)]
+mod quota_history_tests {
+    use super::HistoryPruneGate;
+    use super::QUOTA_HISTORY_PRUNE_INTERVAL_MS;
+
+    #[test]
+    fn prune_gate_admits_one_prune_per_interval() {
+        let gate = HistoryPruneGate::new();
+        let start = 1_000_000;
+        assert!(gate.claim(start), "first round must prune");
+        assert!(!gate.claim(start), "same instant must not prune twice");
+        assert!(
+            !gate.claim(start + QUOTA_HISTORY_PRUNE_INTERVAL_MS - 1),
+            "round inside interval must wait"
+        );
+        assert!(
+            gate.claim(start + QUOTA_HISTORY_PRUNE_INTERVAL_MS),
+            "interval boundary must admit pruning"
+        );
+    }
+
+    #[test]
+    fn prune_gate_saturates_instead_of_wrapping_the_deadline() {
+        let gate = HistoryPruneGate::new();
+        assert!(gate.claim(i64::MAX), "large clock must still admit pruning");
+        assert!(!gate.claim(i64::MAX), "deadline must not wrap to the past");
+    }
 }

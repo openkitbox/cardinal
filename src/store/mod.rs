@@ -56,7 +56,7 @@ pub use provider::{
 };
 pub use quota::{
     QuotaHistoryPoint, list_quota_history, list_quota_snapshots, list_quota_snapshots_by_keys,
-    quota_history_insert, quota_snapshot_upsert,
+    quota_history_insert, quota_history_prune, quota_snapshot_upsert,
 };
 pub use request::{
     AttemptLog, RequestRow, insert_request_logs, list_recent_requests, request_row_anchor,

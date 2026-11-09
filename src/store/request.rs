@@ -77,56 +77,212 @@ pub struct AttemptLog {
     pub rate_bp: Option<i64>,
 }
 
-/// Persist attempt rows to `gateway_requests`, returning the inserted row ids
-/// in attempt order. Called by the ledger writer (`relay::ledger_writer`) in
-/// batches, not per request. Logging failures are logged, never propagated:
-/// accounting must not break the request path. A row whose insert fails
-/// produces no id (it is skipped, so the result may be shorter than
-/// `attempts`).
-pub async fn insert_request_logs(pool: &PgPool, attempts: &[AttemptLog]) -> Vec<i64> {
-    let mut ids = Vec::with_capacity(attempts.len());
-    for attempt in attempts {
-        let result = sqlx::query_scalar::<_, i64>(
-      "INSERT INTO gateway_requests (protocol, client_protocol, effort, alias, provider_id, provider_key_id, model,
-             served_model, status, input_tokens, output_tokens, cached_input_tokens,
-             cache_creation_input_tokens, total_ms, ttft_ms, cost_usd, error, caller_key, agent, request_id,
-             user_id, gateway_key_id, charged_microus, rate_bp)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-             $21, $22, $23, $24)
-             RETURNING id",
-    )
-    .bind(attempt.protocol.as_str())
-    .bind(attempt.client_protocol.map(|p| p.as_str()))
-    .bind(&attempt.effort)
-    .bind(&attempt.alias)
-    .bind(attempt.provider_id)
-    .bind(attempt.provider_key_id)
-    .bind(&attempt.model)
-    .bind(&attempt.served_model)
-    .bind(i32::from(attempt.status))
-    .bind(attempt.input_tokens)
-    .bind(attempt.output_tokens)
-    .bind(attempt.cached_input_tokens)
-    .bind(attempt.cache_creation_input_tokens)
-    .bind(attempt.total_ms)
-    .bind(attempt.ttft_ms)
-    .bind(attempt.cost_usd)
-    .bind(&attempt.error)
-    .bind(&attempt.caller_key)
-    .bind(&attempt.agent)
-    .bind(&attempt.request_id)
-    .bind(attempt.user_id)
-    .bind(attempt.gateway_key_id)
-    .bind(attempt.charged_microus)
-    .bind(attempt.rate_bp)
-    .fetch_one(pool)
-    .await;
-        match result {
-            Ok(id) => ids.push(id),
-            Err(error) => tracing::error!("failed to persist requests row: {error}"),
+/// One round trip for the whole batch: 24 parallel arrays, one per column,
+/// unzipped by a multi-array `UNNEST` and written in `ordinality` order, so the
+/// returned ids follow `attempts`. The column order appears three times (the
+/// INSERT target, the SELECT list and the UNNEST alias) and the bind order must
+/// match it: a positional `UNNEST` misaligns silently when they disagree.
+const REQUEST_LOG_INSERT_SQL: &str = "
+INSERT INTO gateway_requests (protocol, client_protocol, effort, alias, provider_id, provider_key_id,
+        model, served_model, status, input_tokens, output_tokens, cached_input_tokens,
+        cache_creation_input_tokens, total_ms, ttft_ms, cost_usd, error, caller_key, agent, request_id,
+        user_id, gateway_key_id, charged_microus, rate_bp)
+SELECT protocol, client_protocol, effort, alias, provider_id, provider_key_id,
+        model, served_model, status, input_tokens, output_tokens, cached_input_tokens,
+        cache_creation_input_tokens, total_ms, ttft_ms, cost_usd, error, caller_key, agent, request_id,
+        user_id, gateway_key_id, charged_microus, rate_bp
+FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[],
+        $5::bigint[], $6::bigint[], $7::text[], $8::text[], $9::integer[], $10::bigint[],
+        $11::bigint[], $12::bigint[], $13::bigint[], $14::integer[], $15::bigint[], $16::float8[],
+        $17::text[], $18::text[], $19::text[], $20::text[], $21::bigint[], $22::bigint[],
+        $23::bigint[], $24::bigint[])
+    WITH ORDINALITY AS batch(protocol, client_protocol, effort, alias, provider_id, provider_key_id,
+        model, served_model, status, input_tokens, output_tokens, cached_input_tokens,
+        cache_creation_input_tokens, total_ms, ttft_ms, cost_usd, error, caller_key, agent, request_id,
+        user_id, gateway_key_id, charged_microus, rate_bp, ordinality)
+ORDER BY ordinality
+RETURNING id";
+
+#[derive(Debug, PartialEq, Eq)]
+enum BatchFailureStage {
+    Fetch,
+    Commit,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BatchFailure {
+    SafeToFallback,
+    Ambiguous,
+}
+
+fn classify_batch_failure(stage: BatchFailureStage, rollback_succeeded: bool) -> BatchFailure {
+    match (stage, rollback_succeeded) {
+        (BatchFailureStage::Fetch, true) => BatchFailure::SafeToFallback,
+        (BatchFailureStage::Fetch, false) | (BatchFailureStage::Commit, _) => {
+            BatchFailure::Ambiguous
         }
     }
-    ids
+}
+
+struct BatchInsertError {
+    error: sqlx::Error,
+    fallback_allowed: bool,
+}
+
+/// Persist attempt rows to `gateway_requests` in one statement, returning the
+/// inserted row ids in attempt order. Called by the ledger writer
+/// (`relay::ledger_writer`) in batches, not per request, so the round trip is
+/// amortized over the batch. Logging failures are logged, never propagated:
+/// accounting must not break the request path. A failed batch is retried one
+/// row at a time only after its transaction was successfully rolled back.
+pub async fn insert_request_logs(pool: &PgPool, attempts: &[AttemptLog]) -> Vec<i64> {
+    if attempts.is_empty() {
+        return Vec::new();
+    }
+    match insert_batch(pool, attempts).await {
+        Ok(ids) => ids,
+        Err(batch_error) if batch_error.fallback_allowed => {
+            tracing::error!(
+                rows = attempts.len(),
+                error = %batch_error.error,
+                "failed to persist request log batch after rollback; retrying its rows one at a time"
+            );
+            let mut ids = Vec::with_capacity(attempts.len());
+            for attempt in attempts {
+                match insert_batch(pool, std::slice::from_ref(attempt)).await {
+                    Ok(row_ids) => ids.extend(row_ids),
+                    Err(error) => {
+                        tracing::error!("failed to persist requests row: {}", error.error)
+                    }
+                }
+            }
+            ids
+        }
+        Err(batch_error) => {
+            tracing::error!(
+                rows = attempts.len(),
+                error = %batch_error.error,
+                "request log batch outcome is ambiguous; refusing row fallback"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Insert one batch in an explicit transaction and return its new ids in
+/// attempt order. A query failure is safe to retry only when rollback succeeds;
+/// a failed commit is always ambiguous because the server may have committed.
+async fn insert_batch(
+    pool: &PgPool,
+    attempts: &[AttemptLog],
+) -> Result<Vec<i64>, BatchInsertError> {
+    let mut transaction = pool.begin().await.map_err(|error| BatchInsertError {
+        error,
+        fallback_allowed: false,
+    })?;
+    let query = sqlx::query_scalar::<_, i64>(REQUEST_LOG_INSERT_SQL)
+        .bind(column(attempts, |a| a.protocol.as_str()))
+        .bind(column(attempts, |a| a.client_protocol.map(|p| p.as_str())))
+        .bind(column(attempts, |a| a.effort.as_deref()))
+        .bind(column(attempts, |a| a.alias.as_deref()))
+        .bind(column(attempts, |a| a.provider_id))
+        .bind(column(attempts, |a| a.provider_key_id))
+        .bind(column(attempts, |a| a.model.as_str()))
+        .bind(column(attempts, |a| a.served_model.as_deref()))
+        .bind(column(attempts, |a| i32::from(a.status)))
+        .bind(column(attempts, |a| a.input_tokens))
+        .bind(column(attempts, |a| a.output_tokens))
+        .bind(column(attempts, |a| a.cached_input_tokens))
+        .bind(column(attempts, |a| a.cache_creation_input_tokens))
+        .bind(column(attempts, |a| a.total_ms))
+        .bind(column(attempts, |a| a.ttft_ms))
+        .bind(column(attempts, |a| a.cost_usd))
+        .bind(column(attempts, |a| a.error.as_deref()))
+        .bind(column(attempts, |a| a.caller_key.as_deref()))
+        .bind(column(attempts, |a| a.agent.as_deref()))
+        .bind(column(attempts, |a| a.request_id.as_deref()))
+        .bind(column(attempts, |a| a.user_id))
+        .bind(column(attempts, |a| a.gateway_key_id))
+        .bind(column(attempts, |a| a.charged_microus))
+        .bind(column(attempts, |a| a.rate_bp));
+    let ids = match query.fetch_all(&mut *transaction).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            let rollback_succeeded = match transaction.rollback().await {
+                Ok(()) => true,
+                Err(rollback_error) => {
+                    tracing::error!(
+                        error = %rollback_error,
+                        "failed to roll back ambiguous request log batch"
+                    );
+                    false
+                }
+            };
+            return Err(BatchInsertError {
+                error,
+                fallback_allowed: classify_batch_failure(
+                    BatchFailureStage::Fetch,
+                    rollback_succeeded,
+                ) == BatchFailure::SafeToFallback,
+            });
+        }
+    };
+    transaction
+        .commit()
+        .await
+        .map_err(|error| BatchInsertError {
+            error,
+            fallback_allowed: classify_batch_failure(BatchFailureStage::Commit, true)
+                == BatchFailure::SafeToFallback,
+        })?;
+    Ok(ids)
+}
+
+/// One bind array per column. Strings are borrowed from `attempts`; only the
+/// pointers and the copyable scalar fields are collected.
+fn column<'a, T>(attempts: &'a [AttemptLog], map: impl Fn(&'a AttemptLog) -> T) -> Vec<T> {
+    attempts.iter().map(map).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BatchFailure, BatchFailureStage, REQUEST_LOG_INSERT_SQL, classify_batch_failure};
+
+    #[test]
+    fn only_a_successful_rollback_allows_row_fallback() {
+        assert_eq!(
+            classify_batch_failure(BatchFailureStage::Fetch, true),
+            BatchFailure::SafeToFallback
+        );
+        assert_eq!(
+            classify_batch_failure(BatchFailureStage::Fetch, false),
+            BatchFailure::Ambiguous
+        );
+        assert_eq!(
+            classify_batch_failure(BatchFailureStage::Commit, true),
+            BatchFailure::Ambiguous
+        );
+    }
+
+    const COLUMNS: &str = "protocol, client_protocol, effort, alias, provider_id, provider_key_id, model, served_model, status, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens, total_ms, ttft_ms, cost_usd, error, caller_key, agent, request_id, user_id, gateway_key_id, charged_microus, rate_bp";
+
+    /// The statement names the column order three times (INSERT target, SELECT
+    /// list, UNNEST alias) and a multi-array UNNEST pairs its arrays by
+    /// position, so a column added to one list alone would write every value of
+    /// the batch into the wrong field.
+    #[test]
+    fn batch_statement_names_the_same_columns_in_every_list() {
+        let sql: String = REQUEST_LOG_INSERT_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(sql.matches(COLUMNS).count(), 3, "columns: {COLUMNS}");
+        assert_eq!(
+            sql.matches('$').count(),
+            24,
+            "one placeholder per column, in column order: {sql}"
+        );
+    }
 }
 
 /// One `gateway_requests` row (the request log).

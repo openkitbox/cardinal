@@ -19,14 +19,14 @@
 //!   that the oldest charges are dropped and logged (lost revenue, never an
 //!   overcharge). Charges whose user no longer exists, or whose arithmetic
 //!   would overflow, are dropped with an error.
-//! - **Statistics rows** (`gateway_requests`): written best-effort, row by
-//!   row, and cleared after the attempt whether or not every insert landed —
+//! - **Statistics rows** (`gateway_requests`): written best-effort in one
+//!   batch (with per-row fallback if rejected), and cleared after the attempt whether or not every insert landed —
 //!   the store logs failures, and keeping the rows would re-insert them.
 //!
 //! Ordering: one mpsc producer order per push, and the buffer preserves push
 //! order, so a request's attempts land in PG in the same order the old
 //! per-request insert produced (id order == time order is preserved within a
-//! batch; [`crate::store::insert_request_logs`] inserts sequentially).
+//! batch; [`crate::store::insert_request_logs`] preserves that order).
 //!
 //! Shutdown: [`LedgerWriterHandle::flush_and_shutdown`] signals the flush
 //! task to drain the channel and write a final batch before exiting, so a

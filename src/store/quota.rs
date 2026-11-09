@@ -97,11 +97,10 @@ pub async fn list_quota_snapshots_by_keys(
     Ok(snapshots)
 }
 
-// ---------- quota history (append-only probe samples, card trend chart) ----------
-
-/// Append one history row per plan window after a successful probe, then drop
-/// this key's rows older than any chart can show (a monthly window is the
-/// longest at ~31 days; a fortnight of slack covers a probe gap).
+/// Append one history row per plan window after a successful probe, as a single
+/// statement. Retention is NOT enforced here: a per-key DELETE on every probe
+/// was write amplification, so pruning moved to [`quota_history_prune`], which
+/// the probe fan-out runs at a low frequency.
 ///
 /// History exists only because the snapshot table keeps the latest reading
 /// alone — the card's cumulative trend needs the samples behind it. Callers
@@ -111,26 +110,44 @@ pub async fn quota_history_insert(
     key_id: i64,
     quota: &KeyQuota,
 ) -> anyhow::Result<()> {
-    for window in &quota.windows {
-        sqlx::query(
-            "INSERT INTO gateway_key_quota_history (key_id, window_name, used_pct, resets_at)
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(key_id)
-        .bind(&window.name)
-        .bind(window.used_pct)
-        .bind(window.resets_at)
-        .execute(pool)
-        .await?;
+    if quota.windows.is_empty() {
+        return Ok(()); // nothing to append, and no statement to send
     }
-    sqlx::query(
-        "DELETE FROM gateway_key_quota_history
-         WHERE key_id = $1 AND probed_at < now() - interval '45 days'",
-    )
-    .bind(key_id)
-    .execute(pool)
-    .await?;
+    let mut query = sqlx::QueryBuilder::new(
+        "INSERT INTO gateway_key_quota_history (key_id, window_name, used_pct, resets_at) ",
+    );
+    query.push_values(quota.windows.iter(), |mut row, window| {
+        row.push_bind(key_id)
+            .push_bind(&window.name)
+            .push_bind(window.used_pct)
+            .push_bind(window.resets_at);
+    });
+    // `probed_at` keeps its column default (`now()`): one statement stamps
+    // every window of a probe with the same instant.
+    query.build().execute(pool).await?;
     Ok(())
+}
+
+/// Drop every history row no chart can show — older than 45 days, which is a
+/// monthly window (~31 days) plus a fortnight of slack for a probe gap —
+/// returning how many were deleted. One statement for all keys: the per-key
+/// delete that used to ride along with every probe is gone, so running this is
+/// the caller's decision, not the insert's. The cutoff stays the one
+/// authoritative rule and the table stays the one place the rows live.
+///
+/// Index-backed by `idx_gateway_key_quota_history_probed_at`
+/// (migrations/0023_pg_load_indexes.sql), so a prune that finds nothing is an
+/// index scan rather than a walk over the append-only table.
+///
+/// Callers log a failure and carry on: quota is decorative.
+pub async fn quota_history_prune(pool: &PgPool) -> anyhow::Result<u64> {
+    let deleted = sqlx::query(
+        "DELETE FROM gateway_key_quota_history WHERE probed_at < now() - interval '45 days'",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(deleted)
 }
 
 /// The chart series for every key/window: the LAST probe of each hour over
@@ -179,4 +196,38 @@ pub async fn list_quota_history(pool: &PgPool) -> anyhow::Result<Vec<QuotaHistor
             },
         )
         .collect())
+}
+
+#[cfg(test)]
+fn history_insert_sql(window_count: usize) -> String {
+    let mut sql = String::from(
+        "INSERT INTO gateway_key_quota_history (key_id, window_name, used_pct, resets_at) VALUES ",
+    );
+    for index in 0..window_count {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        let first_bind = index * 4 + 1;
+        sql.push_str(&format!(
+            "(${0}, ${1}, ${2}, ${3})",
+            first_bind,
+            first_bind + 1,
+            first_bind + 2,
+            first_bind + 3
+        ));
+    }
+    sql
+}
+
+#[cfg(test)]
+mod tests {
+    use super::history_insert_sql;
+
+    #[test]
+    fn history_insert_uses_one_statement_for_all_windows() {
+        assert_eq!(
+            history_insert_sql(3),
+            "INSERT INTO gateway_key_quota_history (key_id, window_name, used_pct, resets_at) VALUES ($1, $2, $3, $4), ($5, $6, $7, $8), ($9, $10, $11, $12)"
+        );
+    }
 }
