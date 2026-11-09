@@ -772,6 +772,19 @@ mod tests {
     }
 
     #[test]
+    fn relay_observation_rejects_invalid_utf8_and_json() {
+        let mut decoder = StreamDecoder::new();
+        assert_eq!(
+            decoder.observe_raw_for_relay(b"\xff"),
+            Err(ProtocolError::InvalidUpstreamResponse)
+        );
+        assert_eq!(
+            decoder.observe_raw_for_relay(b"{"),
+            Err(ProtocolError::InvalidUpstreamResponse)
+        );
+    }
+
+    #[test]
     fn relay_observation_is_unchanged() {
         let added = tool_added(0, "call_a", "alpha");
         let args = args_delta(0, "{}");

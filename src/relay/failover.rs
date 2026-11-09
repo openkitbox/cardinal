@@ -15,7 +15,7 @@ use std::time::Duration;
 use regex::Regex;
 
 use super::optional;
-use crate::protocol::ProtocolError;
+use crate::protocol::{ProtocolError, Terminal};
 use crate::upstream::cursor_tokens::CursorTokenError;
 use crate::upstream::kiro_tokens::KiroTokenError;
 use crate::upstream::openai_tokens::OpenaiTokenError;
@@ -49,6 +49,10 @@ pub enum AttemptError {
     /// [`Failure::Other`] — so a pre-commit abort rests and retries exactly
     /// like a mid-read transport error.
     AbortedStream,
+    /// The upstream emitted an explicit terminal failure before the translated
+    /// stream committed. This is an answer from the vendor, not a transport
+    /// failure, so it must not be retried on another candidate.
+    UpstreamTerminal(Terminal),
     /// The candidate's Kiro OIDC credential could not produce a bearer (lazy
     /// refresh failed) or the runtime host did not match the credential's
     /// region. Carries the token module's own verdict — never a token — so the
@@ -88,6 +92,7 @@ impl AttemptError {
             // An abort only ever surfaces when every candidate died pre-commit: the
             // upstream family, not the request's fault.
             Self::AbortedStream => ProtocolError::UpstreamError.status(),
+            Self::UpstreamTerminal(_) => ProtocolError::UpstreamError.status(),
             Self::KiroTokenError(error) => error.client_status(),
             Self::OpencodeTokenError(error) => error.client_status(),
             Self::CursorTokenError(error) => error.client_status(),
@@ -113,6 +118,7 @@ impl AttemptError {
         match self {
             Self::Transport(error) => as_protocol_error(error).code(),
             Self::AbortedStream => ProtocolError::UpstreamError.code(),
+            Self::UpstreamTerminal(_) => ProtocolError::UpstreamError.code(),
             Self::KiroTokenError(error) => error.code(),
             Self::OpencodeTokenError(error) => error.code(),
             Self::CursorTokenError(error) => error.code(),
@@ -125,6 +131,9 @@ impl AttemptError {
         match self {
             Self::Transport(error) => error.to_string(),
             Self::AbortedStream => "upstream stream died before the response committed".to_owned(),
+            Self::UpstreamTerminal(terminal) => {
+                format!("upstream stream ended with an explicit {terminal:?} terminal")
+            }
             // Safe to surface: the token error carries no OAuth material.
             Self::KiroTokenError(error) => error.to_string(),
             Self::OpencodeTokenError(error) => error.to_string(),
@@ -331,6 +340,7 @@ pub fn classify(error: &AttemptError) -> Failure {
         // Pre-commit stream abort: the upstream died before producing anything —
         // the connection/timeout family, resting and retrying like a mid-read error.
         AttemptError::AbortedStream => return Failure::Other,
+        AttemptError::UpstreamTerminal(_) => return Failure::Request,
         // The credential plane, not the request: a dead refresh token (or a
         // runtime host that contradicts its region) is permanent — fail over
         // without resting or blaming anybody; the account needs a re-import,
@@ -602,5 +612,18 @@ impl Failover {
     #[doc(hidden)]
     pub fn set_retry_pause(&mut self, pause: Duration) {
         self.retry_pause = pause;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_upstream_terminal_is_not_transferable() {
+        let error = AttemptError::UpstreamTerminal(Terminal::Failed);
+
+        assert_eq!(classify(&error), Failure::Request);
+        assert!(!classify(&error).transferable());
     }
 }

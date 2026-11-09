@@ -183,6 +183,10 @@ pub(super) enum HoldSignal {
     /// frame channel's receiver is only dropped after the dispatcher sees a
     /// signal, so its sends can never fail while the hold stands.
     ClientGone,
+    /// An explicit upstream failed/cancelled terminal was observed before the
+    /// translated stream committed. Preserve the vendor verdict for dispatch;
+    /// it is not a retryable transport abort.
+    UpstreamTerminal(protocol::Terminal),
 }
 
 /// Pre-commit buffer cap: past it the hold commits with what it has (memory
@@ -771,13 +775,13 @@ async fn drive_stream(
             }
         }
         StreamPump::Translated {
-            upstream,
+            upstream: upstream_protocol,
             mut translator,
             context_window,
             mut cache_read,
         } => {
             let mut cache_hit = None;
-            let mut upstream = protocol::Decoder::new(upstream, context_window);
+            let mut upstream = protocol::Decoder::new(upstream_protocol, context_window);
             // A protocol that reports its usage after the terminal event (KAS)
             // makes the client close wait for the tail; every other upstream
             // forwards first.
@@ -864,7 +868,23 @@ async fn drive_stream(
                             Some(events) => events,
                             None => match upstream.observe_wire(&frame) {
                                 Ok(events) => events,
-                                Err(_) => {
+                                Err(error) => {
+                                    if upstream_protocol == ProtocolId::OpenAiResponses
+                                        && matches!(
+                                            error,
+                                            protocol::ProtocolError::InvalidUpstreamResponse
+                                        )
+                                    {
+                                        if hold.is_some() {
+                                            signal_hold(&mut commit_tx, HoldSignal::Aborted);
+                                            return (None, ttft_ms, captured, None);
+                                        }
+                                        interrupted = Some(
+                                            "upstream Responses stream contained invalid JSON"
+                                                .to_owned(),
+                                        );
+                                        continue;
+                                    }
                                     tracing::warn!(
                                         "translated stream: undecodable upstream frame skipped"
                                     );
@@ -878,6 +898,19 @@ async fn drive_stream(
                         let terminal_at_eof = events
                             .iter()
                             .any(|event| matches!(event, protocol::StreamEvent::Finish { .. }));
+                        if hold.is_some()
+                            && terminal_at_eof
+                            && matches!(
+                                upstream.finish(),
+                                protocol::Terminal::Failed | protocol::Terminal::Cancelled
+                            )
+                        {
+                            signal_hold(
+                                &mut commit_tx,
+                                HoldSignal::UpstreamTerminal(upstream.finish()),
+                            );
+                            return (None, ttft_ms, captured, None);
+                        }
                         if terminal_at_eof {
                             // Settle once: a second terminal sighting never erases the hit.
                             if let Some(read) = cache_read.take() {
@@ -1006,6 +1039,17 @@ async fn drive_stream(
                                     &mut wire,
                                 )
                                 .await;
+                            } else if upstream.terminal_seen()
+                                && matches!(
+                                    upstream.finish(),
+                                    protocol::Terminal::Failed | protocol::Terminal::Cancelled
+                                )
+                            {
+                                signal_hold(
+                                    &mut commit_tx,
+                                    HoldSignal::UpstreamTerminal(upstream.finish()),
+                                );
+                                return (None, ttft_ms, captured, None);
                             } else {
                                 tracing::info!(
                                     "translated stream ended before the commit point; aborting for failover"
@@ -1018,16 +1062,21 @@ async fn drive_stream(
                         // Upstream EOF: the decoder's verdict decides the close
                         // (B §4.2) — a stream that never saw its terminal event
                         // is Incomplete, never a "stop".
-                        let verdict = if matches!(upstream.finish(), protocol::Terminal::Completed)
-                        {
-                            protocol::Terminal::Completed
-                        } else {
-                            if !upstream.terminal_seen() {
-                                interrupted =
-                                    Some("upstream stream ended without terminal frame".to_owned());
+                        let verdict = match upstream.finish() {
+                            protocol::Terminal::Completed => protocol::Terminal::Completed,
+                            protocol::Terminal::Failed | protocol::Terminal::Cancelled => {
+                                interrupted = Some(
+                                    "upstream stream ended with an explicit terminal error"
+                                        .to_owned(),
+                                );
+                                protocol::Terminal::Failed
                             }
-                            protocol::Terminal::Incomplete
+                            protocol::Terminal::Incomplete => protocol::Terminal::Incomplete,
                         };
+                        if !upstream.terminal_seen() {
+                            interrupted =
+                                Some("upstream stream ended without terminal frame".to_owned());
+                        }
                         // An explicit ceiling closes as length; a broken EOF
                         // keeps the generic truncation marker.
                         let closed = if upstream.output_ceiling_reached() {

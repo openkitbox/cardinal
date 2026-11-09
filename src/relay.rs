@@ -3058,6 +3058,9 @@ pub async fn dispatch_at(
                         Ok(HoldSignal::ClientGone) => Err(failover::AttemptError::Transport(
                             transport::TransportError::ClientGone,
                         )),
+                        Ok(HoldSignal::UpstreamTerminal(terminal)) => {
+                            Err(failover::AttemptError::UpstreamTerminal(terminal))
+                        }
                     }
                 }
                 Err(error) => Err(error),
