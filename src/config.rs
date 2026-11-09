@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::upstream::Dns;
 use serde::Deserialize;
 
 /// TLS termination for the gateway listener (optional): PEM cert/key paths.
@@ -118,6 +119,8 @@ pub struct ProviderSeed {
     pub name: String,
     pub protocol: String,
     pub base_url: String,
+    #[serde(default)]
+    pub dns: Dns,
     /// Inferred from the protocol when omitted (anthropic_messages → x_api_key, otherwise bearer).
     pub auth_scheme: Option<String>,
     #[serde(default = "default_true")]

@@ -111,6 +111,7 @@ impl CursorUsage {
         bearer: &CursorBearer,
         conversation_id: &str,
         since: DateTime<Utc>,
+        dns: crate::upstream::Dns,
     ) -> Resolved {
         if self.is_unreadable(key_id) {
             return Resolved::Unreadable;
@@ -119,7 +120,7 @@ impl CursorUsage {
         let end = Instant::now() + UNTIL;
         tokio::time::sleep(FIRST_WAIT).await;
         loop {
-            match self.ask(key_id, bearer, conversation_id, since).await {
+            match self.ask(key_id, bearer, conversation_id, since, dns).await {
                 Ask::Found(counts) => return Resolved::Dashboard(counts),
                 Ask::Refused => {
                     self.unreadable.insert(key_id, Instant::now());
@@ -163,6 +164,7 @@ impl CursorUsage {
         bearer: &CursorBearer,
         conversation_id: &str,
         since: DateTime<Utc>,
+        dns: crate::upstream::Dns,
     ) -> Ask {
         let since_ms = since.timestamp_millis();
         let now_ms = Utc::now().timestamp_millis();
@@ -193,7 +195,7 @@ impl CursorUsage {
         let deadline = Instant::now() + ASK;
         let response = match self
             .transport
-            .send_with_headers(&prepared, &headers, &[], deadline)
+            .send_with_headers(&prepared, dns, &headers, &[], deadline)
             .await
         {
             Ok(response) => response,

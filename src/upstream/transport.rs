@@ -8,7 +8,7 @@
 //!   limit instead of being buffered without bound;
 //! - transport performs exactly one send; retry policy belongs to the relay.
 
-use super::dns::Resolvers;
+use super::dns::{Dns, HickoryResolver, Resolvers};
 use crate::protocol::Prepared;
 use crate::protocol::ProtocolId;
 use crate::protocol::wire::{WireError, WireFrame, WireFramer};
@@ -198,7 +198,7 @@ enum Http {
 /// address is part of the pool identity so connections are never reused across
 /// a re-resolved host; the version, so a bidi stream never lands on an HTTP/1.1
 /// connection.
-type ClientKey = (String, String, u16, Vec<IpAddr>, Http);
+type ClientKey = (String, String, u16, Vec<IpAddr>, Http, Dns);
 /// Process-wide outbound transport.
 #[derive(Clone)]
 pub struct Transport {
@@ -286,7 +286,7 @@ pub fn validate_saved_endpoint(url: &str, allow_private: bool) -> anyhow::Result
 /// than 443. This is an allowlist: unknown or unusual ranges are refused.
 pub(crate) async fn validate_destination(
     url: &str,
-    resolvers: &Resolvers,
+    resolver: &HickoryResolver,
     allow_plaintext_loopback: bool,
     allow_ports: &[u16],
     allow_private_destinations: bool,
@@ -314,10 +314,8 @@ pub(crate) async fn validate_destination(
     {
         return Err(TransportError::Connect);
     }
-    // The provider's host picks the DNS preset (hard-coded pairing in dns.rs);
-    // the SSRF address checks below run identically for every preset.
-    let resolved = resolvers
-        .for_host(&host)
+    // The caller selects the provider's DNS region; SSRF checks are identical for every resolver.
+    let resolved = resolver
         .resolve_all(&host)
         .await
         .map_err(|_| TransportError::Connect)?;
@@ -396,6 +394,16 @@ pub(crate) fn is_global_unicast(ip: IpAddr) -> bool {
 }
 
 impl Transport {
+    fn clients_lock(&self) -> std::sync::MutexGuard<'_, HashMap<ClientKey, reqwest::Client>> {
+        match self.clients.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!("upstream client pool mutex was poisoned; recovering its state");
+                error.into_inner()
+            }
+        }
+    }
+
     pub fn new(limits: Limits) -> anyhow::Result<Self> {
         // Validate the client configuration at startup so a misconfigured
         // transport fails fast instead of on the first request. Per-destination
@@ -424,13 +432,21 @@ impl Transport {
         self.limits.clone()
     }
 
+    /// The long-lived resolver for one DNS region. Admin-plane probes borrow it
+    /// from the process's transport instead of building resolver trees per call.
+    pub(crate) fn resolver(&self, dns: Dns) -> &Arc<HickoryResolver> {
+        self.resolvers.resolver(dns)
+    }
+
     /// Send one prepared request. `deadline` is the request's absolute budget.
     pub async fn send(
         &self,
         prepared: &Prepared,
+        dns: Dns,
         deadline: Instant,
     ) -> Result<reqwest::Response, TransportError> {
-        self.send_with_headers(prepared, &[], &[], deadline).await
+        self.send_with_headers(prepared, dns, &[], &[], deadline)
+            .await
     }
 
     /// Send with authentication headers produced by the credential module. The
@@ -438,6 +454,7 @@ impl Transport {
     pub async fn send_with_headers(
         &self,
         prepared: &Prepared,
+        dns: Dns,
         headers: &[(&'static str, String)],
         query: &[(&'static str, String)],
         deadline: Instant,
@@ -450,13 +467,13 @@ impl Transport {
         // gets a fresh destination validation instead of reusing a stale pin.
         let destination = validate_destination(
             &prepared.url,
-            &self.resolvers,
+            self.resolvers.resolver(dns),
             self.limits.allow_plaintext_loopback,
             &self.limits.allowed_ports,
             self.limits.allow_private_destinations,
         )
         .await?;
-        let client = self.client_for(&prepared.url, &destination, Http::H1)?;
+        let client = self.client_for(&prepared.url, &destination, Http::H1, dns)?;
         let mut request = client
             .post(&prepared.url)
             .header(CONTENT_TYPE, prepared.content_type)
@@ -489,6 +506,7 @@ impl Transport {
     pub async fn send_bidi(
         &self,
         prepared: &Prepared,
+        dns: Dns,
         headers: &[(&'static str, String)],
         body: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
         deadline: Instant,
@@ -499,13 +517,13 @@ impl Transport {
         }
         let destination = validate_destination(
             &prepared.url,
-            &self.resolvers,
+            self.resolvers.resolver(dns),
             self.limits.allow_plaintext_loopback,
             &self.limits.allowed_ports,
             self.limits.allow_private_destinations,
         )
         .await?;
-        let client = self.client_for(&prepared.url, &destination, Http::H2)?;
+        let client = self.client_for(&prepared.url, &destination, Http::H2, dns)?;
         let mut request = client
             .post(&prepared.url)
             .header(CONTENT_TYPE, prepared.content_type)
@@ -589,6 +607,7 @@ impl Transport {
         url: &str,
         destination: &Destination,
         http: Http,
+        dns: Dns,
     ) -> Result<reqwest::Client, TransportError> {
         let parsed = reqwest::Url::parse(url).map_err(|_| TransportError::Connect)?;
         let key: ClientKey = (
@@ -597,20 +616,16 @@ impl Transport {
             destination.port,
             destination.addresses.clone(),
             http,
+            dns,
         );
-        if let Some(client) = self
-            .clients
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&key)
-        {
+        if let Some(client) = self.clients_lock().get(&key) {
             return Ok(client.clone());
         }
         let mut builder = reqwest::Client::builder()
             // Hygiene: the client resolves through the same preset that validated
             // the destination (inert in practice — `resolve_to_addrs` below pins
             // every address and redirects are disabled).
-            .dns_resolver(Arc::clone(self.resolvers.for_host(&destination.host)))
+            .dns_resolver(Arc::clone(self.resolvers.resolver(dns)))
             .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(64)
             .tcp_keepalive(Duration::from_secs(60))
@@ -636,10 +651,7 @@ impl Transport {
                 .http2_keep_alive_while_idle(true),
         };
         let client = builder.build().map_err(|_| TransportError::Connect)?;
-        let mut clients = self
-            .clients
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut clients = self.clients_lock();
         if clients.len() >= 64 {
             clients.clear();
         }

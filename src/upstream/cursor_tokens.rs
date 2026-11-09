@@ -273,6 +273,7 @@ impl CursorTokens {
         pool: &PgPool,
         key_id: i64,
         credential: &KeyCredential<'_>,
+        dns: crate::upstream::Dns,
     ) -> Result<Arc<CursorBearer>, CursorTokenError> {
         if let Some(verdict) = self.dead_verdict(key_id) {
             return Err(verdict);
@@ -280,7 +281,7 @@ impl CursorTokens {
         if let Some(bearer) = self.adoptable(key_id, Freshness::Check) {
             return Ok(bearer);
         }
-        self.resolve_locked(pool, key_id, credential, Freshness::Check)
+        self.resolve_locked(pool, key_id, credential, Freshness::Check, dns)
             .await
     }
 
@@ -294,11 +295,12 @@ impl CursorTokens {
         key_id: i64,
         credential: &KeyCredential<'_>,
         rejected: &str,
+        dns: crate::upstream::Dns,
     ) -> Result<Arc<CursorBearer>, CursorTokenError> {
         if let Some(verdict) = self.dead_verdict(key_id) {
             return Err(verdict);
         }
-        self.resolve_locked(pool, key_id, credential, Freshness::Force { rejected })
+        self.resolve_locked(pool, key_id, credential, Freshness::Force { rejected }, dns)
             .await
     }
 
@@ -333,9 +335,13 @@ impl CursorTokens {
     /// Exchange a not-yet-saved API key for a bearer, caching nothing: the
     /// save-time validation of a `static` Cursor key, which has no row and so
     /// no cache slot yet. The same exchange the dispatch path performs.
-    pub async fn probe_static(&self, api_key: &str) -> Result<CursorBearer, CursorTokenError> {
+    pub async fn probe_static(
+        &self,
+        api_key: &str,
+        dns: crate::upstream::Dns,
+    ) -> Result<CursorBearer, CursorTokenError> {
         let (status, answer) = self
-            .post(EXCHANGE_PATH, b"{}".to_vec(), Some(api_key))
+            .post(EXCHANGE_PATH, b"{}".to_vec(), Some(api_key), dns)
             .await?;
         let access_token = classify_exchange(status, &answer)?;
         let expires_at = jwt_expiry(&access_token).ok_or(CursorTokenError::Client)?;
@@ -408,6 +414,7 @@ impl CursorTokens {
         key_id: i64,
         credential: &KeyCredential<'_>,
         mode: Freshness<'_>,
+        dns: crate::upstream::Dns,
     ) -> Result<Arc<CursorBearer>, CursorTokenError> {
         let gate = self.gate(key_id);
         let _guard = gate.lock().await;
@@ -434,8 +441,10 @@ impl CursorTokens {
             }
         }
         let outcome = match credential {
-            KeyCredential::CursorOauth(bundle) => self.refresh_oauth(pool, key_id, bundle).await,
-            KeyCredential::Static(api_key) => self.exchange_static(key_id, api_key).await,
+            KeyCredential::CursorOauth(bundle) => {
+                self.refresh_oauth(pool, key_id, bundle, dns).await
+            }
+            KeyCredential::Static(api_key) => self.exchange_static(key_id, api_key, dns).await,
             // A Kiro, OpenCode or OpenAI bundle never authenticates a Cursor
             // row: the credential module refuses to store one, and a caller
             // that hands one over has the wrong key.
@@ -469,6 +478,7 @@ impl CursorTokens {
         pool: &PgPool,
         key_id: i64,
         stored: &CursorOAuth,
+        dns: crate::upstream::Dns,
     ) -> Result<Arc<CursorBearer>, CursorTokenError> {
         let grant = serde_json::json!({
             "grant_type": "refresh_token",
@@ -476,7 +486,7 @@ impl CursorTokens {
             "refresh_token": stored.refresh_token,
         });
         let body = serde_json::to_vec(&grant).map_err(|_| CursorTokenError::Client)?;
-        let (status, answer) = self.post(REFRESH_PATH, body, None).await?;
+        let (status, answer) = self.post(REFRESH_PATH, body, None, dns).await?;
         let access_token = match classify_refresh(status, &answer)? {
             GrantAnswer::Revoked => return Err(CursorTokenError::Expired),
             GrantAnswer::Token(access_token) => access_token,
@@ -546,9 +556,10 @@ impl CursorTokens {
         &self,
         key_id: i64,
         api_key: &str,
+        dns: crate::upstream::Dns,
     ) -> Result<Arc<CursorBearer>, CursorTokenError> {
         let (status, answer) = self
-            .post(EXCHANGE_PATH, b"{}".to_vec(), Some(api_key))
+            .post(EXCHANGE_PATH, b"{}".to_vec(), Some(api_key), dns)
             .await?;
         let access_token = classify_exchange(status, &answer)?;
         let expires_at = match jwt_expiry(&access_token) {
@@ -574,6 +585,7 @@ impl CursorTokens {
         path: &str,
         body: Vec<u8>,
         bearer: Option<&str>,
+        dns: crate::upstream::Dns,
     ) -> Result<(u16, Vec<u8>), CursorTokenError> {
         let prepared = Prepared {
             protocol: TOKEN_PROTOCOL,
@@ -589,10 +601,10 @@ impl CursorTokens {
             Some(api_key) => {
                 let headers = [("authorization", format!("Bearer {api_key}"))];
                 self.transport
-                    .send_with_headers(&prepared, &headers, &[], deadline)
+                    .send_with_headers(&prepared, dns, &headers, &[], deadline)
                     .await
             }
-            None => self.transport.send(&prepared, deadline).await,
+            None => self.transport.send(&prepared, dns, deadline).await,
         }
         .map_err(map_transport_error)?;
         let status = response.status().as_u16();

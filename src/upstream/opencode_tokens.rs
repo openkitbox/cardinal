@@ -435,7 +435,9 @@ fn skew() -> Duration {
 /// Reduce one console failure to the relay-facing verdict.
 fn map_auth_error(error: &AuthError) -> OpencodeTokenError {
     match error {
-        AuthError::Transport { .. } => OpencodeTokenError::Transport,
+        AuthError::Transport { .. } | AuthError::Unavailable { .. } => {
+            OpencodeTokenError::Transport
+        }
         AuthError::SsoRequired { .. } | AuthError::Unauthorized { .. } => {
             OpencodeTokenError::Expired
         }

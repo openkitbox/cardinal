@@ -322,7 +322,7 @@ fn form_body(fields: &[(&str, &str)]) -> String {
 /// The issuer HTTP client: a connection pool, a timeout and the issuer origin.
 /// Stateless otherwise — every account-specific value is a call argument.
 pub struct Client {
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
     issuer: String,
 }
 
@@ -333,40 +333,49 @@ impl Default for Client {
 }
 
 impl Client {
-    /// Build the client against the production issuer. Construction stays
-    /// infallible the way the other login clients' is: one retry, then
-    /// reqwest's default (every request carries the timeout itself, so only
-    /// the redirect refusal is lost in that unrealistic fallback).
+    /// Build the client against the production issuer. Resolver or HTTP client
+    /// construction failure leaves the client unavailable: encrypted DNS is
+    /// mandatory, so there is no system-DNS fallback.
     #[must_use]
     pub fn new() -> Self {
         Self::with_issuer(ISSUER)
     }
 
     fn with_issuer(issuer: &str) -> Self {
-        let build = || {
-            reqwest::Client::builder()
+        let http = match crate::upstream::dns::Resolvers::new() {
+            Ok(resolvers) => reqwest::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::clone(
+                    // The OpenAI issuer is fixed overseas; login has no provider row yet.
+                    resolvers.resolver(crate::upstream::Dns::Overseas),
+                ))
                 .build()
+                .map_err(|error| anyhow::anyhow!(error)),
+            Err(error) => Err(error),
         };
-        let http = build().unwrap_or_else(|error| {
-            tracing::warn!(
-                %error,
-                "OpenAI auth client build failed; retrying once before the infallible default"
-            );
-            build().unwrap_or_default()
-        });
+        let http = match http {
+            Ok(http) => Some(http),
+            Err(error) => {
+                tracing::warn!(%error, "OpenAI auth client is unavailable: encrypted resolver setup failed");
+                None
+            }
+        };
         Self {
             http,
             issuer: issuer.trim_end_matches('/').to_owned(),
         }
     }
 
+    fn http(&self, operation: &'static str) -> Result<&reqwest::Client, AuthError> {
+        self.http.as_ref().ok_or(AuthError::Transport { operation })
+    }
+
     /// Start a device login: show the operator `user_code` and
     /// [`VERIFICATION_URL`], then call [`Self::poll_device`] every `interval`.
     pub async fn start_device(&self) -> Result<DeviceGrant, AuthError> {
         let request = self
-            .http
+            .http(OP_USERCODE)?
             .post(format!("{}{USERCODE_PATH}", self.issuer))
             .json(&UsercodeRequest {
                 client_id: CLIENT_ID,
@@ -392,7 +401,7 @@ impl Client {
         user_code: &str,
     ) -> Result<PollVerdict, AuthError> {
         let request = self
-            .http
+            .http(OP_DEVICE_TOKEN)?
             .post(format!("{}{DEVICE_TOKEN_PATH}", self.issuer))
             .json(&DevicePollRequest {
                 device_auth_id,
@@ -456,7 +465,7 @@ impl Client {
         form: String,
     ) -> Result<Vec<u8>, AuthError> {
         let request = self
-            .http
+            .http(operation)?
             .post(format!("{}{TOKEN_PATH}", self.issuer))
             .header(
                 reqwest::header::CONTENT_TYPE,

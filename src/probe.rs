@@ -93,9 +93,14 @@ pub async fn fetch_models(
     auth_scheme: &str,
     api_key: &str,
     org_id: Option<&str>,
+    transport: &crate::upstream::transport::Transport,
+    dns: crate::upstream::Dns,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     let urls = model_list_urls(base_url, protocol)?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .dns_resolver(std::sync::Arc::clone(transport.resolver(dns)))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
     let mut errors = Vec::new();
     for url in &urls {
         match fetch_at(&client, url, protocol, auth_scheme, api_key, org_id).await {
@@ -483,6 +488,7 @@ fn parse_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
 pub async fn fetch_kiro_models(
     transport: &crate::upstream::transport::Transport,
     context: &crate::upstream::KiroCallContext,
+    dns: crate::upstream::Dns,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     anyhow::ensure!(
         crate::kiro::valid_region(&context.api_region),
@@ -512,7 +518,7 @@ pub async fn fetch_kiro_models(
     let auth = [("authorization", format!("Bearer {}", context.bearer()))];
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     let response = transport
-        .send_with_headers(&prepared, &auth, &[], deadline)
+        .send_with_headers(&prepared, dns, &auth, &[], deadline)
         .await
         .map_err(|_| anyhow::anyhow!("模型目录服务请求失败"))?;
     let status = response.status();
@@ -609,6 +615,7 @@ fn parse_kiro_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
 pub async fn fetch_cursor_models(
     transport: &crate::upstream::transport::Transport,
     bearer: &crate::upstream::cursor_tokens::CursorBearer,
+    dns: crate::upstream::Dns,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     use crate::protocol::cursor::request as cursor_request;
     let prepared = cursor_request::unary_json(
@@ -618,7 +625,7 @@ pub async fn fetch_cursor_models(
     let headers = cursor_request::unary_headers(bearer.access_token(), bearer.team_id());
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     let response = transport
-        .send_with_headers(&prepared, &headers, &[], deadline)
+        .send_with_headers(&prepared, dns, &headers, &[], deadline)
         .await
         .map_err(|_| anyhow::anyhow!("模型目录服务请求失败"))?;
     let status = response.status();
@@ -688,8 +695,11 @@ const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 pub(crate) async fn codex_get(
     url: &str,
     bearer: &crate::openai::OpenaiOAuth,
+    transport: &crate::upstream::transport::Transport,
+    dns: crate::upstream::Dns,
 ) -> anyhow::Result<(u16, String)> {
     let client = reqwest::Client::builder()
+        .dns_resolver(std::sync::Arc::clone(transport.resolver(dns)))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| anyhow::anyhow!("Codex probe client unavailable"))?;
@@ -716,10 +726,14 @@ pub(crate) async fn codex_get(
 /// (`OpenaiTokens::resolve`), so this stays free of the credential store.
 pub async fn fetch_openai_codex_models(
     bearer: &crate::upstream::OpenaiBearer,
+    transport: &crate::upstream::transport::Transport,
+    dns: crate::upstream::Dns,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     let (status, body) = codex_get(
         &format!("{CODEX_MODELS_URL}?client_version={CODEX_CLIENT_VERSION}"),
         bearer,
+        transport,
+        dns,
     )
     .await?;
     if !(200..300).contains(&status) {

@@ -85,6 +85,7 @@ use crate::credentials::{AuthKind, KeyCredential, resolve_key_credential};
 use crate::key_terms;
 use crate::kiro::KiroOAuth;
 use crate::store::{self, ProviderInput, RouteEntry, RouteStrategy};
+use crate::upstream::Dns;
 
 /// Admin key SHA-256 (shared in-process, injected by main from config).
 pub struct AdminKey(pub String);
@@ -191,7 +192,10 @@ fn admin(depot: &Depot) -> crate::admin_ops::Admin {
         .expect("app state injected");
     crate::admin_ops::Admin::new(
         state.pool.clone(),
-        state.transport.limits().allow_private_destinations,
+        (
+            state.transport.clone(),
+            state.transport.limits().allow_private_destinations,
+        ),
         Arc::clone(&state.failover),
         state.smart_cache.clone(),
         state.route_cache.clone(),
@@ -261,6 +265,8 @@ struct ProviderSpecBody {
     auth_scheme: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default)]
+    dns: Dns,
 }
 
 impl ProviderSpecBody {
@@ -271,6 +277,7 @@ impl ProviderSpecBody {
             base_url: &self.base_url,
             auth_scheme: self.auth_scheme.as_deref(),
             enabled: self.enabled,
+            dns: self.dns,
         }
     }
 }

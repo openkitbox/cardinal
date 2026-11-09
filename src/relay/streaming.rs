@@ -80,6 +80,7 @@ pub(super) struct CursorHandle {
     pub(super) bearer: std::sync::Arc<crate::upstream::cursor_tokens::CursorBearer>,
     pub(super) usage: std::sync::Arc<crate::upstream::CursorUsage>,
     pub(super) key_id: i64,
+    pub(super) dns: crate::upstream::Dns,
 }
 
 impl CursorHandle {
@@ -106,6 +107,7 @@ impl CursorHandle {
                 &self.bearer,
                 &report.conversation_id,
                 report.started_at,
+                self.dns,
             )
             .await;
         Some(match resolved {

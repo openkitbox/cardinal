@@ -361,6 +361,7 @@ static QUOTA_HISTORY_PRUNE: HistoryPruneGate = HistoryPruneGate::new();
 pub async fn probe_all_quotas(
     pool: &PgPool,
     smart_cache: Option<&crate::relay::SmartCache>,
+    transport: &crate::upstream::transport::Transport,
     kiro_tokens: Option<&Arc<crate::upstream::KiroTokens>>,
     opencode_tokens: Option<&Arc<crate::upstream::OpencodeTokens>>,
     cursor_tokens: Option<&Arc<crate::upstream::CursorTokens>>,
@@ -458,13 +459,15 @@ pub async fn probe_all_quotas(
             };
             let provider_name = provider.name.clone();
             let base_url = provider.base_url.clone();
+            let provider_dns = provider.dns;
             let anchor = anchors.get(&key_id).copied();
             let pool = pool.clone();
+            let transport = transport.clone();
             tasks.spawn(async move {
                 let mut quota = match &source {
-                    QuotaSource::Kiro(tokens) => quota::fetch_kiro_quota(&pool, tokens, &key).await,
+                    QuotaSource::Kiro(tokens) => quota::fetch_kiro_quota(&pool, tokens, &key, provider_dns).await,
                     QuotaSource::Cursor(tokens) => {
-                        quota::fetch_cursor_quota(&pool, tokens, &key).await
+                        quota::fetch_cursor_quota(&pool, tokens, &key, provider_dns).await
                     }
                     QuotaSource::Opencode(tokens) => match tokens.resolve(&pool, key_id).await {
                         Ok(bundle) => {
@@ -473,6 +476,8 @@ pub async fn probe_all_quotas(
                                 &base_url,
                                 &bundle.access_token,
                                 bundle.org_id.as_deref(),
+                                provider_dns,
+                                &transport,
                             )
                             .await
                         }
@@ -484,7 +489,7 @@ pub async fn probe_all_quotas(
                         }
                     },
                     QuotaSource::Openai(tokens) => match tokens.resolve(&pool, key_id).await {
-                        Ok(bearer) => quota::fetch_openai_codex_quota(&bearer, key_id).await,
+                        Ok(bearer) => quota::fetch_openai_codex_quota(&bearer, key_id, &transport, provider_dns).await,
                         Err(error) => {
                             // Quota is decorative: a credential-plane failure
                             // only costs this round's reading.
@@ -493,7 +498,7 @@ pub async fn probe_all_quotas(
                         }
                     },
                     QuotaSource::Static(api_key) => {
-                        quota::fetch_quota(&provider_name, &base_url, api_key, None).await
+                        quota::fetch_quota(&provider_name, &base_url, api_key, None, provider_dns, &transport).await
                     }
                 };
                 // The vendor read's own instant, taken before any DB work: the
@@ -570,6 +575,7 @@ pub async fn probe_all_quotas(
 #[derive(Clone)]
 pub struct Admin {
     pool: PgPool,
+    transport: crate::upstream::transport::Transport,
     /// Mirrors `Transport::limits().allow_private_destinations`: whether the
     /// save-time endpoint check accepts private/loopback upstreams.
     allow_private: bool,
@@ -626,7 +632,7 @@ impl Admin {
     /// the live relay process.
     pub fn new(
         pool: PgPool,
-        allow_private: bool,
+        transport_and_private: (crate::upstream::transport::Transport, bool),
         failover: Arc<crate::relay::Failover>,
         smart_cache: crate::relay::SmartCache,
         route_cache: crate::relay::RouteCache,
@@ -635,7 +641,8 @@ impl Admin {
     ) -> Self {
         Self {
             pool,
-            allow_private,
+            transport: transport_and_private.0,
+            allow_private: transport_and_private.1,
             failover,
             smart_cache,
             route_cache,
@@ -884,6 +891,7 @@ impl Admin {
         let rows = probe_all_quotas(
             &self.pool,
             Some(&self.smart_cache),
+            &self.transport,
             self.kiro_tokens.as_ref(),
             self.opencode_tokens.as_ref(),
             self.cursor_tokens.as_ref(),
@@ -944,10 +952,10 @@ impl Admin {
                 anyhow::bail!("Cursor 模型列表需要已接线的 token 管理器")
             };
             let bearer = tokens
-                .probe_static(api_key)
+                .probe_static(api_key, input.dns)
                 .await
                 .map_err(|error| ProbeError::Regular(error.into()))?;
-            return probe::fetch_cursor_models(tokens.transport(), &bearer)
+            return probe::fetch_cursor_models(tokens.transport(), &bearer, input.dns)
                 .await
                 .map_err(|error| ProbeError::Regular(error).into());
         }
@@ -957,6 +965,8 @@ impl Admin {
             input.resolved_auth_scheme(),
             api_key,
             None,
+            &self.transport,
+            input.dns,
         )
         .await
         .map_err(ProbeError::Regular)?)
@@ -982,13 +992,13 @@ impl Admin {
             anyhow::bail!("key {key_id} 的 provider {} 不存在", key.provider_id)
         };
         let models = if provider.protocol == "kiro" {
-            self.probe_kiro_models(&key).await?
+            self.probe_kiro_models(&provider, &key).await?
         } else if provider.protocol == "cursor" {
-            self.probe_cursor_models(&key).await?
+            self.probe_cursor_models(&provider, &key).await?
         } else if key.auth_kind == AuthKind::OpencodeOauth.as_str() {
             self.probe_opencode_models(&provider, &key).await?
         } else if key.auth_kind == AuthKind::OpenaiOauth.as_str() {
-            self.probe_openai_models(&key).await?
+            self.probe_openai_models(&provider, &key).await?
         } else {
             let api_key = key
                 .api_key
@@ -1000,6 +1010,8 @@ impl Admin {
                 &provider.auth_scheme,
                 api_key,
                 None,
+                &self.transport,
+                provider.dns,
             )
             .await
             .map_err(ProbeError::Regular)?
@@ -1027,6 +1039,7 @@ impl Admin {
     /// `api_region`, never from the provider row's runtime `base_url`.
     async fn probe_kiro_models(
         &self,
+        provider: &store::ProviderRow,
         key: &store::ProviderKeyRow,
     ) -> anyhow::Result<Vec<ProbeModel>> {
         let Some(tokens) = &self.kiro_tokens else {
@@ -1035,10 +1048,10 @@ impl Admin {
             anyhow::bail!("Kiro 模型列表需要已接线的 token 管理器")
         };
         let context = tokens
-            .access_token(&self.pool, key)
+            .access_token(&self.pool, key, provider.dns)
             .await
             .map_err(|error| ProbeError::Kiro(error.into()))?;
-        probe::fetch_kiro_models(tokens.transport(), &context)
+        probe::fetch_kiro_models(tokens.transport(), &context, provider.dns)
             .await
             .map_err(|error| ProbeError::Kiro(error).into())
     }
@@ -1066,6 +1079,8 @@ impl Admin {
             &provider.auth_scheme,
             &bundle.access_token,
             bundle.org_id.as_deref(),
+            &self.transport,
+            provider.dns,
         )
         .await
         .map_err(|error| ProbeError::Regular(error).into())
@@ -1077,6 +1092,7 @@ impl Admin {
     /// of the account's refresh token).
     async fn probe_openai_models(
         &self,
+        provider: &store::ProviderRow,
         key: &store::ProviderKeyRow,
     ) -> anyhow::Result<Vec<ProbeModel>> {
         let Some(tokens) = &self.openai_tokens else {
@@ -1086,7 +1102,7 @@ impl Admin {
             .resolve(&self.pool, key.id)
             .await
             .map_err(|error| ProbeError::Regular(error.into()))?;
-        probe::fetch_openai_codex_models(&bearer)
+        probe::fetch_openai_codex_models(&bearer, &self.transport, provider.dns)
             .await
             .map_err(|error| ProbeError::Regular(error).into())
     }
@@ -1098,6 +1114,7 @@ impl Admin {
     /// the credential kind.
     async fn probe_cursor_models(
         &self,
+        provider: &store::ProviderRow,
         key: &store::ProviderKeyRow,
     ) -> anyhow::Result<Vec<ProbeModel>> {
         let Some(tokens) = &self.cursor_tokens else {
@@ -1110,10 +1127,10 @@ impl Admin {
             })?),
         };
         let bearer = tokens
-            .resolve(&self.pool, key.id, &credential)
+            .resolve(&self.pool, key.id, &credential, provider.dns)
             .await
             .map_err(|error| ProbeError::Regular(error.into()))?;
-        probe::fetch_cursor_models(tokens.transport(), &bearer)
+        probe::fetch_cursor_models(tokens.transport(), &bearer, provider.dns)
             .await
             .map_err(|error| ProbeError::Regular(error).into())
     }
@@ -1215,10 +1232,10 @@ impl Admin {
             anyhow::bail!("Kiro 模型列表需要已接线的 token 管理器")
         };
         let candidate = tokens
-            .candidate_for_probe(oauth)
+            .candidate_for_probe(oauth, provider.dns)
             .await
             .map_err(|error| ProbeError::Kiro(error.into()))?;
-        let models = probe::fetch_kiro_models(tokens.transport(), &candidate.call)
+        let models = probe::fetch_kiro_models(tokens.transport(), &candidate.call, provider.dns)
             .await
             .map_err(ProbeError::Kiro)?;
         let candidate_oauth = candidate.oauth;
@@ -1559,6 +1576,8 @@ impl Admin {
             &provider.auth_scheme,
             &bundle.access_token,
             bundle.org_id.as_deref(),
+            &self.transport,
+            provider.dns,
         )
         .await
         {
@@ -1918,7 +1937,7 @@ impl Admin {
         // The credential is committed: everything below is best effort.
         if let Some(tokens) = &self.openai_tokens {
             let bearer = tokens.adopt(key_id, bundle);
-            match probe::fetch_openai_codex_models(&bearer).await {
+            match probe::fetch_openai_codex_models(&bearer, &self.transport, provider.dns).await {
                 Ok(models) => {
                     if let Err(error) = store::update_key_models(&self.pool, key_id, &models).await
                     {
@@ -2283,7 +2302,7 @@ impl Admin {
         match &self.cursor_tokens {
             Some(tokens) => {
                 let bearer = tokens.adopt(key_id, &bundle);
-                match probe::fetch_cursor_models(tokens.transport(), &bearer).await {
+                match probe::fetch_cursor_models(tokens.transport(), &bearer, provider.dns).await {
                     Ok(models) => {
                         if let Err(error) =
                             store::update_key_models(&self.pool, key_id, &models).await
@@ -2618,7 +2637,7 @@ fn login_failure_message(error: &anyhow::Error) -> String {
 /// not model as a grant verdict) cannot improve by waiting.
 fn is_transient_poll_failure(error: &auth::AuthError) -> bool {
     match error {
-        auth::AuthError::Transport { .. } => true,
+        auth::AuthError::Transport { .. } | auth::AuthError::Unavailable { .. } => true,
         auth::AuthError::Status { status, .. } => {
             status.is_server_error() || status.as_u16() == 429
         }

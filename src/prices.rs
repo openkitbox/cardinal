@@ -180,7 +180,12 @@ async fn sync_inner(catalog: &Catalog) -> anyhow::Result<()> {
 }
 
 async fn fetch() -> anyhow::Result<Vec<u8>> {
+    let resolvers = crate::upstream::dns::Resolvers::new()?;
     let client = reqwest::Client::builder()
+        .dns_resolver(std::sync::Arc::clone(
+            // models.dev is a fixed overseas endpoint, not a provider.
+            resolvers.resolver(crate::upstream::Dns::Overseas),
+        ))
         .user_agent("cardinal")
         .timeout(FETCH_TIMEOUT)
         .build()?;

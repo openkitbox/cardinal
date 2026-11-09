@@ -29,7 +29,7 @@ dashmap = "6"
 dirs = "7"
 futures = "0.3"
 hex = "0.4"
-hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "https-ring", "webpki-roots"] }
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "https-ring", "tls-ring", "webpki-roots"] }
 nanoid = "0.5"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "query", "http2"] }

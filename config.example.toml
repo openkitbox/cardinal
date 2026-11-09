@@ -47,6 +47,7 @@ listen = "127.0.0.1:8787"
 # # auth_scheme 省略时按协议推断（anthropic_messages → x_api_key，其余 → bearer）
 # # auth_scheme = "x_api_key"
 # enabled = true                      # 默认 true
+# dns = "domestic"                    # DNS 分域：overseas（默认）或 domestic
 
 # [[gateway.providers]]
 # name = "deepseek"

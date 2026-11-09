@@ -276,9 +276,12 @@ async fn probe_quota_reset(
     provider_name: &str,
     base_url: &str,
     api_key: Option<&str>,
+    dns: crate::upstream::Dns,
+    transport: &crate::upstream::transport::Transport,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let api_key = api_key?;
-    let quota = crate::quota::fetch_quota(provider_name, base_url, api_key, None).await?;
+    let quota =
+        crate::quota::fetch_quota(provider_name, base_url, api_key, None, dns, transport).await?;
     let now = chrono::Utc::now();
     let reset = quota
         .windows
@@ -399,6 +402,7 @@ struct CursorDeps<'a> {
     credential: &'a KeyCredential<'a>,
     /// The usage reconciler the settlement reads the dashboard with.
     usage: &'a std::sync::Arc<CursorUsage>,
+    dns: crate::upstream::Dns,
 }
 
 /// The unchanging surroundings of one dispatch attempt: transport, the chosen
@@ -412,6 +416,7 @@ struct AttemptContext<'a> {
     credential: &'a crate::providers::AuthSchemeMaterial<'a>,
     unfit: &'a optional::Unfit,
     provider_id: i64,
+    dns: crate::upstream::Dns,
     vendor_skip: &'a [&'static str],
     /// The conversation seed (the serialized first user message), computed once
     /// per dispatch; `None` when no OpenCode or Codex upstream is in play.
@@ -508,6 +513,7 @@ async fn send_attempt(
         credential,
         unfit,
         provider_id,
+        dns,
         vendor_skip,
         session_seed,
         fixups,
@@ -533,7 +539,7 @@ async fn send_attempt(
     let cursor_bearer = match (protocol, cursor) {
         (ProtocolId::Cursor, Some(deps)) => Some(
             deps.tokens
-                .resolve(deps.pool, deps.key_id, deps.credential)
+                .resolve(deps.pool, deps.key_id, deps.credential, dns)
                 .await
                 .map_err(failover::AttemptError::CursorTokenError)?,
         ),
@@ -562,7 +568,7 @@ async fn send_attempt(
             // host before and after resolving it; fail closed on a mismatch.
             let call = deps
                 .tokens
-                .access_token_for_endpoint(deps.pool, deps.key, &capability.endpoint)
+                .access_token_for_endpoint(deps.pool, deps.key, &capability.endpoint, dns)
                 .await
                 .map_err(failover::AttemptError::KiroTokenError)?;
             Some(call)
@@ -749,6 +755,7 @@ async fn send_attempt(
     if let (Some(bearer), Some(deps)) = (cursor_bearer, cursor) {
         return send_cursor(
             transport,
+            dns,
             deps,
             bearer,
             prepared,
@@ -795,7 +802,7 @@ async fn send_attempt(
     let mut openai_retried = false;
     loop {
         let response = transport
-            .send_with_headers(&prepared, &headers, &query_pairs, deadline)
+            .send_with_headers(&prepared, dns, &headers, &query_pairs, deadline)
             .await
             .map_err(failover::AttemptError::Transport)?;
         let status = response.status().as_u16();
@@ -895,6 +902,7 @@ async fn send_attempt(
                     deps.key,
                     &capability.endpoint,
                     call.bearer(),
+                    dns,
                 )
                 .await
                 .map_err(failover::AttemptError::KiroTokenError)?;
@@ -1015,6 +1023,7 @@ async fn send_attempt(
 /// refusal is the attempt's error, with the bearer excised from Cursor's words.
 async fn send_cursor(
     transport: &Transport,
+    dns: crate::upstream::Dns,
     deps: CursorDeps<'_>,
     mut bearer: std::sync::Arc<CursorBearer>,
     mut prepared: protocol::Prepared,
@@ -1025,7 +1034,7 @@ async fn send_cursor(
     let mut refreshed = false;
     let mut max_mode = false;
     loop {
-        let error = match cursor_run::open(transport, &prepared, &headers, deadline).await {
+        let error = match cursor_run::open(transport, dns, &prepared, &headers, deadline).await {
             Ok(run) => {
                 return Ok(Sent {
                     status: run.status,
@@ -1051,6 +1060,7 @@ async fn send_cursor(
                     deps.key_id,
                     deps.credential,
                     bearer.access_token(),
+                    dns,
                 )
                 .await
                 .map_err(failover::AttemptError::CursorTokenError)?;
@@ -1159,6 +1169,7 @@ fn cursor_handle(
         bearer,
         usage: std::sync::Arc::clone(deps.usage),
         key_id: deps.key_id,
+        dns: deps.dns,
     })
 }
 
@@ -2912,6 +2923,7 @@ pub async fn dispatch_at(
                         credential: &credential,
                         unfit: failover.unfit(),
                         provider_id: provider.id,
+                        dns: provider.dns,
                         vendor_skip,
                         session_seed: session_seed.as_deref(),
                         fixups,
@@ -2955,6 +2967,7 @@ pub async fn dispatch_at(
                             key_id: candidate.key.id,
                             credential,
                             usage: cursor_usage,
+                            dns: candidate.provider.dns,
                         }),
                     },
                     target_model,
@@ -3274,6 +3287,8 @@ pub async fn dispatch_at(
                                     provider.name.as_str(),
                                     provider.base_url.as_str(),
                                     candidate.key.api_key.as_deref(),
+                                    provider.dns,
+                                    transport,
                                 )
                                 .await,
                             }

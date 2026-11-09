@@ -1,6 +1,7 @@
 use sqlx::PgPool;
 
 use crate::protocol::ProtocolId;
+use crate::upstream::Dns;
 
 use crate::config::{ModelPriceSeed, ProviderSeed};
 
@@ -12,6 +13,8 @@ pub struct ProviderRow {
     pub base_url: String,
     pub auth_scheme: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub dns: Dns,
 }
 
 /// Auth scheme inferred from the protocol when a declaration omits it.
@@ -26,7 +29,7 @@ pub fn default_auth_scheme(protocol: &str) -> &'static str {
 
 pub async fn list_providers(pool: &PgPool) -> anyhow::Result<Vec<ProviderRow>> {
     let rows =
-    sqlx::query_as::<_, ProviderRow>("SELECT id, name, protocol, base_url, auth_scheme, enabled FROM gateway_providers ORDER BY id")
+    sqlx::query_as::<_, ProviderRow>("SELECT id, name, protocol, base_url, auth_scheme, enabled, dns FROM gateway_providers ORDER BY id")
       .fetch_all(pool)
       .await?;
     Ok(rows)
@@ -34,7 +37,7 @@ pub async fn list_providers(pool: &PgPool) -> anyhow::Result<Vec<ProviderRow>> {
 
 pub async fn get_provider(pool: &PgPool, id: i64) -> anyhow::Result<Option<ProviderRow>> {
     let row =
-    sqlx::query_as::<_, ProviderRow>("SELECT id, name, protocol, base_url, auth_scheme, enabled FROM gateway_providers WHERE id = $1")
+    sqlx::query_as::<_, ProviderRow>("SELECT id, name, protocol, base_url, auth_scheme, enabled, dns FROM gateway_providers WHERE id = $1")
       .bind(id)
       .fetch_optional(pool)
       .await?;
@@ -47,7 +50,7 @@ pub async fn get_provider_by_name(
     name: &str,
 ) -> anyhow::Result<Option<ProviderRow>> {
     let row =
-    sqlx::query_as::<_, ProviderRow>("SELECT id, name, protocol, base_url, auth_scheme, enabled FROM gateway_providers WHERE name = $1")
+    sqlx::query_as::<_, ProviderRow>("SELECT id, name, protocol, base_url, auth_scheme, enabled, dns FROM gateway_providers WHERE name = $1")
       .bind(name)
       .fetch_optional(pool)
       .await?;
@@ -61,6 +64,7 @@ pub struct ProviderInput<'a> {
     pub base_url: &'a str,
     pub auth_scheme: Option<&'a str>,
     pub enabled: bool,
+    pub dns: Dns,
 }
 
 impl ProviderInput<'_> {
@@ -83,14 +87,15 @@ fn validate_provider_name(name: &str) -> anyhow::Result<()> {
 pub async fn insert_provider(pool: &PgPool, input: &ProviderInput<'_>) -> anyhow::Result<i64> {
     validate_provider_name(input.name)?;
     let id: (i64,) = sqlx::query_as(
-        "INSERT INTO gateway_providers (name, protocol, base_url, auth_scheme, enabled)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        "INSERT INTO gateway_providers (name, protocol, base_url, auth_scheme, enabled, dns)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(input.name)
     .bind(input.protocol)
     .bind(input.base_url)
     .bind(input.resolved_auth_scheme())
     .bind(input.enabled)
+    .bind(input.dns)
     .fetch_one(pool)
     .await?;
     Ok(id.0)
@@ -109,8 +114,8 @@ pub async fn find_or_create_provider(
 ) -> anyhow::Result<i64> {
     validate_provider_name(input.name)?;
     let inserted: Option<(i64,)> = sqlx::query_as(
-        "INSERT INTO gateway_providers (name, protocol, base_url, auth_scheme, enabled)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO gateway_providers (name, protocol, base_url, auth_scheme, enabled, dns)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (name) DO NOTHING
          RETURNING id",
     )
@@ -119,6 +124,7 @@ pub async fn find_or_create_provider(
     .bind(input.base_url)
     .bind(input.resolved_auth_scheme())
     .bind(input.enabled)
+    .bind(input.dns)
     .fetch_optional(pool)
     .await?;
     if let Some((id,)) = inserted {
@@ -140,6 +146,11 @@ pub async fn find_or_create_provider(
         input.name,
         row.base_url,
         input.base_url
+    );
+    anyhow::ensure!(
+        row.protocol == input.protocol && row.dns == input.dns,
+        "provider '{}' already exists with a different protocol or DNS region",
+        input.name
     );
     Ok(row.id)
 }
@@ -193,6 +204,7 @@ pub async fn find_or_create_kiro_provider(
         "SELECT id FROM gateway_providers
          WHERE protocol = 'kiro' AND auth_scheme = 'bearer'
            AND rtrim(base_url, '/') = $1
+           AND dns = 'overseas'
          ORDER BY id
          LIMIT 1",
     )
@@ -205,8 +217,8 @@ pub async fn find_or_create_kiro_provider(
     }
 
     let inserted: Option<(i64,)> = sqlx::query_as(
-        "INSERT INTO gateway_providers (name, protocol, base_url, auth_scheme, enabled)
-         VALUES ($1, 'kiro', $2, 'bearer', true)
+        "INSERT INTO gateway_providers (name, protocol, base_url, auth_scheme, enabled, dns)
+         VALUES ($1, 'kiro', $2, 'bearer', true, 'overseas')
          ON CONFLICT (name) DO NOTHING
          RETURNING id",
     )
@@ -220,7 +232,7 @@ pub async fn find_or_create_kiro_provider(
     }
 
     let existing_name: Option<ProviderRow> = sqlx::query_as(
-        "SELECT id, name, protocol, base_url, auth_scheme, enabled
+        "SELECT id, name, protocol, base_url, auth_scheme, enabled, dns
          FROM gateway_providers WHERE name = $1",
     )
     .bind(name)
@@ -235,8 +247,9 @@ pub async fn find_or_create_kiro_provider(
     anyhow::ensure!(
         existing_name.protocol == "kiro"
             && existing_name.auth_scheme == "bearer"
-            && normalize_kiro_base_url(&existing_name.base_url) == normalized_base_url,
-        "provider '{}' already exists with a different protocol, auth scheme, or endpoint",
+            && normalize_kiro_base_url(&existing_name.base_url) == normalized_base_url
+            && existing_name.dns == Dns::Overseas,
+        "provider '{}' already exists with a different protocol, auth scheme, endpoint, or DNS region",
         name
     );
     let id = existing_name.id;
@@ -252,13 +265,14 @@ pub async fn update_provider(
 ) -> anyhow::Result<bool> {
     validate_provider_name(input.name)?;
     let result =
-    sqlx::query("UPDATE gateway_providers SET name = $2, protocol = $3, base_url = $4, auth_scheme = $5, enabled = $6 WHERE id = $1")
+    sqlx::query("UPDATE gateway_providers SET name = $2, protocol = $3, base_url = $4, auth_scheme = $5, enabled = $6, dns = $7 WHERE id = $1")
       .bind(id)
       .bind(input.name)
       .bind(input.protocol)
       .bind(input.base_url)
       .bind(input.resolved_auth_scheme())
       .bind(input.enabled)
+    .bind(input.dns)
       .execute(pool)
       .await?;
     Ok(result.rows_affected() > 0)
@@ -360,7 +374,7 @@ pub async fn delete_provider_if_empty(
 
 pub async fn list_providers_by_ids(pool: &PgPool, ids: &[i64]) -> anyhow::Result<Vec<ProviderRow>> {
     let rows = sqlx::query_as::<_, ProviderRow>(
-    "SELECT id, name, protocol, base_url, auth_scheme, enabled FROM gateway_providers WHERE id = ANY($1) ORDER BY id",
+    "SELECT id, name, protocol, base_url, auth_scheme, enabled, dns FROM gateway_providers WHERE id = ANY($1) ORDER BY id",
   )
   .bind(ids)
   .fetch_all(pool)
@@ -390,17 +404,18 @@ pub async fn seed_from_config(
             .as_deref()
             .unwrap_or_else(|| default_auth_scheme(&p.protocol));
         sqlx::query(
-            "INSERT INTO gateway_providers (name, protocol, base_url, auth_scheme, enabled)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO gateway_providers (name, protocol, base_url, auth_scheme, enabled, dns)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (name) DO UPDATE SET
                protocol = EXCLUDED.protocol, base_url = EXCLUDED.base_url,
-               auth_scheme = EXCLUDED.auth_scheme, enabled = EXCLUDED.enabled",
+               auth_scheme = EXCLUDED.auth_scheme, enabled = EXCLUDED.enabled, dns = EXCLUDED.dns",
         )
         .bind(&p.name)
         .bind(&p.protocol)
         .bind(&p.base_url)
         .bind(auth_scheme)
         .bind(p.enabled)
+        .bind(p.dns)
         .execute(pool)
         .await?;
     }

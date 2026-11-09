@@ -300,6 +300,7 @@ async fn quota_prober(
     pool: sqlx::PgPool,
     smart_cache: relay::SmartCache,
     tokens: QuotaTokens,
+    transport: transport::Transport,
     activity: crate::activity::ActivitySink,
     cancel: CancellationToken,
 ) {
@@ -314,6 +315,7 @@ async fn quota_prober(
             let rows = admin_ops::probe_all_quotas(
                 &pool,
                 Some(&smart_cache),
+                &transport,
                 Some(&tokens.kiro),
                 Some(&tokens.opencode),
                 Some(&tokens.cursor),
@@ -433,6 +435,7 @@ impl Gateway {
                 cursor: Arc::clone(&core.cursor_tokens),
                 openai: Arc::clone(&core.openai_tokens),
             },
+            core.transport.clone(),
             core.activity.clone(),
             core.prober_cancel.clone(),
         ));

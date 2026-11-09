@@ -87,12 +87,13 @@ pub async fn fetch_cursor_quota(
     pool: &sqlx::PgPool,
     tokens: &crate::upstream::CursorTokens,
     key: &crate::store::ProviderKeyRow,
+    dns: crate::upstream::Dns,
 ) -> Option<KeyQuota> {
     let credential = match key.cursor_oauth() {
         Some(bundle) => KeyCredential::CursorOauth(bundle),
         None => KeyCredential::Static(key.api_key.as_deref()?),
     };
-    let bearer = match tokens.resolve(pool, key.id, &credential).await {
+    let bearer = match tokens.resolve(pool, key.id, &credential, dns).await {
         Ok(bearer) => bearer,
         Err(error) => {
             tracing::warn!(key_id = key.id, error = %error, "Cursor quota probe: credential unavailable");
@@ -112,6 +113,7 @@ pub async fn fetch_cursor_quota(
             transport,
             &bearer,
             key.id,
+            dns,
             PERIOD_USAGE_PATH,
             Bytes::from_static(b"{}")
         ),
@@ -119,6 +121,7 @@ pub async fn fetch_cursor_quota(
             transport,
             &bearer,
             key.id,
+            dns,
             HARD_LIMIT_PATH,
             Bytes::from_static(b"{}")
         ),
@@ -126,6 +129,7 @@ pub async fn fetch_cursor_quota(
             transport,
             &bearer,
             key.id,
+            dns,
             PLAN_INFO_PATH,
             Bytes::from_static(b"{}")
         ),
@@ -137,6 +141,7 @@ pub async fn fetch_cursor_quota(
                 transport,
                 &bearer,
                 key.id,
+                dns,
                 AGGREGATED_EVENTS_PATH,
                 Bytes::from_static(b"{}"),
             )
@@ -167,6 +172,7 @@ pub async fn fetch_cursor_quota(
         transport,
         &bearer,
         key.id,
+        dns,
         ME_PATH,
         Bytes::from_static(b"{}"),
     )
@@ -189,6 +195,7 @@ pub async fn fetch_cursor_quota(
         transport,
         &bearer,
         key.id,
+        dns,
         BILLING_CYCLE_PATH,
         Bytes::from_static(b"{}"),
     )
@@ -205,6 +212,7 @@ pub async fn fetch_cursor_quota(
         transport,
         &bearer,
         key.id,
+        dns,
         AGGREGATED_EVENTS_PATH,
         body.to_string().into(),
     )
@@ -233,6 +241,7 @@ async fn call(
     transport: &Transport,
     bearer: &CursorBearer,
     key_id: i64,
+    dns: crate::upstream::Dns,
     path: &str,
     body: Bytes,
 ) -> Option<Value> {
@@ -240,7 +249,7 @@ async fn call(
     let headers = cursor_request::unary_headers(bearer.access_token(), bearer.team_id());
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let response = match transport
-        .send_with_headers(&prepared, &headers, &[], deadline)
+        .send_with_headers(&prepared, dns, &headers, &[], deadline)
         .await
     {
         Ok(response) => response,

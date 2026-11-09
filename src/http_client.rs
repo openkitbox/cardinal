@@ -108,10 +108,19 @@ fn build_client(timeout: Option<Duration>) -> reqwest::Client {
         }
         builder.build()
     };
-    build().unwrap_or_else(|error| {
-    tracing::warn!(%error, "admin HTTP client build failed; retrying once before the infallible default");
-    build().unwrap_or_default()
-  })
+    match build() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "admin HTTP client build failed; retrying once");
+            match build() {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(%error, "admin HTTP client build failed twice");
+                    reqwest::Client::new()
+                }
+            }
+        }
+    }
 }
 
 /// A partial key update for [`GatewayHttpClient::update_key`], serialized as
@@ -675,6 +684,7 @@ impl GatewayHttpClient {
           "base_url": input.base_url,
           "auth_scheme": input.auth_scheme,
           "enabled": input.enabled,
+        "dns": input.dns,
           "api_key": api_key,
         });
         json(self.post("/api/keys/validate").json(&body)).await
@@ -780,6 +790,12 @@ impl GatewayHttpClient {
                         input.name, provider.base_url
                     )));
                 }
+                if provider.dns != input.dns {
+                    return Err(ClientError::Decode(format!(
+                        "provider {} has incompatible DNS region {}",
+                        input.name, provider.dns
+                    )));
+                }
                 Ok((provider.id, false))
             }
         }
@@ -808,6 +824,7 @@ impl GatewayHttpClient {
             base_url: &provider.base_url,
             auth_scheme: Some(provider.auth_scheme.as_str()),
             enabled,
+            dns: provider.dns,
         };
         self.update_provider(id, &input).await
     }
@@ -1673,5 +1690,6 @@ fn provider_body(input: &ProviderInput<'_>) -> serde_json::Value {
       "base_url": input.base_url,
       "auth_scheme": input.auth_scheme,
       "enabled": input.enabled,
+        "dns": input.dns,
     })
 }

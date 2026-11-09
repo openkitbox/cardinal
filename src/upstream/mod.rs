@@ -23,6 +23,7 @@ pub mod transport;
 
 pub use cursor_tokens::{CursorTokenError, CursorTokens};
 pub use cursor_usage::CursorUsage;
+pub use dns::Dns;
 pub use kiro_tokens::{KiroCallContext, KiroProbeCredential, KiroTokenError, KiroTokens};
 pub use openai_tokens::{OpenaiBearer, OpenaiTokenError, OpenaiTokens};
 pub use opencode_tokens::{OpencodeTokenError, OpencodeTokens};

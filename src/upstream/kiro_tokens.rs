@@ -521,12 +521,13 @@ impl KiroTokens {
     pub async fn candidate_for_probe(
         &self,
         candidate: KiroOAuth,
+        dns: crate::upstream::Dns,
     ) -> Result<KiroProbeCredential, KiroTokenError> {
         let now = chrono::Utc::now().timestamp();
         let oauth = if candidate.fresh_for(now) {
             candidate
         } else {
-            merged_exchange(&candidate, self.refresh(None, &candidate).await?)
+            merged_exchange(&candidate, self.refresh(None, &candidate, dns).await?)
         };
         let call = call_context(&oauth);
         Ok(KiroProbeCredential { oauth, call })
@@ -609,6 +610,7 @@ impl KiroTokens {
         &self,
         pool: &PgPool,
         key: &ProviderKeyRow,
+        dns: crate::upstream::Dns,
     ) -> Result<KiroCallContext, KiroTokenError> {
         let state = self.state_for(key)?;
         loop {
@@ -633,7 +635,7 @@ impl KiroTokens {
                 commit(&mut guard, &before, stored, true, None);
                 continue;
             }
-            let (refreshed, expected) = self.refresh_from_snapshot(pool, key, &before).await?;
+            let (refreshed, expected) = self.refresh_from_snapshot(pool, key, &before, dns).await?;
             let mut guard = state.lock().await;
             if !commit(&mut guard, &before, refreshed, false, Some(expected)) {
                 continue;
@@ -660,6 +662,7 @@ impl KiroTokens {
         pool: &PgPool,
         key: &ProviderKeyRow,
         endpoint: &str,
+        dns: crate::upstream::Dns,
     ) -> Result<KiroCallContext, KiroTokenError> {
         // Typed decode rather than the raw JSON: the precheck only needs the
         // region, but a bundle that no longer decodes is a missing credential
@@ -667,7 +670,7 @@ impl KiroTokens {
         // resolution that follows).
         let oauth = key.kiro_oauth().ok_or(KiroTokenError::MissingCredential)?;
         ensure_endpoint(key, endpoint, &oauth.api_region, EndpointStage::Precheck)?;
-        let call = self.access_token(pool, key).await?;
+        let call = self.access_token(pool, key, dns).await?;
         ensure_endpoint(key, endpoint, &call.api_region, EndpointStage::Resolved)?;
         Ok(call)
     }
@@ -681,8 +684,9 @@ impl KiroTokens {
         key: &ProviderKeyRow,
         endpoint: &str,
         old_bearer: &str,
+        dns: crate::upstream::Dns,
     ) -> Result<KiroCallContext, KiroTokenError> {
-        let recovered = self.recover_invalidated(pool, key, old_bearer).await?;
+        let recovered = self.recover_invalidated(pool, key, old_bearer, dns).await?;
         ensure_endpoint(
             key,
             endpoint,
@@ -701,6 +705,7 @@ impl KiroTokens {
         pool: &PgPool,
         key: &ProviderKeyRow,
         old_bearer: &str,
+        dns: crate::upstream::Dns,
     ) -> Result<KiroCallContext, KiroTokenError> {
         let state = self.state_for(key)?;
         loop {
@@ -742,7 +747,7 @@ impl KiroTokens {
                     "Kiro token reread failed; recovering from memory"
                 ),
             }
-            let (refreshed, expected) = self.refresh_from_snapshot(pool, key, &base).await?;
+            let (refreshed, expected) = self.refresh_from_snapshot(pool, key, &base, dns).await?;
             let mut guard = state.lock().await;
             if !commit(&mut guard, &base, refreshed, false, Some(expected)) {
                 continue;
@@ -800,8 +805,9 @@ impl KiroTokens {
         pool: &PgPool,
         key: &ProviderKeyRow,
         before: &StateSnapshot,
+        dns: crate::upstream::Dns,
     ) -> Result<(KiroOAuth, KiroOAuth), KiroTokenError> {
-        let refreshed = match self.refresh(Some(key.id), &before.oauth).await {
+        let refreshed = match self.refresh(Some(key.id), &before.oauth, dns).await {
             Ok(exchange) => merged_exchange(&before.oauth, exchange),
             Err(KiroTokenError::Invalidated) if before.persisted => {
                 let Some(stored) = store::kiro_oauth(pool, key.id)
@@ -817,7 +823,7 @@ impl KiroTokens {
                 }
                 if !same_exchange_identity(&stored, &before.oauth) {
                     let refreshed =
-                        merged_exchange(&stored, self.refresh(Some(key.id), &stored).await?);
+                        merged_exchange(&stored, self.refresh(Some(key.id), &stored, dns).await?);
                     return Ok((refreshed, stored));
                 } else {
                     return Err(KiroTokenError::Invalidated);
@@ -894,6 +900,7 @@ impl KiroTokens {
         &self,
         key_id: Option<i64>,
         current: &KiroOAuth,
+        dns: crate::upstream::Dns,
     ) -> Result<RefreshExchange, KiroTokenError> {
         let identity = exchange_identity_digest(current);
         let gate = match self.refresh_gates.entry(identity) {
@@ -916,7 +923,7 @@ impl KiroTokens {
             }
             self.refresh_gates
                 .remove_if(&identity, |_, existing| Arc::ptr_eq(existing, &gate));
-            return Box::pin(self.refresh(key_id, current)).await;
+            return Box::pin(self.refresh(key_id, current, dns)).await;
         }
         gate.users.fetch_add(1, Ordering::AcqRel);
         let user =
@@ -925,7 +932,7 @@ impl KiroTokens {
             if let Some(result) = self.closed_refresh_result(&gate).await {
                 return result;
             }
-            return Box::pin(self.refresh(key_id, current)).await;
+            return Box::pin(self.refresh(key_id, current, dns)).await;
         }
         let notified = gate.notify.notified();
         let existing = {
@@ -955,7 +962,7 @@ impl KiroTokens {
             }
         }
         let owner = RefreshOwner::new(user);
-        let answer = match self.create_token(key_id, current).await {
+        let answer = match self.create_token(key_id, current, dns).await {
             Ok(answer) => answer,
             Err(error) => {
                 let mut result = lock_gate_result(&gate);
@@ -1024,6 +1031,7 @@ impl KiroTokens {
         &self,
         key_id: Option<i64>,
         oauth: &KiroOAuth,
+        dns: crate::upstream::Dns,
     ) -> Result<CreateTokenResponse, KiroTokenError> {
         if !crate::kiro::valid_region(&oauth.auth_region)
             || !crate::kiro::valid_region(&oauth.api_region)
@@ -1056,7 +1064,7 @@ impl KiroTokens {
         let deadline = Instant::now() + TOKEN_TIMEOUT;
         let response = self
             .transport
-            .send(&prepared, deadline)
+            .send(&prepared, dns, deadline)
             .await
             .map_err(send_error)?;
         let status = response.status().as_u16();

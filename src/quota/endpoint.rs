@@ -41,9 +41,22 @@ pub async fn fetch_quota(
     base_url: &str,
     api_key: &str,
     org_id: Option<&str>,
+    dns: crate::upstream::Dns,
+    transport: &crate::upstream::transport::Transport,
 ) -> Option<KeyQuota> {
     let endpoint = quota_endpoint(provider_name, base_url)?;
-    let client = reqwest::Client::new();
+    let resolvers = transport.resolver(dns);
+    let client = match reqwest::Client::builder()
+        .dns_resolver(std::sync::Arc::clone(resolvers))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "quota probe: client build failed");
+            return None;
+        }
+    };
     let request = client
         .get(&endpoint.url)
         .timeout(PROBE_TIMEOUT)

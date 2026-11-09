@@ -92,8 +92,9 @@ pub async fn fetch_kiro_quota(
     pool: &sqlx::PgPool,
     tokens: &crate::upstream::KiroTokens,
     key: &crate::store::ProviderKeyRow,
+    dns: crate::upstream::Dns,
 ) -> Option<KeyQuota> {
-    let context = match tokens.access_token(pool, key).await {
+    let context = match tokens.access_token(pool, key, dns).await {
         Ok(context) => context,
         Err(error) => {
             tracing::warn!(key_id = key.id, error = %error, "Kiro quota probe: credential unavailable");
@@ -117,7 +118,7 @@ pub async fn fetch_kiro_quota(
     let transport = tokens.transport();
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     let response = match transport
-        .send_with_headers(&call.prepared, &call.auth, &call.query, deadline)
+        .send_with_headers(&call.prepared, dns, &call.auth, &call.query, deadline)
         .await
     {
         Ok(response) => response,

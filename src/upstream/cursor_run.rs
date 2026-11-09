@@ -156,13 +156,14 @@ impl Run {
 /// refresh, 429 rest, failover).
 pub async fn open(
     transport: &Transport,
+    dns: crate::upstream::Dns,
     prepared: &Prepared,
     auth: &[(&'static str, String)],
     deadline: Instant,
 ) -> Result<Run, TransportError> {
     let plan = prepared.cursor.clone().ok_or(TransportError::InvalidBody)?;
     if bidi_enabled() {
-        match open_bidi(transport, prepared, &plan, auth, deadline).await {
+        match open_bidi(transport, dns, prepared, &plan, auth, deadline).await {
             Ok(run) => return Ok(run),
             Err(Opening::Refused(error)) => return Err(error),
             Err(Opening::Fallback(error)) => {
@@ -174,7 +175,7 @@ pub async fn open(
             }
         }
     }
-    open_split(transport, &plan, auth, deadline).await
+    open_split(transport, dns, &plan, auth, deadline).await
 }
 
 /// Which transport a Run opens on, as the relay reports it.
@@ -229,6 +230,7 @@ enum Opening {
 /// request body.
 async fn open_bidi(
     transport: &Transport,
+    dns: crate::upstream::Dns,
     prepared: &Prepared,
     plan: &Arc<RunPlan>,
     auth: &[(&'static str, String)],
@@ -256,7 +258,10 @@ async fn open_bidi(
             .map_err(|_| std::io::Error::other("client message too large for a Connect frame"));
         Some((frame, inbox))
     });
-    let response = match transport.send_bidi(prepared, auth, body, deadline).await {
+    let response = match transport
+        .send_bidi(prepared, dns, auth, body, deadline)
+        .await
+    {
         Ok(response) => response,
         Err(error @ (TransportError::Connect | TransportError::Timeout)) => {
             return Err(Opening::Fallback(error));
@@ -300,6 +305,7 @@ async fn open_bidi(
 /// `run_request` as append 0.
 async fn open_split(
     transport: &Transport,
+    dns: crate::upstream::Dns,
     plan: &Arc<RunPlan>,
     auth: &[(&'static str, String)],
     deadline: Instant,
@@ -315,7 +321,7 @@ async fn open_split(
         cursor: None,
     };
     let response = transport
-        .send_with_headers(&downlink, auth, &[], deadline)
+        .send_with_headers(&downlink, dns, auth, &[], deadline)
         .await?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
@@ -334,6 +340,7 @@ async fn open_split(
     let (fail_tx, fail_rx) = oneshot::channel();
     let appender = Appender {
         transport: transport.clone(),
+        dns,
         url: plan.append_url.clone(),
         headers: append_headers(&plan.request_id, auth),
         request_id: plan.request_id.clone(),
@@ -761,6 +768,7 @@ fn error_end(failure: &Failure) -> Frame {
 /// The uplink: one task per Run, appending messages in order.
 struct Appender {
     transport: Transport,
+    dns: crate::upstream::Dns,
     url: String,
     headers: Vec<(&'static str, String)>,
     request_id: String,
@@ -838,7 +846,7 @@ impl Appender {
         };
         let sent = tokio::select! {
             () = self.cancel.cancelled() => return Ok(()),
-            sent = self.transport.send_with_headers(&prepared, &self.headers, &[], deadline) => sent,
+            sent = self.transport.send_with_headers(&prepared, self.dns, &self.headers, &[], deadline) => sent,
         };
         let response = match sent {
             Ok(response) => response,

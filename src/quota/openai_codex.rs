@@ -29,8 +29,13 @@ const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 /// non-2xx status, a timeout, an unreadable body or an answer without a window
 /// all yield `None`, logged with the key id, status and byte count ONLY — the
 /// answer is account data and the request carries a bearer.
-pub async fn fetch_openai_codex_quota(bearer: &OpenaiBearer, key_id: i64) -> Option<KeyQuota> {
-    let (status, body) = match crate::probe::codex_get(USAGE_URL, bearer).await {
+pub async fn fetch_openai_codex_quota(
+    bearer: &OpenaiBearer,
+    key_id: i64,
+    transport: &crate::upstream::transport::Transport,
+    dns: crate::upstream::Dns,
+) -> Option<KeyQuota> {
+    let (status, body) = match crate::probe::codex_get(USAGE_URL, bearer, transport, dns).await {
         Ok(answer) => answer,
         Err(error) => {
             tracing::warn!(key_id, %error, "Codex quota probe: request failed");

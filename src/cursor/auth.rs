@@ -167,7 +167,7 @@ const OP_ME: &str = "GetMe";
 /// The login HTTP client: a connection pool and a timeout, nothing per
 /// account. The backend origin is a field so a test can point it at a stub.
 pub struct Client {
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
     backend: String,
 }
 
@@ -178,9 +178,9 @@ impl Default for Client {
 }
 
 impl Client {
-    /// Build the client against the production backend. Construction is kept
-    /// infallible the way the OpenCode client's is: one retry, then reqwest's
-    /// default, with the per-request timeout surviving the fallback.
+    /// Build the client against the production backend. Resolver or HTTP
+    /// client construction failure leaves the client unavailable: encrypted
+    /// DNS is mandatory, so there is no system-DNS fallback.
     #[must_use]
     pub fn new() -> Self {
         Self::with_backend(API_ORIGIN)
@@ -189,25 +189,41 @@ impl Client {
     /// Build the client against `backend` (a test stub's origin).
     #[must_use]
     pub fn with_backend(backend: &str) -> Self {
-        let build = || reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build();
-        let http = build().unwrap_or_else(|error| {
-            tracing::warn!(
-                %error,
-                "Cursor login client build failed; retrying once before the infallible default"
-            );
-            build().unwrap_or_default()
-        });
+        let http = match crate::upstream::dns::Resolvers::new() {
+            Ok(resolvers) => reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::clone(
+                    // The Cursor console is fixed overseas; login has no provider row yet.
+                    resolvers.resolver(crate::upstream::Dns::Overseas),
+                ))
+                .build()
+                .map_err(|error| anyhow::anyhow!(error)),
+            Err(error) => Err(error),
+        };
+        let http = match http {
+            Ok(http) => Some(http),
+            Err(error) => {
+                tracing::warn!(%error, "Cursor login client is unavailable: encrypted resolver setup failed");
+                None
+            }
+        };
         Self {
             http,
             backend: backend.trim_end_matches('/').to_owned(),
         }
     }
 
+    fn http(&self) -> Option<&reqwest::Client> {
+        self.http.as_ref()
+    }
+
     /// Ask once whether the sign-in landed. No `Authorization` and only the
     /// client-type header: the poll is anonymous by design.
     pub async fn poll(&self, challenge: &Challenge) -> Result<PollVerdict, AuthError> {
         let response = self
-            .http
+            .http()
+            .ok_or(AuthError::Transport { operation: OP_POLL })?
             .get(format!("{}{POLL_PATH}", self.backend))
             .query(&[
                 ("uuid", challenge.uuid().to_string()),
@@ -244,8 +260,8 @@ impl Client {
     /// The signed-in account's email, for the account card. Best effort: a
     /// failure is `None`, and the login is committed regardless.
     pub async fn email(&self, access_token: &str, team_id: Option<&str>) -> Option<String> {
-        let mut request = self
-            .http
+        let http = self.http()?;
+        let mut request = http
             .post(format!("{}{ME_PATH}", self.backend))
             .header("content-type", "application/json")
             .header(

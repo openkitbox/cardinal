@@ -190,6 +190,12 @@ pub enum AuthError {
         #[source]
         source: reqwest::Error,
     },
+    /// The encrypted resolver or HTTP client could not be constructed.
+    #[error("{operation}: request to {origin} is unavailable because encrypted DNS setup failed")]
+    Unavailable {
+        operation: &'static str,
+        origin: String,
+    },
     /// A non-success status that is not a grant verdict.
     #[error("{operation}: {origin} answered HTTP {status}{}", detail_suffix(.detail))]
     Status {
@@ -558,7 +564,7 @@ fn parse_device_code(
 /// decide which account a call is for and when it happens. The client holds
 /// only the connection pool and the timeout.
 pub struct Client {
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
 }
 
 impl Default for Client {
@@ -568,20 +574,37 @@ impl Default for Client {
 }
 
 impl Client {
-    /// Build the console client. Client construction is kept infallible (the
-    /// only realistic failure is TLS-backend init): one retry with the same
-    /// configuration, then reqwest's default, and every request carries the
-    /// timeout itself so the budget survives the fallback.
+    /// Build the console client. Resolver or HTTP client construction failure
+    /// leaves the client unavailable: encrypted DNS is mandatory, so there is
+    /// no system-DNS fallback.
     pub fn new() -> Self {
-        let build = || reqwest::Client::builder().timeout(CONSOLE_TIMEOUT).build();
-        let http = build().unwrap_or_else(|error| {
-            tracing::warn!(
-                %error,
-                "OpenCode console client build failed; retrying once before the infallible default"
-            );
-            build().unwrap_or_default()
-        });
+        let http = match crate::upstream::dns::Resolvers::new() {
+            Ok(resolvers) => reqwest::Client::builder()
+                .timeout(CONSOLE_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::clone(
+                    // The OpenCode console is fixed overseas; login has no provider row yet.
+                    resolvers.resolver(crate::upstream::Dns::Overseas),
+                ))
+                .build()
+                .map_err(|error| anyhow::anyhow!(error)),
+            Err(error) => Err(error),
+        };
+        let http = match http {
+            Ok(http) => Some(http),
+            Err(error) => {
+                tracing::warn!(%error, "OpenCode console client is unavailable: encrypted resolver setup failed");
+                None
+            }
+        };
         Self { http }
+    }
+
+    fn http(&self, operation: &'static str, origin: &str) -> Result<&reqwest::Client, AuthError> {
+        self.http.as_ref().ok_or_else(|| AuthError::Unavailable {
+            operation,
+            origin: origin.to_owned(),
+        })
     }
 
     /// Start a device-code login: the caller shows `user_code` and
@@ -594,7 +617,7 @@ impl Client {
             "supports_org_scope": true,
         });
         let request = self
-            .http
+            .http(OP_DEVICE_CODE, origin)?
             .post(format!("{origin}/{OP_DEVICE_CODE}"))
             .json(&body);
         let (status, text) = self.round_trip(OP_DEVICE_CODE, origin, request).await?;
@@ -673,7 +696,10 @@ impl Client {
         origin: &str,
         body: serde_json::Value,
     ) -> Result<TokenGrant, AuthError> {
-        let request = self.http.post(format!("{origin}/{OP_TOKEN}")).json(&body);
+        let request = self
+            .http(OP_TOKEN, origin)?
+            .post(format!("{origin}/{OP_TOKEN}"))
+            .json(&body);
         let (status, text) = self.round_trip(OP_TOKEN, origin, request).await?;
         parse_token_grant(status, &text, origin)
     }
@@ -687,7 +713,7 @@ impl Client {
         access_token: &str,
     ) -> Result<String, AuthError> {
         let request = self
-            .http
+            .http(operation, origin)?
             .get(format!("{origin}/{operation}"))
             .bearer_auth(access_token);
         let (status, text) = self.round_trip(operation, origin, request).await?;
