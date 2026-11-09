@@ -137,6 +137,8 @@ struct Core {
     /// In-memory price cache — seeded from PG at startup, write-through on
     /// catalog upsert; no PG round-trip on the request path.
     price_cache: relay::PriceCache,
+    /// Shared GUI bootstrap read model.
+    admin_snapshot: admin_ops::AdminSnapshot,
     /// `[gateway].payloads`: relay mirrors request/response bodies into the log.
     payload_log: bool,
 }
@@ -263,6 +265,7 @@ impl Core {
             route_cache,
             rest_cache,
             price_cache,
+            admin_snapshot: admin_ops::AdminSnapshot::new(),
             payload_log: config.payloads,
         })
     }
@@ -299,6 +302,7 @@ struct QuotaTokens {
 async fn quota_prober(
     pool: sqlx::PgPool,
     smart_cache: relay::SmartCache,
+    admin_snapshot: admin_ops::AdminSnapshot,
     tokens: QuotaTokens,
     transport: transport::Transport,
     activity: crate::activity::ActivitySink,
@@ -323,6 +327,9 @@ async fn quota_prober(
             )
             .await;
             if !rows.is_empty() {
+                // The round persisted fresh snapshots, so the cached GUI
+                // bootstrap document must be assembled again.
+                admin_snapshot.invalidate().await;
                 activity.quota_refreshed();
             }
           }
@@ -429,6 +436,7 @@ impl Gateway {
         let prober_handle = tokio::spawn(quota_prober(
             core.pool.clone(),
             core.smart_cache.clone(),
+            core.admin_snapshot.clone(),
             QuotaTokens {
                 kiro: Arc::clone(&core.kiro_tokens),
                 opencode: Arc::clone(&core.opencode_tokens),
@@ -466,6 +474,7 @@ impl Gateway {
             route_cache: core.route_cache.clone(),
             rest_cache: core.rest_cache.clone(),
             price_cache: core.price_cache.clone(),
+            admin_snapshot: core.admin_snapshot.clone(),
             kiro_tokens: core.kiro_tokens.clone(),
             prompt_cache: core.prompt_cache.clone(),
             opencode_tokens: core.opencode_tokens.clone(),
@@ -482,6 +491,13 @@ impl Gateway {
             server_stopped: core.server_stopped.clone(),
             payload_log: core.payload_log,
         });
+        // Assemble the GUI bootstrap document once, after the dispatcher and
+        // every registry exist, so the first activity connect and every manual
+        // refresh share one read model instead of repeating the PostgreSQL
+        // fan-out. A failed build is not fatal: readers retry one rebuild.
+        if let Err(error) = admin::admin_from_state(&state).initialize_snapshot().await {
+            tracing::warn!(error = %format!("{error:#}"), "bootstrap snapshot: startup build failed; the first reader rebuilds");
+        }
 
         let server = Server::new(acceptor);
         let handle = server.handle();

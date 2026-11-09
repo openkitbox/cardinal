@@ -190,6 +190,12 @@ fn admin(depot: &Depot) -> crate::admin_ops::Admin {
     let state = depot
         .get_typed::<Arc<crate::api::AppState>>()
         .expect("app state injected");
+    admin_from_state(state)
+}
+
+/// Build the facade over an already shared state (used by gateway startup to
+/// prime the bootstrap snapshot without a synthetic depot).
+pub(crate) fn admin_from_state(state: &crate::api::AppState) -> crate::admin_ops::Admin {
     crate::admin_ops::Admin::new(
         state.pool.clone(),
         (
@@ -202,6 +208,7 @@ fn admin(depot: &Depot) -> crate::admin_ops::Admin {
         state.rest_cache.clone(),
         state.activity.clone(),
     )
+    .with_snapshot(state.admin_snapshot.clone())
     .with_kiro_tokens(Arc::clone(&state.kiro_tokens))
     .with_opencode_tokens(Arc::clone(&state.opencode_tokens))
     .with_cursor_tokens(Arc::clone(&state.cursor_tokens))
@@ -321,6 +328,7 @@ async fn create_provider(request: &mut Request, depot: &mut Depot, response: &mu
     match store::insert_provider(pool, &body.spec.input()).await {
         Ok(id) => {
             let _ = admin(depot).refresh_route_cache().await;
+            state(depot).admin_snapshot.invalidate().await;
             response.status_code(StatusCode::CREATED);
             json_response(response, &json!({"id": id}));
         }
@@ -348,6 +356,7 @@ async fn find_or_create_kiro_provider(
             if let Err(error) = admin(depot).refresh_route_cache().await {
                 tracing::warn!(%error, "route cache refresh after Kiro provider find-or-create failed");
             }
+            state(depot).admin_snapshot.invalidate().await;
             response.status_code(if created {
                 StatusCode::CREATED
             } else {
@@ -393,6 +402,7 @@ async fn update_provider(request: &mut Request, depot: &mut Depot, response: &mu
     match store::update_provider(pool, id, &body.spec.input()).await {
         Ok(true) => {
             let _ = admin(depot).refresh_route_cache().await;
+            state(depot).admin_snapshot.invalidate().await;
             json_response(response, &json!({"ok": true}))
         }
         Ok(false) => not_found(response, "provider"),
@@ -412,6 +422,7 @@ async fn delete_provider(request: &mut Request, depot: &mut Depot, response: &mu
         Ok(store::ProviderDeleteOutcome::Deleted { kiro_key_ids }) => {
             state(depot).kiro_tokens.remove_provider(&kiro_key_ids);
             let _ = admin(depot).refresh_route_cache().await;
+            state(depot).admin_snapshot.invalidate().await;
             json_response(response, &json!({"ok": true}))
         }
         Ok(store::ProviderDeleteOutcome::Missing) => not_found(response, "provider"),
@@ -434,6 +445,7 @@ async fn delete_provider_if_empty(
     match store::delete_provider_if_empty(pool, id).await {
         Ok(store::EmptyProviderDeleteOutcome::Deleted) => {
             let _ = admin(depot).refresh_route_cache().await;
+            state(depot).admin_snapshot.invalidate().await;
             json_response(response, &json!({"ok": true}))
         }
         Ok(store::EmptyProviderDeleteOutcome::HasKeys) => {
@@ -522,6 +534,7 @@ async fn put_route(request: &mut Request, depot: &mut Depot, response: &mut Resp
     {
         Ok(()) => {
             let _ = admin(depot).refresh_route_cache().await;
+            state(depot).admin_snapshot.invalidate().await;
             json_response(response, &json!({"ok": true}))
         }
         Err(error) => bad_request(response, error),
@@ -844,7 +857,10 @@ async fn create_gateway_key(request: &mut Request, depot: &mut Depot, response: 
         },
     };
     match store::create_gateway_key(pool, user_id, label, terms, created_by).await {
-        Ok(key) => json_response(response, &json!({ "key": key })),
+        Ok(key) => {
+            state(depot).admin_snapshot.invalidate().await;
+            json_response(response, &json!({ "key": key }))
+        }
         Err(error) if store::is_label_taken(&error) => {
             response.status_code(StatusCode::CONFLICT);
             json_response(response, &json!({ "error": "label already in use" }));
@@ -898,7 +914,10 @@ async fn patch_gateway_key(request: &mut Request, depot: &mut Depot, response: &
         }
     };
     match store::update_gateway_key(pool, id, None, patch).await {
-        Ok(true) => json_response(response, &json!({ "ok": true })),
+        Ok(true) => {
+            state(depot).admin_snapshot.invalidate().await;
+            json_response(response, &json!({ "ok": true }))
+        }
         Ok(false) => {
             response.status_code(StatusCode::NOT_FOUND);
             json_response(response, &json!({ "error": "key not found" }));
@@ -1142,7 +1161,7 @@ fn sse_events(
 #[handler]
 async fn activity_stream(depot: &mut Depot, response: &mut Response) {
     let initial = match admin(depot).bootstrap().await {
-        Ok(document) => crate::activity::ActivityEvent::Bootstrap(Box::new(document)),
+        Ok(document) => crate::activity::ActivityEvent::Bootstrap(document),
         Err(error) => {
             tracing::warn!("activity sse: bootstrap failed ({error:#}); subscriber re-reads");
             crate::activity::ActivityEvent::Resync
@@ -1159,7 +1178,7 @@ async fn activity_stream(depot: &mut Depot, response: &mut Response) {
 /// refresh and as the subscriber's reconnect fallback.
 #[handler]
 async fn bootstrap(depot: &mut Depot, response: &mut Response) {
-    match admin(depot).bootstrap().await {
+    match admin(depot).bootstrap_for_refresh().await {
         Ok(document) => json_response(response, &document),
         Err(error) => internal(response, error),
     }
@@ -1362,7 +1381,10 @@ async fn create_user(request: &mut Request, depot: &mut Depot, response: &mut Re
         max_concurrent: body.max_concurrent,
     };
     match store::create_user(pool, user).await {
-        Ok(id) => respond_user(pool, id, response).await,
+        Ok(id) => {
+            state(depot).admin_snapshot.invalidate().await;
+            respond_user(pool, id, response).await
+        }
         Err(error) if store::is_conflict(&error) => {
             json_error(response, StatusCode::CONFLICT, "login already in use");
         }
@@ -1409,7 +1431,10 @@ async fn patch_user(request: &mut Request, depot: &mut Depot, response: &mut Res
         max_concurrent: body.max_concurrent,
     };
     match store::patch_user(pool, id, patch).await {
-        Ok(true) => respond_user(pool, id, response).await,
+        Ok(true) => {
+            state(depot).admin_snapshot.invalidate().await;
+            respond_user(pool, id, response).await
+        }
         Ok(false) => json_error(response, StatusCode::NOT_FOUND, "user not found"),
         Err(error) if store::is_unknown_group(&error) => {
             json_error(response, StatusCode::NOT_FOUND, "group not found");
@@ -1447,7 +1472,10 @@ async fn create_user_group(request: &mut Request, depot: &mut Depot, response: &
         return;
     }
     match store::create_group(pool, name, rate_bp, body.route_aliases.as_deref()).await {
-        Ok(id) => respond_group(pool, id, response).await,
+        Ok(id) => {
+            state(depot).admin_snapshot.invalidate().await;
+            respond_group(pool, id, response).await
+        }
         Err(error) if store::is_conflict(&error) => {
             json_error(response, StatusCode::CONFLICT, "group name already in use");
         }
@@ -1482,7 +1510,10 @@ async fn patch_user_group(request: &mut Request, depot: &mut Depot, response: &m
         route_aliases: body.route_aliases.as_ref().map(Option::as_deref),
     };
     match store::patch_group(pool, id, patch).await {
-        Ok(true) => respond_group(pool, id, response).await,
+        Ok(true) => {
+            state(depot).admin_snapshot.invalidate().await;
+            respond_group(pool, id, response).await
+        }
         Ok(false) => json_error(response, StatusCode::NOT_FOUND, "group not found"),
         Err(error) if store::is_conflict(&error) => {
             json_error(response, StatusCode::CONFLICT, "group name already in use");
@@ -1524,6 +1555,7 @@ async fn credit_user(
         .unwrap_or("admin");
     match store::credit(pool, id, kind, amount, note, operator).await {
         Ok(Some(entry)) => {
+            state(depot).admin_snapshot.invalidate().await;
             let balance = entry.balance_after_microus;
             json_response(
                 response,
@@ -2466,7 +2498,10 @@ async fn create_key_group(request: &mut Request, depot: &mut Depot, response: &m
         return;
     };
     match store::create_key_group(state_pool(depot), &body.name).await {
-        Ok(id) => json_response(response, &json!({"id": id})),
+        Ok(id) => {
+            state(depot).admin_snapshot.invalidate().await;
+            json_response(response, &json!({"id": id}))
+        }
         Err(error) => key_group_error(response, error),
     }
 }
@@ -2485,7 +2520,10 @@ async fn rename_key_group(request: &mut Request, depot: &mut Depot, response: &m
         return;
     };
     match store::rename_key_group(state_pool(depot), id, &body.name).await {
-        Ok(true) => json_response(response, &json!({"ok": true})),
+        Ok(true) => {
+            state(depot).admin_snapshot.invalidate().await;
+            json_response(response, &json!({"ok": true}))
+        }
         Ok(false) => not_found(response, "key group"),
         Err(error) => key_group_error(response, error),
     }
@@ -2501,7 +2539,10 @@ async fn delete_key_group(request: &mut Request, depot: &mut Depot, response: &m
         return;
     };
     match store::delete_key_group(state_pool(depot), id).await {
-        Ok(true) => json_response(response, &json!({"ok": true})),
+        Ok(true) => {
+            state(depot).admin_snapshot.invalidate().await;
+            json_response(response, &json!({"ok": true}))
+        }
         Ok(false) => not_found(response, "key group"),
         Err(error) => internal(response, error),
     }

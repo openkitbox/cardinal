@@ -97,9 +97,16 @@ pub enum ActivityEvent {
         #[serde(default)]
         metrics: EndMetrics,
     },
-    /// Ledger rows were just inserted (the GUI refreshes its newest page and
-    /// usage aggregates). Carries no payload: the reload is a full re-read.
+    /// Ledger rows were just inserted (or attempted); the legacy unit event
+    /// remains available for reconnect reseeding.
     Persisted,
+    /// Ledger rows were just inserted (or attempted), with the flush's
+    /// lightweight request summaries. Serializes flat: `{"t":"persisted_batch",
+    /// "requests":[…]}`.
+    PersistedBatch {
+        #[serde(default)]
+        requests: Vec<PersistedRequest>,
+    },
     /// A key-level concurrency slot was taken or released. `inflight` is the
     /// occupancy **after** the change (absolute, not a delta), so a dropped
     /// frame self-heals on the next event for that key. The GUI mirrors these
@@ -116,8 +123,8 @@ pub enum ActivityEvent {
     /// render from ([`crate::admin_ops::Bootstrap`]), assembled when a
     /// subscriber connects. Sent as the FIRST frame of a subscription, so
     /// opening the client costs one connection instead of a request per page.
-    /// Boxed: the document dwarfs every other variant.
-    Bootstrap(Box<crate::admin_ops::Bootstrap>),
+    /// Shared: cloning a broadcast event must not duplicate the document.
+    Bootstrap(Arc<crate::admin_ops::Bootstrap>),
 }
 
 /// The outcome an [`ActivityEvent::End`] reports: `"ok"` only when the
@@ -163,6 +170,52 @@ pub struct EndMetrics {
     /// feed row can say `err(429)` instead of a bare error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PersistedRequest {
+    pub request_id: Option<String>,
+    pub route: Option<String>,
+    pub provider_id: i64,
+    pub provider_key_id: i64,
+    pub model: String,
+    pub served_model: Option<String>,
+    pub caller_key: Option<String>,
+    pub user_id: Option<i64>,
+    pub status: u16,
+    pub error: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub charged_microus: Option<i64>,
+    pub total_ms: i32,
+    pub ttft_ms: Option<i64>,
+}
+
+impl PersistedRequest {
+    #[must_use]
+    pub fn from_attempt(row: &crate::store::AttemptLog) -> Self {
+        Self {
+            request_id: row.request_id.clone(),
+            route: row.alias.clone(),
+            provider_id: row.provider_id,
+            provider_key_id: row.provider_key_id,
+            model: row.model.clone(),
+            served_model: row.served_model.clone(),
+            caller_key: row.caller_key.clone(),
+            user_id: row.user_id,
+            status: row.status,
+            error: row.error.as_deref().map(clip),
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cached_input_tokens: row.cached_input_tokens,
+            cost_usd: row.cost_usd,
+            charged_microus: row.charged_microus,
+            total_ms: row.total_ms,
+            ttft_ms: row.ttft_ms,
+        }
+    }
 }
 
 /// The payload of an [`ActivityEvent::Start`] (the old struct variant, boxed
@@ -353,10 +406,14 @@ impl ActivitySink {
     }
 
     /// Ledger rows landed; listeners should re-read their view. Fired after
-    /// the insert *attempt* — a swallowed insert failure still notifies (the
-    /// refresh then simply re-reads unchanged data, same as a dropped event).
+    /// the insert *attempt* — a swallowed insert failure still notifies.
     pub fn persisted(&self) {
         self.publish(ActivityEvent::Persisted);
+    }
+
+    /// Ledger rows landed with their lightweight request summaries.
+    pub fn persisted_batch(&self, requests: Vec<PersistedRequest>) {
+        self.publish(ActivityEvent::PersistedBatch { requests });
     }
 
     /// Announce a key-level slot's new occupancy (absolute count). The

@@ -12,6 +12,7 @@
 //! are preserved verbatim (`anyhow` chains) so the HTTP 400/404/502 bodies
 //! stay informative.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
@@ -137,6 +138,97 @@ pub struct Bootstrap {
     /// Account groups with their member key ids (the only place membership
     /// lives; `keys` carries none), in id order.
     pub key_groups: Vec<store::KeyGroupView>,
+}
+
+/// How long a manual bootstrap refresh may reuse the process snapshot. SSE
+/// reconnects have no age limit; configuration writes and completed quota
+/// probes explicitly invalidate the document.
+const BOOTSTRAP_SNAPSHOT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A rebuildable, process-wide read cache for the admin bootstrap document.
+/// PostgreSQL remains authoritative: every cached value can be discarded and
+/// assembled again. The document is shared by `Arc`, never deep-copied by
+/// readers, and the rebuild mutex coalesces concurrent cache misses.
+#[derive(Clone, Default)]
+pub struct AdminSnapshot {
+    inner: Arc<AdminSnapshotInner>,
+}
+
+#[derive(Default)]
+struct AdminSnapshotInner {
+    current: tokio::sync::RwLock<Option<CachedBootstrap>>,
+    rebuild: tokio::sync::Mutex<()>,
+}
+
+struct CachedBootstrap {
+    document: Arc<Bootstrap>,
+    built_at: tokio::time::Instant,
+}
+
+impl AdminSnapshot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn cached(&self, max_age: Option<std::time::Duration>) -> Option<Arc<Bootstrap>> {
+        let guard = self.inner.current.read().await;
+        let cached = guard.as_ref()?;
+        if max_age.is_some_and(|max_age| cached.built_at.elapsed() >= max_age) {
+            return None;
+        }
+        Some(Arc::clone(&cached.document))
+    }
+
+    async fn get_or_build<F, Fut>(&self, load: F) -> anyhow::Result<Arc<Bootstrap>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<Bootstrap>>,
+    {
+        self.get_or_build_with_max_age(None, load).await
+    }
+
+    async fn get_or_build_recent<F, Fut>(&self, load: F) -> anyhow::Result<Arc<Bootstrap>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<Bootstrap>>,
+    {
+        self.get_or_build_with_max_age(Some(BOOTSTRAP_SNAPSHOT_MAX_AGE), load)
+            .await
+    }
+
+    async fn get_or_build_with_max_age<F, Fut>(
+        &self,
+        max_age: Option<std::time::Duration>,
+        load: F,
+    ) -> anyhow::Result<Arc<Bootstrap>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<Bootstrap>>,
+    {
+        if let Some(document) = self.cached(max_age).await {
+            return Ok(document);
+        }
+        let _rebuild = self.inner.rebuild.lock().await;
+        // A concurrent reader may have populated the snapshot while this
+        // caller waited for the rebuild turn.
+        if let Some(document) = self.cached(max_age).await {
+            return Ok(document);
+        }
+        let document = Arc::new(load().await?);
+        *self.inner.current.write().await = Some(CachedBootstrap {
+            document: Arc::clone(&document),
+            built_at: tokio::time::Instant::now(),
+        });
+        Ok(document)
+    }
+
+    /// Drop the derived document after a successful mutation. Taking the
+    /// rebuild turn prevents an in-flight read from republishing pre-write
+    /// data after this invalidation.
+    pub async fn invalidate(&self) {
+        let _rebuild = self.inner.rebuild.lock().await;
+        *self.inner.current.write().await = None;
+    }
 }
 
 /// The probed key row does not exist. The admin HTTP surface maps this to
@@ -623,6 +715,8 @@ pub struct Admin {
     /// Centralized dispatcher: queried for live slot occupancy (None until
     /// [`Self::with_dispatcher`] wires it).
     dispatcher: Option<tokio::sync::mpsc::UnboundedSender<crate::relay::dispatcher::DispatchEvent>>,
+    /// Process-wide bootstrap read model shared with [`crate::api::AppState`].
+    snapshot: AdminSnapshot,
 }
 
 impl Admin {
@@ -656,7 +750,15 @@ impl Admin {
             openai_tokens: None,
             openai_login: None,
             dispatcher: None,
+            snapshot: AdminSnapshot::new(),
         }
+    }
+
+    /// Share the process's bootstrap snapshot. The HTTP admin surface wires
+    /// the same instance into every per-request facade.
+    pub fn with_snapshot(mut self, snapshot: AdminSnapshot) -> Self {
+        self.snapshot = snapshot;
+        self
     }
 
     /// Wire the live Cursor token manager so its model probes and key
@@ -740,7 +842,13 @@ impl Admin {
     /// Refresh the route cache and publish its complete concurrency-cap view. Existing
     /// inflight work is never cancelled; the dispatcher applies the new cap
     /// only to future assignments.
+    ///
+    /// Every caller is an admin mutation whose result the bootstrap document
+    /// carries, so the shared snapshot is invalidated here: the next GUI
+    /// connect or manual refresh rebuilds it from PostgreSQL instead of serving
+    /// the pre-write document.
     pub(crate) async fn refresh_route_cache(&self) -> anyhow::Result<()> {
+        self.invalidate_snapshot().await;
         let Some(dispatcher) = &self.dispatcher else {
             self.route_cache.refresh(&self.pool).await?;
             return Ok(());
@@ -756,7 +864,27 @@ impl Admin {
     /// The key list comes from a single global query rather than a
     /// per-provider fan-out, and live occupancy is filled from one dispatcher
     /// query — so this replaces the client's whole startup burst.
-    pub async fn bootstrap(&self) -> anyhow::Result<Bootstrap> {
+    ///
+    /// The result is the process snapshot: a connect or reconnect reuses the
+    /// current document, and only an empty (never built, or invalidated after
+    /// a write/probe) snapshot triggers the PostgreSQL fan-out.
+    pub async fn bootstrap(&self) -> anyhow::Result<Arc<Bootstrap>> {
+        self.snapshot
+            .get_or_build(|| async { self.load_bootstrap().await })
+            .await
+    }
+
+    /// The document for a manual refresh: the snapshot unless it is older than
+    /// five minutes, in which case it is rebuilt once. The long stale window
+    /// keeps an operator's browser refresh from becoming a database read; a
+    /// direct database edit shows up at the next rebuild.
+    pub async fn bootstrap_for_refresh(&self) -> anyhow::Result<Arc<Bootstrap>> {
+        self.snapshot
+            .get_or_build_recent(|| async { self.load_bootstrap().await })
+            .await
+    }
+
+    async fn load_bootstrap(&self) -> anyhow::Result<Bootstrap> {
         let providers = store::list_providers(&self.pool).await?;
         let rows = store::list_all_keys(&self.pool).await?;
         let live = self.live_inflight().await;
@@ -781,6 +909,17 @@ impl Admin {
             model_success: store::last_model_success(&self.pool).await?,
             key_groups: store::list_key_groups(&self.pool).await?,
         })
+    }
+
+    /// Mark the shared bootstrap document stale after a configuration write or
+    /// a completed quota probe; the next connection rebuilds it from PostgreSQL.
+    pub async fn invalidate_snapshot(&self) {
+        self.snapshot.invalidate().await;
+    }
+
+    /// Build the initial process snapshot after all gateway state is wired.
+    pub async fn initialize_snapshot(&self) -> anyhow::Result<()> {
+        self.bootstrap().await.map(|_| ())
     }
 
     /// Every concurrency-limited key with its live occupancy (for the health page).
@@ -899,6 +1038,9 @@ impl Admin {
         )
         .await;
         if !rows.is_empty() {
+            // The probe persisted fresh quota snapshots, history and balances:
+            // the cached bootstrap document predates them.
+            self.invalidate_snapshot().await;
             self.activity.quota_refreshed();
         }
         rows
@@ -2475,13 +2617,16 @@ impl Admin {
     pub async fn delete_key(&self, provider_id: i64, key_id: i64) -> anyhow::Result<()> {
         let deleted = delete_key(&self.pool, provider_id, key_id).await?;
         anyhow::ensure!(deleted.is_some(), "no such key {key_id}");
+        self.invalidate_snapshot().await;
         Ok(())
     }
 
     /// Clear one key's cooldown (idempotent).
     pub async fn clear_rest(&self, key_id: i64) -> anyhow::Result<()> {
         self.failover.failures().clear(key_id);
-        self.rest_cache.clear_key(key_id).await
+        self.rest_cache.clear_key(key_id).await?;
+        self.invalidate_snapshot().await;
+        Ok(())
     }
 
     /// Clear all cooldown rows for every key of a provider (idempotent).
@@ -2491,7 +2636,9 @@ impl Admin {
         for key in store::list_provider_keys(&self.pool, provider_id).await? {
             self.failover.failures().clear(key.id);
         }
-        self.rest_cache.clear_provider(provider_id).await
+        self.rest_cache.clear_provider(provider_id).await?;
+        self.invalidate_snapshot().await;
+        Ok(())
     }
 
     /// All active cooldown rows (admin display).

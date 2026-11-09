@@ -43,6 +43,9 @@ pub struct AppState {
     pub rest_cache: relay::RestCache,
     /// In-memory price cache.
     pub price_cache: relay::PriceCache,
+    /// Process-wide bootstrap document shared by the admin surface and the
+    /// activity stream (see [`crate::admin_ops::AdminSnapshot`]).
+    pub admin_snapshot: crate::admin_ops::AdminSnapshot,
     /// Per-key Kiro OIDC token manager: lazy refresh, single-flight per key and
     /// write-back of the rotated bundle. The admin plane updates it on
     /// credential replace/delete.

@@ -292,10 +292,22 @@ async fn flush(
                     "ledger batch flush: some rows failed to insert"
                 );
             }
+            // `insert_request_logs` returns only rows that were durably
+            // inserted. A short result cannot be paired with the complete
+            // in-memory summary, so retain the old unit event and never
+            // publish a misleading PersistedBatch containing failed rows.
+            activity.persisted();
+        } else {
+            let requests = buffer
+                .iter()
+                .map(crate::activity::PersistedRequest::from_attempt)
+                .collect::<Vec<_>>();
+            activity.persisted_batch(requests);
         }
         buffer.clear();
+    } else {
+        activity.persisted();
     }
-    activity.persisted();
 }
 
 /// The charge a ledger row carries: a billed user, a request id and a

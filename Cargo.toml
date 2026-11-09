@@ -41,7 +41,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 rustfs-mimalloc = { version = "0.7", features = ["no_thp"] }
 salvo = { version = "1.0.1", features = ["server", "http1", "http2", "server-handle", "rustls", "affix-state", "sse", "logging"] }
 secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9.34"
 sha2 = "0.11"
