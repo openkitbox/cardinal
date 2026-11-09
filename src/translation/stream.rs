@@ -606,7 +606,7 @@ impl StreamTranslator {
                 // Terminal honesty: an EOF verdict wins over the synthesized reason
                 // (Responses has the vocabulary for it — unlike Chat/Anthropic, whose
                 // arms keep their historical null-finish/max_tokens conventions).
-                let failed = matches!(eof, Some(Terminal::Failed));
+                let failed = matches!(eof, Some(Terminal::Failed | Terminal::Cancelled));
                 let truncated = !failed
                     && (matches!(
                         reason.as_str(),

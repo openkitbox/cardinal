@@ -23,6 +23,7 @@ use super::{
     Terminal,
 };
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 /// Build the upstream request for one attempt.
 ///
@@ -241,6 +242,7 @@ pub struct StreamDecoder {
     /// Responses output positions include non-tool items; Chat needs dense
     /// tool indexes. Grows only on `output_item.added` of a function_call.
     tool_slots: Vec<ToolSlot>,
+    payload_log: bool,
 }
 
 struct ToolSlot {
@@ -253,6 +255,10 @@ struct ToolSlot {
 impl StreamDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_payload_log(&mut self, enabled: bool) {
+        self.payload_log = enabled;
     }
 
     pub fn usage(&self) -> Option<UsageCounts> {
@@ -277,15 +283,15 @@ impl StreamDecoder {
         }
         let value: Value =
             serde_json::from_str(data).map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
+        self.diagnostic_event(&value, data.as_bytes());
         let terminal = self.observe_event(&value)?;
         self.decode_delta(&value, &mut events)?;
         if let Some(terminal) = terminal {
             if let Some(usage) = self.usage.clone() {
                 events.push(StreamEvent::Usage(usage));
             }
-            // A failed or cancelled response emits no Finish: the pump's EOF
-            // verdict then closes the Chat stream with a null finish_reason
-            // instead of a clean `stop`.
+            // Failed and cancelled responses do not have a Chat finish reason;
+            // the pump still observes their terminal state independently.
             if let Some(reason) = self.finish_reason(terminal, &value) {
                 events.push(StreamEvent::Finish {
                     reason: reason.to_owned(),
@@ -320,11 +326,13 @@ impl StreamDecoder {
                 if item.get("type").and_then(Value::as_str) != Some("function_call") {
                     return Ok(());
                 }
-                let output_index = output_index(value)?;
+                let Some(output_index) = value.get("output_index").and_then(Value::as_u64) else {
+                    return Ok(());
+                };
                 let call_id = item.get("call_id").and_then(Value::as_str);
                 let name = item.get("name").and_then(Value::as_str);
                 let (Some(call_id), Some(name)) = (call_id, name) else {
-                    return Err(ProtocolError::InvalidUpstreamResponse);
+                    return Ok(());
                 };
                 let index = u32::try_from(self.tool_slots.len())
                     .map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
@@ -341,7 +349,9 @@ impl StreamDecoder {
                 });
             }
             Some("response.function_call_arguments.delta") => {
-                let slot = self.tool_slot(value)?;
+                let Some(slot) = self.tool_slot(value) else {
+                    return Ok(());
+                };
                 if let Some(arguments) = non_empty_delta(value) {
                     slot.arguments.push_str(arguments);
                     events.push(StreamEvent::ToolCallDelta {
@@ -367,12 +377,11 @@ impl StreamDecoder {
         Ok(())
     }
 
-    fn tool_slot(&mut self, value: &Value) -> Result<&mut ToolSlot, ProtocolError> {
-        let output_index = output_index(value)?;
+    fn tool_slot(&mut self, value: &Value) -> Option<&mut ToolSlot> {
+        let output_index = output_index(value).ok()?;
         self.tool_slots
             .iter_mut()
             .find(|slot| slot.output_index == output_index)
-            .ok_or(ProtocolError::InvalidUpstreamResponse)
     }
 
     /// Completion events carry the full arguments, sometimes without deltas.
@@ -383,11 +392,19 @@ impl StreamDecoder {
         snapshot: &Value,
         events: &mut Vec<StreamEvent>,
     ) -> Result<(), ProtocolError> {
-        let arguments = snapshot
-            .get("arguments")
-            .and_then(Value::as_str)
-            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
-        let slot = self.tool_slot(value)?;
+        let Some(arguments) = snapshot.get("arguments").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Ok(output_index) = output_index(value) else {
+            return Ok(());
+        };
+        let Some(slot) = self
+            .tool_slots
+            .iter_mut()
+            .find(|slot| slot.output_index == output_index)
+        else {
+            return Ok(());
+        };
         let suffix = arguments
             .strip_prefix(slot.arguments.as_str())
             .ok_or(ProtocolError::InvalidUpstreamResponse)?;
@@ -419,7 +436,7 @@ impl StreamDecoder {
                 if reason == Some("max_output_tokens") {
                     Some("length")
                 } else {
-                    Some("stop")
+                    Some("max_tokens_truncated")
                 }
             }
             Terminal::Failed | Terminal::Cancelled => None,
@@ -467,6 +484,7 @@ impl StreamDecoder {
         }
         let value: Value =
             serde_json::from_str(data).map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
+        self.diagnostic_event(&value, data.as_bytes());
         self.observe_event(&value)?;
         Ok(())
     }
@@ -502,6 +520,28 @@ impl StreamDecoder {
             }
         }
         Ok(terminal)
+    }
+
+    fn diagnostic_event(&self, value: &Value, data: &[u8]) {
+        if !self.payload_log
+            || !tracing::enabled!(target: "gateway::payload", tracing::Level::DEBUG)
+        {
+            return;
+        }
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let mut hash = Sha256::new();
+        hash.update(data);
+        let digest = hash.finalize();
+        let event_type = event_type.chars().take(128).collect::<String>();
+        tracing::debug!(
+            target: "gateway::payload",
+            event_type,
+            data_len = data.len(),
+            data_hash = %hex::encode(&digest[..16]),
+            has_response = value.get("response").is_some(),
+            has_item = value.get("item").is_some(),
+            "Responses stream event diagnostics"
+        );
     }
 
     /// Terminal verdict. A stream that ends without a terminal event is not a
@@ -722,8 +762,9 @@ mod tests {
         assert_eq!(
             events,
             vec![StreamEvent::Finish {
-                reason: "stop".to_owned()
-            }]
+                reason: "max_tokens_truncated".to_owned()
+            }],
+            "content_filter must remain an incomplete terminal, not a successful Chat stop"
         );
 
         let mut failed = StreamDecoder::new();
@@ -748,17 +789,54 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_output_item_snapshot_is_ignored() {
+        let mut decoder = StreamDecoder::new();
+        let events = feed(
+            &mut decoder,
+            &[
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call"}}"#,
+                r#"{"type":"response.output_text.delta","delta":"after"}"#,
+            ],
+        );
+        assert_eq!(events, vec![StreamEvent::TextDelta("after".to_owned())]);
+    }
+
+    #[test]
+    fn incomplete_codex_metadata_is_ignored() {
+        let mut decoder = StreamDecoder::new();
+        let incomplete_added =
+            r#"{"type":"response.output_item.added","item":{"type":"function_call"}}"#;
+        assert!(decoder.observe_raw(incomplete_added.as_bytes()).is_ok());
+        assert!(
+            decoder
+                .observe_raw(br#"{"type":"response.function_call_arguments.delta","delta":"x"}"#)
+                .is_ok()
+        );
+        let events = decoder
+            .observe_raw(br#"{"type":"response.output_text.delta","delta":"after"}"#)
+            .expect("subsequent content remains decodable");
+        assert_eq!(events, vec![StreamEvent::TextDelta("after".to_owned())]);
+    }
+
+    #[test]
     fn bad_frames_fail() {
         let mut decoder = StreamDecoder::new();
-        assert!(matches!(
-            decoder.observe_raw(args_delta(9, "x").as_bytes()),
-            Err(ProtocolError::InvalidUpstreamResponse)
-        ));
+        // A well-formed event whose optional identity is absent is ignored: only
+        // malformed JSON (or an upstream error event) is a decode failure.
+        assert!(
+            decoder
+                .observe_raw(args_delta(9, "x").as_bytes())
+                .expect("unknown tool slot is ignored")
+                .is_empty(),
+            "an arguments delta for an unseen slot emits nothing"
+        );
         let no_call_id = r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"n"}}"#;
-        assert!(matches!(
-            decoder.observe_raw(no_call_id.as_bytes()),
-            Err(ProtocolError::InvalidUpstreamResponse)
-        ));
+        assert!(
+            decoder
+                .observe_raw(no_call_id.as_bytes())
+                .expect("missing optional function-call identity is ignored")
+                .is_empty()
+        );
         assert!(matches!(
             decoder.observe_raw(br#"{"type":"error","message":"boom"}"#),
             Err(ProtocolError::UpstreamError)

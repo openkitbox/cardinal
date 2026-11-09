@@ -510,6 +510,12 @@ impl Decoder {
             Self::Unstreamed => Err(ProtocolError::UnsupportedApi),
         }
     }
+
+    pub fn set_payload_log(&mut self, enabled: bool) {
+        if let Self::Responses(decoder) = self {
+            decoder.set_payload_log(enabled);
+        }
+    }
     /// Observe one frame in whichever wire the upstream protocol uses. The
     /// framing must match the decoder: SSE is the wire of the four
     /// client-facing decoders, AWS Event Stream is Kiro's. A mismatch is an

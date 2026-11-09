@@ -3055,12 +3055,12 @@ pub async fn dispatch_at(
                         Ok(HoldSignal::Aborted) | Err(_) => {
                             Err(failover::AttemptError::AbortedStream)
                         }
-                        Ok(HoldSignal::ClientGone) => Err(failover::AttemptError::Transport(
-                            transport::TransportError::ClientGone,
-                        )),
                         Ok(HoldSignal::UpstreamTerminal(terminal)) => {
                             Err(failover::AttemptError::UpstreamTerminal(terminal))
                         }
+                        Ok(HoldSignal::ClientGone) => Err(failover::AttemptError::Transport(
+                            transport::TransportError::ClientGone,
+                        )),
                     }
                 }
                 Err(error) => Err(error),
