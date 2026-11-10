@@ -243,6 +243,7 @@ pub struct StreamDecoder {
     /// tool indexes. Grows only on `output_item.added` of a function_call.
     tool_slots: Vec<ToolSlot>,
     payload_log: bool,
+    upstream_error_event: bool,
 }
 
 struct ToolSlot {
@@ -532,6 +533,9 @@ impl StreamDecoder {
     /// when this event is terminal. Usage from a terminal event's `response`
     /// object overwrites any earlier value (last wins, as in chat).
     fn observe_event(&mut self, value: &Value) -> Result<Option<Terminal>, ProtocolError> {
+        if self.terminal.is_some() {
+            return Ok(None);
+        }
         match value.get("type").and_then(Value::as_str) {
             // Content deltas: the relay streaming hold's commit signal. Refusal and
             // custom-tool-call-input deltas are user-visible content too.
@@ -549,7 +553,12 @@ impl StreamDecoder {
             Some("response.incomplete") => Some(Terminal::Incomplete),
             Some("response.failed") => Some(Terminal::Failed),
             Some("response.cancelled") => Some(Terminal::Cancelled),
-            Some("error") => return Err(ProtocolError::UpstreamError),
+            Some("error") => {
+                self.upstream_error_event = true;
+                self.diagnostic_upstream_error(value);
+                self.terminal = Some(Terminal::Failed);
+                Some(Terminal::Failed)
+            }
             _ => None,
         };
         if let Some(terminal) = terminal {
@@ -612,6 +621,38 @@ impl StreamDecoder {
         );
     }
 
+    fn diagnostic_upstream_error(&self, value: &Value) {
+        if !self.payload_log
+            || !tracing::enabled!(target: "gateway::payload", tracing::Level::DEBUG)
+        {
+            return;
+        }
+        let error = value.get("error");
+        let error_type = error
+            .and_then(|error| error.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let code = error
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let param_present = error.is_some_and(|error| error.get("param").is_some());
+        let message = error
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let message_hash = Sha256::digest(message.as_bytes());
+        tracing::debug!(
+            target: "gateway::payload",
+            error_type = %error_type.chars().take(128).collect::<String>(),
+            error_code = %code.chars().take(128).collect::<String>(),
+            param_present,
+            message_len = message.len(),
+            message_hash = %hex::encode(&message_hash[..16]),
+            "Responses upstream error event"
+        );
+    }
+
     /// success (B §4.7).
     pub fn finish(&self) -> Terminal {
         match self.terminal {
@@ -628,6 +669,11 @@ impl StreamDecoder {
     /// commit signal (see the chat kernel for the full contract).
     pub fn content_seen(&self) -> bool {
         self.content_seen
+    }
+
+    /// Whether the upstream emitted a Responses `error` event.
+    pub fn upstream_error_event(&self) -> bool {
+        self.upstream_error_event
     }
 }
 
@@ -1069,10 +1115,13 @@ mod tests {
                 .expect("missing optional function-call identity is ignored")
                 .is_empty()
         );
-        assert!(matches!(
-            decoder.observe_raw(br#"{"type":"error","message":"boom"}"#),
-            Err(ProtocolError::UpstreamError)
-        ));
+        decoder
+            .observe_raw(
+                br#"{"type":"error","error":{"type":"service_unavailable","message":"boom"}}"#,
+            )
+            .expect("upstream error is a valid terminal event");
+        assert!(decoder.upstream_error_event());
+        assert_eq!(decoder.finish(), Terminal::Failed);
         assert!(
             decoder
                 .observe_raw(b"  ")
@@ -1107,9 +1156,13 @@ mod tests {
             Err(ProtocolError::InvalidUpstreamResponse)
         );
         assert_eq!(
-            decoder.observe_raw_for_relay(br#"{"type":"error","message":"boom"}"#),
-            Err(ProtocolError::UpstreamError)
+            decoder.observe_raw_for_relay(
+                br#"{"type":"error","error":{"type":"service_unavailable","message":"boom"}}"#
+            ),
+            Ok(())
         );
+        assert!(decoder.upstream_error_event());
+        assert_eq!(decoder.finish(), Terminal::Failed);
     }
     #[test]
     fn relay_observation_is_unchanged() {

@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocol::sse::RawFrame;
 use crate::protocol::wire::WireFrame;
-use crate::protocol::{self, ProtocolId};
+use crate::protocol::{self, ProtocolId, Terminal};
 
 use crate::activity::ActivitySink;
 use crate::body_log::CapturedBody;
@@ -671,6 +671,31 @@ async fn drive_stream(
                         }
                         let observation = decoder.observe_raw_for_relay(&frame);
                         if let Err(error) = observation {
+                            if decoder.upstream_error_event() {
+                                if hold.is_some() {
+                                    signal_hold(
+                                        &mut commit_tx,
+                                        HoldSignal::UpstreamTerminal(Terminal::Failed),
+                                    );
+                                    return (None, ttft_ms, captured, None);
+                                }
+                                if deliver(
+                                    tx,
+                                    &frame,
+                                    &mut wire,
+                                    &mut activity,
+                                    &mut client_gone,
+                                    on_client_gone,
+                                )
+                                .await
+                                .is_break()
+                                {
+                                    break;
+                                }
+                                interrupted =
+                                    Some(format!("upstream Responses error event: {error}"));
+                                break;
+                            }
                             if hold.is_some() {
                                 signal_hold(&mut commit_tx, HoldSignal::Aborted);
                                 return (None, ttft_ms, captured, None);
@@ -700,6 +725,31 @@ async fn drive_stream(
                         // Passthrough observation: raw observation yields no events; usage comes from the decoder.
                         if let Some(counts) = decoder.usage() {
                             usage = Some(counts);
+                        }
+                        if decoder.upstream_error_event() {
+                            if hold.is_some() {
+                                signal_hold(
+                                    &mut commit_tx,
+                                    HoldSignal::UpstreamTerminal(Terminal::Failed),
+                                );
+                                return (None, ttft_ms, captured, None);
+                            }
+                            if deliver(
+                                tx,
+                                &frame,
+                                &mut wire,
+                                &mut activity,
+                                &mut client_gone,
+                                on_client_gone,
+                            )
+                            .await
+                            .is_break()
+                            {
+                                break;
+                            }
+                            interrupted =
+                                Some("upstream Responses error event observed".to_owned());
+                            break;
                         }
                         if let Some(held) = &mut hold {
                             held.push(frame);
@@ -909,6 +959,39 @@ async fn drive_stream(
                             None => match upstream.observe_wire(&frame) {
                                 Ok(events) => events,
                                 Err(error) => {
+                                    if upstream_protocol == ProtocolId::OpenAiResponses
+                                        && upstream.upstream_error_event()
+                                    {
+                                        tracing::warn!(
+                                            request_id = %request_id,
+                                            error = %error,
+                                            "translated stream: upstream Responses error event observed"
+                                        );
+                                        interrupted = Some(
+                                            "upstream Responses error event observed".to_owned(),
+                                        );
+                                        let Ok(frames) =
+                                            translator.close_after_eof(protocol::Terminal::Failed)
+                                        else {
+                                            break;
+                                        };
+                                        for frame in frames {
+                                            if deliver(
+                                                tx,
+                                                &frame,
+                                                &mut wire,
+                                                &mut activity,
+                                                &mut client_gone,
+                                                on_client_gone,
+                                            )
+                                            .await
+                                            .is_break()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        break;
+                                    }
                                     if upstream_protocol == ProtocolId::OpenAiResponses
                                         && matches!(
                                             error,

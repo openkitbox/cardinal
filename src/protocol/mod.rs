@@ -616,6 +616,19 @@ impl Decoder {
         }
     }
 
+    /// Whether the Responses upstream emitted an explicit `error` event.
+    pub fn upstream_error_event(&self) -> bool {
+        match self {
+            Self::Responses(decoder) => decoder.upstream_error_event(),
+            Self::Chat(_)
+            | Self::Messages(_)
+            | Self::Gemini(_)
+            | Self::Kiro(_)
+            | Self::Cursor(_)
+            | Self::Unstreamed => false,
+        }
+    }
+
     /// Whether the upstream reported an explicit output-ceiling terminal
     /// (Kiro's benign `ContentLengthExceededException`). The stream is
     /// truncated but legitimate: it must be delivered with a length close, not
