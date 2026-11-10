@@ -38,8 +38,10 @@ pub struct OpenaiOAuth {
     /// The ChatGPT workspace id (`chatgpt-account-id` header value).
     pub account_id: String,
     /// Account email as the token named it (decoration only).
+    #[serde(default)]
     pub email: Option<String>,
     /// Subscription plan as the token named it (decoration only).
+    #[serde(default)]
     pub plan_type: Option<String>,
 }
 
@@ -188,4 +190,24 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
         return None;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenaiOAuth;
+
+    #[test]
+    fn deserializes_legacy_bundle_without_optional_identity_fields() {
+        let value = serde_json::json!({
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at": "2026-01-01T00:00:00Z",
+            "account_id": "acct_123"
+        });
+
+        let bundle: OpenaiOAuth = serde_json::from_value(value).expect("legacy bundle decodes");
+
+        assert_eq!(bundle.email, None);
+        assert_eq!(bundle.plan_type, None);
+    }
 }

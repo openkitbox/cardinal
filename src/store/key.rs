@@ -183,12 +183,19 @@ pub struct ProviderKeyView {
     /// report).
     #[serde(default = "static_auth_kind")]
     pub auth_kind: String,
-    /// The OpenCode or Cursor account's e-mail, when its bundle carries one.
-    /// None for every other credential kind — and for an account whose login
-    /// could not read it, so a card falls back to the label rather than to a
-    /// blank.
+    /// The OpenCode, Cursor, or OpenAI account's e-mail, when its bundle
+    /// carries one. None for every other credential kind — and for an account
+    /// whose login could not read it, so a card falls back to the label rather
+    /// than to a blank.
     #[serde(default)]
     pub account: Option<String>,
+    /// The OpenAI Codex account's e-mail, when its OAuth bundle carries one.
+    /// This is separate from `account` for the Codex card's identity shape.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// The OpenAI Codex subscription plan, when known.
+    #[serde(default)]
+    pub plan_type: Option<String>,
     /// The OpenCode account's organization name, when it belongs to one; the
     /// Cursor account's team (by id — the login records no team name).
     #[serde(default)]
@@ -198,22 +205,168 @@ pub struct ProviderKeyView {
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ProviderKeyRow, ProviderKeyView};
+    use crate::credentials::AuthKind;
+    use crate::openai::OpenaiOAuth;
+
+    #[test]
+    fn openai_oauth_view_exposes_identity_without_tokens() {
+        let bundle = OpenaiOAuth {
+            access_token: "access-secret".to_owned(),
+            refresh_token: "refresh-secret".to_owned(),
+            expires_at: chrono::Utc::now(),
+            account_id: "acct_123".to_owned(),
+            email: Some("codex@example.com".to_owned()),
+            plan_type: Some("pro".to_owned()),
+        };
+        let row = ProviderKeyRow {
+            id: 1,
+            provider_id: 2,
+            label: "Codex".to_owned(),
+            api_key: None,
+            enabled: true,
+            position: 0,
+            max_concurrency: None,
+            rest_on_429: true,
+            models: None,
+            allowed_models: None,
+            auth_kind: AuthKind::OpenaiOauth.as_str().to_owned(),
+            oauth: Some(serde_json::to_value(bundle).expect("OAuth bundle serializes")),
+            archived_at: None,
+        };
+
+        let view = ProviderKeyView::new(&row, None);
+        let json = serde_json::to_string(&view).expect("key view serializes");
+
+        assert_eq!(view.email.as_deref(), Some("codex@example.com"));
+        assert_eq!(view.plan_type.as_deref(), Some("pro"));
+        assert!(
+            !json.contains("access-secret"),
+            "access token leaked: {json}"
+        );
+        assert!(
+            !json.contains("refresh-secret"),
+            "refresh token leaked: {json}"
+        );
+    }
+
+    #[test]
+    fn openai_oauth_view_reads_identity_without_decoding_tokens() {
+        let row = ProviderKeyRow {
+            id: 1,
+            provider_id: 2,
+            label: "Codex".to_owned(),
+            api_key: None,
+            enabled: true,
+            position: 0,
+            max_concurrency: None,
+            rest_on_429: true,
+            models: None,
+            allowed_models: None,
+            auth_kind: AuthKind::OpenaiOauth.as_str().to_owned(),
+            oauth: Some(serde_json::json!({
+                "email": "codex@example.com",
+                "plan_type": "pro"
+            })),
+            archived_at: None,
+        };
+
+        let view = ProviderKeyView::new(&row, None);
+
+        assert_eq!(view.email.as_deref(), Some("codex@example.com"));
+        assert_eq!(view.plan_type.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn provider_oauth_views_project_identity_without_tokens() {
+        let common = |auth_kind: AuthKind, oauth: serde_json::Value| ProviderKeyRow {
+            id: 1,
+            provider_id: 2,
+            label: "OAuth".to_owned(),
+            api_key: None,
+            enabled: true,
+            position: 0,
+            max_concurrency: None,
+            rest_on_429: true,
+            models: None,
+            allowed_models: None,
+            auth_kind: auth_kind.as_str().to_owned(),
+            oauth: Some(oauth),
+            archived_at: None,
+        };
+
+        let opencode = common(
+            AuthKind::OpencodeOauth,
+            serde_json::json!({
+                "access_token": "opencode-access-secret",
+                "refresh_token": "opencode-refresh-secret",
+                "email": "oc@example.com",
+                "org_name": "Example Org"
+            }),
+        );
+        let opencode_view = ProviderKeyView::new(&opencode, None);
+        let opencode_json = serde_json::to_string(&opencode_view).expect("key view serializes");
+        assert_eq!(opencode_view.account.as_deref(), Some("oc@example.com"));
+        assert_eq!(opencode_view.organization.as_deref(), Some("Example Org"));
+        assert!(!opencode_json.contains("opencode-access-secret"));
+        assert!(!opencode_json.contains("opencode-refresh-secret"));
+
+        let cursor = common(
+            AuthKind::CursorOauth,
+            serde_json::json!({
+                "access_token": "cursor-access-secret",
+                "refresh_token": "cursor-refresh-secret",
+                "email": "cursor@example.com",
+                "team_id": "team-123"
+            }),
+        );
+        let cursor_view = ProviderKeyView::new(&cursor, None);
+        let cursor_json = serde_json::to_string(&cursor_view).expect("key view serializes");
+        assert_eq!(cursor_view.account.as_deref(), Some("cursor@example.com"));
+        assert_eq!(cursor_view.organization.as_deref(), Some("团队 team-123"));
+        assert!(!cursor_json.contains("cursor-access-secret"));
+        assert!(!cursor_json.contains("cursor-refresh-secret"));
+    }
+}
+
 impl ProviderKeyView {
     pub fn new(row: &ProviderKeyRow, inflight: Option<i32>) -> Self {
         // The bundle is decoded once per row; only the display projection is
         // kept, so the tokens never reach the view (and the decode's String
         // fields are moved out, not cloned).
         // Each accessor answers only for its own auth_kind.
-        let (account, organization) = if let Some(bundle) = row.opencode_oauth() {
-            (bundle.email, bundle.org_name)
-        } else if let Some(bundle) = row.cursor_oauth() {
-            (
-                bundle.email,
-                bundle.team_id.map(|team_id| format!("团队 {team_id}")),
-            )
-        } else {
-            (None, None)
-        };
+        let (account, organization, email, plan_type) =
+            if row.auth_kind == AuthKind::OpencodeOauth.as_str() {
+                let OpenCodeIdentityProjection { email, org_name } = row
+                    .oauth
+                    .as_ref()
+                    .and_then(opencode_identity_projection)
+                    .unwrap_or_default();
+                (email, org_name, None, None)
+            } else if row.auth_kind == AuthKind::CursorOauth.as_str() {
+                let CursorIdentityProjection { email, team_id } = row
+                    .oauth
+                    .as_ref()
+                    .and_then(cursor_identity_projection)
+                    .unwrap_or_default();
+                (
+                    email,
+                    team_id.map(|team_id| format!("团队 {team_id}")),
+                    None,
+                    None,
+                )
+            } else if row.auth_kind == AuthKind::OpenaiOauth.as_str() {
+                let OpenaiIdentityProjection { email, plan_type } = row
+                    .oauth
+                    .as_ref()
+                    .and_then(openai_identity_projection)
+                    .unwrap_or_default();
+                (None, None, email, plan_type)
+            } else {
+                (None, None, None, None)
+            };
         Self {
             id: row.id,
             provider_id: row.provider_id,
@@ -227,10 +380,78 @@ impl ProviderKeyView {
             allowed_models: row.allowed_models.clone(),
             auth_kind: row.auth_kind.clone(),
             account,
+            email,
+            plan_type,
             organization,
             archived_at: row.archived_at,
         }
     }
+}
+
+/// The display-only identity fields of an OpenAI OAuth bundle. This projection
+/// intentionally never deserializes the secret token fields.
+#[derive(Default)]
+struct OpenaiIdentityProjection {
+    email: Option<String>,
+    plan_type: Option<String>,
+}
+
+/// The display-only identity fields of an OpenCode OAuth bundle. This
+/// projection intentionally never deserializes the secret token fields.
+#[derive(Default)]
+struct OpenCodeIdentityProjection {
+    email: Option<String>,
+    org_name: Option<String>,
+}
+
+fn opencode_identity_projection(value: &serde_json::Value) -> Option<OpenCodeIdentityProjection> {
+    let object = value.as_object()?;
+    Some(OpenCodeIdentityProjection {
+        email: object
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        org_name: object
+            .get("org_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// The display-only identity fields of a Cursor OAuth bundle. This projection
+/// intentionally never deserializes the secret token fields.
+#[derive(Default)]
+struct CursorIdentityProjection {
+    email: Option<String>,
+    team_id: Option<String>,
+}
+
+fn cursor_identity_projection(value: &serde_json::Value) -> Option<CursorIdentityProjection> {
+    let object = value.as_object()?;
+    Some(CursorIdentityProjection {
+        email: object
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        team_id: object
+            .get("team_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn openai_identity_projection(value: &serde_json::Value) -> Option<OpenaiIdentityProjection> {
+    let object = value.as_object()?;
+    Some(OpenaiIdentityProjection {
+        email: object
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        plan_type: object
+            .get("plan_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 /// The `auth_kind` of a payload that predates the field: a row of that era
