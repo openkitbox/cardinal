@@ -275,17 +275,36 @@ impl StreamDecoder {
     /// point, with no `String` re-framing hop in between.
     pub fn observe_raw(&mut self, data: &[u8]) -> Result<Vec<StreamEvent>, ProtocolError> {
         let mut events = Vec::new();
-        let data = std::str::from_utf8(data)
-            .map_err(|_| ProtocolError::InvalidUpstreamResponse)?
-            .trim();
+        let text = match std::str::from_utf8(data) {
+            Ok(text) => text,
+            Err(_) => {
+                self.diagnostic_decode("utf8", data, None);
+                return Err(ProtocolError::InvalidUpstreamResponse);
+            }
+        };
+        let data = text.trim();
         if data.is_empty() {
             return Ok(events);
         }
-        let value: Value =
-            serde_json::from_str(data).map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
+        let value: Value = match serde_json::from_str(data) {
+            Ok(value) => value,
+            Err(_) => {
+                self.diagnostic_decode("json", data.as_bytes(), None);
+                return Err(ProtocolError::InvalidUpstreamResponse);
+            }
+        };
         self.diagnostic_event(&value, data.as_bytes());
-        let terminal = self.observe_event(&value)?;
-        self.decode_delta(&value, &mut events)?;
+        let terminal = match self.observe_event(&value) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                self.diagnostic_decode("event", data.as_bytes(), Some(&value));
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.decode_delta(&value, &mut events) {
+            self.diagnostic_decode("fields", data.as_bytes(), Some(&value));
+            return Err(error);
+        }
         if let Some(terminal) = terminal {
             if let Some(usage) = self.usage.clone() {
                 events.push(StreamEvent::Usage(usage));
@@ -405,9 +424,12 @@ impl StreamDecoder {
         else {
             return Ok(());
         };
-        let suffix = arguments
-            .strip_prefix(slot.arguments.as_str())
-            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+        let Some(suffix) = arguments.strip_prefix(slot.arguments.as_str()) else {
+            // A completion snapshot can be stale or omit a previously emitted
+            // prefix. It cannot be safely reconciled, and emitting it would
+            // duplicate or corrupt tool arguments; keep the stream decodable.
+            return Ok(());
+        };
         if !suffix.is_empty() {
             events.push(StreamEvent::ToolCallDelta {
                 index: slot.index,
@@ -455,9 +477,14 @@ impl StreamDecoder {
 
     /// Observe a raw Responses SSE payload without materializing customer events.
     pub fn observe_raw_for_relay(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
-        let data = std::str::from_utf8(data)
-            .map_err(|_| ProtocolError::InvalidUpstreamResponse)?
-            .trim();
+        let text = match std::str::from_utf8(data) {
+            Ok(text) => text,
+            Err(_) => {
+                self.diagnostic_decode("utf8", data, None);
+                return Err(ProtocolError::InvalidUpstreamResponse);
+            }
+        };
+        let data = text.trim();
         if data.is_empty() {
             return Ok(());
         }
@@ -478,14 +505,26 @@ impl StreamDecoder {
             // The frame's JSON shape is still validated without materializing it:
             // a malformed frame is rejected exactly as before (the scan touches no
             // `Value` tree).
-            serde_json::from_str::<serde::de::IgnoredAny>(data)
-                .map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
-            return Ok(());
+            match serde_json::from_str::<serde::de::IgnoredAny>(data) {
+                Ok(_) => return Ok(()),
+                Err(_) => {
+                    self.diagnostic_decode("json", data.as_bytes(), None);
+                    return Err(ProtocolError::InvalidUpstreamResponse);
+                }
+            }
         }
-        let value: Value =
-            serde_json::from_str(data).map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
+        let value: Value = match serde_json::from_str(data) {
+            Ok(value) => value,
+            Err(_) => {
+                self.diagnostic_decode("json", data.as_bytes(), None);
+                return Err(ProtocolError::InvalidUpstreamResponse);
+            }
+        };
         self.diagnostic_event(&value, data.as_bytes());
-        self.observe_event(&value)?;
+        if let Err(error) = self.observe_event(&value) {
+            self.diagnostic_decode("event", data.as_bytes(), Some(&value));
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -544,7 +583,35 @@ impl StreamDecoder {
         );
     }
 
-    /// Terminal verdict. A stream that ends without a terminal event is not a
+    fn diagnostic_decode(&self, stage: &str, data: &[u8], value: Option<&Value>) {
+        if !self.payload_log
+            || !tracing::enabled!(target: "gateway::payload", tracing::Level::DEBUG)
+        {
+            return;
+        }
+        let event_type = value
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let digest = Sha256::digest(data);
+        tracing::debug!(
+            target: "gateway::payload",
+            decode_stage = stage,
+            event_type = %event_type.chars().take(128).collect::<String>(),
+            data_len = data.len(),
+            data_hash = %hex::encode(&digest[..16]),
+            has_type = value.is_some_and(|value| value.get("type").is_some()),
+            has_response = value.is_some_and(|value| value.get("response").is_some()),
+            has_item = value.is_some_and(|value| value.get("item").is_some()),
+            has_delta = value.is_some_and(|value| value.get("delta").is_some()),
+            has_output_index = value.is_some_and(|value| value.get("output_index").is_some()),
+            has_arguments = value.is_some_and(|value| value.get("arguments").is_some()),
+            has_call_id = value.is_some_and(|value| value.get("call_id").is_some()),
+            has_name = value.is_some_and(|value| value.get("name").is_some()),
+            "Responses stream decode diagnostics"
+        );
+    }
+
     /// success (B §4.7).
     pub fn finish(&self) -> Terminal {
         match self.terminal {
@@ -628,7 +695,15 @@ mod tests {
 
     fn args_delta(output_index: u32, delta: &str) -> String {
         format!(
-            r#"{{"type":"response.function_call_arguments.delta","output_index":{output_index},"delta":"{delta}"}}"#
+            r#"{{"type":"response.function_call_arguments.delta","output_index":{output_index},"delta":{}}}"#,
+            serde_json::to_string(delta).expect("argument delta serializes")
+        )
+    }
+
+    fn args_done(output_index: u32, arguments: &str) -> String {
+        format!(
+            r#"{{"type":"response.function_call_arguments.done","output_index":{output_index},"arguments":{}}}"#,
+            serde_json::to_string(arguments).expect("argument snapshot serializes")
         )
     }
 
@@ -664,7 +739,7 @@ mod tests {
             r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1"}}"#.to_owned(),
             tool_added(2, "call_a", "alpha"),
             tool_added(3, "call_b", "beta"),
-            args_delta(3, "{\\\"b\\\""),
+            args_delta(3, r#"{"b""#),
             args_delta(2, "{}"),
         ];
         let refs: Vec<&str> = frames.iter().map(String::as_str).collect();
@@ -819,6 +894,163 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_completion_snapshot_is_ignored() {
+        let mut decoder = StreamDecoder::new();
+        let added = tool_added(0, "call_a", "alpha");
+        let events = feed(&mut decoder, &[&added, &args_delta(0, "{\\\"ok\\\":true}")]);
+        assert_eq!(events.len(), 2);
+        let completion = r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"not-the-emitted-prefix"}"#;
+        assert!(decoder.observe_raw(completion.as_bytes()).is_ok());
+        assert!(
+            decoder
+                .observe_raw(br#"{"type":"response.output_text.delta","delta":"after"}"#)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn arguments_done_without_delta_emits_complete_snapshot() {
+        let mut decoder = StreamDecoder::new();
+        let added = tool_added(0, "call_a", "alpha");
+        let events = feed(&mut decoder, &[&added, &args_done(0, r#"{"x":1}"#)]);
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_a".to_owned()),
+                    name: Some("alpha".to_owned()),
+                    arguments: String::new(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: "{\"x\":1}".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn arguments_done_emits_only_snapshot_suffix_after_delta() {
+        let mut decoder = StreamDecoder::new();
+        let added = tool_added(0, "call_a", "alpha");
+        let delta = args_delta(0, r#"{"x""#);
+        let events = feed(&mut decoder, &[&added, &delta, &args_done(0, r#"{"x":1}"#)]);
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_a".to_owned()),
+                    name: Some("alpha".to_owned()),
+                    arguments: String::new(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: "{\"x\"".to_owned(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: ":1}".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_arguments_done_is_idempotent() {
+        let mut decoder = StreamDecoder::new();
+        let added = tool_added(0, "call_a", "alpha");
+        let done =
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{}"}"#;
+        let events = feed(&mut decoder, &[&added, done, done]);
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_a".to_owned()),
+                    name: Some("alpha".to_owned()),
+                    arguments: String::new(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: "{}".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn argument_snapshots_match_interleaved_output_indexes() {
+        let mut decoder = StreamDecoder::new();
+        let first = tool_added(2, "call_a", "alpha");
+        let second = tool_added(7, "call_b", "beta");
+        let first_delta = args_delta(2, r#"{"a""#);
+        let second_delta = args_delta(7, r#"{"b""#);
+        let events = feed(
+            &mut decoder,
+            &[
+                &first,
+                &second,
+                &first_delta,
+                &second_delta,
+                &args_done(7, r#"{"b":2}"#),
+                &args_done(2, r#"{"a":1}"#),
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_a".to_owned()),
+                    name: Some("alpha".to_owned()),
+                    arguments: String::new(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 1,
+                    id: Some("call_b".to_owned()),
+                    name: Some("beta".to_owned()),
+                    arguments: String::new(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: "{\"a\"".to_owned(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: "{\"b\"".to_owned(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: ":2}".to_owned(),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: ":1}".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn bad_frames_fail() {
         let mut decoder = StreamDecoder::new();
         // A well-formed event whose optional identity is absent is ignored: only
@@ -862,6 +1094,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn diagnostics_classify_decode_failures_without_payload() {
+        let mut decoder = StreamDecoder::new();
+        decoder.set_payload_log(true);
+        assert_eq!(
+            decoder.observe_raw_for_relay(b"\xff"),
+            Err(ProtocolError::InvalidUpstreamResponse)
+        );
+        assert_eq!(
+            decoder.observe_raw_for_relay(br#"{"type":"response.completed""#),
+            Err(ProtocolError::InvalidUpstreamResponse)
+        );
+        assert_eq!(
+            decoder.observe_raw_for_relay(br#"{"type":"error","message":"boom"}"#),
+            Err(ProtocolError::UpstreamError)
+        );
+    }
     #[test]
     fn relay_observation_is_unchanged() {
         let added = tool_added(0, "call_a", "alpha");

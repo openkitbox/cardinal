@@ -267,6 +267,13 @@ impl HoldState {
     }
 }
 
+fn explicit_non_success_terminal(verdict: protocol::Terminal) -> bool {
+    matches!(
+        verdict,
+        protocol::Terminal::Incomplete | protocol::Terminal::Failed | protocol::Terminal::Cancelled
+    )
+}
+
 /// One read step of the pump loop.
 enum PumpRead {
     Frame(WireFrame),
@@ -945,16 +952,14 @@ async fn drive_stream(
                                 }
                             },
                         };
+                        let terminal_verdict = upstream.finish();
                         let terminal_error = upstream.terminal_seen()
-                            && matches!(
-                                upstream.finish(),
-                                protocol::Terminal::Failed | protocol::Terminal::Cancelled
-                            );
+                            && explicit_non_success_terminal(terminal_verdict);
                         if terminal_error {
                             if hold.is_some() {
                                 signal_hold(
                                     &mut commit_tx,
-                                    HoldSignal::UpstreamTerminal(upstream.finish()),
+                                    HoldSignal::UpstreamTerminal(terminal_verdict),
                                 );
                                 return (None, ttft_ms, captured, None);
                             }
@@ -962,8 +967,7 @@ async fn drive_stream(
                                 "upstream Responses stream ended with an explicit terminal error"
                                     .to_owned(),
                             );
-                            let Ok(frames) = translator.close_after_eof(protocol::Terminal::Failed)
-                            else {
+                            let Ok(frames) = translator.close_after_eof(terminal_verdict) else {
                                 break;
                             };
                             for frame in frames {
@@ -991,10 +995,7 @@ async fn drive_stream(
                             .any(|event| matches!(event, protocol::StreamEvent::Finish { .. }));
                         if terminal_at_eof
                             && hold.is_some()
-                            && matches!(
-                                upstream.finish(),
-                                protocol::Terminal::Failed | protocol::Terminal::Cancelled
-                            )
+                            && explicit_non_success_terminal(upstream.finish())
                         {
                             signal_hold(
                                 &mut commit_tx,
@@ -1330,5 +1331,47 @@ mod tests {
             (protocol::Terminal::Incomplete, true),
             "an EOF with no terminal is interrupted, regardless of decoder defaults"
         );
+    }
+
+    #[test]
+    fn precommit_terminal_never_treats_incomplete_as_success() {
+        for verdict in [
+            protocol::Terminal::Incomplete,
+            protocol::Terminal::Failed,
+            protocol::Terminal::Cancelled,
+        ] {
+            assert!(
+                explicit_non_success_terminal(verdict),
+                "explicit Responses terminal {verdict:?} must not commit the attempt"
+            );
+        }
+        assert!(!explicit_non_success_terminal(
+            protocol::Terminal::Completed
+        ));
+    }
+
+    #[test]
+    fn precommit_terminal_signals_upstream_terminal() {
+        for verdict in [
+            protocol::Terminal::Incomplete,
+            protocol::Terminal::Failed,
+            protocol::Terminal::Cancelled,
+        ] {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let mut commit_tx = Some(tx);
+            signal_hold(&mut commit_tx, HoldSignal::UpstreamTerminal(verdict));
+
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(HoldSignal::UpstreamTerminal(actual)) if actual == verdict
+            ));
+        }
+    }
+
+    #[test]
+    fn completed_terminal_does_not_signal_upstream_terminal() {
+        assert!(!explicit_non_success_terminal(
+            protocol::Terminal::Completed
+        ));
     }
 }
