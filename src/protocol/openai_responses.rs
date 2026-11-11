@@ -242,6 +242,9 @@ pub struct StreamDecoder {
     /// Responses output positions include non-tool items; Chat needs dense
     /// tool indexes. Grows only on `output_item.added` of a function_call.
     tool_slots: Vec<ToolSlot>,
+    /// Reasoning snapshots are keyed by their Responses output position so a
+    /// completion snapshot can be reconciled with deltas from the same item.
+    reasoning_slots: Vec<ReasoningSlot>,
     payload_log: bool,
     upstream_error_event: bool,
 }
@@ -251,6 +254,12 @@ struct ToolSlot {
     index: u32,
     /// Arguments already emitted, retained to reconcile completion snapshots.
     arguments: String,
+}
+
+struct ReasoningSlot {
+    output_index: u64,
+    /// Reasoning text already emitted to the translated client.
+    text: String,
 }
 
 impl StreamDecoder {
@@ -336,6 +345,10 @@ impl StreamDecoder {
             }
             Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
                 if let Some(text) = non_empty_delta(value) {
+                    let Ok(output_index) = output_index(value) else {
+                        return Ok(());
+                    };
+                    self.append_reasoning_delta(output_index, text);
                     events.push(StreamEvent::ReasoningDelta(text.to_owned()));
                 }
             }
@@ -386,15 +399,106 @@ impl StreamDecoder {
                 self.complete_arguments(value, value, events)?;
             }
             Some("response.output_item.done") => {
-                if let Some(item) = value.get("item")
-                    && item.get("type").and_then(Value::as_str) == Some("function_call")
-                {
-                    self.complete_arguments(value, item, events)?;
+                if let Some(item) = value.get("item") {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("function_call") => self.complete_arguments(value, item, events)?,
+                        Some("reasoning") => {
+                            let Ok(output_index) = output_index(value) else {
+                                return Ok(());
+                            };
+                            self.emit_reasoning_item_snapshot(output_index, item, events);
+                        }
+                        _ => {}
+                    }
                 }
+            }
+            Some("response.reasoning_summary_text.done") => {
+                let Some(text) = value.get("text").and_then(Value::as_str) else {
+                    return Ok(());
+                };
+                let Ok(output_index) = output_index(value) else {
+                    return Ok(());
+                };
+                self.emit_reasoning_snapshot(output_index, text, events);
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn append_reasoning_delta(&mut self, output_index: u64, text: &str) {
+        if let Some(slot) = self
+            .reasoning_slots
+            .iter_mut()
+            .find(|slot| slot.output_index == output_index)
+        {
+            slot.text.push_str(text);
+        } else {
+            self.reasoning_slots.push(ReasoningSlot {
+                output_index,
+                text: text.to_owned(),
+            });
+        }
+    }
+
+    fn emit_reasoning_snapshot(
+        &mut self,
+        output_index: u64,
+        snapshot: &str,
+        events: &mut Vec<StreamEvent>,
+    ) {
+        let slot = if let Some(position) = self
+            .reasoning_slots
+            .iter()
+            .position(|slot| slot.output_index == output_index)
+        {
+            &mut self.reasoning_slots[position]
+        } else {
+            self.reasoning_slots.push(ReasoningSlot {
+                output_index,
+                text: String::new(),
+            });
+            let position = self.reasoning_slots.len() - 1;
+            &mut self.reasoning_slots[position]
+        };
+        let Some(suffix) = snapshot.strip_prefix(slot.text.as_str()) else {
+            // A stale or inconsistent snapshot cannot be safely reconciled.
+            return;
+        };
+        if !suffix.is_empty() {
+            events.push(StreamEvent::ReasoningDelta(suffix.to_owned()));
+            slot.text.push_str(suffix);
+        }
+    }
+
+    fn emit_reasoning_item_snapshot(
+        &mut self,
+        output_index: u64,
+        item: &Value,
+        events: &mut Vec<StreamEvent>,
+    ) {
+        let position = if let Some(position) = self
+            .reasoning_slots
+            .iter()
+            .position(|slot| slot.output_index == output_index)
+        {
+            position
+        } else {
+            self.reasoning_slots.push(ReasoningSlot {
+                output_index,
+                text: String::new(),
+            });
+            self.reasoning_slots.len() - 1
+        };
+        let emitted = &self.reasoning_slots[position].text;
+        let Some(suffix) = reasoning_snapshot_suffix(emitted, item) else {
+            return;
+        };
+        if suffix.is_empty() {
+            return;
+        }
+        self.reasoning_slots[position].text.push_str(&suffix);
+        events.push(StreamEvent::ReasoningDelta(suffix));
     }
 
     fn tool_slot(&mut self, value: &Value) -> Option<&mut ToolSlot> {
@@ -708,6 +812,37 @@ fn non_empty_delta(value: &Value) -> Option<&str> {
         .get("delta")
         .and_then(Value::as_str)
         .filter(|delta| !delta.is_empty())
+}
+
+fn reasoning_snapshot_suffix(emitted: &str, item: &Value) -> Option<String> {
+    for field in ["summary", "content"] {
+        let Some(parts) = item.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        let mut remaining = emitted;
+        let mut suffix = String::new();
+        let mut saw_text = false;
+        for part in parts {
+            let Some(part_text) = part.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            saw_text = true;
+            if remaining.is_empty() {
+                suffix.push_str(part_text);
+            } else if let Some(rest) = part_text.strip_prefix(remaining) {
+                remaining = "";
+                suffix.push_str(rest);
+            } else if let Some(rest) = remaining.strip_prefix(part_text) {
+                remaining = rest;
+            } else {
+                break;
+            }
+        }
+        if saw_text && remaining.is_empty() {
+            return Some(suffix);
+        }
+    }
+    None
 }
 
 fn output_index(value: &Value) -> Result<u64, ProtocolError> {
