@@ -333,11 +333,29 @@ async fn attempt(
     client_ir: &mut ClientIr,
     request_id: &str,
     deadline: std::time::Instant,
+    fresh_connection: bool,
 ) -> Result<RelayOutcome, failover::AttemptError> {
     if !request.stream {
-        attempt_json(ctx, target_model, request, client_ir, deadline).await
+        attempt_json(
+            ctx,
+            target_model,
+            request,
+            client_ir,
+            deadline,
+            fresh_connection,
+        )
+        .await
     } else {
-        attempt_stream(ctx, target_model, request, client_ir, request_id, deadline).await
+        attempt_stream(
+            ctx,
+            target_model,
+            request,
+            client_ir,
+            request_id,
+            deadline,
+            fresh_connection,
+        )
+        .await
     }
 }
 
@@ -506,6 +524,7 @@ async fn send_attempt(
     client_ir: &mut ClientIr,
     stream: bool,
     deadline: std::time::Instant,
+    fresh_connection: bool,
 ) -> Result<Sent, failover::AttemptError> {
     let AttemptContext {
         transport,
@@ -800,11 +819,20 @@ async fn send_attempt(
     let mut kiro_retried = false;
     let mut opencode_retried = false;
     let mut openai_retried = false;
+    let mut use_fresh_connection = fresh_connection;
     loop {
-        let response = transport
-            .send_with_headers(&prepared, dns, &headers, &query_pairs, deadline)
-            .await
-            .map_err(failover::AttemptError::Transport)?;
+        let fresh = use_fresh_connection;
+        use_fresh_connection = false;
+        let response = if fresh {
+            transport
+                .send_with_headers_fresh(&prepared, dns, &headers, &query_pairs, deadline)
+                .await
+        } else {
+            transport
+                .send_with_headers(&prepared, dns, &headers, &query_pairs, deadline)
+                .await
+        }
+        .map_err(failover::AttemptError::Transport)?;
         let status = response.status().as_u16();
         // Only 2xx is a success. Redirects are never followed (the credential
         // must not reach another authority), so a 3xx is a failed attempt too.
@@ -1110,13 +1138,23 @@ async fn attempt_stream(
     client_ir: &mut ClientIr,
     request_id: &str,
     deadline: std::time::Instant,
+    fresh_connection: bool,
 ) -> Result<RelayOutcome, failover::AttemptError> {
     let Sent {
         status,
         upstream,
         protocol,
         cache_read,
-    } = send_attempt(ctx, target_model, request, client_ir, true, deadline).await?;
+    } = send_attempt(
+        ctx,
+        target_model,
+        request,
+        client_ir,
+        true,
+        deadline,
+        fresh_connection,
+    )
+    .await?;
     let (reader, cursor) = match upstream {
         Upstream::Http(response) => (ctx.transport.stream(response, deadline, protocol), None),
         // The Run's driver already split the downlink into frames; the reader
@@ -1180,13 +1218,23 @@ async fn attempt_json(
     request: &RelayRequest,
     client_ir: &mut ClientIr,
     deadline: std::time::Instant,
+    fresh_connection: bool,
 ) -> Result<RelayOutcome, failover::AttemptError> {
     let Sent {
         status,
         upstream,
         protocol,
         cache_read,
-    } = send_attempt(ctx, target_model, request, client_ir, false, deadline).await?;
+    } = send_attempt(
+        ctx,
+        target_model,
+        request,
+        client_ir,
+        false,
+        deadline,
+        fresh_connection,
+    )
+    .await?;
     let limit = ctx.transport.limits().max_json_bytes;
     let (body, cursor) = match upstream {
         Upstream::Http(response) => (
@@ -1988,6 +2036,31 @@ pub enum DispatchOutcome {
 
 /// In-place retries of the last candidate never pause longer than this.
 const MAX_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Codex can emit a pre-commit failed terminal while the connection itself is
+/// still unhealthy. Give the same request one fresh-connection retry.
+const CODEX_FAILED_TERMINAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether a failed streaming Codex attempt has enough budget for its one
+/// fresh-connection replay. Keeping this decision pure makes the narrow retry
+/// contract explicit and leaves the dispatch loop responsible only for waiting
+/// and carrying the retry state.
+fn codex_failed_terminal_retry_eligible(
+    is_codex: bool,
+    is_streaming: bool,
+    already_retried: bool,
+    error: &failover::AttemptError,
+    remaining: std::time::Duration,
+) -> bool {
+    is_codex
+        && is_streaming
+        && !already_retried
+        && remaining >= CODEX_FAILED_TERMINAL_RETRY_DELAY
+        && matches!(
+            error,
+            failover::AttemptError::UpstreamTerminal(protocol::Terminal::Failed)
+        )
+}
 
 /// Whole-call budget for a retrieval request. The transport's `total` is an
 /// hour, sized for a long SSE stream; a retrieval call has no stream, a much
@@ -2830,6 +2903,8 @@ pub async fn dispatch_at(
         // account: Rate ×3 anywhere) run inside this loop; the dispatcher slot
         // guard is held across them.
         let mut retried = 0u32;
+        let mut fresh_connection = false;
+        let mut failed_terminal_retried = false;
         // Zhipu GLM passthrough fixup: the 5.x always-thinking models reject
         // `thinking: {"type": "disabled"}` (HTTP 400, code 1210 — "该模型始终思考，
         // 不支持关闭思考；请使用 low、high 或 max"). The field never reaches the
@@ -2975,6 +3050,7 @@ pub async fn dispatch_at(
                     &mut client_ir,
                     &request_id,
                     deadline,
+                    fresh_connection,
                 )
                 .await;
                 watchdog.disarm();
@@ -3259,6 +3335,29 @@ pub async fn dispatch_at(
                     // The attempt resolved in failure: drop its live row (the row it
                     // just pushed is persisted at the terminal insert below).
                     activity.end(seq, EndStatus::Error, metrics);
+                    // A Codex stream that reports Failed before its commit point
+                    // is safe to replay on the same candidate. Keep this outside
+                    // the generic failover taxonomy: it neither cools the key nor
+                    // transfers the request, and each try retains its own row.
+                    if codex_failed_terminal_retry_eligible(
+                        codex,
+                        request.stream,
+                        failed_terminal_retried,
+                        &error,
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    ) {
+                        failed_terminal_retried = true;
+                        fresh_connection = true;
+                        tracing::info!(
+                            request_id = %request_id,
+                            provider = provider.name.as_str(),
+                            key = candidate.key.label.as_str(),
+                            model = target_model,
+                            "Codex stream failed before commit; retrying once on a fresh connection"
+                        );
+                        tokio::time::sleep(CODEX_FAILED_TERMINAL_RETRY_DELAY).await;
+                        continue;
+                    }
                     // The client disappeared: record the row for the ledger and stop —
                     // never classify, cool the key, bump the counter, fail over, or
                     // retry in place (a reconnect replays the whole request anyway).

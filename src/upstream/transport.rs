@@ -393,6 +393,12 @@ pub(crate) fn is_global_unicast(ip: IpAddr) -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ClientMode {
+    Pooled,
+    Fresh,
+}
+
 impl Transport {
     fn clients_lock(&self) -> std::sync::MutexGuard<'_, HashMap<ClientKey, reqwest::Client>> {
         match self.clients.lock() {
@@ -459,6 +465,35 @@ impl Transport {
         query: &[(&'static str, String)],
         deadline: Instant,
     ) -> Result<reqwest::Response, TransportError> {
+        self.send_with_headers_mode(prepared, dns, headers, query, deadline, ClientMode::Pooled)
+            .await
+    }
+
+    /// Send one prepared HTTP/1.1 request through a client that is never placed
+    /// in, or read from, the shared client pool. The client is created after the
+    /// same destination validation and DNS pinning as the pooled path, and its
+    /// idle pool is disabled so this attempt cannot reuse a prior connection.
+    pub async fn send_with_headers_fresh(
+        &self,
+        prepared: &Prepared,
+        dns: Dns,
+        headers: &[(&'static str, String)],
+        query: &[(&'static str, String)],
+        deadline: Instant,
+    ) -> Result<reqwest::Response, TransportError> {
+        self.send_with_headers_mode(prepared, dns, headers, query, deadline, ClientMode::Fresh)
+            .await
+    }
+
+    async fn send_with_headers_mode(
+        &self,
+        prepared: &Prepared,
+        dns: Dns,
+        headers: &[(&'static str, String)],
+        query: &[(&'static str, String)],
+        deadline: Instant,
+        mode: ClientMode,
+    ) -> Result<reqwest::Response, TransportError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(TransportError::Timeout);
@@ -473,7 +508,10 @@ impl Transport {
             self.limits.allow_private_destinations,
         )
         .await?;
-        let client = self.client_for(&prepared.url, &destination, Http::H1, dns)?;
+        let client = match mode {
+            ClientMode::Pooled => self.client_for(&prepared.url, &destination, Http::H1, dns)?,
+            ClientMode::Fresh => self.fresh_client_for(&prepared.url, &destination, dns)?,
+        };
         let mut request = client
             .post(&prepared.url)
             .header(CONTENT_TYPE, prepared.content_type)
@@ -609,6 +647,26 @@ impl Transport {
         http: Http,
         dns: Dns,
     ) -> Result<reqwest::Client, TransportError> {
+        self.client_for_mode(url, destination, http, dns, ClientMode::Pooled)
+    }
+
+    fn fresh_client_for(
+        &self,
+        url: &str,
+        destination: &Destination,
+        dns: Dns,
+    ) -> Result<reqwest::Client, TransportError> {
+        self.client_for_mode(url, destination, Http::H1, dns, ClientMode::Fresh)
+    }
+
+    fn client_for_mode(
+        &self,
+        url: &str,
+        destination: &Destination,
+        http: Http,
+        dns: Dns,
+        mode: ClientMode,
+    ) -> Result<reqwest::Client, TransportError> {
         let parsed = reqwest::Url::parse(url).map_err(|_| TransportError::Connect)?;
         let key: ClientKey = (
             parsed.scheme().to_owned(),
@@ -618,7 +676,9 @@ impl Transport {
             http,
             dns,
         );
-        if let Some(client) = self.clients_lock().get(&key) {
+        if matches!(mode, ClientMode::Pooled)
+            && let Some(client) = self.clients_lock().get(&key)
+        {
             return Ok(client.clone());
         }
         let mut builder = reqwest::Client::builder()
@@ -627,7 +687,11 @@ impl Transport {
             // every address and redirects are disabled).
             .dns_resolver(Arc::clone(self.resolvers.resolver(dns)))
             .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(64)
+            .pool_max_idle_per_host(if matches!(mode, ClientMode::Fresh) {
+                0
+            } else {
+                64
+            })
             .tcp_keepalive(Duration::from_secs(60))
             .connect_timeout(self.limits.connect)
             .resolve_to_addrs(
@@ -651,11 +715,13 @@ impl Transport {
                 .http2_keep_alive_while_idle(true),
         };
         let client = builder.build().map_err(|_| TransportError::Connect)?;
-        let mut clients = self.clients_lock();
-        if clients.len() >= 64 {
-            clients.clear();
+        if matches!(mode, ClientMode::Pooled) {
+            let mut clients = self.clients_lock();
+            if clients.len() >= 64 {
+                clients.clear();
+            }
+            clients.insert(key, client.clone());
         }
-        clients.insert(key, client.clone());
         Ok(client)
     }
 
@@ -902,5 +968,28 @@ impl StreamReader {
 impl From<WireError> for TransportError {
     fn from(_error: WireError) -> Self {
         Self::InvalidBody
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_client_does_not_touch_shared_pool() {
+        let transport = Transport::new(Limits::default()).expect("transport should build");
+        let destination = Destination {
+            host: "api.example.com".to_owned(),
+            port: 443,
+            address: "203.0.113.10".parse().expect("valid test address"),
+            addresses: vec!["203.0.113.10".parse().expect("valid test address")],
+        };
+
+        let client = transport
+            .fresh_client_for("https://api.example.com", &destination, Dns::Overseas)
+            .expect("fresh client should build");
+        drop(client);
+
+        assert!(transport.clients_lock().is_empty());
     }
 }
