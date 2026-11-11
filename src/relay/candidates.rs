@@ -43,6 +43,7 @@ pub struct Candidate {
     /// Per-item concurrency cap of the route entry (None = only the key-level
     /// cap applies).
     pub entry_cap: Option<i32>,
+    pub weight: u16,
     /// Effort levels the candidate's snapshot says its upstream model accepts,
     /// canonical and ascending. `None` = unconstrained (no snapshot, model
     /// absent from it, or nothing listed).
@@ -172,6 +173,7 @@ pub fn expand_direct(
             upstream_model: upstream_model.to_owned(),
             route_alias: None,
             entry_cap: None,
+            weight: 1,
             supported_efforts: supported,
             default_effort: default,
             context_window,
@@ -273,6 +275,7 @@ fn make_candidate(
         entry_cap: entry
             .max_concurrency
             .and_then(|cap| i32::try_from(cap).ok()),
+        weight: entry.weight,
         supported_efforts: supported,
         default_effort: default,
         context_window: model_context(key, model),

@@ -27,6 +27,7 @@ struct RouteCacheInner {
     keys_by_provider: HashMap<i64, Vec<Arc<ProviderKeyRow>>>, // provider_id → keys
     routes_by_alias: HashMap<String, RouteRow>,
     all_routes: Vec<RouteRow>,
+    weighted: HashMap<String, Arc<super::weighted::WeightedState>>,
 }
 
 impl RouteCache {
@@ -39,6 +40,7 @@ impl RouteCache {
                 keys_by_provider: HashMap::new(),
                 routes_by_alias: HashMap::new(),
                 all_routes: Vec::new(),
+                weighted: HashMap::new(),
             })),
             generation: Arc::new(AtomicU64::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -122,14 +124,48 @@ impl RouteCache {
             keys_by_provider,
             routes_by_alias,
             all_routes: routes,
+            weighted: HashMap::new(),
         })
     }
 
-    fn replace_inner(&self, new_inner: RouteCacheInner) {
+    fn replace_inner(&self, mut new_inner: RouteCacheInner) {
         let Ok(mut inner) = self.inner.write() else {
             tracing::warn!("route cache lock poisoned while replacing snapshot");
             return;
         };
+        let generation = self.generation.load(Ordering::Relaxed) + 1;
+        for (alias, state) in &inner.weighted {
+            let unchanged = inner
+                .routes_by_alias
+                .get(alias)
+                .zip(new_inner.routes_by_alias.get(alias))
+                .is_some_and(|(old, new)| {
+                    old.incarnation == new.incarnation
+                        && old.strategy == new.strategy
+                        && old.entries.len() == new.entries.len()
+                        && old.entries.iter().zip(&new.entries).all(|(a, b)| {
+                            a.key_id == b.key_id && a.model == b.model && a.weight == b.weight
+                        })
+                });
+            if unchanged {
+                state.advance(generation);
+                new_inner.weighted.insert(alias.clone(), Arc::clone(state));
+            } else {
+                state.retire();
+            }
+        }
+        for route in &new_inner.all_routes {
+            if route.strategy == crate::store::RouteStrategy::Weighted {
+                new_inner
+                    .weighted
+                    .entry(route.alias.clone())
+                    .or_insert_with(|| {
+                        let state = Arc::new(super::weighted::WeightedState::default());
+                        state.advance(generation);
+                        state
+                    });
+            }
+        }
         *inner = new_inner;
         self.generation.fetch_add(1, Ordering::Release);
     }
@@ -156,6 +192,20 @@ impl RouteCache {
 
     pub fn route_by_alias(&self, alias: &str) -> Option<RouteRow> {
         self.inner.read().ok()?.routes_by_alias.get(alias).cloned()
+    }
+
+    pub(super) fn route_with_weighted_state(
+        &self,
+        alias: &str,
+    ) -> Option<(RouteRow, Option<super::weighted::Snapshot>)> {
+        let inner = self.inner.read().ok()?;
+        Some((
+            inner.routes_by_alias.get(alias)?.clone(),
+            inner
+                .weighted
+                .get(alias)
+                .map(|state| (Arc::clone(state), self.generation.load(Ordering::Relaxed))),
+        ))
     }
 
     /// The keys named by `ids`, in (position, id) order, shared under one lock.

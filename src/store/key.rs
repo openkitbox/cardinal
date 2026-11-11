@@ -1562,6 +1562,9 @@ pub async fn reorder_keys(pool: &PgPool, ids: &[i64]) -> anyhow::Result<()> {
 pub struct RouteEntry {
     pub key_id: i64,
     pub model: String,
+    /// Relative share within a weighted route.
+    #[serde(default = "default_route_weight")]
+    pub weight: u16,
     #[serde(default)]
     pub label: Option<String>,
     /// This account's concurrency cap on this route and model (None = unlimited
@@ -1581,6 +1584,10 @@ pub struct RouteEntry {
     /// rows written before rules existed; writes never emit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_window: Option<ActiveWindow>,
+}
+
+fn default_route_weight() -> u16 {
+    1
 }
 
 impl RouteEntry {
@@ -1730,6 +1737,8 @@ pub enum RouteStrategy {
     Smart,
     /// Ready candidates round-robin per request, ignoring quota/balance.
     Rotate,
+    /// Smooth weighted round-robin across ready entries.
+    Weighted,
 }
 
 impl RouteStrategy {
@@ -1739,6 +1748,7 @@ impl RouteStrategy {
             Self::Ordered => "ordered",
             Self::Smart => "smart",
             Self::Rotate => "rotate",
+            Self::Weighted => "weighted",
         }
     }
 
@@ -1749,6 +1759,7 @@ impl RouteStrategy {
             "ordered" => Ok(Self::Ordered),
             "smart" => Ok(Self::Smart),
             "rotate" => Ok(Self::Rotate),
+            "weighted" => Ok(Self::Weighted),
             other => anyhow::bail!("unknown route strategy {other:?}"),
         }
     }
@@ -1756,6 +1767,9 @@ impl RouteStrategy {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RouteRow {
+    /// Database-owned revision, changed on insertion or an entries/strategy update.
+    #[serde(skip)]
+    pub(crate) incarnation: i64,
     pub alias: String,
     pub entries: Vec<RouteEntry>,
     /// Declared context window in tokens; `None` = undeclared (/v1/models then

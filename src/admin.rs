@@ -485,7 +485,7 @@ struct RouteBody {
 /// const so the test that pins this exact body
 /// (`route_api_tests::unknown_strategy_is_rejected_with_400`) shares one
 /// source of truth — the only extracted 400 message in this file.
-const INVALID_ROUTE_BODY: &str = "invalid route body (expected {entries: [...], context_window?, strategy? = ordered, smart, or rotate})";
+const INVALID_ROUTE_BODY: &str = "invalid route body (expected {entries: [...], context_window?, strategy? = ordered, smart, rotate, or weighted})";
 
 #[handler]
 async fn list_routes(depot: &mut Depot, response: &mut Response) {

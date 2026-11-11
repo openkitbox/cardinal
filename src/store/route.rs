@@ -57,6 +57,7 @@ pub(super) async fn strip_entries_of_keys(
 
 /// One raw `gateway_routes` row straight off SQL, before entries/strategy parsing.
 type RawRouteRow = (
+    i64,
     String,
     serde_json::Value,
     Option<i64>,
@@ -67,14 +68,22 @@ type RawRouteRow = (
 
 pub async fn list_routes(pool: &PgPool) -> anyhow::Result<Vec<RouteRow>> {
     let rows: Vec<RawRouteRow> = sqlx::query_as(
-        "SELECT alias, entries, context_window, strategy, note, efforts FROM gateway_routes ORDER BY alias",
+        "SELECT incarnation, alias, entries, context_window, strategy, note, efforts FROM gateway_routes ORDER BY alias",
     )
     .fetch_all(pool)
     .await?;
     rows.into_iter()
         .map(
-            |(alias, entries, context_window, strategy, note, efforts)| {
-                parse_route(alias, entries, context_window, &strategy, note, efforts)
+            |(incarnation, alias, entries, context_window, strategy, note, efforts)| {
+                parse_route(
+                    incarnation,
+                    alias,
+                    entries,
+                    context_window,
+                    &strategy,
+                    note,
+                    efforts,
+                )
             },
         )
         .collect()
@@ -82,14 +91,22 @@ pub async fn list_routes(pool: &PgPool) -> anyhow::Result<Vec<RouteRow>> {
 
 pub async fn get_route(pool: &PgPool, alias: &str) -> anyhow::Result<Option<RouteRow>> {
     let row: Option<RawRouteRow> = sqlx::query_as(
-            "SELECT alias, entries, context_window, strategy, note, efforts FROM gateway_routes WHERE alias = $1",
+            "SELECT incarnation, alias, entries, context_window, strategy, note, efforts FROM gateway_routes WHERE alias = $1",
         )
     .bind(alias)
     .fetch_optional(pool)
     .await?;
     row.map(
-        |(alias, entries, context_window, strategy, note, efforts)| {
-            parse_route(alias, entries, context_window, &strategy, note, efforts)
+        |(incarnation, alias, entries, context_window, strategy, note, efforts)| {
+            parse_route(
+                incarnation,
+                alias,
+                entries,
+                context_window,
+                &strategy,
+                note,
+                efforts,
+            )
         },
     )
     .transpose()
@@ -145,6 +162,12 @@ pub async fn put_route(
     );
     if let Some((key_id, model)) = duplicate_entry(entries) {
         anyhow::bail!("route {alias} lists key {key_id} with model {model} more than once");
+    }
+    for entry in entries {
+        anyhow::ensure!(
+            (1..=1000).contains(&entry.weight),
+            "route {alias} entry weight must be between 1 and 1000"
+        );
     }
     let mut tx = pool.begin().await?;
     for entry in entries {
@@ -222,6 +245,7 @@ pub async fn delete_route(pool: &PgPool, alias: &str) -> anyhow::Result<bool> {
 }
 
 fn parse_route(
+    incarnation: i64,
     alias: String,
     entries: serde_json::Value,
     context_window: Option<i64>,
@@ -234,6 +258,12 @@ fn parse_route(
     // re-pointed (it expands to zero candidates → 404 at dispatch).
     let entries: Vec<RouteEntry> = serde_json::from_value(entries)
         .map_err(|e| anyhow::anyhow!("route {alias} has invalid entries JSON: {e}"))?;
+    anyhow::ensure!(
+        entries
+            .iter()
+            .all(|entry| (1..=1000).contains(&entry.weight)),
+        "route {alias} has an invalid entry weight"
+    );
     let strategy =
         RouteStrategy::from_column(strategy).map_err(|e| anyhow::anyhow!("route {alias}: {e}"))?;
     // 读路径宽容:手写过 SQL 的坏 JSON 不阻塞启动,降级为 legacy 派生并告警。
@@ -248,6 +278,7 @@ fn parse_route(
             .ok()
     });
     Ok(RouteRow {
+        incarnation,
         alias,
         entries,
         context_window,

@@ -18,6 +18,7 @@ mod smart;
 pub mod smart_cache;
 mod streaming;
 pub mod trace;
+mod weighted;
 
 pub use dispatcher::{
     Assignment, CandidateCaps, CandidateState, DispatchDecision, DispatchEvent, DispatchRequest,
@@ -1554,6 +1555,7 @@ enum Resolution {
         /// interchangeable routes to one model, so ranking them by quota beats
         /// always taking the first account by position.
         strategy: store::RouteStrategy,
+        weighted: Option<weighted::Snapshot>,
         candidates: Vec<candidates::Candidate>,
         /// Candidates excluded during expansion, with the reason.
         excluded: Vec<(candidates::Candidate, trace::SkipReason)>,
@@ -1686,6 +1688,7 @@ fn resolve(
                 // provider to its first account forever; position only breaks
                 // quota ties inside `smart::order`.
                 strategy: store::RouteStrategy::Smart,
+                weighted: None,
                 candidates,
                 excluded,
                 window_skipped: 0,
@@ -1696,8 +1699,8 @@ fn resolve(
         // No enabled provider with this name: fall through to the route lookup
         // (a route alias may itself contain `/`).
     }
-    match route_cache.route_by_alias(model) {
-        Some(route) => {
+    match route_cache.route_with_weighted_state(model) {
+        Some((route, weighted)) => {
             // One candidate per entry: each entry names its own account, so
             // the key set is just the entries' key ids (dangling ids drop out).
             // Deduped: one account serving several models on this route is the
@@ -1736,6 +1739,7 @@ fn resolve(
             Ok(Resolution::Candidates {
                 alias: Some(route.alias),
                 strategy: route.strategy,
+                weighted,
                 candidates,
                 excluded,
                 window_skipped: expansion.window_skipped,
@@ -2249,6 +2253,7 @@ fn order_ready(
     smart_cache: &smart_cache::SmartCache,
     rotate_cursors: &rotate::RotateCursors,
     strategy: store::RouteStrategy,
+    weighted: Option<&weighted::Snapshot>,
     alias: Option<&str>,
     ready: Vec<candidates::Candidate>,
     now: chrono::DateTime<chrono::Utc>,
@@ -2271,6 +2276,13 @@ fn order_ready(
                 (ordered, Some(reasons))
             }
             store::RouteStrategy::Rotate => (rotate_ready(ready, rotate_cursors, alias), None),
+            store::RouteStrategy::Weighted => (
+                match weighted {
+                    Some((state, generation)) => state.order(*generation, ready),
+                    None => ready,
+                },
+                None,
+            ),
             // Ordered, and Smart with no snapshot to rank by.
             _ => (ready, None),
         };
@@ -2461,48 +2473,58 @@ pub async fn dispatch_at(
 
     // Model resolution: direct `provider/model` first, then the route table.
     // `now` (one read per request) is what route active windows are judged against.
-    let (alias, strategy, mut expanded, excluded, window_skipped, secret_skipped, efforts) =
-        match resolve(route_cache, &model, now) {
-            Ok(Resolution::Candidates {
-                alias,
-                strategy,
-                candidates,
-                excluded,
-                window_skipped,
-                secret_skipped,
-                efforts,
-            }) => (
-                alias,
-                strategy,
-                candidates,
-                excluded,
-                window_skipped,
-                secret_skipped,
-                efforts,
-            ),
-            Ok(Resolution::EmptySuffix) => {
-                return DispatchOutcome::Failed {
-                    status: 400,
-                    message: format!("missing upstream model after the provider prefix in {model}"),
-                    retry_after_secs: None,
-                };
-            }
-            Ok(Resolution::NoRoute) => {
-                return DispatchOutcome::Failed {
-                    status: 404,
-                    message: format!("no route for model {model}"),
-                    retry_after_secs: None,
-                };
-            }
-            Err(error) => {
-                tracing::warn!("model resolution failed: {error}");
-                return DispatchOutcome::Failed {
-                    status: 500,
-                    message: "model resolution failed".into(),
-                    retry_after_secs: None,
-                };
-            }
-        };
+    let (
+        alias,
+        strategy,
+        weighted,
+        mut expanded,
+        excluded,
+        window_skipped,
+        secret_skipped,
+        efforts,
+    ) = match resolve(route_cache, &model, now) {
+        Ok(Resolution::Candidates {
+            alias,
+            strategy,
+            weighted,
+            candidates,
+            excluded,
+            window_skipped,
+            secret_skipped,
+            efforts,
+        }) => (
+            alias,
+            strategy,
+            weighted,
+            candidates,
+            excluded,
+            window_skipped,
+            secret_skipped,
+            efforts,
+        ),
+        Ok(Resolution::EmptySuffix) => {
+            return DispatchOutcome::Failed {
+                status: 400,
+                message: format!("missing upstream model after the provider prefix in {model}"),
+                retry_after_secs: None,
+            };
+        }
+        Ok(Resolution::NoRoute) => {
+            return DispatchOutcome::Failed {
+                status: 404,
+                message: format!("no route for model {model}"),
+                retry_after_secs: None,
+            };
+        }
+        Err(error) => {
+            tracing::warn!("model resolution failed: {error}");
+            return DispatchOutcome::Failed {
+                status: 500,
+                message: "model resolution failed".into(),
+                retry_after_secs: None,
+            };
+        }
+    };
     if secret_skipped > 0 {
         tracing::warn!(
             model = model.as_str(),
@@ -2524,6 +2546,9 @@ pub async fn dispatch_at(
             priced
         });
         if expanded.is_empty() {
+            if let Some((state, generation)) = &weighted {
+                state.order(*generation, Vec::new());
+            }
             tracing::warn!(
                 model = model.as_str(),
                 user_id = principal.map(|principal| principal.user_id),
@@ -2537,6 +2562,9 @@ pub async fn dispatch_at(
         }
     }
     if expanded.is_empty() {
+        if let Some((state, generation)) = &weighted {
+            state.order(*generation, Vec::new());
+        }
         // All entries filtered by their time window is a temporary state, not a
         // missing route — say so plainly instead of the generic 404.
         if window_skipped > 0 {
@@ -2600,6 +2628,7 @@ pub async fn dispatch_at(
         smart_cache,
         rotate_cursors,
         strategy,
+        weighted.as_ref(),
         alias.as_deref(),
         ready,
         chrono::Utc::now(),
