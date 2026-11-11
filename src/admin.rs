@@ -1131,9 +1131,10 @@ fn sse_events(
     async_stream::stream! {
       loop {
         tokio::select! {
-          // Silence for the whole interval: a comment frame keeps the
-          // connection warm through intermediaries.
-          () = tokio::time::sleep(keep_alive) => yield Ok(SseEvent::default().comment("alive")),
+          // Prefer an already queued business event when both branches are
+          // ready at the heartbeat boundary; the heartbeat is a keep-alive,
+          // never a reason to starve the activity feed.
+          biased;
           event = receiver.recv() => match event {
             Some(event) => match SseEvent::default().json(&event) {
               Ok(frame) => yield Ok(frame),
@@ -1143,7 +1144,10 @@ fn sse_events(
             },
             // The listener task is gone (it never returns) — end the stream.
             None => break,
-          }
+          },
+          // Silence for the whole interval: a comment frame keeps the
+          // connection warm through intermediaries.
+          () = tokio::time::sleep(keep_alive) => yield Ok(SseEvent::default().comment("alive")),
         }
       }
     }
@@ -2758,5 +2762,55 @@ async fn agent_disconnect(request: &mut Request, response: &mut Response) {
     match result {
         Ok(restored) => json_response(response, &json!({"ok": true, "restored": restored})),
         Err(error) => internal(response, error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sse_events;
+    use crate::activity::ActivityEvent;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn activity_sse_emits_repeated_heartbeats_and_later_activity() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let mut stream = Box::pin(sse_events(receiver, std::time::Duration::ZERO));
+
+        let first_heartbeat = stream
+            .next()
+            .await
+            .expect("stream should stay open")
+            .expect("heartbeat should render");
+        assert_eq!(
+            first_heartbeat.to_string(),
+            ":alive\n\n",
+            "first frame should be a heartbeat"
+        );
+
+        let second_heartbeat = stream
+            .next()
+            .await
+            .expect("stream should stay open")
+            .expect("heartbeat should render");
+        assert_eq!(
+            second_heartbeat.to_string(),
+            ":alive\n\n",
+            "second frame should be a heartbeat"
+        );
+
+        sender
+            .send(ActivityEvent::Persisted)
+            .await
+            .expect("receiver is open");
+        let activity = stream
+            .next()
+            .await
+            .expect("activity stream should stay open")
+            .expect("activity should render");
+        assert_eq!(
+            activity.to_string(),
+            "data: {\"t\":\"persisted\"}\n\n",
+            "activity should arrive after repeated heartbeats"
+        );
     }
 }

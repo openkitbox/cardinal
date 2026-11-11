@@ -47,16 +47,15 @@ use crate::store::AttemptLog;
 use crate::store::Charge;
 
 /// Default flush cadence for the production writer.
-pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Default early-flush trigger for the production writer.
 pub const DEFAULT_BATCH_SIZE: usize = 100;
 
 /// How long a settled charge may still sit in the flush buffer. Reconciliation
-/// ignores request rows and ledger entries younger than this (it is 12 ×
-/// [`DEFAULT_FLUSH_INTERVAL`]), so a charge that has just been queued never
-/// reads as uncollected before its first flush attempt.
-///
+/// ignores request rows and ledger entries younger than this fixed grace window,
+/// so a charge that has just been queued never reads as uncollected before its
+/// first flush attempt.
 /// It does not cover the retry queue: after a failed *settlement* the request
 /// rows are still written (the flush inserts them whatever the settle did)
 /// while their entries wait for the next flush, so reconciliation reports them
@@ -257,6 +256,39 @@ async fn flush_loop(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PersistedNotification {
+    None,
+    Persisted,
+    Batch,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FlushPersistence {
+    request_rows: usize,
+    inserted_rows: usize,
+    notification: PersistedNotification,
+    clear_request_rows: bool,
+}
+
+impl FlushPersistence {
+    fn plan(request_rows: usize, inserted_rows: usize) -> Self {
+        let notification = if request_rows == 0 {
+            PersistedNotification::None
+        } else if request_rows == inserted_rows {
+            PersistedNotification::Batch
+        } else {
+            PersistedNotification::Persisted
+        };
+        Self {
+            request_rows,
+            inserted_rows,
+            notification,
+            clear_request_rows: request_rows > 0,
+        }
+    }
+}
+
 /// Settle the batch's charges (with any pending retries), then write the
 /// buffered statistics rows, and notify activity listeners (the `Persisted`
 /// event fires per flush, not per request). The statistics buffer is cleared
@@ -278,35 +310,42 @@ async fn flush(
     settle(pool, pending, kind).await;
     if !buffer.is_empty() {
         let ids = crate::store::insert_request_logs(pool, buffer).await;
-        if ids.len() != buffer.len() {
-            if kind == FlushKind::Final {
-                tracing::error!(
-                    expected = buffer.len(),
-                    inserted = ids.len(),
-                    "ledger shutdown flush: rows lost — PG unreachable during final flush"
-                );
-            } else {
-                tracing::warn!(
-                    expected = buffer.len(),
-                    inserted = ids.len(),
-                    "ledger batch flush: some rows failed to insert"
-                );
+        let persistence = FlushPersistence::plan(buffer.len(), ids.len());
+        match persistence.notification {
+            PersistedNotification::None => {
+                unreachable!("non-empty request buffer has no notification")
             }
-            // `insert_request_logs` returns only rows that were durably
-            // inserted. A short result cannot be paired with the complete
-            // in-memory summary, so retain the old unit event and never
-            // publish a misleading PersistedBatch containing failed rows.
-            activity.persisted();
-        } else {
-            let requests = buffer
-                .iter()
-                .map(crate::activity::PersistedRequest::from_attempt)
-                .collect::<Vec<_>>();
-            activity.persisted_batch(requests);
+            PersistedNotification::Persisted => {
+                if kind == FlushKind::Final {
+                    tracing::error!(
+                        expected = persistence.request_rows,
+                        inserted = persistence.inserted_rows,
+                        "ledger shutdown flush: rows lost — PG unreachable during final flush"
+                    );
+                } else {
+                    tracing::warn!(
+                        expected = persistence.request_rows,
+                        inserted = persistence.inserted_rows,
+                        "ledger batch flush: some rows failed to insert"
+                    );
+                }
+                // `insert_request_logs` returns only rows that were durably
+                // inserted. A short result cannot be paired with the complete
+                // in-memory summary, so retain the old unit event and never
+                // publish a misleading PersistedBatch containing failed rows.
+                activity.persisted();
+            }
+            PersistedNotification::Batch => {
+                let requests = buffer
+                    .iter()
+                    .map(crate::activity::PersistedRequest::from_attempt)
+                    .collect::<Vec<_>>();
+                activity.persisted_batch(requests);
+            }
         }
-        buffer.clear();
-    } else {
-        activity.persisted();
+        if persistence.clear_request_rows {
+            buffer.clear();
+        }
     }
 }
 
@@ -397,6 +436,77 @@ fn log_report(report: &crate::store::SettleReport) {
         tracing::warn!(
             duplicates = report.duplicates,
             "billing settlement: request ids already charged; skipped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_FLUSH_INTERVAL, FlushPersistence, PersistedNotification};
+    use std::time::Duration;
+
+    #[test]
+    fn default_flush_interval_is_realtime() {
+        assert_eq!(
+            DEFAULT_FLUSH_INTERVAL,
+            Duration::from_millis(100),
+            "ledger activity should reach listeners without a multi-second delay"
+        );
+    }
+
+    #[test]
+    fn complete_request_flush_publishes_batch_and_clears_rows() {
+        assert_eq!(
+            FlushPersistence::plan(3, 3),
+            FlushPersistence {
+                request_rows: 3,
+                inserted_rows: 3,
+                notification: PersistedNotification::Batch,
+                clear_request_rows: true,
+            },
+            "a fully inserted request batch should carry its request summaries and clear the buffer"
+        );
+    }
+
+    #[test]
+    fn partial_request_flush_publishes_unit_event_and_clears_rows() {
+        assert_eq!(
+            FlushPersistence::plan(3, 2),
+            FlushPersistence {
+                request_rows: 3,
+                inserted_rows: 2,
+                notification: PersistedNotification::Persisted,
+                clear_request_rows: true,
+            },
+            "a partial request insert should trigger a corrective reload and clear the buffer"
+        );
+    }
+
+    #[test]
+    fn failed_request_flush_publishes_unit_event_and_clears_rows() {
+        assert_eq!(
+            FlushPersistence::plan(3, 0),
+            FlushPersistence {
+                request_rows: 3,
+                inserted_rows: 0,
+                notification: PersistedNotification::Persisted,
+                clear_request_rows: true,
+            },
+            "a failed request insert should trigger a corrective reload and clear the buffer"
+        );
+    }
+
+    #[test]
+    fn settlement_only_flush_keeps_request_buffer_untouched_and_silent() {
+        assert_eq!(
+            FlushPersistence::plan(0, 0),
+            FlushPersistence {
+                request_rows: 0,
+                inserted_rows: 0,
+                notification: PersistedNotification::None,
+                clear_request_rows: false,
+            },
+            "a charge-only retry must not trigger a request reload or clear request rows"
         );
     }
 }

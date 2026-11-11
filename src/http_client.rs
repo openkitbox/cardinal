@@ -1408,12 +1408,7 @@ impl GatewayHttpClient {
         ClientError,
     > {
         // `stream`, not `http`: no total timeout on the never-ending response.
-        let response = self
-            .stream
-            .get(format!("{}/api/activity", self.base))
-            .bearer_auth(&*self.admin_key)
-            .send()
-            .await?;
+        let response = self.activity_request().send().await?;
         if !response.status().is_success() {
             return Err(http_error(response).await);
         }
@@ -1462,6 +1457,12 @@ impl GatewayHttpClient {
                 }
             },
         ))
+    }
+
+    fn activity_request(&self) -> reqwest::RequestBuilder {
+        self.stream
+            .get(format!("{}/api/activity", self.base))
+            .bearer_auth(&*self.admin_key)
     }
 }
 
@@ -1692,4 +1693,29 @@ fn provider_body(input: &ProviderInput<'_>) -> serde_json::Value {
       "enabled": input.enabled,
         "dns": input.dns,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_request_has_no_total_timeout() {
+        let client = GatewayHttpClient::new("http://127.0.0.1:10202", "test-key");
+        let request = client
+            .activity_request()
+            .build()
+            .expect("activity request should build");
+
+        assert_eq!(request.timeout(), None);
+    }
+
+    #[test]
+    fn activity_reconnect_backoff_doubles_and_caps() {
+        assert_eq!(backoff_delay(0), Duration::from_millis(500));
+        assert_eq!(backoff_delay(1), Duration::from_secs(1));
+        assert_eq!(backoff_delay(2), Duration::from_secs(2));
+        assert_eq!(backoff_delay(6), BACKOFF_MAX);
+        assert_eq!(backoff_delay(u32::MAX), BACKOFF_MAX);
+    }
 }
