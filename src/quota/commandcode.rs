@@ -148,6 +148,7 @@ pub(super) fn parse_commandcode_quota(body: &str) -> Option<KeyQuota> {
             balance,
             plan: None,
             details: Vec::new(),
+            codex_resets: None,
         })
     }
 }

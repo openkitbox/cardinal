@@ -310,6 +310,7 @@ fn parse_kiro_quota(body: &str) -> Option<KeyQuota> {
         balance: None,
         plan: None,
         details,
+        codex_resets: None,
     })
 }
 

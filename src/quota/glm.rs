@@ -79,5 +79,6 @@ pub(super) fn parse_glm_quota(body: &str) -> Option<KeyQuota> {
         balance: None,
         plan: None,
         details: Vec::new(),
+        codex_resets: None,
     })
 }

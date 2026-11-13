@@ -29,6 +29,8 @@
 //!   unknown or finished)
 //! - `GET /api/providers/:id/keys/:key_id/reveal` — the full KeyView, plaintext credential included (the ONLY
 //!   plaintext-serving endpoint; the list shape stays masked)
+//! - `GET /api/providers/:id/keys/:key_id/openai-resets` — short-lived Codex reset-credit details
+//! - `POST /api/providers/:id/keys/:key_id/openai-resets/consume` — consume one credit
 //! - `POST /api/key-groups` `{name}` → `{id}`, `PATCH/DELETE /api/key-groups/:id` — account groups (409 on a taken name, 400 on an invalid one,
 //!   404 on an unknown id); membership is set per key through the key PATCH's `group_ids` (absent = untouched, array = full replace)
 //! - `PUT /api/keys/order` `{ids: [..]}` — assign global positions sequentially in array order (one transaction)
@@ -79,6 +81,7 @@ use serde_json::json;
 use crate::admin_ops::CursorLoginError;
 use crate::admin_ops::OpenaiLoginError;
 use crate::admin_ops::OpenaiLoginRequest;
+use crate::admin_ops::OpenaiResetError;
 use crate::admin_ops::OpencodeLoginError;
 use crate::agent;
 use crate::credentials::{AuthKind, KeyCredential, resolve_key_credential};
@@ -1691,6 +1694,140 @@ fn internal(response: &mut Response, error: anyhow::Error) {
     let _ = response.body("internal error");
 }
 
+#[derive(Deserialize)]
+struct OpenaiResetConsumeBody {
+    redeem_request_id: String,
+    #[serde(default)]
+    credit_id: Option<String>,
+}
+
+const MAX_OPENAI_RESET_ID_CHARS: usize = 256;
+// Allow both bounded ids at their maximum UTF-8 size plus JSON framing, while
+// rejecting unrelated or malformed bodies before deserialization can allocate.
+const MAX_OPENAI_RESET_BODY_BYTES: usize = 4 << 10;
+
+fn normalize_openai_reset_id(value: String, field: &'static str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(match field {
+            "redeem_request_id" => "redeem_request_id must not be empty",
+            _ => "credit_id must not be empty",
+        });
+    }
+    if value.chars().count() > MAX_OPENAI_RESET_ID_CHARS {
+        return Err(match field {
+            "redeem_request_id" => "redeem_request_id is too long",
+            _ => "credit_id is too long",
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(match field {
+            "redeem_request_id" => "redeem_request_id contains invalid characters",
+            _ => "credit_id contains invalid characters",
+        });
+    }
+    Ok(value.to_owned())
+}
+
+fn openai_reset_error_response(error: &OpenaiResetError) -> (StatusCode, &'static str) {
+    match error {
+        OpenaiResetError::KeyNotFound => (StatusCode::NOT_FOUND, "OpenAI account key not found"),
+        OpenaiResetError::NotOpenaiKey | OpenaiResetError::NotOpenaiProvider => (
+            StatusCode::BAD_REQUEST,
+            "key is not an OpenAI Codex account",
+        ),
+        OpenaiResetError::ManagerUnavailable => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OpenAI reset service is not configured",
+        ),
+        OpenaiResetError::Credentials(_) => (
+            StatusCode::BAD_GATEWAY,
+            "OpenAI credentials are unavailable",
+        ),
+        OpenaiResetError::CreditUnavailable => (
+            StatusCode::BAD_REQUEST,
+            "selected reset credit is unavailable",
+        ),
+        OpenaiResetError::Upstream => (StatusCode::BAD_GATEWAY, "OpenAI reset service unavailable"),
+        OpenaiResetError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+    }
+}
+
+fn openai_reset_error(response: &mut Response, error: OpenaiResetError) {
+    let (status, message) = openai_reset_error_response(&error);
+    response.status_code(status);
+    json_response(response, &json!({ "error": message }));
+}
+
+#[handler]
+async fn openai_reset_details(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let (Some(provider_id), Some(key_id)) =
+        (request.param::<i64>("id"), request.param::<i64>("key_id"))
+    else {
+        json_error(
+            response,
+            StatusCode::BAD_REQUEST,
+            "invalid OpenAI account key id",
+        );
+        return;
+    };
+    match admin(depot).openai_reset_details(provider_id, key_id).await {
+        Ok(details) => json_response(response, &details),
+        Err(error) => openai_reset_error(response, error),
+    }
+}
+
+#[handler]
+async fn consume_openai_reset(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let (Some(provider_id), Some(key_id)) =
+        (request.param::<i64>("id"), request.param::<i64>("key_id"))
+    else {
+        json_error(
+            response,
+            StatusCode::BAD_REQUEST,
+            "invalid OpenAI account key id",
+        );
+        return;
+    };
+    let Ok(body) = request
+        .parse_json_with_max_size::<OpenaiResetConsumeBody>(MAX_OPENAI_RESET_BODY_BYTES)
+        .await
+    else {
+        json_error(
+            response,
+            StatusCode::BAD_REQUEST,
+            "invalid OpenAI reset consume body",
+        );
+        return;
+    };
+    let redeem_request_id =
+        match normalize_openai_reset_id(body.redeem_request_id, "redeem_request_id") {
+            Ok(value) => value,
+            Err(message) => {
+                json_error(response, StatusCode::BAD_REQUEST, message);
+                return;
+            }
+        };
+    let credit_id = match body
+        .credit_id
+        .map(|value| normalize_openai_reset_id(value, "credit_id"))
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(message) => {
+            json_error(response, StatusCode::BAD_REQUEST, message);
+            return;
+        }
+    };
+    match admin(depot)
+        .consume_openai_reset(provider_id, key_id, redeem_request_id, credit_id)
+        .await
+    {
+        Ok(outcome) => json_response(response, &outcome),
+        Err(error) => openai_reset_error(response, error),
+    }
+}
+
 /// `/api/*` sub-router (loopback-only + admin auth). Mounted on the main router.
 pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Router {
     Router::with_path("api")
@@ -1742,6 +1879,14 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
                 .delete(delete_key),
         )
         .push(Router::with_path("providers/{id}/keys/{key_id}/reveal").get(reveal_key))
+        .push(
+            Router::with_path("providers/{id}/keys/{key_id}/openai-resets")
+                .get(openai_reset_details),
+        )
+        .push(
+            Router::with_path("providers/{id}/keys/{key_id}/openai-resets/consume")
+                .post(consume_openai_reset),
+        )
         .push(Router::with_path("keys/order").put(reorder_keys))
         .push(Router::with_path("key-groups").post(create_key_group))
         .push(
@@ -2767,9 +2912,36 @@ async fn agent_disconnect(request: &mut Request, response: &mut Response) {
 
 #[cfg(test)]
 mod tests {
+    use super::OpenaiResetError;
+    use super::normalize_openai_reset_id;
+    use super::openai_reset_error_response;
     use super::sse_events;
     use crate::activity::ActivityEvent;
     use futures::StreamExt;
+    use salvo::http::StatusCode;
+
+    #[test]
+    fn reset_errors_have_fixed_safe_status_and_message() {
+        let (status, message) = openai_reset_error_response(&OpenaiResetError::NotOpenaiKey);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(message, "key is not an OpenAI Codex account");
+
+        let (status, message) = openai_reset_error_response(&OpenaiResetError::Upstream);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "OpenAI reset service unavailable");
+    }
+
+    #[test]
+    fn reset_ids_are_trimmed_and_bounded_at_the_admin_boundary() {
+        assert_eq!(
+            normalize_openai_reset_id("  request-1  ".to_owned(), "redeem_request_id")
+                .expect("valid request id"),
+            "request-1"
+        );
+        assert!(normalize_openai_reset_id(" ".to_owned(), "credit_id").is_err());
+        assert!(normalize_openai_reset_id("x".repeat(257), "credit_id").is_err());
+        assert!(normalize_openai_reset_id("credit\n1".to_owned(), "credit_id").is_err());
+    }
 
     #[tokio::test]
     async fn activity_sse_emits_repeated_heartbeats_and_later_activity() {

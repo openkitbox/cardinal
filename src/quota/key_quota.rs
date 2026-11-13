@@ -76,4 +76,42 @@ pub struct KeyQuota {
     /// the sub2api relay source fills them today.
     #[serde(default)]
     pub details: Vec<String>,
+    /// Codex reset-credit details, when this is an OpenAI Codex account.
+    /// The long-lived snapshot deliberately contains display data only; the
+    /// upstream credit ids stay in the short-lived admin action response.
+    #[serde(default)]
+    pub codex_resets: Option<CodexResetSummary>,
+}
+
+/// Display-safe summary of the reset credits reported by ChatGPT WHAM.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CodexResetSummary {
+    /// The upstream's authoritative count. It must not be replaced by the
+    /// length of `credits`, since the endpoint may paginate or omit entries.
+    pub available_count: u32,
+    #[serde(default)]
+    pub credits: Vec<CodexResetDisplay>,
+}
+
+/// One reset credit without its secret-like upstream selection id.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CodexResetDisplay {
+    pub status: String,
+    pub reset_type: Option<String>,
+    pub granted_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeyQuota;
+
+    #[test]
+    fn old_snapshot_without_codex_resets_still_deserializes() {
+        let snapshot = r#"{"windows":[],"balance":null,"plan":null,"details":[]}"#;
+        let quota: KeyQuota = serde_json::from_str(snapshot).expect("old snapshot is valid");
+        assert!(quota.codex_resets.is_none());
+    }
 }

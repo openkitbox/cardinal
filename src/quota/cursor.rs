@@ -232,6 +232,7 @@ pub async fn fetch_cursor_quota(
         balance: None,
         plan: Some(plan_name.unwrap_or_else(|| "Enterprise".to_owned())),
         details,
+        codex_resets: None,
     })
 }
 
@@ -593,6 +594,7 @@ fn parse_cursor_quota(
         balance: None,
         plan: plan_name,
         details,
+        codex_resets: None,
     })
 }
 

@@ -217,6 +217,7 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
         balance,
         plan: None,
         details,
+        codex_resets: None,
     })
 }
 

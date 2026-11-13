@@ -698,19 +698,8 @@ pub(crate) async fn codex_get(
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
 ) -> anyhow::Result<(u16, String)> {
-    let client = reqwest::Client::builder()
-        .dns_resolver(std::sync::Arc::clone(transport.resolver(dns)))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| anyhow::anyhow!("Codex probe client unavailable"))?;
-    let response = client
-        .get(url)
-        .timeout(PROBE_TIMEOUT)
-        .bearer_auth(&bearer.access_token)
-        .header("chatgpt-account-id", &bearer.account_id)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header("originator", "cardinal")
-        .header("version", CODEX_CLIENT_VERSION)
+    let client = codex_client(transport, dns)?;
+    let response = codex_request(&client, reqwest::Method::GET, url, bearer, None)
         .send()
         .await
         .map_err(|_| anyhow::anyhow!("Codex backend request failed"))?;
@@ -719,6 +708,64 @@ pub(crate) async fn codex_get(
         .await
         .map_err(|_| anyhow::anyhow!("Codex backend response unreadable"))?;
     Ok((status, body))
+}
+
+/// POST a bounded JSON Codex backend request. The request body is sent as-is
+/// from a typed caller and is never included in errors or logs.
+pub(crate) async fn codex_post(
+    url: &str,
+    bearer: &crate::openai::OpenaiOAuth,
+    body: &[u8],
+    transport: &crate::upstream::transport::Transport,
+    dns: crate::upstream::Dns,
+) -> anyhow::Result<(u16, String)> {
+    anyhow::ensure!(body.len() <= 16 * 1024, "Codex request is too large");
+    let client = codex_client(transport, dns)?;
+    let response = codex_request(&client, reqwest::Method::POST, url, bearer, Some(body))
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("Codex backend request failed"))?;
+    let status = response.status().as_u16();
+    let body = read_bounded(response)
+        .await
+        .map_err(|_| anyhow::anyhow!("Codex backend response unreadable"))?;
+    Ok((status, body))
+}
+
+fn codex_client(
+    transport: &crate::upstream::transport::Transport,
+    dns: crate::upstream::Dns,
+) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .dns_resolver(std::sync::Arc::clone(transport.resolver(dns)))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| anyhow::anyhow!("Codex probe client unavailable"))
+}
+
+/// Build one Codex request without performing I/O. Keeping this separate from
+/// the transport makes the vendor contract testable without a mock server.
+pub(crate) fn codex_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    bearer: &crate::openai::OpenaiOAuth,
+    body: Option<&[u8]>,
+) -> reqwest::RequestBuilder {
+    let mut request = client
+        .request(method, url)
+        .timeout(PROBE_TIMEOUT)
+        .bearer_auth(&bearer.access_token)
+        .header("chatgpt-account-id", &bearer.account_id)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header("originator", "cardinal")
+        .header("version", CODEX_CLIENT_VERSION);
+    if let Some(body) = body {
+        request = request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_owned());
+    }
+    request
 }
 
 /// Fetch a ChatGPT-subscription account's Codex model catalogue

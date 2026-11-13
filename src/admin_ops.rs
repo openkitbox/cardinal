@@ -236,6 +236,61 @@ impl AdminSnapshot {
 #[derive(Debug, thiserror::Error)]
 #[error("no such key {0}")]
 pub struct NoSuchKey(pub i64);
+
+/// A fixed-message error for the OpenAI Codex reset-credit admin actions.
+/// Upstream responses and credential details never cross this boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenaiResetError {
+    #[error("OpenAI account key not found")]
+    KeyNotFound,
+    #[error("key is not an OpenAI Codex account")]
+    NotOpenaiKey,
+    #[error("provider is not an OpenAI Codex provider")]
+    NotOpenaiProvider,
+    #[error("OpenAI reset service is not configured")]
+    ManagerUnavailable,
+    #[error("OpenAI credentials are unavailable")]
+    Credentials(#[source] crate::upstream::OpenaiTokenError),
+    #[error("selected reset credit is unavailable")]
+    CreditUnavailable,
+    #[error("OpenAI reset service request failed")]
+    Upstream,
+    #[error("internal error")]
+    Internal(#[source] anyhow::Error),
+}
+
+/// One reset credit returned to the authenticated admin GUI. The id is kept
+/// only on this short-lived action response; quota snapshots use
+/// [`crate::quota::CodexResetDisplay`] and omit it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct OpenaiResetCredit {
+    pub id: String,
+    pub status: String,
+    pub reset_type: Option<String>,
+    pub granted_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+/// The upstream's authoritative count and the reset credits included in the
+/// details response.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct OpenaiResetDetails {
+    pub available_count: u32,
+    pub credits: Vec<OpenaiResetCredit>,
+}
+
+/// Body-free, fixed-vocabulary result of consuming a reset credit.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OpenaiResetOutcome {
+    Reset { windows_reset: Vec<String> },
+    AlreadyRedeemed,
+    NothingToReset,
+    NoCredit,
+    Unknown,
+}
 /// An outbound probe failed: the vendor rejected the credential, DNS,
 /// timeout, or an undecodable payload. The admin HTTP surface maps this to
 /// 502 Bad Gateway — the request was well-formed; the dependency failed.
@@ -1064,6 +1119,129 @@ impl Admin {
                 Vec::new()
             }
         }
+    }
+
+    /// Fetch reset-credit details for one OpenAI Codex account. The key and
+    /// provider are checked before resolving the shared bearer.
+    pub async fn openai_reset_details(
+        &self,
+        provider_id: i64,
+        key_id: i64,
+    ) -> Result<OpenaiResetDetails, OpenaiResetError> {
+        let (key, provider) = self.openai_reset_key(key_id).await?;
+        if key.provider_id != provider_id {
+            return Err(OpenaiResetError::KeyNotFound);
+        }
+        let Some(tokens) = &self.openai_tokens else {
+            return Err(OpenaiResetError::ManagerUnavailable);
+        };
+        let bearer = tokens.resolve(&self.pool, key.id).await.map_err(|error| {
+            tracing::warn!(
+                key_id,
+                "Codex reset details: OpenAI credentials unavailable"
+            );
+            OpenaiResetError::Credentials(error)
+        })?;
+        let details = quota::fetch_openai_codex_resets(&bearer, &self.transport, provider.dns)
+            .await
+            .map_err(|_error| {
+                tracing::warn!(key_id, "Codex reset details: upstream request failed");
+                OpenaiResetError::Upstream
+            })?;
+        Ok(OpenaiResetDetails {
+            available_count: details.available_count,
+            credits: details
+                .credits
+                .into_iter()
+                .map(|credit| OpenaiResetCredit {
+                    id: credit.id,
+                    status: credit.status,
+                    reset_type: credit.reset_type,
+                    granted_at: credit.granted_at,
+                    expires_at: credit.expires_at,
+                    title: credit.title,
+                    description: credit.description,
+                })
+                .collect(),
+        })
+    }
+
+    /// Consume one reset credit without retrying the irreversible upstream
+    /// operation. The caller owns the idempotency key and may reuse it after an
+    /// uncertain transport result.
+    pub async fn consume_openai_reset(
+        &self,
+        provider_id: i64,
+        key_id: i64,
+        redeem_request_id: String,
+        credit_id: Option<String>,
+    ) -> Result<OpenaiResetOutcome, OpenaiResetError> {
+        let (key, provider) = self.openai_reset_key(key_id).await?;
+        if key.provider_id != provider_id {
+            return Err(OpenaiResetError::KeyNotFound);
+        }
+        let Some(tokens) = &self.openai_tokens else {
+            return Err(OpenaiResetError::ManagerUnavailable);
+        };
+        let bearer = tokens.resolve(&self.pool, key.id).await.map_err(|error| {
+            tracing::warn!(
+                key_id,
+                "Codex reset consume: OpenAI credentials unavailable"
+            );
+            OpenaiResetError::Credentials(error)
+        })?;
+        if credit_id.is_some() {
+            let details = quota::fetch_openai_codex_resets(&bearer, &self.transport, provider.dns)
+                .await
+                .map_err(|_error| {
+                    tracing::warn!(key_id, "Codex reset consume: upstream details failed");
+                    OpenaiResetError::Upstream
+                })?;
+            quota::validate_codex_reset_credit(&details, credit_id.as_deref())
+                .map_err(|_| OpenaiResetError::CreditUnavailable)?;
+        }
+        let request = crate::quota::CodexResetConsumeRequest {
+            redeem_request_id,
+            credit_id,
+        };
+        quota::consume_openai_codex_reset(&bearer, &request, &self.transport, provider.dns)
+            .await
+            .map_err(|_error| {
+                tracing::warn!(key_id, "Codex reset consume: upstream request failed");
+                OpenaiResetError::Upstream
+            })
+            .and_then(map_openai_reset_outcome)
+    }
+
+    async fn openai_reset_key(
+        &self,
+        key_id: i64,
+    ) -> Result<(store::ProviderKeyRow, store::ProviderRow), OpenaiResetError> {
+        let Some(key) = store::list_keys_by_ids(&self.pool, &[key_id])
+            .await
+            .map_err(|_error| {
+                tracing::warn!(key_id, "Codex reset: key lookup failed");
+                OpenaiResetError::Internal(anyhow::anyhow!("OpenAI reset key lookup failed"))
+            })?
+            .into_iter()
+            .next()
+        else {
+            return Err(OpenaiResetError::KeyNotFound);
+        };
+        if key.auth_kind != AuthKind::OpenaiOauth.as_str() {
+            return Err(OpenaiResetError::NotOpenaiKey);
+        }
+        let Some(provider) = store::get_provider(&self.pool, key.provider_id)
+            .await
+            .map_err(|_error| {
+                tracing::warn!(key_id, "Codex reset: provider lookup failed");
+                OpenaiResetError::Internal(anyhow::anyhow!("OpenAI reset provider lookup failed"))
+            })?
+        else {
+            return Err(OpenaiResetError::NotOpenaiProvider);
+        };
+        ensure_openai_provider(&provider).map_err(|_| OpenaiResetError::NotOpenaiProvider)?;
+        Ok((key, provider))
     }
 
     // ---------- writes (same validation semantics as the HTTP admin handlers) ----------
@@ -3135,6 +3313,20 @@ fn ensure_openai_provider(provider: &store::ProviderRow) -> Result<(), OpenaiLog
     })
 }
 
+fn map_openai_reset_outcome(
+    outcome: crate::quota::CodexResetOutcome,
+) -> Result<OpenaiResetOutcome, OpenaiResetError> {
+    match outcome {
+        crate::quota::CodexResetOutcome::Reset { windows_reset } => {
+            Ok(OpenaiResetOutcome::Reset { windows_reset })
+        }
+        crate::quota::CodexResetOutcome::AlreadyRedeemed => Ok(OpenaiResetOutcome::AlreadyRedeemed),
+        crate::quota::CodexResetOutcome::NothingToReset => Ok(OpenaiResetOutcome::NothingToReset),
+        crate::quota::CodexResetOutcome::NoCredit => Ok(OpenaiResetOutcome::NoCredit),
+        crate::quota::CodexResetOutcome::Unknown => Err(OpenaiResetError::Upstream),
+    }
+}
+
 #[cfg(test)]
 mod quota_history_tests {
     use super::HistoryPruneGate;
@@ -3161,5 +3353,78 @@ mod quota_history_tests {
         let gate = HistoryPruneGate::new();
         assert!(gate.claim(i64::MAX), "large clock must still admit pruning");
         assert!(!gate.claim(i64::MAX), "deadline must not wrap to the past");
+    }
+}
+
+#[cfg(test)]
+mod codex_reset_contract_tests {
+    use super::{
+        OpenaiResetCredit, OpenaiResetDetails, OpenaiResetOutcome, map_openai_reset_outcome,
+    };
+    use crate::quota::CodexResetOutcome;
+
+    #[test]
+    fn unknown_consume_outcome_maps_to_bad_gateway_error() {
+        assert!(matches!(
+            map_openai_reset_outcome(CodexResetOutcome::Unknown),
+            Err(super::OpenaiResetError::Upstream)
+        ));
+    }
+
+    #[test]
+    fn reset_details_are_display_safe_but_keep_credit_id_for_admin_action() {
+        let details = OpenaiResetDetails {
+            available_count: 2,
+            credits: vec![OpenaiResetCredit {
+                id: "credit-1".to_owned(),
+                status: "available".to_owned(),
+                reset_type: Some("primary".to_owned()),
+                granted_at: None,
+                expires_at: None,
+                title: Some("Primary".to_owned()),
+                description: None,
+            }],
+        };
+        let json = serde_json::to_value(details).expect("reset details should serialize");
+        assert_eq!(json["available_count"], 2);
+        assert_eq!(json["credits"][0]["id"], "credit-1");
+        assert!(!json.to_string().contains("access_token"));
+    }
+
+    #[test]
+    fn outcome_wire_shape_is_stable() {
+        let json = serde_json::to_value(OpenaiResetOutcome::Reset {
+            windows_reset: vec!["primary".to_owned()],
+        })
+        .expect("outcome should serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({"outcome":"reset","windows_reset":["primary"]})
+        );
+    }
+
+    #[test]
+    fn every_consume_outcome_is_explicit_on_the_admin_wire() {
+        let outcomes = [
+            (
+                CodexResetOutcome::AlreadyRedeemed,
+                serde_json::json!({"outcome":"already_redeemed"}),
+            ),
+            (
+                CodexResetOutcome::NothingToReset,
+                serde_json::json!({"outcome":"nothing_to_reset"}),
+            ),
+            (
+                CodexResetOutcome::NoCredit,
+                serde_json::json!({"outcome":"no_credit"}),
+            ),
+        ];
+        for (source, expected) in outcomes {
+            let mapped = map_openai_reset_outcome(source).expect("known outcome should map");
+            assert_eq!(
+                serde_json::to_value(mapped).expect("outcome should serialize"),
+                expected
+            );
+        }
     }
 }

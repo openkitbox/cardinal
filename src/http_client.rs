@@ -364,6 +364,37 @@ pub struct OpenaiLoginStatus {
     pub message: Option<String>,
 }
 
+/// One short-lived Codex reset credit. The id is returned only by the
+/// authenticated reset-details action, never by bootstrap quota snapshots.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpenaiResetCredit {
+    pub id: String,
+    pub status: String,
+    pub reset_type: Option<String>,
+    pub granted_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Codex reset-credit details for one account.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpenaiResetDetails {
+    pub available_count: u32,
+    pub credits: Vec<OpenaiResetCredit>,
+}
+
+/// Body-free result of a Codex reset-credit consume action.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OpenaiResetOutcome {
+    Reset { windows_reset: Vec<String> },
+    AlreadyRedeemed,
+    NothingToReset,
+    NoCredit,
+    Unknown,
+}
+
 /// The body of `POST /api/providers/{id}/cursor-login`: the same shape as
 /// [`OpencodeLoginRequest`] (`key_id` re-authenticates an existing
 /// `cursor_oauth` account instead of creating one).
@@ -1163,6 +1194,40 @@ impl GatewayHttpClient {
     /// cancellable: the server answers 404 and this returns an error.
     pub async fn cancel_openai_login(&self, session: &str) -> Result<(), ClientError> {
         ok(self.delete(&format!("/api/openai-logins/{session}"))).await
+    }
+
+    /// Fetch fresh reset-credit details for an OpenAI Codex account.
+    pub async fn openai_reset_details(
+        &self,
+        provider_id: i64,
+        key_id: i64,
+    ) -> Result<OpenaiResetDetails, ClientError> {
+        json(self.get(&format!(
+            "/api/providers/{provider_id}/keys/{key_id}/openai-resets"
+        )))
+        .await
+    }
+
+    /// Consume one reset credit. The caller supplies the idempotency key and
+    /// must reuse it if the result is uncertain.
+    pub async fn consume_openai_reset(
+        &self,
+        provider_id: i64,
+        key_id: i64,
+        redeem_request_id: &str,
+        credit_id: Option<&str>,
+    ) -> Result<OpenaiResetOutcome, ClientError> {
+        let body = serde_json::json!({
+            "redeem_request_id": redeem_request_id,
+            "credit_id": credit_id,
+        });
+        json(
+            self.post(&format!(
+                "/api/providers/{provider_id}/keys/{key_id}/openai-resets/consume"
+            ))
+            .json(&body),
+        )
+        .await
     }
 
     // ---------- Cursor account login ----------

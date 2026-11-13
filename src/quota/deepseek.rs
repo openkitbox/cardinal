@@ -37,5 +37,6 @@ pub(super) fn parse_deepseek_balance(body: &str) -> Option<KeyQuota> {
         }),
         plan: None,
         details: Vec::new(),
+        codex_resets: None,
     })
 }

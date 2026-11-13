@@ -31,6 +31,7 @@ pub(super) fn parse_kimi_balance(body: &str) -> Option<KeyQuota> {
         }),
         plan: None,
         details: Vec::new(),
+        codex_resets: None,
     })
 }
 
@@ -203,6 +204,7 @@ pub(super) fn parse_kimi_code_usages(body: &str) -> Option<KeyQuota> {
             balance: None,
             plan: None,
             details: Vec::new(),
+            codex_resets: None,
         })
     }
 }
