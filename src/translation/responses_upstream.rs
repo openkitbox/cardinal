@@ -31,9 +31,6 @@ use std::mem;
 /// Responses rejects a `max_output_tokens` below this floor.
 const MIN_OUTPUT_TOKENS: u64 = 16;
 
-/// Prefix of a derived `prompt_cache_key`; marks keys this gateway invented.
-const CACHE_KEY_PREFIX: &str = "cardinal_cc_";
-
 /// Build a Responses request from the IR. `stream` and `store` are left to the
 /// relay and the kernel's `prepare`. The product must pass
 /// `crate::protocol::openai_responses::validate_request`.
@@ -48,7 +45,7 @@ pub fn from_ir(request: &IrRequest, model: &str) -> Parsed<Value> {
     }
     body.insert(
         "input".to_owned(),
-        Value::Array(build_input(request, &mut dropped)),
+        Value::Array(build_input(request, &mut dropped)?),
     );
 
     if !request.tools.is_empty() {
@@ -103,6 +100,8 @@ pub fn from_ir(request: &IrRequest, model: &str) -> Parsed<Value> {
     };
     if let Some(key) = cache_key {
         body.insert("prompt_cache_key".to_owned(), Value::String(key));
+    } else {
+        note(&mut dropped, "prompt_cache_key");
     }
 
     let value = Value::Object(body);
@@ -131,22 +130,52 @@ struct InputBuilder {
     /// emitted call id -> tool name, for the label on returned images.
     call_names: HashMap<String, String>,
     synthesized: u64,
+    paired: std::collections::HashSet<String>,
 }
 
-fn build_input(request: &IrRequest, dropped: &mut Vec<&'static str>) -> Vec<Value> {
+fn build_input(
+    request: &IrRequest,
+    dropped: &mut Vec<&'static str>,
+) -> Result<Vec<Value>, ProtocolError> {
     let mut input = InputBuilder::default();
     for message in &request.messages {
         match message.role {
-            IrRole::Assistant => input.assistant(&message.parts, dropped),
-            IrRole::User => input.user(&message.parts, dropped),
+            IrRole::Assistant => input.assistant(&message.parts, dropped)?,
+            IrRole::User => input.user(&message.parts, dropped)?,
+            IrRole::System | IrRole::Developer => input.instruction(message.role, &message.parts),
         }
     }
     input.flush_pending_images();
-    input.items
+    Ok(input.items)
 }
 
 impl InputBuilder {
-    fn assistant(&mut self, parts: &[IrPart], dropped: &mut Vec<&'static str>) {
+    fn instruction(&mut self, role: IrRole, parts: &[IrPart]) {
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                IrPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        if text.is_empty() {
+            return;
+        }
+        self.flush_pending_images();
+        let role = match role {
+            IrRole::System => "system",
+            IrRole::Developer => "developer",
+            IrRole::User | IrRole::Assistant => return,
+        };
+        let mut content = vec![typed_text("input_text", &text)];
+        self.flush_message(role, &mut content);
+    }
+
+    fn assistant(
+        &mut self,
+        parts: &[IrPart],
+        dropped: &mut Vec<&'static str>,
+    ) -> Result<(), ProtocolError> {
         self.flush_pending_images();
         let mut content: Vec<Value> = Vec::new();
         for part in parts {
@@ -161,7 +190,13 @@ impl InputBuilder {
                     self.flush_message("assistant", &mut content);
                     let arguments = args.to_string();
                     let (ir_id, wire_id) = match id {
+                        Some(id) if self.call_ids.contains_key(id) => {
+                            return Err(ProtocolError::ToolPairingUnrepresentable);
+                        }
                         Some(id) => (id.clone(), id.clone()),
+                        None if self.call_ids.contains_key("") => {
+                            return Err(ProtocolError::ToolPairingUnrepresentable);
+                        }
                         None => {
                             self.synthesized += 1;
                             (
@@ -187,9 +222,14 @@ impl InputBuilder {
             }
         }
         self.flush_message("assistant", &mut content);
+        Ok(())
     }
 
-    fn user(&mut self, parts: &[IrPart], dropped: &mut Vec<&'static str>) {
+    fn user(
+        &mut self,
+        parts: &[IrPart],
+        dropped: &mut Vec<&'static str>,
+    ) -> Result<(), ProtocolError> {
         let mut content: Vec<Value> = Vec::new();
         for part in parts {
             match part {
@@ -210,9 +250,11 @@ impl InputBuilder {
                     is_error,
                 } => {
                     let Some(wire_id) = self.call_ids.get(call_id) else {
-                        note(dropped, "tool_result.unpaired");
-                        continue;
+                        return Err(ProtocolError::ToolPairingUnrepresentable);
                     };
+                    if !self.paired.insert(call_id.clone()) {
+                        return Err(ProtocolError::ToolPairingUnrepresentable);
+                    }
                     // Images from the previous result open the user's own
                     // message rather than a second consecutive one.
                     content.append(&mut self.pending_images);
@@ -261,6 +303,7 @@ impl InputBuilder {
             full.append(&mut content);
             self.flush_message("user", &mut full);
         }
+        Ok(())
     }
 
     fn flush_pending_images(&mut self) {
@@ -348,10 +391,14 @@ fn is_reasoning_model(model: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
-/// A stable cache-routing key for clients that sent none: the same model,
-/// effort, tool set, system prompt and opening user turn always land on the
-/// same key, so the upstream can reuse the prompt prefix. `None` when there is
-/// neither a system prompt nor user text to anchor on.
+/// A stable cache-routing key for clients that sent none.
+///
+/// The translation boundary has no upstream account identity: `from_ir` receives
+/// only the target model. The generated key is therefore deliberately scoped to
+/// Cardinal's target model, not presented as a globally unique account key. The
+/// upstream account remains the security/cache boundary, so two accounts may
+/// derive the same value without sharing cached prompt data. An explicit client
+/// key is preserved separately above and is the client's responsibility.
 fn derive_prompt_cache_key(request: &IrRequest, model: &str) -> Option<String> {
     let first_user: String = request
         .messages
@@ -386,11 +433,30 @@ fn derive_prompt_cache_key(request: &IrRequest, model: &str) -> Option<String> {
     }
     frame(&mut hasher, system);
     frame(&mut hasher, &first_user);
+    // The source position is part of the digest because the folded text alone
+    // is not authoritative when an instruction moves relative to other items.
+    // The same target-scoped key may occur on two accounts, but account-local
+    // upstream cache state prevents cross-account cache reads.
+    for (position, message) in request.messages.iter().enumerate() {
+        let role = match message.role {
+            IrRole::System => Some("system"),
+            IrRole::Developer => Some("developer"),
+            IrRole::User | IrRole::Assistant => None,
+        };
+        if let Some(role) = role {
+            frame(&mut hasher, role);
+            frame(&mut hasher, &position.to_string());
+            for part in &message.parts {
+                if let IrPart::Text(text) = part {
+                    frame(&mut hasher, text);
+                }
+            }
+        }
+    }
     let digest = hasher.finalize();
-    Some(format!("{CACHE_KEY_PREFIX}{}", hex::encode(&digest[..16])))
+    Some(format!("cardinal_cc_{}", hex::encode(&digest[..16])))
 }
 
-/// Length-framed so adjacent fields can never run together.
 fn frame(hasher: &mut Sha256, text: &str) {
     hasher.update((text.len() as u64).to_le_bytes());
     hasher.update(text.as_bytes());
@@ -415,24 +481,37 @@ pub fn response_to_ir(
         return Err(ProtocolError::UpstreamError);
     }
 
+    let completed = status == Some("completed");
+    let output = body.get("output").and_then(Value::as_array);
+    if completed && output.is_none() {
+        return Err(ProtocolError::UpstreamError);
+    }
     let mut parts: Vec<IrPart> = Vec::new();
     let mut has_call = false;
-    for item in body
-        .get("output")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for item in output.into_iter().flatten() {
         match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => {
-                let summary: Vec<&str> = item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|entry| entry.get("text").and_then(Value::as_str))
-                    .filter(|text| !text.is_empty())
-                    .collect();
+                if completed && item.get("status").and_then(Value::as_str) == Some("incomplete") {
+                    return Err(ProtocolError::UpstreamError);
+                }
+                let Some(summary_items) = item.get("summary").and_then(Value::as_array) else {
+                    if completed {
+                        return Err(ProtocolError::UpstreamError);
+                    }
+                    continue;
+                };
+                let mut summary = Vec::new();
+                for entry in summary_items {
+                    let Some(text) = entry.get("text").and_then(Value::as_str) else {
+                        if completed {
+                            return Err(ProtocolError::UpstreamError);
+                        }
+                        continue;
+                    };
+                    if !text.is_empty() {
+                        summary.push(text);
+                    }
+                }
                 if !summary.is_empty() {
                     parts.push(IrPart::Thinking {
                         text: summary.join(SYSTEM_JOIN),
@@ -440,17 +519,22 @@ pub fn response_to_ir(
                 }
             }
             Some("message") => {
-                for entry in item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
+                let Some(content) = item.get("content").and_then(Value::as_array) else {
+                    if completed {
+                        return Err(ProtocolError::UpstreamError);
+                    }
+                    continue;
+                };
+                for entry in content {
                     let text = match entry.get("type").and_then(Value::as_str) {
                         Some("output_text") => entry.get("text").and_then(Value::as_str),
                         Some("refusal") => entry.get("refusal").and_then(Value::as_str),
-                        _ => None,
+                        _ if completed => return Err(ProtocolError::UpstreamError),
+                        _ => continue,
                     };
+                    if completed && text.is_none() {
+                        return Err(ProtocolError::UpstreamError);
+                    }
                     if let Some(text) = text.filter(|text| !text.is_empty()) {
                         parts.push(IrPart::Text(text.to_owned()));
                     }
@@ -483,25 +567,28 @@ pub fn response_to_ir(
                     args,
                 });
             }
+            _ if completed => return Err(ProtocolError::UpstreamError),
             _ => {}
         }
     }
 
-    let stop = if status == Some("completed") {
-        if has_call {
-            IrStop::ToolUse
-        } else {
-            IrStop::Stop
+    let stop = match status {
+        Some("completed") => {
+            if has_call {
+                IrStop::ToolUse
+            } else {
+                IrStop::Stop
+            }
         }
-    } else {
-        match body
+        Some("incomplete") => match body
             .pointer("/incomplete_details/reason")
             .and_then(Value::as_str)
         {
             Some("max_output_tokens") => IrStop::Length,
             Some(reason) => IrStop::Other(reason.to_owned()),
             None => IrStop::Other("incomplete".to_owned()),
-        }
+        },
+        _ => IrStop::Other("incomplete".to_owned()),
     };
     Ok(IrResponse {
         model: body
@@ -527,6 +614,10 @@ fn usage_counts(usage: &Value) -> Option<UsageCounts> {
         reasoning_output_tokens: usage
             .pointer("/output_tokens_details/reasoning_tokens")
             .and_then(Value::as_u64),
+        reasoning_tokens_included: usage
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+            .map(|_| true),
         ..Default::default()
     })
 }
@@ -659,7 +750,7 @@ mod tests {
                 {"type": "input_text", "text": "[attachment application/pdf]"},
             ])
         );
-        assert_eq!(dropped, vec!["file"]);
+        assert_eq!(dropped, vec!["file", "prompt_cache_key"]);
     }
 
     #[test]
@@ -703,7 +794,7 @@ mod tests {
         ]));
         let (body, dropped) = build(&ir, "gpt-4o");
         assert!(!body.to_string().contains("pondering"), "{body}");
-        assert_eq!(dropped, vec!["thinking"]);
+        assert_eq!(dropped, vec!["thinking", "prompt_cache_key"]);
     }
 
     #[test]
@@ -729,11 +820,11 @@ mod tests {
         assert!(id.starts_with("call_"), "{id}");
         assert_eq!(output["call_id"], id);
         assert_eq!(output["output"], "found");
-        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(dropped, vec!["prompt_cache_key"], "{dropped:?}");
     }
 
     #[test]
-    fn unpaired_result_is_dropped_and_error_flag_recorded() {
+    fn unpaired_result_is_rejected_without_payload() {
         let mut ir = request();
         ir.messages.push(assistant(vec![IrPart::ToolCall {
             id: Some("c1".to_owned()),
@@ -754,12 +845,10 @@ mod tests {
                 is_error: false,
             },
         ]));
-        let (body, dropped) = build(&ir, "gpt-4o");
-        let items = body["input"].as_array().expect("input");
-        assert_eq!(items.len(), 2, "{body}");
-        assert_eq!(items[1]["output"], "boom");
-        assert!(dropped.contains(&"tool_result.is_error"), "{dropped:?}");
-        assert!(dropped.contains(&"tool_result.unpaired"), "{dropped:?}");
+        assert_eq!(
+            from_ir(&ir, "gpt-4o"),
+            Err(ProtocolError::ToolPairingUnrepresentable)
+        );
     }
 
     #[test]
@@ -933,8 +1022,16 @@ mod tests {
         ir.messages.push(user(vec![text("hello")]));
         ir.tools.push(tool("search"));
 
-        let (first, _) = build(&ir, "gpt-4o");
-        let (second, _) = build(&ir, "gpt-4o");
+        let (first, dropped) = build(&ir, "gpt-4o");
+        assert!(
+            dropped.is_empty(),
+            "derived cache key is not a loss: {dropped:?}"
+        );
+        let (second, second_dropped) = build(&ir, "gpt-4o");
+        assert!(
+            second_dropped.is_empty(),
+            "derived cache key is not a loss: {second_dropped:?}"
+        );
         let key = first["prompt_cache_key"].as_str().expect("derived key");
         assert_eq!(second["prompt_cache_key"], key, "same input, same key");
         assert!(key.starts_with("cardinal_cc_"), "{key}");

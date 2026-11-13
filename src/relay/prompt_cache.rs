@@ -99,6 +99,10 @@ impl Prefix {
     /// emitter cannot forward; the estimate only sets the cached share.
     #[must_use]
     pub fn of(scope: Scope<'_>, request: &IrRequest) -> Self {
+        let folds_mid_instructions = request
+            .messages
+            .iter()
+            .any(|message| matches!(message.role, IrRole::System | IrRole::Developer));
         let mut hasher = Sha256::new();
         feed_str(&mut hasher, "cardinal-kiro-prompt-cache-v1");
         hasher.update(scope.account_key_id.to_le_bytes());
@@ -106,11 +110,24 @@ impl Prefix {
         feed_str(&mut hasher, scope.model);
 
         let mut boundaries = Vec::with_capacity(request.messages.len() + 1);
-        let mut tokens = feed_head(&mut hasher, request);
+        let mut tokens = if folds_mid_instructions {
+            let folded = request.folded_system();
+            feed_head_with_system(&mut hasher, request, folded.as_deref())
+        } else {
+            feed_head(&mut hasher, request)
+        };
         if tokens > 0 {
             boundaries.push(boundary(&hasher, tokens));
         }
-        for message in &request.messages {
+        for (position, message) in request.messages.iter().enumerate() {
+            if folds_mid_instructions && matches!(message.role, IrRole::System | IrRole::Developer)
+            {
+                continue;
+            }
+            if folds_mid_instructions {
+                hasher.update([0x26]);
+                hasher.update((position as u64).to_le_bytes());
+            }
             tokens = tokens.saturating_add(feed_message(&mut hasher, message));
             boundaries.push(boundary(&hasher, tokens));
         }
@@ -260,11 +277,36 @@ fn boundary(hasher: &Sha256, tokens: u64) -> Boundary {
 
 /// The head block: system prompt and tool declarations.
 fn feed_head(hasher: &mut Sha256, request: &IrRequest) -> u64 {
+    feed_head_with_system(hasher, request, request.system.as_deref())
+}
+
+fn feed_head_with_system(hasher: &mut Sha256, request: &IrRequest, system: Option<&str>) -> u64 {
     hasher.update([0x10]);
     let mut tokens = 0u64;
-    if let Some(system) = request.system.as_deref() {
+    if let Some(system) = system {
         feed_str(hasher, system);
         tokens = tokens.saturating_add(text_tokens(system));
+    }
+    if request
+        .messages
+        .iter()
+        .any(|message| matches!(message.role, IrRole::System | IrRole::Developer))
+    {
+        // These instructions are folded into the head on the wire. Keep their
+        // source role and position in the authoritative digest as well, or two
+        // distinct instruction layouts with the same folded text would collide.
+        for (position, message) in request.messages.iter().enumerate() {
+            let role = match message.role {
+                IrRole::System => Some("system"),
+                IrRole::Developer => Some("developer"),
+                IrRole::User | IrRole::Assistant => None,
+            };
+            if let Some(role) = role {
+                hasher.update([0x12]);
+                hasher.update((position as u64).to_le_bytes());
+                feed_str(hasher, role);
+            }
+        }
     }
     for tool in &request.tools {
         hasher.update([0x11]);
@@ -283,6 +325,8 @@ fn feed_message(hasher: &mut Sha256, message: &IrMessage) -> u64 {
     hasher.update([match message.role {
         IrRole::User => 0x20,
         IrRole::Assistant => 0x21,
+        IrRole::System => 0x22,
+        IrRole::Developer => 0x23,
     }]);
     message.parts.iter().fold(0u64, |tokens, part| {
         tokens.saturating_add(feed_part(hasher, part))

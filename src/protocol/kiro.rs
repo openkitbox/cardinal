@@ -517,6 +517,11 @@ impl StreamDecoder {
         })
     }
 
+    pub fn usage_if_changed(&self, previous: Option<&UsageCounts>) -> Option<UsageCounts> {
+        let usage = self.usage();
+        (usage.as_ref() != previous).then_some(usage).flatten()
+    }
+
     pub fn terminal_seen(&self) -> bool {
         self.metadata_seen || self.content_length_exceeded
     }

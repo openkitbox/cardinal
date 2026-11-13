@@ -31,8 +31,13 @@ fn sse(event: &Value) -> RawFrame {
 /// translated pump does, returning the Chat chunks (parsed) the client sees.
 fn chat_chunks(events: &[Value]) -> (Vec<Value>, Terminal) {
     let mut decoder = Decoder::new(ProtocolId::OpenAiResponses, None);
-    let mut translator =
-        StreamTranslator::new(ProtocolId::OpenAiChat, "gpt-5.4", "req-1").expect("chat client");
+    let mut translator = StreamTranslator::new(
+        ProtocolId::OpenAiChat,
+        ProtocolId::OpenAiResponses,
+        "gpt-5.4",
+        "req-1",
+    )
+    .expect("chat client");
     let mut out = Vec::new();
     for event in events {
         let upstream = decoder.observe_raw(&sse(event)).expect("frame decodes");
@@ -81,7 +86,7 @@ fn chat_request_reaches_the_upstream_as_a_responses_body() {
         body["prompt_cache_key"]
             .as_str()
             .is_some_and(|key| key.starts_with("cardinal_cc_")),
-        "a derived cache key is sent when the client sent none: {body}"
+        "a target-scoped derived cache key is sent when the client sent none: {body}"
     );
 
     let tool = &body["tools"][0];
@@ -144,6 +149,11 @@ fn tool_call_stream_finishes_as_tool_calls() {
         json!({"type": "response.function_call_arguments.delta", "output_index": 1, "delta": "{\"city\":"}),
         json!({"type": "response.function_call_arguments.delta", "output_index": 1, "delta": "\"Paris\"}"}),
         json!({"type": "response.completed", "response": {"status": "completed",
+               "output": [
+                   {"type": "reasoning", "id": "rs_1", "summary": []},
+                   {"type": "function_call", "call_id": "call_9", "name": "weather",
+                    "arguments": "{\"city\":\"Paris\"}"}
+               ],
                "usage": {"input_tokens": 3, "output_tokens": 2}}}),
     ]);
 

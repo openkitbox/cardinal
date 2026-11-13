@@ -33,6 +33,7 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
 
     let mut system: Vec<String> = Vec::new();
     let mut messages: Vec<IrMessage> = Vec::new();
+    let mut saw_ordinary = false;
     // Stand-ins for absent fields, borrowed instead of cloning the present ones.
     let empty_object = Value::Object(Map::new());
     let empty_content = Value::String(String::new());
@@ -49,16 +50,29 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
         match role {
             "system" | "developer" => {
                 if let Some(text) = content.and_then(string_or_text) {
-                    system.push(text);
+                    if saw_ordinary {
+                        messages.push(IrMessage {
+                            role: if role == "system" {
+                                IrRole::System
+                            } else {
+                                IrRole::Developer
+                            },
+                            parts: vec![IrPart::Text(text)],
+                        });
+                    } else {
+                        system.push(text);
+                    }
                 }
             }
             "user" => {
+                saw_ordinary = true;
                 messages.push(IrMessage {
                     role: IrRole::User,
                     parts: content.map_or_else(Vec::new, chat_parts),
                 });
             }
             "assistant" => {
+                saw_ordinary = true;
                 let mut parts: Vec<IrPart> = Vec::new();
                 // DeepSeek-style `reasoning_content` or OpenRouter-style `reasoning`.
                 if let Some(reasoning) = message
@@ -103,6 +117,7 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
                 });
             }
             "tool" => {
+                saw_ordinary = true;
                 let call_id = message
                     .get("tool_call_id")
                     .and_then(Value::as_str)
@@ -174,10 +189,13 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
         _ => None,
     };
 
-    let effort = object
-        .get("reasoning_effort")
+    let raw_effort = object.get("reasoning_effort");
+    let effort = raw_effort
         .and_then(Value::as_str)
         .and_then(Effort::parse_name);
+    if raw_effort.is_some() && effort.is_none() {
+        dropped.push("reasoning_effort");
+    }
     // The upstream cache-routing hint rides the IR; Kiro derives its
     // conversation id from it. A present-but-unusable value is a recorded loss,
     // never a claimed hint.
@@ -261,6 +279,7 @@ pub fn from_ir(
     let mut synthesized = 0u64;
     for message in &request.messages {
         match message.role {
+            IrRole::System | IrRole::Developer => {}
             IrRole::Assistant => {
                 if !pending_images.is_empty() {
                     let mut image_parts = vec![
@@ -421,7 +440,7 @@ pub fn from_ir(
     let mut body = Map::new();
     body.insert("model".to_owned(), Value::String(model.to_owned()));
     body.insert("messages".to_owned(), Value::Array(messages));
-    if let Some(system) = &request.system {
+    if let Some(system) = request.folded_system() {
         let mut system_entry = Map::new();
         system_entry.insert("role".to_owned(), Value::String("system".to_owned()));
         system_entry.insert("content".to_owned(), Value::String(system.clone()));
@@ -621,21 +640,21 @@ pub fn emit_response_json(response: &super::ir::IrResponse) -> Result<Vec<u8>, P
         message.insert("reasoning_content".to_owned(), Value::String(reasoning));
     }
     let finish_reason = match &response.stop {
-        IrStop::Length => "length",
-        IrStop::ToolUse => "tool_calls",
-        // A content filter must not read as a natural stop; other dialect-specific
-        // reasons keep collapsing to it (there is no richer wire value).
-        IrStop::Stop => "stop",
-        IrStop::Other(reason) if reason == "content_filter" => "content_filter",
-        IrStop::Other(_) => "stop",
+        IrStop::Length => Value::String("length".to_owned()),
+        IrStop::ToolUse => Value::String("tool_calls".to_owned()),
+        // A content filter has a wire spelling. Other dialect-specific reasons
+        // have no Chat spelling, so a null finish is the honest incomplete form;
+        // it must not masquerade as a token limit.
+        IrStop::Stop => Value::String("stop".to_owned()),
+        IrStop::Other(reason) if reason == "content_filter" => {
+            Value::String("content_filter".to_owned())
+        }
+        IrStop::Other(_) => Value::Null,
     };
     let mut choice = Map::new();
     choice.insert("index".to_owned(), Value::from(0));
     choice.insert("message".to_owned(), Value::Object(message));
-    choice.insert(
-        "finish_reason".to_owned(),
-        Value::String(finish_reason.to_owned()),
-    );
+    choice.insert("finish_reason".to_owned(), finish_reason);
     let mut body = serde_json::json!({
       "id": format!("chatcmpl-{:032x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().unsigned_abs()),
       "object": "chat.completion",
@@ -651,13 +670,22 @@ pub fn emit_response_json(response: &super::ir::IrResponse) -> Result<Vec<u8>, P
 
 /// Chat usage wire shape from `UsageCounts`.
 pub(crate) fn usage_to_chat(usage: &crate::protocol::usage::UsageCounts) -> Value {
-    serde_json::json!({
+    let mut result = serde_json::json!({
       "prompt_tokens": usage.input_tokens,
       "completion_tokens": usage.output_tokens,
       "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens),
-      "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens.unwrap_or(0)},
-      "completion_tokens_details": {"reasoning_tokens": usage.reasoning_output_tokens.unwrap_or(0)},
-    })
+    });
+    if let Some(cached) = usage.cached_input_tokens {
+        result["prompt_tokens_details"] = serde_json::json!({"cached_tokens": cached});
+    }
+    if let Some(reasoning) = usage.reasoning_output_tokens {
+        let mut details = serde_json::json!({"reasoning_tokens": reasoning});
+        if usage.reasoning_tokens_included == Some(true) {
+            details["reasoning_tokens_included"] = Value::Bool(true);
+        }
+        result["completion_tokens_details"] = details;
+    }
+    result
 }
 
 /// Chat `finish_reason` back into the IR stop concept.
@@ -681,20 +709,20 @@ pub(crate) fn usage_from_chat(
     let reasoning = usage
         .pointer("/completion_tokens_details/reasoning_tokens")
         .and_then(Value::as_u64);
+    let reasoning_included = usage
+        .pointer("/completion_tokens_details/reasoning_tokens_included")
+        .and_then(Value::as_bool);
+    let input_tokens = usage.get("prompt_tokens").and_then(Value::as_u64)?;
+    let output_tokens = usage.get("completion_tokens").and_then(Value::as_u64)?;
     Some(crate::protocol::usage::UsageCounts {
-        input_tokens: usage
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: usage
-            .get("completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
+        output_tokens,
         calls: 0,
         cached_input_tokens: cached,
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_output_tokens: reasoning,
+        reasoning_tokens_included: reasoning_included,
         thought_output_tokens: None,
         tool_prompt_tokens: None,
         tool_use_tokens: None,
@@ -768,7 +796,6 @@ fn image_url_of(image: &Value) -> Option<&str> {
         .or_else(|| image.get("url").and_then(Value::as_str))
 }
 
-/// A `{"type": "text"}` content part that takes ownership of its text.
 fn text_part(text: String) -> Value {
     let mut part = Map::new();
     part.insert("type".to_owned(), Value::String("text".to_owned()));
@@ -825,8 +852,6 @@ fn string_or_text(value: &Value) -> Option<String> {
     Some(out)
 }
 
-/// Tool arguments: an object when parseable, otherwise wrapped so nothing is
-/// lost.
 pub(super) fn parse_args(arguments: Option<&Value>) -> Value {
     let Some(raw) = arguments.and_then(Value::as_str) else {
         return serde_json::json!({});

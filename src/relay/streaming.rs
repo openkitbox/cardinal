@@ -274,6 +274,44 @@ fn explicit_non_success_terminal(verdict: protocol::Terminal) -> bool {
     )
 }
 
+/// Hold the first Responses tool event and every event after it until the
+/// terminal verdict is known. A tool delta is executable only as part of the
+/// validated completed snapshot; releasing only the tool deltas would reorder
+/// them behind later text or reasoning.
+fn stage_responses_chat_events(
+    events: Vec<protocol::StreamEvent>,
+    pending: &mut Vec<protocol::StreamEvent>,
+    terminal: protocol::Terminal,
+) -> Vec<protocol::StreamEvent> {
+    let mut safe = Vec::with_capacity(events.len());
+    for event in events {
+        if !pending.is_empty() {
+            match event {
+                protocol::StreamEvent::Finish { reason } => {
+                    if terminal == protocol::Terminal::Completed {
+                        safe.append(pending);
+                    } else {
+                        // A tool delta is executable only after a completed
+                        // Responses snapshot validates it. Non-tool events are
+                        // safe evidence and may share this terminal frame.
+                        safe.extend(pending.drain(..).filter(|event| {
+                            !matches!(event, protocol::StreamEvent::ToolCallDelta { .. })
+                        }));
+                    }
+                    safe.push(protocol::StreamEvent::Finish { reason });
+                }
+                event => pending.push(event),
+            }
+        } else {
+            match event {
+                event @ protocol::StreamEvent::ToolCallDelta { .. } => pending.push(event),
+                event => safe.push(event),
+            }
+        }
+    }
+    safe
+}
+
 /// One read step of the pump loop.
 enum PumpRead {
     Frame(WireFrame),
@@ -723,7 +761,7 @@ async fn drive_stream(
                             ttft_ms = Some(started.elapsed().as_millis() as i64);
                         }
                         // Passthrough observation: raw observation yields no events; usage comes from the decoder.
-                        if let Some(counts) = decoder.usage() {
+                        if let Some(counts) = decoder.usage_if_changed(usage.as_ref()) {
                             usage = Some(counts);
                         }
                         if decoder.upstream_error_event() {
@@ -872,11 +910,18 @@ async fn drive_stream(
             mut cache_read,
         } => {
             let mut cache_hit = None;
+            // Responses tool deltas are provisional until the completed snapshot
+            // validates them. Chat consumers may execute valid JSON even on a
+            // length finish, so never expose partial calls before that verdict.
+            // Decoder events are provisional: argument deltas may arrive before the
+            // completed snapshot has authenticated identity and the final argument
+            // string. Keep this small pump-side staging buffer so no tool call can
+            // reach Chat before the decoder's terminal validation succeeds.
+            let mut pending_responses_tools = Vec::new();
             let mut upstream = protocol::Decoder::new(upstream_protocol, context_window);
             upstream.set_payload_log(payload_log);
-            // A protocol that reports its usage after the terminal event (KAS)
-            // makes the client close wait for the tail; every other upstream
-            // forwards first.
+            // The source decoder emits its terminal usage snapshot. The translator
+            // owns the client-facing usage shape; absent evidence stays absent.
             let tail_before_finish = upstream.usage_follows_terminal();
             let mut done = false;
             while !done {
@@ -970,11 +1015,22 @@ async fn drive_stream(
                                         interrupted = Some(
                                             "upstream Responses error event observed".to_owned(),
                                         );
-                                        let Ok(frames) =
-                                            translator.close_after_eof(protocol::Terminal::Failed)
-                                        else {
-                                            break;
-                                        };
+                                        let frames =
+                                            if translator.client() == ProtocolId::OpenAiChat {
+                                                protocol::openai_chat::stream_error_frames(
+                                                    None,
+                                                    None,
+                                                    "Upstream response failed",
+                                                    0,
+                                                )
+                                            } else {
+                                                let Ok(frames) = translator
+                                                    .close_after_eof(protocol::Terminal::Failed)
+                                                else {
+                                                    break;
+                                                };
+                                                frames
+                                            };
                                         for frame in frames {
                                             if deliver(
                                                 tx,
@@ -1002,10 +1058,7 @@ async fn drive_stream(
                                             signal_hold(&mut commit_tx, HoldSignal::Aborted);
                                             return (None, ttft_ms, captured, None);
                                         }
-                                        interrupted = Some(
-                                            "upstream Responses stream contained invalid JSON"
-                                                .to_owned(),
-                                        );
+                                        interrupted = Some("invalid upstream response".to_owned());
                                         let Ok(frames) = translator
                                             .close_after_eof(protocol::Terminal::Incomplete)
                                         else {
@@ -1036,8 +1089,13 @@ async fn drive_stream(
                             },
                         };
                         let terminal_verdict = upstream.finish();
+                        let responses_chat = upstream_protocol == ProtocolId::OpenAiResponses
+                            && translator.client() == ProtocolId::OpenAiChat;
+                        let explicit_length = responses_chat && terminal_verdict == Terminal::Incomplete
+                            && events.iter().any(|event| matches!(event, protocol::StreamEvent::Finish { reason } if reason == "length"));
                         let terminal_error = upstream.terminal_seen()
-                            && explicit_non_success_terminal(terminal_verdict);
+                            && explicit_non_success_terminal(terminal_verdict)
+                            && !explicit_length;
                         if terminal_error {
                             if hold.is_some() {
                                 signal_hold(
@@ -1050,8 +1108,23 @@ async fn drive_stream(
                                 "upstream Responses stream ended with an explicit terminal error"
                                     .to_owned(),
                             );
-                            let Ok(frames) = translator.close_after_eof(terminal_verdict) else {
-                                break;
+                            let frames = if responses_chat
+                                && matches!(
+                                    terminal_verdict,
+                                    Terminal::Failed | Terminal::Cancelled
+                                ) {
+                                protocol::openai_chat::stream_error_frames(
+                                    None,
+                                    None,
+                                    "Upstream response failed",
+                                    0,
+                                )
+                            } else {
+                                let Ok(frames) = translator.close_after_eof(terminal_verdict)
+                                else {
+                                    break;
+                                };
+                                frames
                             };
                             for frame in frames {
                                 if deliver(
@@ -1079,6 +1152,7 @@ async fn drive_stream(
                         if terminal_at_eof
                             && hold.is_some()
                             && explicit_non_success_terminal(upstream.finish())
+                            && !explicit_length
                         {
                             signal_hold(
                                 &mut commit_tx,
@@ -1093,7 +1167,7 @@ async fn drive_stream(
                             }
                         }
                         let mut tail_drained = false;
-                        let events = if tail_before_finish && terminal_at_eof {
+                        let mut events = if tail_before_finish && terminal_at_eof {
                             drain_tail(reader, &mut upstream).await;
                             tail_drained = true;
                             translation::stream::usage_before_finish(
@@ -1103,10 +1177,15 @@ async fn drive_stream(
                         } else {
                             events
                         };
-                        for event in &events {
-                            if let protocol::StreamEvent::Usage(counts) = event {
-                                usage = Some(counts.clone());
-                            }
+                        if responses_chat {
+                            events = stage_responses_chat_events(
+                                events,
+                                &mut pending_responses_tools,
+                                terminal_verdict,
+                            );
+                        }
+                        if let Some(counts) = upstream.usage_if_changed(usage.as_ref()) {
+                            usage = Some(counts);
                         }
                         let content = events.iter().any(|event| {
                             matches!(
@@ -1119,12 +1198,73 @@ async fn drive_stream(
                         if ttft_ms.is_none() && content {
                             ttft_ms = Some(started.elapsed().as_millis() as i64);
                         }
-                        // Event → source-protocol client frame.
-                        let Ok(frames) = translator.translate(events) else {
-                            tracing::warn!(
-                                "translated stream: event failed to translate; frame skipped"
-                            );
-                            continue;
+                        // Event → source-protocol client frame. Translation errors are
+                        // wire failures, not ignorable per-frame noise: before the hold
+                        // commits they remain eligible for failover; after commit the
+                        // client receives the protocol's honest incomplete/error close.
+                        let frames = match translator.translate(events) {
+                            Ok(frames) => frames,
+                            Err(error) => {
+                                if !responses_chat {
+                                    // Preserve the historical leniency for translated
+                                    // pairs other than Responses → Chat: an isolated
+                                    // dialect event is skipped, not converted into a
+                                    // new terminal contract.
+                                    tracing::warn!(
+                                        request_id = %request_id,
+                                        error = %error,
+                                        "translated stream: event failed to translate; frame skipped"
+                                    );
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    error = %error,
+                                    "translated stream: Responses → Chat event failed to translate"
+                                );
+                                if hold.is_some() {
+                                    signal_hold(&mut commit_tx, HoldSignal::Aborted);
+                                    return (None, ttft_ms, captured, None);
+                                }
+                                interrupted = Some("translated stream failed".to_owned());
+                                let frames = if translator.client() == ProtocolId::OpenAiChat {
+                                    // Chat's error terminal deliberately has no [DONE].
+                                    protocol::openai_chat::stream_error_frames(
+                                        None,
+                                        None,
+                                        "Upstream response failed",
+                                        0,
+                                    )
+                                } else {
+                                    match translator.close_after_eof(Terminal::Incomplete) {
+                                        Ok(frames) => frames,
+                                        Err(close_error) => {
+                                            tracing::warn!(
+                                                request_id = %request_id,
+                                                error = %close_error,
+                                                "translated stream: failed to synthesize incomplete terminal"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                };
+                                for frame in frames {
+                                    if deliver(
+                                        tx,
+                                        &frame,
+                                        &mut wire,
+                                        &mut activity,
+                                        &mut client_gone,
+                                        on_client_gone,
+                                    )
+                                    .await
+                                    .is_break()
+                                    {
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
                         };
                         // Body capture records the CLIENT-facing (translated) frames.
                         if let Some(captured) = &mut captured {

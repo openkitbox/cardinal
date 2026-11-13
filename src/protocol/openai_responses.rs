@@ -224,6 +224,11 @@ fn usage_counts(usage: &Value) -> Option<UsageCounts> {
             .get("output_tokens_details")
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(Value::as_u64),
+        reasoning_tokens_included: usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .map(|_| true),
         ..Default::default()
     })
 }
@@ -245,15 +250,23 @@ pub struct StreamDecoder {
     /// Reasoning snapshots are keyed by their Responses output position so a
     /// completion snapshot can be reconciled with deltas from the same item.
     reasoning_slots: Vec<ReasoningSlot>,
+    refusal_slots: Vec<(u64, u64, String)>,
+    argument_bytes: usize,
     payload_log: bool,
     upstream_error_event: bool,
 }
+
+const MAX_TOOL_CALLS: usize = 128;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 struct ToolSlot {
     output_index: u64,
     index: u32,
     /// Arguments already emitted, retained to reconcile completion snapshots.
     arguments: String,
+    id: Option<String>,
+    name: Option<String>,
+    announced: bool,
 }
 
 struct ReasoningSlot {
@@ -272,7 +285,17 @@ impl StreamDecoder {
     }
 
     pub fn usage(&self) -> Option<UsageCounts> {
-        self.usage.clone()
+        self.usage_ref().cloned()
+    }
+
+    pub fn usage_ref(&self) -> Option<&UsageCounts> {
+        self.usage.as_ref()
+    }
+
+    pub fn usage_if_changed(&self, previous: Option<&UsageCounts>) -> Option<UsageCounts> {
+        (self.usage.as_ref() != previous)
+            .then(|| self.usage_ref().cloned())
+            .flatten()
     }
 
     /// Observe one frame. There is no `[DONE]` framing in Responses: the
@@ -296,6 +319,9 @@ impl StreamDecoder {
         if data.is_empty() {
             return Ok(events);
         }
+        if self.terminal.is_some() {
+            return Ok(events);
+        }
         let value: Value = match serde_json::from_str(data) {
             Ok(value) => value,
             Err(_) => {
@@ -316,6 +342,70 @@ impl StreamDecoder {
             return Err(error);
         }
         if let Some(terminal) = terminal {
+            if terminal == Terminal::Completed
+                && !self.tool_slots.is_empty()
+                && value
+                    .pointer("/response/output")
+                    .and_then(Value::as_array)
+                    .is_none()
+            {
+                return Err(ProtocolError::InvalidUpstreamResponse);
+            }
+            if terminal == Terminal::Completed
+                && let Some(output) = value.pointer("/response/output").and_then(Value::as_array)
+            {
+                for index in 0..self.tool_slots.len() {
+                    let output_index = self.tool_slots[index].output_index;
+                    let item = usize::try_from(output_index)
+                        .ok()
+                        .and_then(|index| output.get(index))
+                        .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+                    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                        return Err(ProtocolError::InvalidUpstreamResponse);
+                    }
+                    self.reconcile_tool_snapshot(output_index, item)?;
+                }
+                for (position, item) in output.iter().enumerate() {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("function_call") => {
+                            let slot = self
+                                .tool_slots
+                                .iter()
+                                .find(|slot| slot.output_index == position as u64)
+                                .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+                            if item.get("call_id").and_then(Value::as_str) != slot.id.as_deref()
+                                || item.get("name").and_then(Value::as_str) != slot.name.as_deref()
+                                || item.get("arguments").and_then(Value::as_str)
+                                    != Some(slot.arguments.as_str())
+                            {
+                                return Err(ProtocolError::InvalidUpstreamResponse);
+                            }
+                        }
+                        Some("message" | "reasoning") => {}
+                        _ => return Err(ProtocolError::InvalidUpstreamResponse),
+                    }
+                }
+                for (position, item) in output.iter().enumerate() {
+                    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                        let output_index = position as u64;
+                        self.reconcile_reasoning_snapshot(output_index, item)?;
+                    }
+                }
+                for slot in &mut self.tool_slots {
+                    if !slot.announced {
+                        let (Some(id), Some(name)) = (&slot.id, &slot.name) else {
+                            return Err(ProtocolError::InvalidUpstreamResponse);
+                        };
+                        events.push(StreamEvent::ToolCallDelta {
+                            index: slot.index,
+                            id: Some(id.clone()),
+                            name: Some(name.clone()),
+                            arguments: slot.arguments.clone(),
+                        });
+                        slot.announced = true;
+                    }
+                }
+            }
             if let Some(usage) = self.usage.clone() {
                 events.push(StreamEvent::Usage(usage));
             }
@@ -338,6 +428,41 @@ impl StreamDecoder {
         events: &mut Vec<StreamEvent>,
     ) -> Result<(), ProtocolError> {
         match value.get("type").and_then(Value::as_str) {
+            Some("response.refusal.delta" | "response.refusal.done") => {
+                let output = output_index(value)?;
+                let content = value
+                    .get("content_index")
+                    .and_then(Value::as_u64)
+                    .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+                let position = self
+                    .refusal_slots
+                    .iter()
+                    .position(|slot| slot.0 == output && slot.1 == content);
+                let position = position.unwrap_or_else(|| {
+                    self.refusal_slots.push((output, content, String::new()));
+                    self.refusal_slots.len() - 1
+                });
+                let emitted = &mut self.refusal_slots[position].2;
+                let is_delta =
+                    value.get("type").and_then(Value::as_str) == Some("response.refusal.delta");
+                let text = if is_delta {
+                    value.get("delta")
+                } else {
+                    value.get("refusal")
+                }
+                .and_then(Value::as_str)
+                .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+                let suffix = if is_delta {
+                    text
+                } else {
+                    text.strip_prefix(emitted.as_str())
+                        .ok_or(ProtocolError::InvalidUpstreamResponse)?
+                };
+                if !suffix.is_empty() {
+                    emitted.push_str(suffix);
+                    events.push(StreamEvent::TextDelta(suffix.to_owned()));
+                }
+            }
             Some("response.output_text.delta") => {
                 if let Some(text) = non_empty_delta(value) {
                     events.push(StreamEvent::TextDelta(text.to_owned()));
@@ -354,62 +479,90 @@ impl StreamDecoder {
             }
             Some("response.output_item.added") => {
                 let Some(item) = value.get("item") else {
-                    return Ok(());
+                    return Err(ProtocolError::InvalidUpstreamResponse);
                 };
+                if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+                    return Err(ProtocolError::InvalidUpstreamResponse);
+                }
+                if !matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("message" | "reasoning" | "function_call")
+                ) {
+                    return Err(ProtocolError::InvalidUpstreamResponse);
+                }
                 if item.get("type").and_then(Value::as_str) != Some("function_call") {
                     return Ok(());
                 }
-                let Some(output_index) = value.get("output_index").and_then(Value::as_u64) else {
-                    return Ok(());
-                };
-                let call_id = item.get("call_id").and_then(Value::as_str);
-                let name = item.get("name").and_then(Value::as_str);
-                let (Some(call_id), Some(name)) = (call_id, name) else {
-                    return Ok(());
-                };
+                let output_index = output_index(value)?;
+                if self
+                    .tool_slots
+                    .iter()
+                    .any(|slot| slot.output_index == output_index)
+                {
+                    return Err(ProtocolError::InvalidUpstreamResponse);
+                }
                 let index = u32::try_from(self.tool_slots.len())
                     .map_err(|_| ProtocolError::InvalidUpstreamResponse)?;
+                if self.tool_slots.len() >= MAX_TOOL_CALLS {
+                    return Err(ProtocolError::InvalidUpstreamResponse);
+                }
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                self.reserve_argument_bytes(arguments.len())?;
                 self.tool_slots.push(ToolSlot {
                     output_index,
                     index,
-                    arguments: String::new(),
+                    arguments: arguments.to_owned(),
+                    id: None,
+                    name: None,
+                    announced: false,
                 });
-                events.push(StreamEvent::ToolCallDelta {
-                    index,
-                    id: Some(call_id.to_owned()),
-                    name: Some(name.to_owned()),
-                    arguments: String::new(),
-                });
+                self.complete_identity(value, item, events)?;
             }
             Some("response.function_call_arguments.delta") => {
-                let Some(slot) = self.tool_slot(value) else {
-                    return Ok(());
-                };
                 if let Some(arguments) = non_empty_delta(value) {
+                    let output_index = output_index(value)?;
+                    let slot_index = self
+                        .tool_slots
+                        .iter()
+                        .position(|slot| slot.output_index == output_index)
+                        .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+                    self.reserve_argument_bytes(arguments.len())?;
+                    let slot = &mut self.tool_slots[slot_index];
                     slot.arguments.push_str(arguments);
-                    events.push(StreamEvent::ToolCallDelta {
-                        index: slot.index,
-                        id: None,
-                        name: None,
-                        arguments: arguments.to_owned(),
-                    });
+                    if slot.announced {
+                        events.push(StreamEvent::ToolCallDelta {
+                            index: slot.index,
+                            id: None,
+                            name: None,
+                            arguments: arguments.to_owned(),
+                        });
+                    }
                 }
             }
             Some("response.function_call_arguments.done") => {
                 self.complete_arguments(value, value, events)?;
             }
+            Some(
+                "response.custom_tool_call_input.delta" | "response.custom_tool_call_input.done",
+            ) => return Err(ProtocolError::InvalidUpstreamResponse),
             Some("response.output_item.done") => {
-                if let Some(item) = value.get("item") {
-                    match item.get("type").and_then(Value::as_str) {
-                        Some("function_call") => self.complete_arguments(value, item, events)?,
-                        Some("reasoning") => {
-                            let Ok(output_index) = output_index(value) else {
-                                return Ok(());
-                            };
-                            self.emit_reasoning_item_snapshot(output_index, item, events);
-                        }
-                        _ => {}
+                let item = value
+                    .get("item")
+                    .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        self.complete_identity(value, item, events)?;
+                        self.complete_arguments(value, item, events)?;
                     }
+                    Some("reasoning") => {
+                        let output_index = output_index(value)?;
+                        self.emit_reasoning_item_snapshot(output_index, item, events)?;
+                    }
+                    Some("message") => {}
+                    _ => return Err(ProtocolError::InvalidUpstreamResponse),
                 }
             }
             Some("response.reasoning_summary_text.done") => {
@@ -419,7 +572,7 @@ impl StreamDecoder {
                 let Ok(output_index) = output_index(value) else {
                     return Ok(());
                 };
-                self.emit_reasoning_snapshot(output_index, text, events);
+                self.emit_reasoning_snapshot(output_index, text, events)?;
             }
             _ => {}
         }
@@ -446,7 +599,7 @@ impl StreamDecoder {
         output_index: u64,
         snapshot: &str,
         events: &mut Vec<StreamEvent>,
-    ) {
+    ) -> Result<(), ProtocolError> {
         let slot = if let Some(position) = self
             .reasoning_slots
             .iter()
@@ -462,13 +615,13 @@ impl StreamDecoder {
             &mut self.reasoning_slots[position]
         };
         let Some(suffix) = snapshot.strip_prefix(slot.text.as_str()) else {
-            // A stale or inconsistent snapshot cannot be safely reconciled.
-            return;
+            return Err(ProtocolError::InvalidUpstreamResponse);
         };
         if !suffix.is_empty() {
             events.push(StreamEvent::ReasoningDelta(suffix.to_owned()));
             slot.text.push_str(suffix);
         }
+        Ok(())
     }
 
     fn emit_reasoning_item_snapshot(
@@ -476,7 +629,7 @@ impl StreamDecoder {
         output_index: u64,
         item: &Value,
         events: &mut Vec<StreamEvent>,
-    ) {
+    ) -> Result<(), ProtocolError> {
         let position = if let Some(position) = self
             .reasoning_slots
             .iter()
@@ -491,21 +644,131 @@ impl StreamDecoder {
             self.reasoning_slots.len() - 1
         };
         let emitted = &self.reasoning_slots[position].text;
-        let Some(suffix) = reasoning_snapshot_suffix(emitted, item) else {
-            return;
-        };
+        let suffix = reasoning_snapshot_suffix(emitted, item)
+            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
         if suffix.is_empty() {
-            return;
+            return Ok(());
         }
         self.reasoning_slots[position].text.push_str(&suffix);
         events.push(StreamEvent::ReasoningDelta(suffix));
+        Ok(())
     }
 
-    fn tool_slot(&mut self, value: &Value) -> Option<&mut ToolSlot> {
-        let output_index = output_index(value).ok()?;
-        self.tool_slots
-            .iter_mut()
+    fn reconcile_reasoning_snapshot(
+        &self,
+        output_index: u64,
+        item: &Value,
+    ) -> Result<(), ProtocolError> {
+        let Some(slot) = self
+            .reasoning_slots
+            .iter()
             .find(|slot| slot.output_index == output_index)
+        else {
+            return Ok(());
+        };
+        reasoning_snapshot_suffix(&slot.text, item)
+            .map(|_| ())
+            .ok_or(ProtocolError::InvalidUpstreamResponse)
+    }
+
+    fn complete_identity(
+        &mut self,
+        value: &Value,
+        item: &Value,
+        events: &mut Vec<StreamEvent>,
+    ) -> Result<(), ProtocolError> {
+        let output_index = output_index(value)?;
+        let slot_index = self
+            .tool_slots
+            .iter()
+            .position(|slot| slot.output_index == output_index)
+            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+        let slot = &mut self.tool_slots[slot_index];
+        for (field, current) in [("call_id", &mut slot.id), ("name", &mut slot.name)] {
+            if let Some(incoming) = item
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                match current {
+                    Some(old) if old != incoming => {
+                        return Err(ProtocolError::InvalidUpstreamResponse);
+                    }
+                    None => *current = Some(incoming.to_owned()),
+                    _ => {}
+                }
+            }
+        }
+        if !slot.announced
+            && let (Some(id), Some(name)) = (&slot.id, &slot.name)
+        {
+            events.push(StreamEvent::ToolCallDelta {
+                index: slot.index,
+                id: Some(id.clone()),
+                name: Some(name.clone()),
+                arguments: slot.arguments.clone(),
+            });
+            slot.announced = true;
+        }
+        Ok(())
+    }
+
+    fn reserve_argument_bytes(&mut self, additional: usize) -> Result<(), ProtocolError> {
+        let total = self
+            .argument_bytes
+            .checked_add(additional)
+            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+        if total > MAX_TOOL_ARGUMENT_BYTES {
+            return Err(ProtocolError::InvalidUpstreamResponse);
+        }
+        self.argument_bytes = total;
+        Ok(())
+    }
+
+    fn reconcile_tool_snapshot(
+        &mut self,
+        output_index: u64,
+        item: &Value,
+    ) -> Result<(), ProtocolError> {
+        let Some(slot_index) = self
+            .tool_slots
+            .iter()
+            .position(|slot| slot.output_index == output_index)
+        else {
+            return Err(ProtocolError::InvalidUpstreamResponse);
+        };
+        let slot = &mut self.tool_slots[slot_index];
+        for (field, current) in [("call_id", &mut slot.id), ("name", &mut slot.name)] {
+            let incoming = item
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+            match current {
+                Some(old) if old != incoming => {
+                    return Err(ProtocolError::InvalidUpstreamResponse);
+                }
+                None => *current = Some(incoming.to_owned()),
+                _ => {}
+            }
+        }
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let suffix_len = {
+            let slot = &self.tool_slots[slot_index];
+            arguments
+                .strip_prefix(slot.arguments.as_str())
+                .ok_or(ProtocolError::InvalidUpstreamResponse)?
+                .len()
+        };
+        self.reserve_argument_bytes(suffix_len)?;
+        let current_len = self.tool_slots[slot_index].arguments.len();
+        self.tool_slots[slot_index]
+            .arguments
+            .push_str(&arguments[current_len..]);
+        Ok(())
     }
 
     /// Completion events carry the full arguments, sometimes without deltas.
@@ -516,33 +779,33 @@ impl StreamDecoder {
         snapshot: &Value,
         events: &mut Vec<StreamEvent>,
     ) -> Result<(), ProtocolError> {
-        let Some(arguments) = snapshot.get("arguments").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        let Ok(output_index) = output_index(value) else {
-            return Ok(());
-        };
-        let Some(slot) = self
+        let arguments = snapshot
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+        let output_index = output_index(value)?;
+        let Some(slot_index) = self
             .tool_slots
-            .iter_mut()
-            .find(|slot| slot.output_index == output_index)
+            .iter()
+            .position(|slot| slot.output_index == output_index)
         else {
-            return Ok(());
+            return Err(ProtocolError::InvalidUpstreamResponse);
         };
-        let Some(suffix) = arguments.strip_prefix(slot.arguments.as_str()) else {
-            // A completion snapshot can be stale or omit a previously emitted
-            // prefix. It cannot be safely reconciled, and emitting it would
-            // duplicate or corrupt tool arguments; keep the stream decodable.
-            return Ok(());
+        let current_arguments = self.tool_slots[slot_index].arguments.clone();
+        let Some(suffix) = arguments.strip_prefix(current_arguments.as_str()) else {
+            return Err(ProtocolError::InvalidUpstreamResponse);
         };
         if !suffix.is_empty() {
-            events.push(StreamEvent::ToolCallDelta {
-                index: slot.index,
-                id: None,
-                name: None,
-                arguments: suffix.to_owned(),
-            });
-            slot.arguments.push_str(suffix);
+            self.reserve_argument_bytes(suffix.len())?;
+            self.tool_slots[slot_index].arguments.push_str(suffix);
+            if self.tool_slots[slot_index].announced {
+                events.push(StreamEvent::ToolCallDelta {
+                    index: self.tool_slots[slot_index].index,
+                    id: None,
+                    name: None,
+                    arguments: suffix.to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -648,6 +911,7 @@ impl StreamDecoder {
             | Some("response.reasoning_text.delta")
             | Some("response.function_call_arguments.delta")
             | Some("response.refusal.delta")
+            | Some("response.refusal.done")
             | Some("response.custom_tool_call_input.delta")
             | Some("response.code_interpreter_call_code.delta") => self.content_seen = true,
             _ => {}
@@ -805,6 +1069,7 @@ const TERMINAL_SNIFF: &[&str] = &[
     "response.incomplete",
     "response.failed",
     "response.cancelled",
+    "response.refusal.done",
 ];
 
 fn non_empty_delta(value: &Value) -> Option<&str> {
@@ -838,7 +1103,7 @@ fn reasoning_snapshot_suffix(emitted: &str, item: &Value) -> Option<String> {
                 break;
             }
         }
-        if saw_text && remaining.is_empty() {
+        if remaining.is_empty() && (saw_text || emitted.is_empty()) {
             return Some(suffix);
         }
     }
@@ -960,7 +1225,8 @@ mod tests {
     fn completed_reason_depends_on_tool_calls() {
         let mut with_tool = StreamDecoder::new();
         let added = tool_added(0, "call_a", "alpha");
-        let events = feed(&mut with_tool, &[&added, COMPLETED]);
+        let completed_with_tool = r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"call_a","name":"alpha","arguments":""}],"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":3}}}}"#;
+        let events = feed(&mut with_tool, &[&added, completed_with_tool]);
         let usage = UsageCounts {
             input_tokens: 10,
             output_tokens: 4,
@@ -1045,48 +1311,32 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_output_item_snapshot_is_ignored() {
+    fn incomplete_output_item_snapshot_fails() {
         let mut decoder = StreamDecoder::new();
-        let events = feed(
-            &mut decoder,
-            &[
-                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call"}}"#,
-                r#"{"type":"response.output_text.delta","delta":"after"}"#,
-            ],
-        );
-        assert_eq!(events, vec![StreamEvent::TextDelta("after".to_owned())]);
+        assert!(decoder.observe_raw(br#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call"}}"#).is_err());
     }
 
     #[test]
-    fn incomplete_codex_metadata_is_ignored() {
+    fn incomplete_codex_metadata_fails() {
         let mut decoder = StreamDecoder::new();
         let incomplete_added =
             r#"{"type":"response.output_item.added","item":{"type":"function_call"}}"#;
-        assert!(decoder.observe_raw(incomplete_added.as_bytes()).is_ok());
+        assert!(decoder.observe_raw(incomplete_added.as_bytes()).is_err());
         assert!(
             decoder
                 .observe_raw(br#"{"type":"response.function_call_arguments.delta","delta":"x"}"#)
-                .is_ok()
+                .is_err()
         );
-        let events = decoder
-            .observe_raw(br#"{"type":"response.output_text.delta","delta":"after"}"#)
-            .expect("subsequent content remains decodable");
-        assert_eq!(events, vec![StreamEvent::TextDelta("after".to_owned())]);
     }
 
     #[test]
-    fn inconsistent_completion_snapshot_is_ignored() {
+    fn inconsistent_completion_snapshot_fails() {
         let mut decoder = StreamDecoder::new();
         let added = tool_added(0, "call_a", "alpha");
         let events = feed(&mut decoder, &[&added, &args_delta(0, "{\\\"ok\\\":true}")]);
         assert_eq!(events.len(), 2);
         let completion = r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"not-the-emitted-prefix"}"#;
-        assert!(decoder.observe_raw(completion.as_bytes()).is_ok());
-        assert!(
-            decoder
-                .observe_raw(br#"{"type":"response.output_text.delta","delta":"after"}"#)
-                .is_ok()
-        );
+        assert!(decoder.observe_raw(completion.as_bytes()).is_err());
     }
 
     #[test]
@@ -1234,14 +1484,9 @@ mod tests {
     #[test]
     fn bad_frames_fail() {
         let mut decoder = StreamDecoder::new();
-        // A well-formed event whose optional identity is absent is ignored: only
-        // malformed JSON (or an upstream error event) is a decode failure.
         assert!(
-            decoder
-                .observe_raw(args_delta(9, "x").as_bytes())
-                .expect("unknown tool slot is ignored")
-                .is_empty(),
-            "an arguments delta for an unseen slot emits nothing"
+            decoder.observe_raw(args_delta(9, "x").as_bytes()).is_err(),
+            "an argument delta for an unseen slot cannot be reconciled"
         );
         let no_call_id = r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"n"}}"#;
         assert!(

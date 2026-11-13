@@ -139,6 +139,9 @@ impl AttemptError {
             Self::OpencodeTokenError(error) => error.to_string(),
             Self::CursorTokenError(error) => error.to_string(),
             Self::OpenaiTokenError(error) => error.to_string(),
+            Self::Protocol(ProtocolError::ToolPairingUnrepresentable) => {
+                "the request contains tool results that cannot be paired safely".to_owned()
+            }
             Self::Protocol(error) => format!("{error:?}"),
         }
     }
@@ -395,6 +398,9 @@ pub fn classify(error: &AttemptError) -> Failure {
             };
         }
         // Request-shape problems: the request itself is at fault.
+        AttemptError::Protocol(ProtocolError::ToolPairingUnrepresentable) => {
+            return Failure::Blameless;
+        }
         AttemptError::Protocol(_) => return Failure::Request,
     };
     let now = chrono::Utc::now();

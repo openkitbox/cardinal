@@ -21,6 +21,7 @@ use std::fmt;
 /// the client protocol — not the upstream — is captured at construction.
 pub struct StreamTranslator {
     client: ProtocolId,
+    upstream: ProtocolId,
     model: String,
     request_id: String,
     state: State,
@@ -35,7 +36,7 @@ enum State {
     Content {
         blocks: Vec<Block>,
         input_tokens: Option<u64>,
-        output_tokens: u64,
+        output_tokens: Option<u64>,
         usage: Option<Box<UsageCounts>>,
         finish: Option<String>,
     },
@@ -87,14 +88,23 @@ pub fn supports_translated_stream(client: ProtocolId) -> bool {
 }
 
 impl StreamTranslator {
+    pub(crate) fn client(&self) -> ProtocolId {
+        self.client
+    }
     /// Returns `None` for clients this layer cannot synthesize streams for;
     /// callers must have consulted [`supports_translated_stream`] first.
-    pub fn new(client: ProtocolId, model: &str, request_id: &str) -> Option<Self> {
+    pub fn new(
+        client: ProtocolId,
+        upstream: ProtocolId,
+        model: &str,
+        request_id: &str,
+    ) -> Option<Self> {
         if !supports_translated_stream(client) {
             return None;
         }
         Some(Self {
             client,
+            upstream,
             model: model.to_owned(),
             request_id: request_id.to_owned(),
             state: State::Open,
@@ -123,7 +133,7 @@ impl StreamTranslator {
                             *latest = Some(Box::new(usage.clone()));
                             // A usage event carries both counts; the close frame
                             // must not report a fabricated output of 0.
-                            *output_tokens = output;
+                            *output_tokens = Some(output);
                         }
                         self.open_frames(&mut out, Some(usage));
                     }
@@ -195,22 +205,22 @@ impl StreamTranslator {
     fn open_frames(&mut self, out: &mut Vec<RawFrame>, usage: Option<UsageCounts>) {
         match self.client {
             ProtocolId::AnthropicMessages => {
-                let input = usage.as_ref().map(|usage| usage.input_tokens).unwrap_or(0);
+                let mut message = serde_json::json!({
+                    "id": format!("msg_{}", self.request_id),
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                });
+                let usage = anthropic_usage(usage.as_ref(), None);
+                if !usage.as_object().is_some_and(Map::is_empty) {
+                    message["usage"] = usage;
+                }
                 out.push(frame(
                     Some("message_start"),
-                    serde_json::json!({
-                      "type": "message_start",
-                      "message": {
-                        "id": format!("msg_{}", self.request_id),
-                        "type": "message",
-                        "role": "assistant",
-                        "model": self.model,
-                        "content": [],
-                        "stop_reason": Value::Null,
-                        "stop_sequence": Value::Null,
-                        "usage": {"input_tokens": input, "output_tokens": 0},
-                      }
-                    }),
+                    serde_json::json!({"type": "message_start", "message": message}),
                 ));
             }
             ProtocolId::OpenAiResponses => {
@@ -233,6 +243,7 @@ impl StreamTranslator {
                     serde_json::json!({"role": "assistant", "content": ""}),
                     Value::Null,
                     usage.as_ref().map(|usage| usage.input_tokens),
+                    None,
                     None,
                     None,
                 ));
@@ -418,6 +429,15 @@ impl StreamTranslator {
                 match self.client {
                     ProtocolId::OpenAiResponses => {
                         let position = blocks.iter().position(|block| matches!(&block.kind, BlockKind::Tool { index: tool, .. } if *tool == index));
+                        if let Some(position) = position
+                            && blocks[position].closed
+                        {
+                            // Responses lifecycle events cannot reopen an item after its
+                            // `output_item.done`; silently dropping this fragment would
+                            // produce a response with incomplete tool arguments. Fail closed
+                            // instead of emitting an invalid lifecycle order.
+                            return Err(crate::protocol::ProtocolError::InvalidUpstreamResponse);
+                        }
                         let position = match position {
                             Some(position) => position,
                             None => {
@@ -557,7 +577,7 @@ impl StreamTranslator {
                     return Ok(());
                 };
                 *input_tokens = Some(usage.input_tokens);
-                *output_tokens = usage.output_tokens;
+                *output_tokens = Some(usage.output_tokens);
                 *latest = Some(Box::new(usage));
             }
             StreamEvent::Finish { reason } => {
@@ -601,8 +621,6 @@ impl StreamTranslator {
                     .enumerate()
                     .map(|(index, block)| final_item_payload(&self.request_id, index, &block.kind))
                     .collect();
-                let input = input_tokens.unwrap_or(0);
-                let output_tokens = *output_tokens;
                 // Terminal honesty: an EOF verdict wins over the synthesized reason
                 // (Responses has the vocabulary for it — unlike Chat/Anthropic, whose
                 // arms keep their historical null-finish/max_tokens conventions).
@@ -622,21 +640,25 @@ impl StreamTranslator {
                 // Details objects appear only when a real value was observed upstream
                 // — a fabricated zero is worse than absence (the non-streaming arm
                 // applies the same rule).
-                let mut usage_json = serde_json::json!({
-                  "input_tokens": input,
-                  "output_tokens": output_tokens,
-                  "total_tokens": input.saturating_add(output_tokens),
-                });
-                if let Some(usage) = usage.as_deref() {
+                let usage_json = usage.as_deref().map(|usage| {
+                    let mut value = serde_json::json!({
+                      "input_tokens": usage.input_tokens,
+                      "output_tokens": usage.output_tokens,
+                      "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens),
+                    });
                     if let Some(cached) = usage.cached_input_tokens {
-                        usage_json["input_tokens_details"] =
+                        value["input_tokens_details"] =
                             serde_json::json!({"cached_tokens": cached});
                     }
                     if let Some(reasoning) = usage.reasoning_output_tokens {
-                        usage_json["output_tokens_details"] =
-                            serde_json::json!({"reasoning_tokens": reasoning});
+                        let mut details = serde_json::json!({"reasoning_tokens": reasoning});
+                        if self.upstream == ProtocolId::OpenAiResponses {
+                            details["reasoning_tokens_included"] = serde_json::Value::Bool(true);
+                        }
+                        value["output_tokens_details"] = details;
                     }
-                }
+                    value
+                });
                 // Owned `output`/`usage` move into the maps; `json!` would deep-copy
                 // every accumulated item a second time.
                 let mut response = Map::new();
@@ -648,11 +670,19 @@ impl StreamTranslator {
                 response.insert("status".to_owned(), Value::from(status));
                 response.insert("model".to_owned(), Value::String(self.model.clone()));
                 response.insert("output".to_owned(), Value::Array(output));
-                response.insert("usage".to_owned(), usage_json);
+                if let Some(usage_json) = usage_json {
+                    response.insert("usage".to_owned(), usage_json);
+                }
                 if truncated {
                     response.insert(
                         "incomplete_details".to_owned(),
-                        serde_json::json!({"reason": "max_output_tokens"}),
+                        serde_json::json!({
+                            "reason": if reason == "length" || reason == "max_tokens" {
+                                "max_output_tokens"
+                            } else {
+                                "incomplete"
+                            }
+                        }),
                     );
                 }
                 if failed {
@@ -674,14 +704,15 @@ impl StreamTranslator {
                         serde_json::json!({"type": "content_block_stop", "index": last_index}),
                     ));
                 }
-                out.push(frame(
-          Some("message_delta"),
-          serde_json::json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_anthropic_name(&reason), "stop_sequence": Value::Null},
-            "usage": {"output_tokens": *output_tokens},
-          }),
-        ));
+                let mut delta = serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_anthropic_name(&reason), "stop_sequence": Value::Null},
+                });
+                let usage = anthropic_usage(usage.as_deref(), *output_tokens);
+                if !usage.as_object().is_some_and(Map::is_empty) {
+                    delta["usage"] = usage;
+                }
+                out.push(frame(Some("message_delta"), delta));
                 out.push(frame(
                     Some("message_stop"),
                     serde_json::json!({"type": "message_stop"}),
@@ -706,12 +737,13 @@ impl StreamTranslator {
                     Value::Null,
                     finish_reason,
                     if usage_seen { *input_tokens } else { None },
-                    if usage_seen {
-                        Some(*output_tokens)
-                    } else {
-                        None
-                    },
+                    if usage_seen { *output_tokens } else { None },
                     usage.as_ref().and_then(|usage| usage.cached_input_tokens),
+                    usage.as_ref().and_then(|usage| {
+                        usage.reasoning_output_tokens.and_then(|value| {
+                            (self.upstream == ProtocolId::OpenAiResponses).then_some((value, true))
+                        })
+                    }),
                 ));
                 // SH-02: `[DONE]` is an SSE framing marker, not JSON — the wire must
                 // carry `data: [DONE]` (no quotes). JSON-serializing a string value
@@ -738,7 +770,7 @@ fn content_state(input_tokens: Option<u64>) -> State {
     State::Content {
         blocks: Vec::new(),
         input_tokens,
-        output_tokens: 0,
+        output_tokens: None,
         usage: None,
         finish: None,
     }
@@ -1133,6 +1165,26 @@ fn function_call_item_payload(
     })
 }
 
+fn anthropic_usage(input: Option<&UsageCounts>, output: Option<u64>) -> Value {
+    let mut usage = Map::new();
+    if let Some(input) = input {
+        usage.insert("input_tokens".to_owned(), Value::from(input.input_tokens));
+        if let Some(cached) = input.cached_input_tokens {
+            usage.insert("cache_read_input_tokens".to_owned(), Value::from(cached));
+        }
+        if let Some(created) = input.cache_creation_input_tokens {
+            usage.insert(
+                "cache_creation_input_tokens".to_owned(),
+                Value::from(created),
+            );
+        }
+    }
+    if let Some(output) = output {
+        usage.insert("output_tokens".to_owned(), Value::from(output));
+    }
+    Value::Object(usage)
+}
+
 fn chat_chunk(
     model: &str,
     delta: serde_json::Value,
@@ -1140,6 +1192,7 @@ fn chat_chunk(
     input: Option<u64>,
     output: Option<u64>,
     cached: Option<u64>,
+    reasoning: Option<(u64, bool)>,
 ) -> RawFrame {
     let mut usage = serde_json::json!({});
     if let Some(input) = input {
@@ -1150,6 +1203,13 @@ fn chat_chunk(
     }
     if let Some(cached) = cached {
         usage["prompt_tokens_details"] = serde_json::json!({"cached_tokens": cached});
+    }
+    if let Some((reasoning, reasoning_included)) = reasoning {
+        let mut details = serde_json::json!({"reasoning_tokens": reasoning});
+        if reasoning_included {
+            details["reasoning_tokens_included"] = serde_json::Value::Bool(true);
+        }
+        usage["completion_tokens_details"] = details;
     }
     let chunk = serde_json::json!({
       "id": "chatcmpl-xh",

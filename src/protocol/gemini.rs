@@ -311,7 +311,17 @@ impl StreamDecoder {
     }
 
     pub fn usage(&self) -> Option<UsageCounts> {
-        self.usage.clone()
+        self.usage_ref().cloned()
+    }
+
+    pub fn usage_ref(&self) -> Option<&UsageCounts> {
+        self.usage.as_ref()
+    }
+
+    pub fn usage_if_changed(&self, previous: Option<&UsageCounts>) -> Option<UsageCounts> {
+        (self.usage.as_ref() != previous)
+            .then(|| self.usage_ref().cloned())
+            .flatten()
     }
 
     /// Observe one frame, materializing events for the observe path.

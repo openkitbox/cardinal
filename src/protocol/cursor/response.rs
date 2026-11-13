@@ -571,6 +571,12 @@ impl StreamDecoder {
         self.turn_usage.clone()
     }
 
+    pub fn usage_if_changed(&self, previous: Option<&UsageCounts>) -> Option<UsageCounts> {
+        (self.turn_usage.as_ref() != previous)
+            .then(|| self.turn_usage.as_ref().cloned())
+            .flatten()
+    }
+
     #[must_use]
     pub fn terminal_seen(&self) -> bool {
         self.done

@@ -259,11 +259,10 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
         _ => None,
     };
 
-    // Anthropic clients declare thinking via output_config.effort (per the spec)
-    // or a thinking budget block; both normalize to Effort.
-    let effort = object
+    let raw_effort = object
         .get("output_config")
-        .and_then(|config| config.get("effort"))
+        .and_then(|config| config.get("effort"));
+    let effort = raw_effort
         .and_then(Value::as_str)
         .and_then(Effort::parse_name)
         .or_else(|| {
@@ -273,6 +272,9 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
                 .and_then(Value::as_u64)
                 .and_then(Effort::from_budget)
         });
+    if raw_effort.is_some() && effort.is_none() {
+        dropped.push("output_config.effort");
+    }
 
     // The client's declared output limit lowers the caller-supplied ceiling
     // reservation; it never raises it.
@@ -339,6 +341,9 @@ pub fn from_ir(
     let mut call_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut messages: Vec<Value> = Vec::new();
     for message in &request.messages {
+        if matches!(message.role, IrRole::System | IrRole::Developer) {
+            continue;
+        }
         let mut blocks: Vec<Value> = Vec::new();
         for part in &message.parts {
             match part {
@@ -427,6 +432,7 @@ pub fn from_ir(
         let role = match message.role {
             IrRole::User => "user",
             IrRole::Assistant => "assistant",
+            IrRole::System | IrRole::Developer => unreachable!("instructions are folded above"),
         };
         let mut entry = Map::new();
         entry.insert("role".to_owned(), Value::String(role.to_owned()));
@@ -448,7 +454,7 @@ pub fn from_ir(
     };
     body.insert("max_tokens".to_owned(), Value::from(max_tokens));
     body.insert("messages".to_owned(), Value::Array(messages));
-    if let Some(system) = &request.system {
+    if let Some(system) = request.folded_system() {
         body.insert("system".to_owned(), Value::String(system.clone()));
     }
     if let Some(temperature) = request.temperature {
@@ -679,11 +685,22 @@ pub fn emit_response_json(
     // An upstream that reported no token usage leaves the field out entirely:
     // zeroes would be read as a real (free) measurement.
     if let Some(usage) = &response.usage {
-        body["usage"] = serde_json::json!({
+        let mut usage_json = serde_json::json!({
           "input_tokens": usage.input_tokens,
           "output_tokens": usage.output_tokens,
-          "cache_read_input_tokens": usage.cached_input_tokens.unwrap_or(0),
         });
+        if let Some(cached) = usage.cached_input_tokens {
+            usage_json["cache_read_input_tokens"] = Value::from(cached);
+        }
+        if let Some(cache_creation) = usage.cache_creation_input_tokens {
+            usage_json["cache_creation_input_tokens"] = Value::from(cache_creation);
+        }
+        if let Some(cache_creation_1h) = usage.cache_creation_1h_input_tokens {
+            usage_json["cache_creation"] = serde_json::json!({
+                "ephemeral_1h_input_tokens": cache_creation_1h,
+            });
+        }
+        body["usage"] = usage_json;
     }
     serde_json::to_vec(&body).map_err(|_| crate::protocol::ProtocolError::InvalidUpstreamResponse)
 }

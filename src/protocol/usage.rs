@@ -42,6 +42,9 @@ pub struct UsageCounts {
     /// `output_tokens_details.reasoning_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_output_tokens: Option<u64>,
+    /// Internal provenance for translated Responses usage; not wire evidence.
+    #[serde(skip)]
+    pub reasoning_tokens_included: Option<bool>,
     /// Gemini `thoughtsTokenCount`, Interactions `total_thought_tokens`. A
     /// distinct quantity from visible output.
     #[serde(default, skip_serializing_if = "Option::is_none")]

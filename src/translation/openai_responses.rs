@@ -38,10 +38,14 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
     {
         return Err(ProtocolError::InvalidContinuation);
     }
-    // Non-default store/background ask for upstream state; the hop drops the
-    // concept, so the request is served and the loss recorded (the kernel
-    // rejects these outright only on the pass-through path it guards).
+    // A non-default value is not translatable; malformed booleans are invalid
+    // input rather than an absent/default field.
     for field in ["store", "background"] {
+        if let Some(value) = object.get(field)
+            && !value.is_boolean()
+        {
+            return Err(ProtocolError::InvalidRequest);
+        }
         if object.get(field).and_then(Value::as_bool) == Some(true) {
             dropped.push(field);
         }
@@ -153,11 +157,15 @@ pub fn to_ir(body: &Value, ceiling: u64) -> Result<(IrRequest, Vec<&'static str>
         None => ceiling,
     };
 
-    let effort = object
+    let raw_effort = object
         .get("reasoning")
-        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(|reasoning| reasoning.get("effort"));
+    let effort = raw_effort
         .and_then(Value::as_str)
         .and_then(Effort::parse_name);
+    if raw_effort.is_some() && effort.is_none() {
+        dropped.push("reasoning.effort");
+    }
     // The upstream cache-routing hint rides the IR (Kiro derives its
     // conversation id from it); a present-but-unusable value is a recorded loss.
     let prompt_cache_key = super::ir::prompt_cache_key_of(object);
@@ -236,7 +244,22 @@ fn input_item(
                         text.push_str(&part);
                     }
                     if !text.is_empty() {
-                        system.push(text);
+                        let has_ordinary = messages.iter().any(|message| {
+                            matches!(message.role, IrRole::User | IrRole::Assistant)
+                        });
+                        if has_ordinary {
+                            messages.push(IrMessage {
+                                role: if item.get("role").and_then(Value::as_str) == Some("system")
+                                {
+                                    IrRole::System
+                                } else {
+                                    IrRole::Developer
+                                },
+                                parts: vec![IrPart::Text(text)],
+                            });
+                        } else {
+                            system.push(text);
+                        }
                     }
                 }
                 "user" => messages.push(IrMessage {
@@ -438,14 +461,15 @@ pub fn emit_response_json(
         messages += 1;
         output.push(message_item(messages, pending));
     }
-    // A tool-call turn is still a completed response; only truncation is
-    // incomplete (B §4.7 terminal semantics).
+    // A tool-call turn is still a completed response. Unknown/incomplete
+    // reasons remain incomplete rather than being presented as completed.
     let (status, incomplete_details) = match &response.stop {
         IrStop::Length => (
             "incomplete",
             Some(serde_json::json!({"reason": "max_output_tokens"})),
         ),
-        IrStop::Stop | IrStop::ToolUse | IrStop::Other(_) => ("completed", None),
+        IrStop::Other(reason) => ("incomplete", Some(serde_json::json!({"reason": reason}))),
+        IrStop::Stop | IrStop::ToolUse => ("completed", None),
     };
     let mut body = serde_json::json!({
       "id": format!("resp_{:032x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().unsigned_abs()),

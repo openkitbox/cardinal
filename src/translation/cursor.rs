@@ -76,7 +76,7 @@ pub fn from_ir(request: &IrRequest, model: &str) -> super::Parsed<Value> {
 
     let mut staging = Staging::default();
     let system = {
-        let mut text = request.system.clone().unwrap_or_default();
+        let mut text = request.folded_system().unwrap_or_default();
         text.push_str(&catalog(&request.tools));
         text
     };
@@ -88,6 +88,7 @@ pub fn from_ir(request: &IrRequest, model: &str) -> super::Parsed<Value> {
         match message.role {
             IrRole::Assistant => staging.assistant(message, &mut dropped),
             IrRole::User => staging.user(message, &mut dropped),
+            IrRole::System | IrRole::Developer => {}
         }
     }
     staging.close_turn();

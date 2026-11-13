@@ -169,6 +169,9 @@ pub enum ProtocolError {
     InvalidUpstreamResponse,
     /// Upstream returned an error status.
     UpstreamError,
+    /// A translated Responses request contains a tool result that cannot be
+    /// proven to answer exactly one function call.
+    ToolPairingUnrepresentable,
     /// Deadline/idle/connect expiry.
     UpstreamTimeout,
 }
@@ -194,6 +197,7 @@ impl ProtocolError {
             Self::UpstreamRateLimited => "rate_limit_exceeded",
             Self::InvalidUpstreamResponse => "invalid_upstream_response",
             Self::UpstreamError => "upstream_error",
+            Self::ToolPairingUnrepresentable => "tool_pairing_unrepresentable",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::InsufficientFunds => "insufficient_funds",
             Self::TokenLimitExceeded => "token_limit_exceeded",
@@ -219,6 +223,7 @@ impl ProtocolError {
             Self::UpstreamAuthenticationFailed => 502,
             Self::UpstreamRateLimited => 429,
             Self::InvalidUpstreamResponse | Self::UpstreamError => 502,
+            Self::ToolPairingUnrepresentable => 400,
             Self::UpstreamTimeout => 504,
             Self::InsufficientFunds | Self::TokenLimitExceeded => 402,
         }
@@ -601,6 +606,18 @@ impl Decoder {
             Self::Gemini(decoder) => decoder.usage(),
             Self::Kiro(decoder) => decoder.usage(),
             Self::Cursor(decoder) => decoder.usage(),
+            Self::Unstreamed => None,
+        }
+    }
+
+    pub fn usage_if_changed(&self, previous: Option<&UsageCounts>) -> Option<UsageCounts> {
+        match self {
+            Self::Chat(decoder) => decoder.usage_if_changed(previous),
+            Self::Responses(decoder) => decoder.usage_if_changed(previous),
+            Self::Messages(decoder) => decoder.usage_if_changed(previous),
+            Self::Gemini(decoder) => decoder.usage_if_changed(previous),
+            Self::Kiro(decoder) => decoder.usage_if_changed(previous),
+            Self::Cursor(decoder) => decoder.usage_if_changed(previous),
             Self::Unstreamed => None,
         }
     }

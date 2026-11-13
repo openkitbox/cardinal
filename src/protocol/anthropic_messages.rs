@@ -232,6 +232,11 @@ impl StreamDecoder {
         })
     }
 
+    pub fn usage_if_changed(&self, previous: Option<&UsageCounts>) -> Option<UsageCounts> {
+        let usage = self.usage();
+        (usage.as_ref() != previous).then_some(usage).flatten()
+    }
+
     pub fn observe(&mut self, frame: &Frame) -> Result<Vec<StreamEvent>, ProtocolError> {
         self.observe_raw(frame.event.as_deref(), frame.data.as_bytes())
     }

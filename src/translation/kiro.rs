@@ -485,6 +485,10 @@ pub fn from_ir<'a>(request: &'a IrRequest, model: &str) -> super::Parsed<Value> 
     let mut history: Vec<Value> = Vec::new();
     let mut index = 0;
     while index < history_end {
+        if matches!(messages[index].role, IrRole::System | IrRole::Developer) {
+            index += 1;
+            continue;
+        }
         let start = index;
         let role = messages[index].role;
         while index < history_end && messages[index].role == role {
@@ -494,6 +498,7 @@ pub fn from_ir<'a>(request: &'a IrRequest, model: &str) -> super::Parsed<Value> 
         history.push(match role {
             IrRole::User => conversion.history_user_entry(run),
             IrRole::Assistant => conversion.assistant_entry(run),
+            IrRole::System | IrRole::Developer => unreachable!("instructions are skipped above"),
         });
     }
 
@@ -546,7 +551,7 @@ pub fn from_ir<'a>(request: &'a IrRequest, model: &str) -> super::Parsed<Value> 
     // The request-level system text has no wire slot: it rides the front of the
     // first user message — the first history user turn once there is one, else
     // the current turn. No synthetic assistant acknowledgement is fabricated.
-    if let Some(prefix) = system_prefix(request.system.as_deref())
+    if let Some(prefix) = system_prefix(request.folded_system().as_deref())
         && !fold_into_history(&mut history, prefix)
     {
         content = prepend_prefix(&content, prefix);
@@ -625,7 +630,7 @@ pub fn from_ir<'a>(request: &'a IrRequest, model: &str) -> super::Parsed<Value> 
 fn conversation_id(request: &IrRequest) -> String {
     let seed = match request.prompt_cache_key.as_deref() {
         Some(key) => key.to_owned(),
-        None => stable_opening_seed(request.system.as_deref(), &request.messages),
+        None => stable_opening_seed(request.folded_system().as_deref(), &request.messages),
     };
     format!(
         "sess_{}",
@@ -1020,6 +1025,9 @@ fn user_payload<'a>(run: &'a [IrMessage], dropped: &mut Vec<&'static str>) -> Us
     let mut attachments: Vec<Attachment<'a>> = Vec::new();
     let mut ordinal = 0usize;
     for message in run {
+        if matches!(message.role, IrRole::System | IrRole::Developer) {
+            continue;
+        }
         for part in &message.parts {
             match part {
                 IrPart::Text(text) => push_text(&mut content, text),

@@ -200,6 +200,12 @@ impl Effort {
 pub enum IrRole {
     User,
     Assistant,
+    /// A system instruction that occurred after the first ordinary entry.
+    /// Leading system text remains in `IrRequest::system` for compatibility;
+    /// these entries preserve the only ordering that was previously lost.
+    System,
+    /// A developer instruction that occurred after the first ordinary entry.
+    Developer,
 }
 
 /// Where an image's bytes live.
@@ -320,6 +326,36 @@ pub struct IrRequest {
     /// conversation id from it), while emitters whose target has no such concept
     /// record the loss as dropped.
     pub prompt_cache_key: Option<String>,
+}
+
+impl IrRequest {
+    /// Append the ordered instruction entries to the legacy leading system
+    /// prompt. Dialects without an in-place instruction item use this at their
+    /// emission boundary; requests without such entries retain the old bytes.
+    pub fn folded_system(&self) -> Option<String> {
+        let has_entries = self
+            .messages
+            .iter()
+            .any(|message| matches!(message.role, IrRole::System | IrRole::Developer));
+        if !has_entries {
+            return self.system.clone();
+        }
+        let mut folded = self.system.clone().unwrap_or_default();
+        for message in &self.messages {
+            if !matches!(message.role, IrRole::System | IrRole::Developer) {
+                continue;
+            }
+            for part in &message.parts {
+                if let IrPart::Text(text) = part {
+                    if !folded.is_empty() {
+                        folded.push_str(SYSTEM_JOIN);
+                    }
+                    folded.push_str(text);
+                }
+            }
+        }
+        (!folded.is_empty()).then_some(folded)
+    }
 }
 
 /// The cache-routing hint an envelope carries: a non-empty string, else `None`.

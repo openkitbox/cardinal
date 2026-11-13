@@ -43,6 +43,7 @@ pub use crate::protocol::ProtocolId;
 
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::activity::{ActivitySink, EndMetrics, EndStatus};
 use crate::billing;
@@ -1176,11 +1177,15 @@ async fn attempt_stream(
         }
     } else {
         // Translation: synthesize frames in the client protocol.
-        let translator =
-            translation::stream::StreamTranslator::new(request.protocol, target_model, request_id)
-                .ok_or(failover::AttemptError::Protocol(
-                    ProtocolError::UnsupportedApi,
-                ))?;
+        let translator = translation::stream::StreamTranslator::new(
+            request.protocol,
+            protocol,
+            target_model,
+            request_id,
+        )
+        .ok_or(failover::AttemptError::Protocol(
+            ProtocolError::UnsupportedApi,
+        ))?;
         StreamPump::Translated {
             upstream: protocol,
             translator,
@@ -1295,8 +1300,12 @@ async fn attempt_json(
             tracing::debug!(target: PAYLOAD_TARGET, direction = "upstream_response", translated = true, body = %truncate_payload(&String::from_utf8_lossy(&bytes), bytes.len()));
         }
         let terminal = match ir.stop {
-            translation::ir::IrStop::Length => protocol::Terminal::Incomplete,
-            _ => protocol::Terminal::Completed,
+            translation::ir::IrStop::Length | translation::ir::IrStop::Other(_) => {
+                protocol::Terminal::Incomplete
+            }
+            translation::ir::IrStop::Stop | translation::ir::IrStop::ToolUse => {
+                protocol::Terminal::Completed
+            }
         };
         return Ok(RelayOutcome::Json {
             status,
@@ -1311,6 +1320,11 @@ async fn attempt_json(
             },
         });
     };
+    if observed.terminal != protocol::Terminal::Completed
+        && observed.terminal != protocol::Terminal::Incomplete
+    {
+        return Err(failover::AttemptError::UpstreamTerminal(observed.terminal));
+    }
     if observed.usage.is_none()
         && let Some(handle) = cursor
     {
@@ -1388,7 +1402,35 @@ struct PreparedBody {
 /// slot stays empty on a passthrough-only dispatch. A translation error is
 /// kept too: the same body fails the same way for every candidate.
 #[derive(Default)]
-struct ClientIr(Option<Result<translation::ir::IrRequest, ProtocolError>>);
+struct ConversionLossSink {
+    seen: HashSet<(&'static str, ProtocolId, ProtocolId, &'static str)>,
+}
+
+impl ConversionLossSink {
+    fn record(
+        &mut self,
+        stage: &'static str,
+        source: ProtocolId,
+        target: ProtocolId,
+        label: &'static str,
+    ) {
+        if self.seen.insert((stage, source, target, label)) {
+            tracing::warn!(
+                stage,
+                source = source.as_str(),
+                target = target.as_str(),
+                label,
+                "translated request field dropped"
+            );
+        }
+    }
+}
+
+#[derive(Default)]
+struct ClientIr {
+    value: Option<Result<(translation::ir::IrRequest, Vec<&'static str>), ProtocolError>>,
+    losses: ConversionLossSink,
+}
 
 impl ClientIr {
     /// The IR of `body`, translated with `dialect` on first use.
@@ -1396,13 +1438,31 @@ impl ClientIr {
         &mut self,
         dialect: &translation::Dialect,
         body: &Value,
+        source: ProtocolId,
+        target: ProtocolId,
     ) -> Result<&mut translation::ir::IrRequest, ProtocolError> {
-        let slot = self.0.get_or_insert_with(|| {
-            (dialect.to_ir)(body, translation::ir::NO_DECLARED_LIMIT).map(|(ir, _)| ir)
-        });
+        let slot = self
+            .value
+            .get_or_insert_with(|| (dialect.to_ir)(body, translation::ir::NO_DECLARED_LIMIT));
+        if let Ok((_, labels)) = slot {
+            for &label in labels.iter() {
+                self.losses.record("request", source, target, label);
+            }
+        }
         match slot {
-            Ok(ir) => Ok(ir),
+            Ok((ir, _)) => Ok(ir),
             Err(error) => Err(*error),
+        }
+    }
+
+    fn record_emitter_losses(
+        &mut self,
+        source: ProtocolId,
+        target: ProtocolId,
+        labels: &[&'static str],
+    ) {
+        for &label in labels {
+            self.losses.record("emit", source, target, label);
         }
     }
 }
@@ -1425,7 +1485,7 @@ fn prepare_translated(
 ) -> Result<PreparedBody, ProtocolError> {
     let source_dialect = translation::dialect(source)?;
     let upstream_dialect = translation::dialect(upstream)?;
-    let ir = client_ir.get_or_translate(&source_dialect, source_body)?;
+    let ir = client_ir.get_or_translate(&source_dialect, source_body, source, upstream)?;
     let client_effort = ir.effort;
     // 与 passthrough 同一套归一:路由列表(已配置)或 legacy 快照 → 方言
     // 可接受集。显式 off 不在此 clamp——它在下方按厂商标记注入。
@@ -1451,15 +1511,16 @@ fn prepare_translated(
     }
     // Emit and digest against the clamped IR, then undo the clamp (it belongs
     // to this candidate only) before any early return.
-    let emitted = (upstream_dialect.from_ir)(ir, target.upstream_model).map(|(value, _)| {
+    let emitted = (upstream_dialect.from_ir)(ir, target.upstream_model).map(|(value, dropped)| {
         let prompt_prefix = tweaks
             .prompt_scope
             .map(|scope| prompt_cache::Prefix::of(scope, ir));
-        (value, prompt_prefix)
+        (value, prompt_prefix, dropped)
     });
     let effort_off = matches!(ir.effort, Some(Effort::None));
     ir.effort = client_effort;
-    let (mut upstream_value, prompt_prefix) = emitted?;
+    let (mut upstream_value, prompt_prefix, dropped) = emitted?;
+    client_ir.record_emitter_losses(source, upstream, &dropped);
     // Chat 发射器对显式 off 省略字段;按厂商方言注入 off 标记,让"关思考"
     // 在翻译路径真正生效(纯思考模型由方言降级为最低档)。
     if upstream == ProtocolId::OpenAiChat && effort_off {
