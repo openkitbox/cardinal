@@ -342,15 +342,12 @@ impl StreamDecoder {
             return Err(error);
         }
         if let Some(terminal) = terminal {
-            if terminal == Terminal::Completed
-                && !self.tool_slots.is_empty()
-                && value
-                    .pointer("/response/output")
-                    .and_then(Value::as_array)
-                    .is_none()
-            {
-                return Err(ProtocolError::InvalidUpstreamResponse);
-            }
+            // A completed snapshot refines the stream, it never vetoes it: the
+            // deltas are already on the wire, so a snapshot that omits `output`
+            // (the Codex backend does) or disagrees with what was streamed must
+            // not fail a turn the client is already reading — it would see a
+            // truncated success and retry the whole request. Divergence is
+            // recorded instead (see [`note_divergence`]).
             if terminal == Terminal::Completed
                 && let Some(output) = value.pointer("/response/output").and_then(Value::as_array)
             {
@@ -359,51 +356,46 @@ impl StreamDecoder {
                     let item = usize::try_from(output_index)
                         .ok()
                         .and_then(|index| output.get(index))
-                        .ok_or(ProtocolError::InvalidUpstreamResponse)?;
-                    if item.get("type").and_then(Value::as_str) != Some("function_call") {
-                        return Err(ProtocolError::InvalidUpstreamResponse);
-                    }
-                    self.reconcile_tool_snapshot(output_index, item)?;
-                }
-                for (position, item) in output.iter().enumerate() {
-                    match item.get("type").and_then(Value::as_str) {
-                        Some("function_call") => {
-                            let slot = self
-                                .tool_slots
-                                .iter()
-                                .find(|slot| slot.output_index == position as u64)
-                                .ok_or(ProtocolError::InvalidUpstreamResponse)?;
-                            if item.get("call_id").and_then(Value::as_str) != slot.id.as_deref()
-                                || item.get("name").and_then(Value::as_str) != slot.name.as_deref()
-                                || item.get("arguments").and_then(Value::as_str)
-                                    != Some(slot.arguments.as_str())
-                            {
-                                return Err(ProtocolError::InvalidUpstreamResponse);
-                            }
-                        }
-                        Some("message" | "reasoning") => {}
-                        _ => return Err(ProtocolError::InvalidUpstreamResponse),
+                        .filter(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("function_call")
+                        });
+                    match item {
+                        Some(item) => self.reconcile_tool_snapshot(output_index, item)?,
+                        None => note_divergence(
+                            "completed",
+                            output_index,
+                            "no function_call snapshot for a streamed call",
+                        ),
                     }
                 }
                 for (position, item) in output.iter().enumerate() {
                     if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                        let output_index = position as u64;
-                        self.reconcile_reasoning_snapshot(output_index, item)?;
+                        self.reconcile_reasoning_snapshot(position as u64, item);
                     }
                 }
+            }
+            if terminal == Terminal::Completed {
+                // Announce whatever the deltas completed but no `added` frame
+                // opened — with or without a snapshot to reconcile against.
                 for slot in &mut self.tool_slots {
-                    if !slot.announced {
-                        let (Some(id), Some(name)) = (&slot.id, &slot.name) else {
-                            return Err(ProtocolError::InvalidUpstreamResponse);
-                        };
-                        events.push(StreamEvent::ToolCallDelta {
-                            index: slot.index,
-                            id: Some(id.clone()),
-                            name: Some(name.clone()),
-                            arguments: slot.arguments.clone(),
-                        });
-                        slot.announced = true;
+                    if slot.announced {
+                        continue;
                     }
+                    let (Some(id), Some(name)) = (&slot.id, &slot.name) else {
+                        note_divergence(
+                            "completed",
+                            slot.output_index,
+                            "streamed call without identity",
+                        );
+                        continue;
+                    };
+                    events.push(StreamEvent::ToolCallDelta {
+                        index: slot.index,
+                        id: Some(id.clone()),
+                        name: Some(name.clone()),
+                        arguments: slot.arguments.clone(),
+                    });
+                    slot.announced = true;
                 }
             }
             if let Some(usage) = self.usage.clone() {
@@ -615,7 +607,8 @@ impl StreamDecoder {
             &mut self.reasoning_slots[position]
         };
         let Some(suffix) = snapshot.strip_prefix(slot.text.as_str()) else {
-            return Err(ProtocolError::InvalidUpstreamResponse);
+            note_divergence("reasoning_done", output_index, "snapshot diverges");
+            return Ok(());
         };
         if !suffix.is_empty() {
             events.push(StreamEvent::ReasoningDelta(suffix.to_owned()));
@@ -644,8 +637,10 @@ impl StreamDecoder {
             self.reasoning_slots.len() - 1
         };
         let emitted = &self.reasoning_slots[position].text;
-        let suffix = reasoning_snapshot_suffix(emitted, item)
-            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+        let Some(suffix) = reasoning_snapshot_suffix(emitted, item) else {
+            note_divergence("reasoning_item_done", output_index, "snapshot diverges");
+            return Ok(());
+        };
         if suffix.is_empty() {
             return Ok(());
         }
@@ -654,21 +649,17 @@ impl StreamDecoder {
         Ok(())
     }
 
-    fn reconcile_reasoning_snapshot(
-        &self,
-        output_index: u64,
-        item: &Value,
-    ) -> Result<(), ProtocolError> {
+    fn reconcile_reasoning_snapshot(&self, output_index: u64, item: &Value) {
         let Some(slot) = self
             .reasoning_slots
             .iter()
             .find(|slot| slot.output_index == output_index)
         else {
-            return Ok(());
+            return;
         };
-        reasoning_snapshot_suffix(&slot.text, item)
-            .map(|_| ())
-            .ok_or(ProtocolError::InvalidUpstreamResponse)
+        if reasoning_snapshot_suffix(&slot.text, item).is_none() {
+            note_divergence("reasoning_snapshot", output_index, "snapshot diverges");
+        }
     }
 
     fn complete_identity(
@@ -678,11 +669,14 @@ impl StreamDecoder {
         events: &mut Vec<StreamEvent>,
     ) -> Result<(), ProtocolError> {
         let output_index = output_index(value)?;
-        let slot_index = self
+        let Some(slot_index) = self
             .tool_slots
             .iter()
             .position(|slot| slot.output_index == output_index)
-            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
+        else {
+            note_divergence("identity", output_index, "snapshot for an unstreamed call");
+            return Ok(());
+        };
         let slot = &mut self.tool_slots[slot_index];
         for (field, current) in [("call_id", &mut slot.id), ("name", &mut slot.name)] {
             if let Some(incoming) = item
@@ -692,7 +686,7 @@ impl StreamDecoder {
             {
                 match current {
                     Some(old) if old != incoming => {
-                        return Err(ProtocolError::InvalidUpstreamResponse);
+                        note_divergence("identity", output_index, "identity disagrees");
                     }
                     None => *current = Some(incoming.to_owned()),
                     _ => {}
@@ -725,6 +719,10 @@ impl StreamDecoder {
         Ok(())
     }
 
+    /// Fill a streamed call in from a snapshot frame. A snapshot may extend what
+    /// the deltas delivered (then the tail is appended); when it contradicts
+    /// them the streamed bytes win and the divergence is recorded — see
+    /// [`note_divergence`].
     fn reconcile_tool_snapshot(
         &mut self,
         output_index: u64,
@@ -735,39 +733,50 @@ impl StreamDecoder {
             .iter()
             .position(|slot| slot.output_index == output_index)
         else {
-            return Err(ProtocolError::InvalidUpstreamResponse);
+            note_divergence(
+                "tool_snapshot",
+                output_index,
+                "snapshot for an unstreamed call",
+            );
+            return Ok(());
         };
-        let slot = &mut self.tool_slots[slot_index];
-        for (field, current) in [("call_id", &mut slot.id), ("name", &mut slot.name)] {
-            let incoming = item
-                .get(field)
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or(ProtocolError::InvalidUpstreamResponse)?;
-            match current {
-                Some(old) if old != incoming => {
-                    return Err(ProtocolError::InvalidUpstreamResponse);
+        {
+            let slot = &mut self.tool_slots[slot_index];
+            for (field, current) in [("call_id", &mut slot.id), ("name", &mut slot.name)] {
+                let Some(incoming) = item
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                match current {
+                    Some(old) if old != incoming => {
+                        note_divergence("tool_snapshot", output_index, "identity disagrees");
+                    }
+                    None => *current = Some(incoming.to_owned()),
+                    _ => {}
                 }
-                None => *current = Some(incoming.to_owned()),
-                _ => {}
             }
         }
         let arguments = item
             .get("arguments")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let suffix_len = {
-            let slot = &self.tool_slots[slot_index];
-            arguments
-                .strip_prefix(slot.arguments.as_str())
-                .ok_or(ProtocolError::InvalidUpstreamResponse)?
-                .len()
+        let head_len = {
+            let current = self.tool_slots[slot_index].arguments.as_str();
+            if !arguments.starts_with(current) {
+                note_divergence("tool_snapshot", output_index, "arguments diverge");
+                return Ok(());
+            }
+            current.len()
         };
-        self.reserve_argument_bytes(suffix_len)?;
-        let current_len = self.tool_slots[slot_index].arguments.len();
-        self.tool_slots[slot_index]
-            .arguments
-            .push_str(&arguments[current_len..]);
+        let tail = &arguments[head_len..];
+        if tail.is_empty() {
+            return Ok(());
+        }
+        self.reserve_argument_bytes(tail.len())?;
+        self.tool_slots[slot_index].arguments.push_str(tail);
         Ok(())
     }
 
@@ -779,33 +788,47 @@ impl StreamDecoder {
         snapshot: &Value,
         events: &mut Vec<StreamEvent>,
     ) -> Result<(), ProtocolError> {
-        let arguments = snapshot
-            .get("arguments")
-            .and_then(Value::as_str)
-            .ok_or(ProtocolError::InvalidUpstreamResponse)?;
-        let output_index = output_index(value)?;
+        let Some(arguments) = snapshot.get("arguments").and_then(Value::as_str) else {
+            note_divergence("arguments_done", 0, "snapshot carries no arguments");
+            return Ok(());
+        };
+        let Ok(output_index) = output_index(value) else {
+            note_divergence("arguments_done", 0, "snapshot carries no output_index");
+            return Ok(());
+        };
         let Some(slot_index) = self
             .tool_slots
             .iter()
             .position(|slot| slot.output_index == output_index)
         else {
-            return Err(ProtocolError::InvalidUpstreamResponse);
+            note_divergence(
+                "arguments_done",
+                output_index,
+                "snapshot for an unstreamed call",
+            );
+            return Ok(());
         };
-        let current_arguments = self.tool_slots[slot_index].arguments.clone();
-        let Some(suffix) = arguments.strip_prefix(current_arguments.as_str()) else {
-            return Err(ProtocolError::InvalidUpstreamResponse);
-        };
-        if !suffix.is_empty() {
-            self.reserve_argument_bytes(suffix.len())?;
-            self.tool_slots[slot_index].arguments.push_str(suffix);
-            if self.tool_slots[slot_index].announced {
-                events.push(StreamEvent::ToolCallDelta {
-                    index: self.tool_slots[slot_index].index,
-                    id: None,
-                    name: None,
-                    arguments: suffix.to_owned(),
-                });
+        let head_len = {
+            let current = self.tool_slots[slot_index].arguments.as_str();
+            if !arguments.starts_with(current) {
+                note_divergence("arguments_done", output_index, "arguments diverge");
+                return Ok(());
             }
+            current.len()
+        };
+        let tail = &arguments[head_len..];
+        if tail.is_empty() {
+            return Ok(());
+        }
+        self.reserve_argument_bytes(tail.len())?;
+        self.tool_slots[slot_index].arguments.push_str(tail);
+        if self.tool_slots[slot_index].announced {
+            events.push(StreamEvent::ToolCallDelta {
+                index: self.tool_slots[slot_index].index,
+                id: None,
+                name: None,
+                arguments: tail.to_owned(),
+            });
         }
         Ok(())
     }
@@ -1079,6 +1102,21 @@ fn non_empty_delta(value: &Value) -> Option<&str> {
         .filter(|delta| !delta.is_empty())
 }
 
+/// One summary frame disagreed with the deltas it summarizes.
+///
+/// Recorded, never fatal: on the translated path the deltas are already on the
+/// wire, so failing the turn would hand the client a truncated success it can
+/// only answer by retrying the whole request. The streamed bytes win; the
+/// snapshot is used only where it extends them.
+fn note_divergence(stage: &'static str, output_index: u64, reason: &'static str) {
+    tracing::warn!(
+        stage,
+        output_index,
+        reason,
+        "upstream Responses snapshot diverged from the streamed deltas; keeping the streamed bytes"
+    );
+}
+
 fn reasoning_snapshot_suffix(emitted: &str, item: &Value) -> Option<String> {
     for field in ["summary", "content"] {
         let Some(parts) = item.get(field).and_then(Value::as_array) else {
@@ -1311,9 +1349,16 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_output_item_snapshot_fails() {
+    fn incomplete_output_item_snapshot_is_recorded_not_fatal() {
+        // A `done` item that omits the identity the stream already carries has
+        // nothing to add: recorded, never fatal (the deltas are on the wire).
         let mut decoder = StreamDecoder::new();
-        assert!(decoder.observe_raw(br#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call"}}"#).is_err());
+        let events = decoder
+            .observe_raw(
+                br#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call"}}"#,
+            )
+            .expect("a snapshot gap must not fail the stream");
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]
@@ -1330,13 +1375,56 @@ mod tests {
     }
 
     #[test]
-    fn inconsistent_completion_snapshot_fails() {
+    fn inconsistent_arguments_done_keeps_streamed_arguments() {
+        // A summary that contradicts the deltas is recorded, not fatal: the
+        // streamed arguments are what the client (and the caller's tools) saw.
         let mut decoder = StreamDecoder::new();
         let added = tool_added(0, "call_a", "alpha");
         let events = feed(&mut decoder, &[&added, &args_delta(0, "{\\\"ok\\\":true}")]);
         assert_eq!(events.len(), 2);
         let completion = r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"not-the-emitted-prefix"}"#;
-        assert!(decoder.observe_raw(completion.as_bytes()).is_err());
+        assert!(
+            decoder
+                .observe_raw(completion.as_bytes())
+                .expect("a diverging snapshot must not fail the stream")
+                .is_empty()
+        );
+        assert_eq!(
+            decoder.tool_slots[0].arguments, "{\\\"ok\\\":true}",
+            "the streamed arguments survive a diverging snapshot"
+        );
+        assert!(
+            decoder
+                .observe_raw(br#"{"type":"response.completed","response":{}}"#)
+                .is_ok()
+        );
+        assert_eq!(decoder.finish(), Terminal::Completed);
+    }
+
+    #[test]
+    fn completed_without_output_snapshot_is_a_clean_completion() {
+        // The ChatGPT Codex backend answers with a `response.completed` that
+        // carries no `output` snapshot; content arrived as deltas, so this is a
+        // normal completion, not an invalid response (the client used to see a
+        // null `finish_reason` and retry the whole request).
+        let mut decoder = StreamDecoder::new();
+        let added = tool_added(0, "call_a", "alpha");
+        let events = feed(
+            &mut decoder,
+            &[
+                &added,
+                &args_delta(0, r#"{"q":"x"}"#),
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#,
+            ],
+        );
+        assert_eq!(decoder.finish(), Terminal::Completed);
+        assert_eq!(decoder.usage().map(|usage| usage.output_tokens), Some(2));
+        assert!(
+            events.iter().any(
+                |event| matches!(event, StreamEvent::Finish { reason } if reason == "tool_calls")
+            ),
+            "a completed tool call closes as tool_calls: {events:?}"
+        );
     }
 
     #[test]

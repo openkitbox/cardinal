@@ -12,6 +12,9 @@
 //! - no `store`/`stream`/`include`/`service_tier`: the kernel pins `store` and
 //!   the relay injects `stream`; encrypted reasoning is not replayed;
 //! - assistant thinking is dropped (recorded), not wrapped in `<thinking>`;
+//! - in-history system/developer turns fold into `instructions` (this wire has
+//!   no in-history instruction slot, and the Codex backend rejects a `system`
+//!   role inside `input`);
 //! - output ceiling floor is 16, not 128, and an undeclared ceiling is omitted;
 //! - function tools always carry an explicit `strict: false` (Responses
 //!   defaults to `true`, Chat to `false`).
@@ -39,9 +42,15 @@ pub fn from_ir(request: &IrRequest, model: &str) -> Parsed<Value> {
     let mut body = Map::new();
     body.insert("model".to_owned(), Value::String(model.to_owned()));
     // An empty prompt is omitted, not sent as `""`: the upstream treats a
-    // missing field as "no instructions".
-    if let Some(system) = request.system.as_deref().filter(|text| !text.is_empty()) {
-        body.insert("instructions".to_owned(), Value::String(system.to_owned()));
+    // missing field as "no instructions". `folded_system` also carries the
+    // in-history system/developer turns: a Responses upstream reads
+    // instructions from this top-level field alone, and several reject a
+    // `system` role inside `input` outright — the ChatGPT Codex backend
+    // answers `{"detail":"System messages are not allowed"}`. The Chat emitter
+    // folds the same entries (`openai_chat::from_ir`), so both targets see one
+    // prompt.
+    if let Some(system) = request.folded_system().filter(|text| !text.is_empty()) {
+        body.insert("instructions".to_owned(), Value::String(system));
     }
     body.insert(
         "input".to_owned(),
@@ -142,7 +151,9 @@ fn build_input(
         match message.role {
             IrRole::Assistant => input.assistant(&message.parts, dropped)?,
             IrRole::User => input.user(&message.parts, dropped)?,
-            IrRole::System | IrRole::Developer => input.instruction(message.role, &message.parts),
+            // `from_ir` folds these into `instructions`; this wire has no
+            // in-history instruction item.
+            IrRole::System | IrRole::Developer => {}
         }
     }
     input.flush_pending_images();
@@ -150,27 +161,6 @@ fn build_input(
 }
 
 impl InputBuilder {
-    fn instruction(&mut self, role: IrRole, parts: &[IrPart]) {
-        let text = parts
-            .iter()
-            .filter_map(|part| match part {
-                IrPart::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        if text.is_empty() {
-            return;
-        }
-        self.flush_pending_images();
-        let role = match role {
-            IrRole::System => "system",
-            IrRole::Developer => "developer",
-            IrRole::User | IrRole::Assistant => return,
-        };
-        let mut content = vec![typed_text("input_text", &text)];
-        self.flush_message(role, &mut content);
-    }
-
     fn assistant(
         &mut self,
         parts: &[IrPart],
@@ -691,6 +681,42 @@ mod tests {
         ir.system = None;
         let (body, _) = build(&ir, "gpt-4o");
         assert!(body.get("instructions").is_none(), "{body}");
+    }
+
+    #[test]
+    fn in_history_instructions_fold_into_instructions_not_input() {
+        // An instruction that arrived after the conversation started still has
+        // to reach the model, but this wire has no in-history instruction item
+        // and the Codex backend refuses one outright ("System messages are not
+        // allowed"): it folds into `instructions`, exactly as the Chat emitter
+        // folds it into the leading system turn.
+        let mut ir = request();
+        ir.system = Some("static prompt".to_owned());
+        ir.messages.push(user(vec![text("first")]));
+        ir.messages.push(assistant(vec![text("reply")]));
+        ir.messages.push(IrMessage {
+            role: IrRole::System,
+            parts: vec![text("<instruction-update>be terse</instruction-update>")],
+        });
+        ir.messages.push(IrMessage {
+            role: IrRole::Developer,
+            parts: vec![text("dev note")],
+        });
+        ir.messages.push(user(vec![text("next")]));
+        let (body, dropped) = build(&ir, "gpt-6.1-terra");
+        assert_eq!(
+            body["instructions"],
+            "static prompt\n\n<instruction-update>be terse</instruction-update>\n\ndev note"
+        );
+        let input = body["input"].as_array().expect("input array");
+        assert!(
+            input.iter().all(|item| !matches!(
+                item.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            )),
+            "no in-history instruction role may reach the wire: {body}"
+        );
+        assert!(dropped.is_empty(), "folding is lossless: {dropped:?}");
     }
 
     #[test]
