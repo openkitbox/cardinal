@@ -528,8 +528,10 @@ pub async fn fetch_kiro_models(
         .map_err(|_| anyhow::anyhow!("模型目录响应不可读"))?;
     if !status.is_success() {
         // The control plane's error body is upstream-controlled and may quote
-        // request context; the fixed message is all that crosses the admin API.
-        anyhow::bail!("模型目录服务拒绝请求");
+        // request context; the status plus the fixed message is all that
+        // crosses the admin API (and, for a Kiro probe, the only detail the
+        // operator's log line can carry).
+        anyhow::bail!("模型目录服务拒绝请求 (HTTP {})", status.as_u16());
     }
     parse_kiro_models(&String::from_utf8_lossy(&body))
         .map_err(|_| anyhow::anyhow!("模型目录响应无效"))
@@ -634,9 +636,9 @@ pub async fn fetch_cursor_models(
         .await
         .map_err(|_| anyhow::anyhow!("模型目录响应不可读"))?;
     if !status.is_success() {
-        // The vendor's error body may quote request context; the fixed
-        // message is all that crosses the admin API.
-        anyhow::bail!("模型目录服务拒绝请求");
+        // The vendor's error body may quote request context; the status plus
+        // the fixed message is all that crosses the admin API.
+        anyhow::bail!("模型目录服务拒绝请求 (HTTP {})", status.as_u16());
     }
     parse_cursor_models(&String::from_utf8_lossy(&body))
         .map_err(|_| anyhow::anyhow!("模型目录响应无效"))

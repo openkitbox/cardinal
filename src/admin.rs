@@ -1681,7 +1681,17 @@ fn try_bad_gateway(response: &mut Response, error: &anyhow::Error) -> bool {
     };
     response.status_code(StatusCode::BAD_GATEWAY);
     let message = match probe {
-        crate::admin_ops::ProbeError::Kiro(_) => "upstream probe failed".to_owned(),
+        // A Kiro probe's own words never cross the admin API (they are
+        // upstream-controlled), so the log is the only place the operator can
+        // read why the vendor refused the credential — an import that answers
+        // nothing but "502" is otherwise undiagnosable.
+        crate::admin_ops::ProbeError::Kiro(cause) => {
+            tracing::warn!(
+                error = %format!("{cause:#}"),
+                "admin api: Kiro probe failed"
+            );
+            "upstream probe failed".to_owned()
+        }
         crate::admin_ops::ProbeError::Regular(_) => format!("upstream probe failed: {probe}"),
     };
     let _ = response.body(message);

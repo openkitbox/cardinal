@@ -1189,7 +1189,7 @@ fn ensure_endpoint(
 fn call_context(oauth: &KiroOAuth) -> KiroCallContext {
     KiroCallContext {
         bearer: SecretString::from(oauth.access_token.clone()),
-        profile_arn: oauth.effective_profile_arn().map(str::to_owned),
+        profile_arn: Some(oauth.effective_profile_arn().to_owned()),
         api_region: oauth.api_region.clone(),
     }
 }

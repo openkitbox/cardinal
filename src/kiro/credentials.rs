@@ -7,6 +7,17 @@
 pub const SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 
+/// The profile ARN a Builder ID account carries. Such an account owns no
+/// discoverable CodeWhisperer profile (`ListAvailableProfiles` answers
+/// `AWS Builder ID is not supported for this operation`), yet the chat call and
+/// the model catalogue both demand one: an absent ARN is refused with
+/// `profileArn is required for this request` (KAS) or `Invalid profileArn`
+/// (control plane), while this placeholder is accepted. It is the same value the
+/// official client sends, and it belongs to the Builder ID profile host, so it
+/// is not a per-account secret.
+pub const BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
 /// Kiro's AWS SSO OIDC credential (device-code / Builder ID login).
 ///
 /// Persisted as camelCase JSON with a Unix-seconds `expiresAt`. This is the
@@ -99,13 +110,22 @@ impl KiroOAuth {
         }
     }
 
-    /// The profile ARN sent on the KAS wire. Social credentials use the
-    /// shared profile when the export omitted an explicit ARN; IdC keeps the
-    /// optional value unchanged.
-    pub fn effective_profile_arn(&self) -> Option<&str> {
-        self.profile_arn.as_deref().or_else(|| {
-            (self.effective_auth_method() == AuthMethod::Social).then_some(SOCIAL_PROFILE_ARN)
-        })
+    /// The profile ARN every Kiro call must name: the KAS chat body, the model
+    /// catalogue and the usage query all carry one, and an absent value is
+    /// refused upstream (see [`BUILDER_ID_PROFILE_ARN`]). An explicit ARN from
+    /// the export always wins; an omitted one falls back on the authentication
+    /// method — Social logins share [`SOCIAL_PROFILE_ARN`], and an IdC bundle
+    /// without a profile is a Builder ID account, whose only accepted value is
+    /// [`BUILDER_ID_PROFILE_ARN`] (an Enterprise/IAM Identity Center export
+    /// always names its own profile).
+    pub fn effective_profile_arn(&self) -> &str {
+        if let Some(arn) = self.profile_arn.as_deref() {
+            return arn;
+        }
+        match self.effective_auth_method() {
+            AuthMethod::Social => SOCIAL_PROFILE_ARN,
+            AuthMethod::Idc => BUILDER_ID_PROFILE_ARN,
+        }
     }
 
     /// Every required field must hold a real value; whitespace-only counts as
@@ -349,4 +369,66 @@ pub fn parse_import_credentials(
     };
     oauth.validate()?;
     Ok(oauth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bundle shaped the way the import boundary produces one: the client pair
+    /// is what marks the authentication method (IdC), so an empty pair is Social.
+    fn oauth(idc: bool, profile_arn: Option<&str>) -> KiroOAuth {
+        KiroOAuth {
+            access_token: "aoa-test-access".to_owned(),
+            expires_at: 1_800_000_000,
+            refresh_token: "aor-test-refresh".to_owned(),
+            client_id: if idc {
+                "client-id".to_owned()
+            } else {
+                String::new()
+            },
+            client_secret: if idc {
+                "client-secret".to_owned()
+            } else {
+                String::new()
+            },
+            region: "us-east-1".to_owned(),
+            auth_region: "us-east-1".to_owned(),
+            api_region: "us-east-1".to_owned(),
+            profile_arn: profile_arn.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn builder_id_credential_falls_back_to_the_placeholder_profile() {
+        // A Builder ID export has the client pair and no profile ARN. Both the
+        // chat call and the model catalogue refuse an empty ARN, so the
+        // placeholder is the only value the upstream accepts.
+        assert_eq!(
+            oauth(true, None).effective_profile_arn(),
+            BUILDER_ID_PROFILE_ARN,
+            "an IdC bundle without a profile must name the Builder ID placeholder"
+        );
+    }
+
+    #[test]
+    fn social_credential_falls_back_to_the_shared_profile() {
+        assert_eq!(
+            oauth(false, None).effective_profile_arn(),
+            SOCIAL_PROFILE_ARN,
+            "a Social bundle without a profile must name the shared Social profile"
+        );
+    }
+
+    #[test]
+    fn an_explicit_profile_arn_wins_over_the_fallback() {
+        let explicit = "arn:aws:codewhisperer:eu-central-1:111122223333:profile/ABCDEF";
+        for idc in [true, false] {
+            assert_eq!(
+                oauth(idc, Some(explicit)).effective_profile_arn(),
+                explicit,
+                "an export's own profile ARN must never be replaced by a fallback"
+            );
+        }
+    }
 }
