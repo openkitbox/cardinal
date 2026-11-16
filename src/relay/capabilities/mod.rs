@@ -14,7 +14,8 @@
 //! their base_url contract and their per-row facts; this file owns only the
 //! generic contract ([`Capability`], [`select`], [`resolve_for_model`]) and
 //! the single-protocol fallback. Vendor modules: [`kimi`], [`glm`],
-//! [`gemini`], [`opencode`], [`commandcode`], [`deepseek`], [`codex`].
+//! [`gemini`], [`opencode`], [`commandcode`], [`deepseek`], [`codex`],
+//! [`workbuddy`].
 //!
 //! Endpoints are FULL request URLs: the protocol kernels use
 //! `TargetView.endpoint` verbatim.
@@ -26,6 +27,8 @@ mod gemini;
 mod glm;
 mod kimi;
 mod opencode;
+pub(crate) mod workbuddy;
+pub(crate) use workbuddy::{Build, WorkbuddyCredential, headers as workbuddy_headers};
 
 use crate::protocol::ProtocolId;
 use crate::providers::AuthScheme;
@@ -198,6 +201,7 @@ pub fn validate_base_url(provider_name: &str, base_url: &str) -> anyhow::Result<
         ("opencode", _) => opencode::validate_base_url(path),
         ("commandcode", _) => commandcode::validate_base_url(path),
         ("openai", _) if codex::is_codex(provider_name) => codex::validate_base_url(path),
+        ("workbuddy", _) => workbuddy::validate_base_url(provider_name, base_url),
         _ => Ok(()),
     }
 }
@@ -227,6 +231,7 @@ pub fn capabilities(
         ("kimi", code) => kimi::capabilities(base, code),
         ("glm", _) => glm::capabilities(base),
         ("gemini", _) => gemini::capabilities(base),
+        ("workbuddy", _) => workbuddy::capabilities(provider_name, base),
         ("opencode", _) => opencode::capabilities(base),
         ("commandcode", _) => commandcode::capabilities(base),
         ("deepseek", _) => deepseek::capabilities(base),

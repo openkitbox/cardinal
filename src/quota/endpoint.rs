@@ -167,7 +167,7 @@ fn quota_endpoint(provider_name: &str, base_url: &str) -> Option<Endpoint> {
                 parse: parse_commandcode_quota,
             },
             // Official vendor APIs expose no per-key balance.
-            ("anthropic" | "openai" | "gemini" | "kiro", _) => return None,
+            ("anthropic" | "openai" | "gemini" | "kiro" | "workbuddy", _) => return None,
             // Any other (custom) name: many third-party relays run sub2api,
             // whose `/v1/usage` reports the key's wallet / quota / plan.
             _ => Endpoint {
@@ -191,4 +191,15 @@ async fn read_bounded(response: reqwest::Response) -> anyhow::Result<String> {
         anyhow::ensure!(body.len() <= MAX_BODY, "配额响应超过 {MAX_BODY} 字节上限");
     }
     Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quota_endpoint;
+
+    #[test]
+    fn workbuddy_has_no_quota_endpoint() {
+        assert!(quota_endpoint("workbuddy", "https://copilot.tencent.com").is_none());
+        assert!(quota_endpoint("workbuddy-intl", "https://www.workbuddy.ai").is_none());
+    }
 }

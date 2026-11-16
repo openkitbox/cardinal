@@ -387,6 +387,7 @@ pub(super) fn raw_value(raw: &RawValue) -> Option<serde_json::Value> {
 /// `strip_images` rides the same render pass: GLM's data-URI rewrite happens
 /// while serializing (see [`StripDataUris`]), never as a tree copy. Gemini
 /// takes no flag — no Gemini-wire upstream declares the dialect.
+/// `dialect` selects chat-only render fixups; all other kernels ignore it.
 pub fn prepare(
     protocol: ProtocolId,
     client_body: &serde_json::Value,
@@ -394,11 +395,12 @@ pub fn prepare(
     stream: bool,
     skip: &[&str],
     strip_images: bool,
+    dialect: openai_chat::ChatDialect,
 ) -> Result<Prepared, ProtocolError> {
     debug_assert_eq!(protocol, target.protocol);
     match protocol {
         ProtocolId::OpenAiChat => {
-            openai_chat::prepare(client_body, target, stream, skip, strip_images)
+            openai_chat::prepare(client_body, target, stream, skip, strip_images, dialect)
         }
         ProtocolId::OpenAiResponses => {
             openai_responses::prepare(client_body, target, stream, skip, strip_images)

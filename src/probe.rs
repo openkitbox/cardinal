@@ -13,6 +13,7 @@
 use anyhow::Context as _;
 
 use crate::relay::capabilities::codex::CLIENT_VERSION as CODEX_CLIENT_VERSION;
+use crate::relay::capabilities::{Build, WorkbuddyCredential, workbuddy_headers};
 
 /// One probe attempt's budget (matches the magnitude the relay allows for
 /// opening a response).
@@ -644,6 +645,159 @@ pub async fn fetch_cursor_models(
         .map_err(|_| anyhow::anyhow!("模型目录响应无效"))
 }
 
+/// Fetch WorkBuddy's account-specific model catalogue.
+pub async fn fetch_workbuddy_models(
+    base: &str,
+    build: Build,
+    credential: WorkbuddyCredential<'_>,
+    transport: &crate::upstream::transport::Transport,
+    dns: crate::upstream::Dns,
+) -> anyhow::Result<Vec<ProbeModel>> {
+    let base = base.trim_end_matches('/');
+    anyhow::ensure!(!base.is_empty(), "WorkBuddy endpoint is empty");
+    let url = format!("{base}/v3/config");
+    let host = reqwest::Url::parse(base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .ok_or_else(|| anyhow::anyhow!("WorkBuddy endpoint is invalid"))?;
+    anyhow::ensure!(
+        crate::relay::capabilities::workbuddy::host_allowed(build, &host),
+        "WorkBuddy endpoint host is not allowed"
+    );
+    let headers = workbuddy_headers(build, credential, None);
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let response = transport
+        .send_get_with_headers(&url, dns, &headers, &[], deadline)
+        .await
+        .map_err(|_| anyhow::anyhow!("WorkBuddy model catalogue request failed"))?;
+    let status = response.status();
+    let body = transport
+        .read_body(response, MAX_BODY, deadline)
+        .await
+        .map_err(|_| anyhow::anyhow!("WorkBuddy model catalogue response unreadable"))?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "WorkBuddy model catalogue rejected request (HTTP {})",
+            status.as_u16()
+        );
+    }
+    parse_workbuddy_config(&String::from_utf8_lossy(&body))
+}
+
+/// Parse WorkBuddy's `{code, data: {models: [...]}}` response envelope.
+pub fn parse_workbuddy_config(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        code: i64,
+        data: Option<Data>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Data {
+        models: Option<Vec<Entry>>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        id: Option<String>,
+        name: Option<String>,
+        max_input_tokens: Option<u64>,
+        max_output_tokens: Option<u64>,
+        #[serde(default)]
+        supports_images: bool,
+        #[serde(default)]
+        supports_reasoning: bool,
+        reasoning: Option<WorkbuddyReasoning>,
+    }
+
+    let envelope: Envelope = serde_json::from_str(body)?;
+    anyhow::ensure!(
+        envelope.code == 0,
+        "WorkBuddy model catalogue returned an error"
+    );
+    let entries = envelope
+        .data
+        .and_then(|data| data.models)
+        .ok_or_else(|| anyhow::anyhow!("WorkBuddy model catalogue has invalid models"))?;
+    anyhow::ensure!(!entries.is_empty(), "WorkBuddy model catalogue is empty");
+    let models: Vec<ProbeModel> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let id = [entry.id, entry.name]
+                .into_iter()
+                .flatten()
+                .map(|value| value.trim().to_owned())
+                .find(|value| !value.is_empty())?;
+            let (effort_levels, default_effort) =
+                workbuddy_efforts(entry.supports_reasoning, entry.reasoning);
+            Some(ProbeModel {
+                id,
+                rate_multiplier: None,
+                context: entry.max_input_tokens.filter(|value| *value > 0),
+                max_output: entry.max_output_tokens.filter(|value| *value > 0),
+                input_modalities: if entry.supports_images {
+                    vec!["image".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                effort_levels,
+                default_effort,
+            })
+        })
+        .collect();
+    anyhow::ensure!(
+        !models.is_empty(),
+        "WorkBuddy model catalogue has no usable models"
+    );
+    Ok(models)
+}
+
+fn workbuddy_efforts(
+    supports_reasoning: bool,
+    reasoning: Option<WorkbuddyReasoning>,
+) -> (Vec<String>, Option<String>) {
+    let supplied = reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.supported_efforts.as_deref())
+        .unwrap_or_default();
+    let mut levels = if supplied.is_empty() {
+        if supports_reasoning {
+            ["low", "high", "max"].map(str::to_owned).to_vec()
+        } else {
+            Vec::new()
+        }
+    } else {
+        crate::translation::ir::Effort::canonical_levels(supplied)
+    };
+    if supplied.is_empty()
+        && supports_reasoning
+        && let Some(effort) = reasoning.as_ref().and_then(|value| value.effort.as_deref())
+        && let Some(level) = crate::translation::ir::Effort::parse_name(effort)
+            .filter(|level| !matches!(level, crate::translation::ir::Effort::None))
+            .map(crate::translation::ir::Effort::chat_name)
+            .map(str::to_owned)
+    {
+        levels.push(level);
+        levels = crate::translation::ir::Effort::canonical_levels(&levels);
+    }
+    let default_effort = reasoning
+        .as_ref()
+        .and_then(|value| value.default_effort.as_deref().or(value.effort.as_deref()))
+        .and_then(crate::translation::ir::Effort::parse_name)
+        .filter(|level| !matches!(level, crate::translation::ir::Effort::None))
+        .map(crate::translation::ir::Effort::chat_name)
+        .map(str::to_owned)
+        .filter(|level| levels.contains(level));
+    (levels, default_effort)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkbuddyReasoning {
+    supported_efforts: Option<Vec<String>>,
+    default_effort: Option<String>,
+    effort: Option<String>,
+}
+
 /// Parse `GetUsableModels`' `{"models": [{modelId, displayName, maxMode}]}`
 /// into [`ProbeModel`]s. Only the id is required; the display name and the
 /// Max Mode flag are informational (the relay asks for Max Mode when Cursor
@@ -871,4 +1025,81 @@ fn parse_codex_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
         });
     }
     Ok(models)
+}
+
+#[cfg(test)]
+mod workbuddy_tests {
+    use super::parse_workbuddy_config;
+
+    #[test]
+    fn parses_normal_catalogue() {
+        let models = parse_workbuddy_config(
+            r#"{"code":0,"data":{"models":[{"id":"alpha","maxInputTokens":8192,"maxOutputTokens":1024,"supportsImages":true,"supportsReasoning":true,"reasoning":{"supportedEfforts":["low","high"],"defaultEffort":"high"}}]}}"#,
+        )
+        .expect("normal config should parse");
+        assert_eq!(models[0].id, "alpha");
+        assert_eq!(models[0].context, Some(8192));
+        assert_eq!(models[0].max_output, Some(1024));
+        assert_eq!(models[0].input_modalities, vec!["image"]);
+        assert_eq!(models[0].effort_levels, vec!["low", "high"]);
+        assert_eq!(models[0].default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn rejects_nonzero_code() {
+        let error = parse_workbuddy_config(r#"{"code":10001,"msg":"secret"}"#)
+            .expect_err("nonzero code should fail");
+        assert_eq!(
+            error.to_string(),
+            "WorkBuddy model catalogue returned an error"
+        );
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn rejects_empty_models() {
+        let error = parse_workbuddy_config(r#"{"code":0,"data":{"models":[]}}"#)
+            .expect_err("empty catalogue should fail");
+        assert_eq!(error.to_string(), "WorkBuddy model catalogue is empty");
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        assert!(parse_workbuddy_config("{not json").is_err());
+    }
+
+    #[test]
+    fn supplies_reasoning_fallback_when_efforts_are_missing() {
+        let models = parse_workbuddy_config(
+            r#"{"code":0,"data":{"models":[{"id":"thinking","supportsReasoning":true,"reasoning":{"effort":"medium"}},{"id":"plain"}]}}"#,
+        )
+        .expect("missing effort fields should use the documented fallback");
+        assert_eq!(
+            models[0].effort_levels,
+            vec!["low", "high", "max", "medium"]
+        );
+        assert_eq!(models[0].default_effort.as_deref(), Some("medium"));
+        assert!(models[1].effort_levels.is_empty());
+    }
+
+    #[test]
+    fn keeps_supplied_levels_and_filters_default_to_them() {
+        let models = parse_workbuddy_config(
+            r#"{"code":0,"data":{"models":[{"id":"thinking","supportsReasoning":true,"reasoning":{"supportedEfforts":["minimal","HIGH","high"],"effort":"medium","defaultEffort":"xhigh"}}]}}"#,
+        )
+        .expect("supplied reasoning fields should be canonicalized");
+        assert_eq!(models[0].effort_levels, vec!["low", "high"]);
+        assert_eq!(models[0].default_effort, None);
+    }
+
+    #[test]
+    fn skips_blank_ids_and_fails_when_none_are_usable() {
+        let error =
+            parse_workbuddy_config(r#"{"code":0,"data":{"models":[{"id":"  "},{"name":""}]}}"#)
+                .expect_err("catalogue without usable ids should fail");
+        assert_eq!(
+            error.to_string(),
+            "WorkBuddy model catalogue has no usable models"
+        );
+    }
 }

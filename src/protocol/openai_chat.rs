@@ -14,7 +14,111 @@ use super::{
     ObservedResponse, Prepared, ProtocolError, ProtocolId, RawValue, StreamEvent, TargetView,
     Terminal,
 };
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde_json::Value;
+
+/// The wire dialect one chat endpoint demands, applied while the body is
+/// rendered (never by rewriting the client's parsed tree).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChatDialect {
+    /// Prepend a default `system` message when the first message is not one.
+    pub system_first: bool,
+    /// Send `developer` messages with role `system`.
+    pub developer_as_system: bool,
+    /// Write the client's `max_completion_tokens` as `max_tokens`.
+    pub max_tokens_only: bool,
+}
+
+impl ChatDialect {
+    /// The OpenAI-compatible default: the client's body goes as it came.
+    pub const NATIVE: Self = Self {
+        system_first: false,
+        developer_as_system: false,
+        max_tokens_only: false,
+    };
+
+    /// WorkBuddy's chat endpoint (see the module doc of `relay::capabilities::workbuddy`).
+    pub const WORKBUDDY: Self = Self {
+        system_first: true,
+        developer_as_system: true,
+        max_tokens_only: true,
+    };
+}
+
+/// Borrow-only message serializer for endpoint dialect fixups. It walks the
+/// client's existing `Value` tree during wire rendering, without a second parse
+/// or a rewritten copy of the messages.
+struct DialectMessages<'a> {
+    messages: &'a [Value],
+    dialect: ChatDialect,
+    strip_images: bool,
+}
+
+struct DefaultSystemMessage;
+
+impl serde::Serialize for DefaultSystemMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("role", "system")?;
+        map.serialize_entry("content", "You are a helpful assistant.")?;
+        map.end()
+    }
+}
+
+struct DialectMessage<'a> {
+    message: &'a Value,
+    developer_as_system: bool,
+    strip_images: bool,
+}
+
+impl serde::Serialize for DialectMessage<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Some(object) = self.message.as_object() else {
+            return if self.strip_images {
+                serde::Serialize::serialize(&super::StripDataUris(self.message), serializer)
+            } else {
+                serde::Serialize::serialize(self.message, serializer)
+            };
+        };
+        let mut map = serializer.serialize_map(Some(object.len()))?;
+        for (key, value) in object {
+            if key == "role" && self.developer_as_system && value.as_str() == Some("developer") {
+                map.serialize_entry(key, "system")?;
+            } else if self.strip_images {
+                map.serialize_entry(key, &super::StripDataUris(value))?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl serde::Serialize for DialectMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let needs_system = self.dialect.system_first
+            && !self.messages.first().is_some_and(|message| {
+                message
+                    .as_object()
+                    .and_then(|object| object.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("system")
+            });
+        let extra = usize::from(needs_system);
+        let mut sequence = serializer.serialize_seq(Some(self.messages.len() + extra))?;
+        if needs_system {
+            sequence.serialize_element(&DefaultSystemMessage)?;
+        }
+        for message in self.messages {
+            sequence.serialize_element(&DialectMessage {
+                message,
+                developer_as_system: self.dialect.developer_as_system,
+                strip_images: self.strip_images,
+            })?;
+        }
+        sequence.end()
+    }
+}
 
 /// Build the upstream request for one attempt.
 ///
@@ -31,6 +135,7 @@ pub fn prepare(
     stream: bool,
     skip: &[&str],
     strip_images: bool,
+    dialect: ChatDialect,
 ) -> Result<Prepared, ProtocolError> {
     validate_request(client_body)?;
     let object = client_body
@@ -45,11 +150,22 @@ pub fn prepare(
         if skip.contains(&field.as_str()) {
             continue;
         }
+        if dialect.max_tokens_only
+            && field == "max_completion_tokens"
+            && object.contains_key("max_tokens")
+        {
+            continue;
+        }
         if !first {
             out.push(b',');
         }
         first = false;
-        super::write_json(&mut out, field)?;
+        let output_field = if dialect.max_tokens_only && field == "max_completion_tokens" {
+            "max_tokens"
+        } else {
+            field
+        };
+        super::write_json(&mut out, output_field)?;
         out.push(b':');
         if field == "model" {
             super::write_json(&mut out, target.upstream_model)?;
@@ -86,6 +202,17 @@ pub fn prepare(
             } else {
                 super::write_json_value(&mut out, value, strip_images)?;
             }
+        } else if field == "messages" && (dialect.system_first || dialect.developer_as_system) {
+            let messages = value.as_array().ok_or(ProtocolError::InvalidRequest)?;
+            serde_json::to_writer(
+                &mut out,
+                &DialectMessages {
+                    messages,
+                    dialect,
+                    strip_images,
+                },
+            )
+            .map_err(|_| ProtocolError::InvalidRequest)?;
         } else {
             super::write_json_value(&mut out, value, strip_images)?;
         }
@@ -557,4 +684,105 @@ pub fn stream_error_frames(
         id: None,
         data: bytes::Bytes::from(chunk.to_string()),
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target() -> TargetView<'static> {
+        TargetView {
+            protocol: ProtocolId::OpenAiChat,
+            endpoint: "https://example.test/v1/chat/completions",
+            stream_endpoint: None,
+            upstream_model: "test-model",
+            kas_call: None,
+            forced: &[],
+            required: &[],
+        }
+    }
+
+    fn render(body: &Value, dialect: ChatDialect) -> Value {
+        let prepared = prepare(body, &target(), false, &[], false, dialect)
+            .expect("test request should prepare");
+        serde_json::from_slice(&prepared.body).expect("prepared body should be JSON")
+    }
+
+    #[test]
+    fn workbuddy_adds_system_and_renames_token_cap() {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 100,
+        });
+
+        let wire = render(&body, ChatDialect::WORKBUDDY);
+        assert_eq!(
+            wire["messages"][0],
+            serde_json::json!({
+                "role": "system",
+                "content": "You are a helpful assistant."
+            })
+        );
+        assert_eq!(wire["messages"][1], body["messages"][0]);
+        assert_eq!(wire["max_tokens"], 100);
+        assert!(wire.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn workbuddy_does_not_duplicate_existing_system_message() {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "custom"},
+                {"role": "user", "content": "hello"}
+            ],
+        });
+
+        let wire = render(&body, ChatDialect::WORKBUDDY);
+        let messages = wire["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+    }
+
+    #[test]
+    fn workbuddy_maps_developer_role_but_native_preserves_it() {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "developer", "content": "rules"}],
+        });
+
+        assert_eq!(
+            render(&body, ChatDialect::WORKBUDDY)["messages"][1]["role"],
+            "system"
+        );
+        assert_eq!(
+            render(&body, ChatDialect::NATIVE)["messages"][0]["role"],
+            "developer"
+        );
+    }
+
+    #[test]
+    fn native_render_preserves_json_and_keys() {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 100,
+            "custom": {"nested": [true, null, 3]},
+        });
+
+        let wire = render(&body, ChatDialect::NATIVE);
+        assert_eq!(
+            wire,
+            serde_json::from_slice::<Value>(&serde_json::to_vec(&body).expect("body JSON"),)
+                .expect("round-tripped body JSON"),
+        );
+        assert_eq!(
+            wire.as_object().expect("wire object").len(),
+            body.as_object().expect("body object").len()
+        );
+        for key in body.as_object().expect("body object").keys() {
+            assert!(wire.get(key).is_some(), "native output omitted {key}");
+        }
+    }
 }

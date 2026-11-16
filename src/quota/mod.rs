@@ -10,10 +10,10 @@
 //! monthly plan usage (Zen is pay-as-you-go — no source), a Cursor account
 //! its plan's included usage and on-demand spend (by protocol, like Kiro),
 //! an openai-codex (ChatGPT subscription) account its 5-hour and weekly usage
-//! windows from `wham/usage`;
-//! any other name has no vendor source and falls back to a speculative
-//! sub2api relay probe (`/v1/usage`) — except the official vendors
-//! (anthropic, openai, gemini, kiro), whose APIs expose no key balance.
+//! windows from `wham/usage`; WorkBuddy has no confirmed quota source.
+//! Any other name has no vendor source and falls back to a speculative sub2api
+//! relay probe (`/v1/usage`) — except the official vendors (anthropic, openai,
+//! gemini, kiro), whose APIs expose no key balance.
 //! The endpoint URL is derived from the provider row's base_url (scheme +
 //! host + port) plus the table's fixed path, so a row pointing at a mock
 //! server is probed there.

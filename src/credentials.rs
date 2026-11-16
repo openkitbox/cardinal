@@ -2,7 +2,8 @@
 //! plaintext api_key), `kiro_oidc` (a Kiro AWS SSO OIDC bundle),
 //! `opencode_oauth` (an OpenCode Console device-flow bundle), `cursor_oauth`
 //! (a Cursor browser-login bundle) and `openai_oauth` (an OpenAI Codex /
-//! ChatGPT-subscription device-flow bundle).
+//! ChatGPT-subscription device-flow bundle), or a WorkBuddy account-login
+//! bundle.
 //!
 //! This is the create-time decision point shared by the admin surface, the
 //! store and the relay. Nothing here performs I/O: it decides which of the two
@@ -22,6 +23,7 @@ use chrono::Utc;
 use crate::kiro::KiroOAuth;
 use crate::openai::OpenaiOAuth;
 use crate::opencode::OpencodeOAuth;
+use crate::workbuddy::WorkbuddyOAuth;
 
 /// The longest access-token lifetime a stored Cursor bundle may claim. Cursor
 /// publishes no metadata, so a bundle's `expires_at` is decoded from the access
@@ -43,6 +45,8 @@ pub enum AuthKind {
     CursorOauth,
     /// The row's `oauth` bundle: OpenAI Codex (ChatGPT subscription) tokens.
     OpenaiOauth,
+    /// The row's `oauth` bundle: WorkBuddy account-login tokens.
+    WorkbuddyOauth,
 }
 
 impl AuthKind {
@@ -55,6 +59,7 @@ impl AuthKind {
             Self::OpencodeOauth => "opencode_oauth",
             Self::CursorOauth => "cursor_oauth",
             Self::OpenaiOauth => "openai_oauth",
+            Self::WorkbuddyOauth => "workbuddy_oauth",
         }
     }
 
@@ -67,8 +72,9 @@ impl AuthKind {
             "opencode_oauth" => Ok(Self::OpencodeOauth),
             "cursor_oauth" => Ok(Self::CursorOauth),
             "openai_oauth" => Ok(Self::OpenaiOauth),
+            "workbuddy_oauth" => Ok(Self::WorkbuddyOauth),
             other => Err(anyhow!(
-                "unknown auth_kind {other:?} (expected \"static\", \"kiro_oidc\", \"opencode_oauth\", \"cursor_oauth\" or \"openai_oauth\")"
+                "unknown auth_kind {other:?} (expected \"static\", \"kiro_oidc\", \"opencode_oauth\", \"cursor_oauth\", \"openai_oauth\" or \"workbuddy_oauth\")"
             )),
         }
     }
@@ -165,6 +171,8 @@ pub enum KeyCredential<'a> {
     /// An OpenAI Codex (ChatGPT subscription) bundle; the row stores no
     /// api_key.
     OpenaiOauth(OpenaiOAuth),
+    /// A WorkBuddy account-login bundle; the row stores no api_key.
+    WorkbuddyOauth(WorkbuddyOAuth),
 }
 
 impl std::fmt::Debug for KeyCredential<'_> {
@@ -177,6 +185,10 @@ impl std::fmt::Debug for KeyCredential<'_> {
             }
             Self::CursorOauth(oauth) => formatter.debug_tuple("CursorOauth").field(oauth).finish(),
             Self::OpenaiOauth(oauth) => formatter.debug_tuple("OpenaiOauth").field(oauth).finish(),
+            Self::WorkbuddyOauth(oauth) => formatter
+                .debug_tuple("WorkbuddyOauth")
+                .field(oauth)
+                .finish(),
         }
     }
 }
@@ -194,11 +206,14 @@ impl std::fmt::Debug for KeyCredential<'_> {
 /// - an `openai_oauth` credential only ever belongs to an `openai_responses`
 ///   provider (the Codex backend speaks the Responses dialect; migrations/0022
 ///   adds no protocol, the kind alone marks the account login);
+/// - a `workbuddy_oauth` credential only ever belongs to a WorkBuddy provider
+///   with an OpenAI Chat or Anthropic Messages protocol;
 /// - a static key needs a non-empty `api_key` and must NOT carry `oauth`;
 /// - an OAuth kind needs no api_key and a complete bundle of its own shape: the
 ///   raw `oauth` payload is decoded as that kind's bundle, never sniffed;
 /// - any other `auth_kind` is rejected.
 pub fn resolve_key_credential<'a>(
+    provider_name: &str,
     protocol: &str,
     auth_kind: Option<&str>,
     api_key: Option<&'a str>,
@@ -286,6 +301,22 @@ pub fn resolve_key_credential<'a>(
             oauth.validate()?;
             Ok(KeyCredential::OpenaiOauth(oauth))
         }
+        AuthKind::WorkbuddyOauth => {
+            let (vendor, _) = crate::relay::capabilities::provider_kind(provider_name);
+            anyhow::ensure!(
+                vendor == "workbuddy" && matches!(protocol, "openai_chat" | "anthropic_messages"),
+                "auth_kind \"workbuddy_oauth\" requires a WorkBuddy provider with protocol \"openai_chat\" or \"anthropic_messages\" (got provider {provider_name:?}, protocol {protocol:?})"
+            );
+            anyhow::ensure!(
+                api_key.is_none_or(|key| key.trim().is_empty()),
+                "a WorkBuddy OAuth key must not carry an api_key"
+            );
+            let oauth =
+                oauth.ok_or_else(|| anyhow!("auth_kind \"workbuddy_oauth\" requires oauth"))?;
+            let oauth: WorkbuddyOAuth = decode_bundle(oauth, auth_kind)?;
+            oauth.validate()?;
+            Ok(KeyCredential::WorkbuddyOauth(oauth))
+        }
     }
 }
 
@@ -302,4 +333,67 @@ where
             auth_kind.as_str()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle() -> serde_json::Value {
+        serde_json::json!({
+            "access_token": "access-secret",
+            "refresh_token": "refresh-secret",
+            "expires_at": (Utc::now() + Duration::days(30)).to_rfc3339(),
+            "uid": "uid"
+        })
+    }
+
+    #[test]
+    fn workbuddy_oauth_is_accepted_for_both_chat_protocols_and_build_names() {
+        for provider in ["workbuddy", "workbuddy-intl"] {
+            for protocol in ["openai_chat", "anthropic_messages"] {
+                let credential = resolve_key_credential(
+                    provider,
+                    protocol,
+                    Some("workbuddy_oauth"),
+                    Some(" "),
+                    Some(&bundle()),
+                )
+                .expect("valid WorkBuddy OAuth should be accepted");
+                assert!(matches!(credential, KeyCredential::WorkbuddyOauth(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn workbuddy_oauth_is_rejected_for_other_providers_and_protocols() {
+        for (provider, protocol) in [("openai", "openai_chat"), ("workbuddy", "openai_responses")] {
+            assert!(
+                resolve_key_credential(
+                    provider,
+                    protocol,
+                    Some("workbuddy_oauth"),
+                    None,
+                    Some(&bundle()),
+                )
+                .is_err(),
+                "unexpectedly accepted {provider}/{protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn workbuddy_oauth_debug_redacts_tokens() {
+        let credential = resolve_key_credential(
+            "workbuddy",
+            "openai_chat",
+            Some("workbuddy_oauth"),
+            None,
+            Some(&bundle()),
+        )
+        .expect("valid WorkBuddy OAuth should be accepted");
+        let debug = format!("{credential:?}");
+        assert!(!debug.contains("access-secret"));
+        assert!(!debug.contains("refresh-secret"));
+    }
 }

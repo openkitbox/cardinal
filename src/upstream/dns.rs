@@ -18,6 +18,7 @@ use std::{
 const CLOUDFLARE_DOH_NAME: &str = "cloudflare-dns.com";
 const GOOGLE_DOH_NAME: &str = "dns.google";
 const ALIDNS_DOH_NAME: &str = "dns.alidns.com";
+const DNSPOD_DOH_NAME: &str = "doh.pub";
 const DOT_PUB_NAME: &str = "dot.pub";
 const DNS_QUERY_PATH: &str = "/dns-query";
 
@@ -81,7 +82,7 @@ fn name_servers(dns: Dns) -> Vec<NameServerConfig> {
             dot([8, 8, 8, 8], GOOGLE_DOH_NAME),
         ],
         Dns::Domestic => vec![
-            doh([223, 5, 5, 5], ALIDNS_DOH_NAME),
+            doh([1, 12, 12, 12], DNSPOD_DOH_NAME),
             dot([1, 12, 12, 12], DOT_PUB_NAME),
             dot([223, 5, 5, 5], ALIDNS_DOH_NAME),
         ],
@@ -204,5 +205,31 @@ mod tests {
                 assert!(matches!(server.connections[0].port, 443 | 853));
             }
         }
+    }
+
+    #[test]
+    fn domestic_profile_prefers_dns_pod_https_with_encrypted_fallbacks() {
+        let servers = name_servers(Dns::Domestic);
+        assert_eq!(servers[0].ip, IpAddr::V4(Ipv4Addr::new(1, 12, 12, 12)));
+        assert!(matches!(
+            &servers[0].connections[0].protocol,
+            hickory_resolver::config::ProtocolConfig::Https { server_name, path }
+                if server_name.as_ref() == "doh.pub" && path.as_ref() == DNS_QUERY_PATH
+        ));
+        assert_eq!(servers[0].connections[0].port, 443);
+
+        assert!(matches!(
+            &servers[1].connections[0].protocol,
+            hickory_resolver::config::ProtocolConfig::Tls { server_name }
+                if server_name.as_ref() == "dot.pub"
+        ));
+        assert_eq!(servers[1].connections[0].port, 853);
+
+        assert!(matches!(
+            &servers[2].connections[0].protocol,
+            hickory_resolver::config::ProtocolConfig::Tls { server_name }
+                if server_name.as_ref() == ALIDNS_DOH_NAME
+        ));
+        assert_eq!(servers[2].connections[0].port, 853);
     }
 }

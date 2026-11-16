@@ -65,6 +65,12 @@ pub struct AppState {
     pub openai_logins: crate::openai::login::OpenaiLogins,
     /// Per-key Cursor bearer manager, same contract; shared with model probing.
     pub cursor_tokens: Arc<crate::upstream::CursorTokens>,
+    /// Per-key WorkBuddy account bearer manager, shared with dispatch and probes.
+    pub workbuddy_tokens: Arc<crate::upstream::WorkbuddyTokens>,
+    /// The WorkBuddy browser-login client and session registry.
+    pub workbuddy_client: Arc<crate::workbuddy::Client>,
+    /// In-flight WorkBuddy browser logins.
+    pub workbuddy_logins: crate::workbuddy::WorkbuddyLogins,
     /// The Cursor usage reconciler, shared with every settlement task.
     pub cursor_usage: Arc<crate::upstream::CursorUsage>,
     /// The stateless OpenCode Console client: one instance serves the login
@@ -244,6 +250,7 @@ async fn relay_dispatch(
         opencode_tokens: state.opencode_tokens.as_ref(),
         openai_tokens: state.openai_tokens.as_ref(),
         cursor_tokens: state.cursor_tokens.as_ref(),
+        workbuddy_tokens: state.workbuddy_tokens.as_ref(),
         cursor_usage: &state.cursor_usage,
         trace_ring: &state.trace_ring,
         smart_cache: &state.smart_cache,

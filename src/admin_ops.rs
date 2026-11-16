@@ -39,6 +39,11 @@ use crate::opencode::login::SessionState;
 use crate::probe::{self, ProbeModel};
 use crate::quota::{self, KeyQuota};
 use crate::store::{self, ProviderInput};
+use crate::workbuddy;
+use crate::workbuddy::WorkbuddyOAuth;
+use crate::workbuddy::auth::AccountPoll;
+use crate::workbuddy::auth::TokenPoll;
+use crate::workbuddy::login::SessionState as WorkbuddySessionState;
 
 /// In-process key view: the full row plus the row-stored plaintext credential
 /// (display layers mask it; empty when the key has none) plus the live
@@ -418,6 +423,17 @@ pub async fn create_key(
             )
             .await
         }
+        KeyCredential::WorkbuddyOauth(oauth) => {
+            store::insert_workbuddy_provider_key(
+                pool,
+                provider_id,
+                label,
+                oauth,
+                max_concurrency,
+                allowed_models,
+            )
+            .await
+        }
     }
 }
 
@@ -505,14 +521,19 @@ static QUOTA_HISTORY_PRUNE: HistoryPruneGate = HistoryPruneGate::new();
 /// History retention is enforced here, at most hourly, rather than inside the
 /// per-key insert: the trend series only needs to stay bounded, so one
 /// table-wide delete an hour costs far less than one delete per key per round.
+pub struct QuotaProbeTokens {
+    pub kiro: Option<Arc<crate::upstream::KiroTokens>>,
+    pub opencode: Option<Arc<crate::upstream::OpencodeTokens>>,
+    pub cursor: Option<Arc<crate::upstream::CursorTokens>>,
+    pub openai: Option<Arc<crate::upstream::OpenaiTokens>>,
+    pub workbuddy: Option<Arc<crate::upstream::WorkbuddyTokens>>,
+}
+
 pub async fn probe_all_quotas(
     pool: &PgPool,
     smart_cache: Option<&crate::relay::SmartCache>,
     transport: &crate::upstream::transport::Transport,
-    kiro_tokens: Option<&Arc<crate::upstream::KiroTokens>>,
-    opencode_tokens: Option<&Arc<crate::upstream::OpencodeTokens>>,
-    cursor_tokens: Option<&Arc<crate::upstream::CursorTokens>>,
-    openai_tokens: Option<&Arc<crate::upstream::OpenaiTokens>>,
+    tokens: &QuotaProbeTokens,
 ) -> Vec<KeyQuotaRow> {
     /// Which credential a key's probe uses.
     enum QuotaSource {
@@ -546,6 +567,11 @@ pub async fn probe_all_quotas(
             std::collections::HashMap::new()
         });
     for provider in providers.iter().filter(|provider| provider.enabled) {
+        if crate::relay::capabilities::workbuddy::is_workbuddy(&provider.name) {
+            // WorkBuddy has no confirmed quota API; do not resolve its bearer or
+            // fall through to the speculative /v1/usage probe.
+            continue;
+        }
         let keys = match store::list_provider_keys(pool, provider.id).await {
             Ok(keys) => keys,
             Err(error) => {
@@ -565,13 +591,13 @@ pub async fn probe_all_quotas(
             let source = if provider.protocol == "cursor" {
                 // Same rule as Kiro: the bearer must come from the one live
                 // manager, or a second cache would race dispatch's refreshes.
-                let Some(tokens) = cursor_tokens else {
+                let Some(tokens) = tokens.cursor.as_ref() else {
                     tracing::warn!(provider = %provider.name, "quota probe: no Cursor token manager wired; skipping its keys");
                     break;
                 };
                 QuotaSource::Cursor(Arc::clone(tokens))
             } else if provider.protocol == "kiro" {
-                let Some(tokens) = kiro_tokens else {
+                let Some(tokens) = tokens.kiro.as_ref() else {
                     // Without the live manager there is no bearer to reuse, and
                     // minting a second cache would race dispatch's refreshes.
                     // Kiro quotas stay unprobed (decorative, and the GUI's last
@@ -585,7 +611,7 @@ pub async fn probe_all_quotas(
                 // construction, and minting a second token cache would race
                 // dispatch's refreshes (which would lock the account out, since
                 // the console rotates the refresh token).
-                let Some(tokens) = opencode_tokens else {
+                let Some(tokens) = tokens.opencode.as_ref() else {
                     tracing::warn!(provider = %provider.name, "quota probe: no OpenCode token manager wired; skipping its keys");
                     break;
                 };
@@ -593,7 +619,7 @@ pub async fn probe_all_quotas(
             } else if key.auth_kind == AuthKind::OpenaiOauth.as_str() {
                 // Same rule for an OpenAI account row: no api_key, and the
                 // refresh token rotates, so only the shared manager may refresh.
-                let Some(tokens) = openai_tokens else {
+                let Some(tokens) = tokens.openai.as_ref() else {
                     tracing::warn!(provider = %provider.name, "quota probe: no OpenAI token manager wired; skipping its keys");
                     break;
                 };
@@ -638,8 +664,6 @@ pub async fn probe_all_quotas(
                     QuotaSource::Openai(tokens) => match tokens.resolve(&pool, key_id).await {
                         Ok(bearer) => quota::fetch_openai_codex_quota(&bearer, key_id, &transport, provider_dns).await,
                         Err(error) => {
-                            // Quota is decorative: a credential-plane failure
-                            // only costs this round's reading.
                             tracing::warn!(key_id, error = %error, "quota probe: OpenAI bearer unavailable");
                             None
                         }
@@ -752,6 +776,10 @@ pub struct Admin {
     /// [`Self::with_cursor_tokens`] wires it): model probing and save-time key
     /// validation resolve their bearer through dispatch's cache.
     cursor_tokens: Option<Arc<crate::upstream::CursorTokens>>,
+    /// The same arrangement for WorkBuddy account rows.
+    workbuddy_tokens: Option<Arc<crate::upstream::WorkbuddyTokens>>,
+    /// The WorkBuddy browser-login client and process-wide session registry.
+    workbuddy_login: Option<WorkbuddyLogin>,
     /// The OpenCode device-login flow's dependencies (None until
     /// [`Self::with_opencode_login`] wires them): the same stateless console
     /// client dispatch uses, plus the process's session registry.
@@ -800,6 +828,8 @@ impl Admin {
             kiro_tokens: None,
             opencode_tokens: None,
             cursor_tokens: None,
+            workbuddy_tokens: None,
+            workbuddy_login: None,
             opencode_login: None,
             cursor_login: None,
             openai_tokens: None,
@@ -847,6 +877,27 @@ impl Admin {
     /// dispatch's bearer cache and a finished login installs its bundle there.
     pub fn with_openai_tokens(mut self, openai_tokens: Arc<crate::upstream::OpenaiTokens>) -> Self {
         self.openai_tokens = Some(openai_tokens);
+        self
+    }
+
+    /// Wire the live WorkBuddy token manager so dispatch and probes share its
+    /// single-flight bearer refreshes.
+    pub fn with_workbuddy_tokens(
+        mut self,
+        workbuddy_tokens: Arc<crate::upstream::WorkbuddyTokens>,
+    ) -> Self {
+        self.workbuddy_tokens = Some(workbuddy_tokens);
+        self
+    }
+
+    /// Wire the WorkBuddy browser-login flow: one stateless client and the
+    /// process-wide session registry used by spawned pollers.
+    pub fn with_workbuddy_login(
+        mut self,
+        client: Arc<workbuddy::Client>,
+        logins: workbuddy::WorkbuddyLogins,
+    ) -> Self {
+        self.workbuddy_login = Some(WorkbuddyLogin { client, logins });
         self
     }
 
@@ -1086,10 +1137,13 @@ impl Admin {
             &self.pool,
             Some(&self.smart_cache),
             &self.transport,
-            self.kiro_tokens.as_ref(),
-            self.opencode_tokens.as_ref(),
-            self.cursor_tokens.as_ref(),
-            self.openai_tokens.as_ref(),
+            &QuotaProbeTokens {
+                kiro: self.kiro_tokens.clone(),
+                opencode: self.opencode_tokens.clone(),
+                cursor: self.cursor_tokens.clone(),
+                openai: self.openai_tokens.clone(),
+                workbuddy: self.workbuddy_tokens.clone(),
+            },
         )
         .await;
         if !rows.is_empty() {
@@ -1264,6 +1318,22 @@ impl Admin {
         api_key: &str,
     ) -> anyhow::Result<Vec<probe::ProbeModel>> {
         self.validate_endpoint(input.name, input.base_url)?;
+        if crate::relay::capabilities::workbuddy::is_workbuddy(input.name) {
+            let build = crate::relay::capabilities::workbuddy::Build::of(input.name)
+                .ok_or_else(|| anyhow::anyhow!("invalid WorkBuddy provider name"))?;
+            let credential =
+                crate::relay::capabilities::workbuddy::WorkbuddyCredential::Key(api_key);
+            return probe::fetch_workbuddy_models(
+                input.base_url,
+                build,
+                credential,
+                &self.transport,
+                input.dns,
+            )
+            .await
+            .map_err(ProbeError::Regular)
+            .map_err(Into::into);
+        }
         if input.protocol == "cursor" {
             // A Cursor API key never authenticates a request itself: it is
             // exchanged for a bearer, and the usable-models list proves both
@@ -1315,6 +1385,8 @@ impl Admin {
             self.probe_kiro_models(&provider, &key).await?
         } else if provider.protocol == "cursor" {
             self.probe_cursor_models(&provider, &key).await?
+        } else if crate::relay::capabilities::workbuddy::is_workbuddy(&provider.name) {
+            self.probe_workbuddy_models(&provider, &key).await?
         } else if key.auth_kind == AuthKind::OpencodeOauth.as_str() {
             self.probe_opencode_models(&provider, &key).await?
         } else if key.auth_kind == AuthKind::OpenaiOauth.as_str() {
@@ -1453,6 +1525,335 @@ impl Admin {
         probe::fetch_cursor_models(tokens.transport(), &bearer, provider.dns)
             .await
             .map_err(|error| ProbeError::Regular(error).into())
+    }
+
+    async fn probe_workbuddy_models(
+        &self,
+        provider: &store::ProviderRow,
+        key: &store::ProviderKeyRow,
+    ) -> anyhow::Result<Vec<ProbeModel>> {
+        let build = crate::relay::capabilities::workbuddy::Build::of(&provider.name)
+            .ok_or_else(|| anyhow::anyhow!("invalid WorkBuddy provider name"))?;
+        let credential = if key.auth_kind == AuthKind::WorkbuddyOauth.as_str() {
+            let Some(tokens) = &self.workbuddy_tokens else {
+                anyhow::bail!("WorkBuddy model list needs a wired token manager")
+            };
+            let bundle = tokens
+                .resolve_with_build(&self.pool, key.id, provider.dns, build)
+                .await
+                .map_err(|error| ProbeError::Regular(error.into()))?;
+            return probe::fetch_workbuddy_models(
+                &provider.base_url,
+                build,
+                crate::relay::capabilities::workbuddy::WorkbuddyCredential::Account {
+                    access_token: &bundle.access_token,
+                    uid: &bundle.uid,
+                    domain: bundle.domain.as_deref(),
+                },
+                &self.transport,
+                provider.dns,
+            )
+            .await
+            .map_err(ProbeError::Regular)
+            .map_err(Into::into);
+        } else {
+            let api_key = key
+                .api_key
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("WorkBuddy key has no api_key"))?;
+            crate::relay::capabilities::workbuddy::WorkbuddyCredential::Key(api_key)
+        };
+        probe::fetch_workbuddy_models(
+            &provider.base_url,
+            build,
+            credential,
+            &self.transport,
+            provider.dns,
+        )
+        .await
+        .map_err(ProbeError::Regular)
+        .map_err(Into::into)
+    }
+
+    /// Start a WorkBuddy browser login. Validation and all database reads happen
+    /// before the vendor is contacted, so rejected input leaves no session or
+    /// row behind.
+    pub async fn start_workbuddy_login(
+        &self,
+        provider_id: i64,
+        label: &str,
+        key_id: Option<i64>,
+        group_ids: &[i64],
+        max_concurrency: Option<i32>,
+    ) -> Result<WorkbuddyLoginStarted, WorkbuddyLoginError> {
+        let wiring = self.workbuddy_login.as_ref().ok_or_else(|| {
+            WorkbuddyLoginError::Internal(anyhow::anyhow!("WorkBuddy login is not wired"))
+        })?;
+        let Some(provider) = store::get_provider(&self.pool, provider_id).await? else {
+            return Err(WorkbuddyLoginError::ProviderNotFound(provider_id));
+        };
+        let Some(build) = crate::relay::capabilities::workbuddy::Build::of(&provider.name) else {
+            return Err(WorkbuddyLoginError::NotWorkbuddyProvider(provider_id));
+        };
+        if max_concurrency.is_some_and(|limit| limit <= 0) {
+            return Err(WorkbuddyLoginError::Invalid(
+                "max_concurrency must be positive".to_owned(),
+            ));
+        }
+        let keys = store::list_provider_keys(&self.pool, provider_id).await?;
+        let (label, key_id, group_ids) = match key_id {
+            Some(key_id) => {
+                let Some(existing) = keys.iter().find(|row| row.id == key_id) else {
+                    return Err(WorkbuddyLoginError::KeyNotFound(key_id));
+                };
+                if existing.auth_kind != AuthKind::WorkbuddyOauth.as_str() {
+                    return Err(WorkbuddyLoginError::KeyNotFound(key_id));
+                }
+                (existing.label.clone(), Some(key_id), Vec::new())
+            }
+            None => {
+                let label = label.trim();
+                if label.is_empty() {
+                    return Err(WorkbuddyLoginError::Invalid(
+                        "label must not be empty".to_owned(),
+                    ));
+                }
+                if keys.iter().any(|row| row.label == label) {
+                    return Err(WorkbuddyLoginError::LabelConflict(label.to_owned()));
+                }
+                if !store::key_groups_exist(&self.pool, group_ids).await? {
+                    return Err(WorkbuddyLoginError::Invalid("unknown group id".to_owned()));
+                }
+                (label.to_owned(), None, group_ids.to_vec())
+            }
+        };
+        let client = Arc::new(wiring.client.with_dns(provider.dns));
+        let started = client
+            .start(
+                &provider.base_url,
+                workbuddy::auth::BuildInfo {
+                    platform: build.platform(),
+                    app: build.app(),
+                },
+            )
+            .await
+            .map_err(|error| WorkbuddyLoginError::Internal(anyhow::Error::new(error)))?;
+        let now = Utc::now();
+        let expires_at = now + Duration::seconds(WORKBUDDY_LOGIN_LIFETIME_SECS);
+        let (id, session) = wiring
+            .logins
+            .start(started.state, started.auth_url, expires_at, now);
+        let poll = WorkbuddyLoginPoll {
+            session,
+            client,
+            provider,
+            build,
+            label,
+            key_id,
+            group_ids,
+            max_concurrency,
+        };
+        tokio::spawn(self.clone().drive_workbuddy_login(poll));
+        Ok(WorkbuddyLoginStarted {
+            session: id.to_string(),
+            login_url: wiring
+                .logins
+                .get(&id, now)
+                .map(|session| session.login_url().to_owned())
+                .unwrap_or_default(),
+            expires_in: WORKBUDDY_LOGIN_LIFETIME_SECS as u64,
+        })
+    }
+
+    async fn drive_workbuddy_login(self, poll: WorkbuddyLoginPoll) {
+        let WorkbuddyLoginPoll {
+            session,
+            client,
+            provider,
+            build,
+            label,
+            key_id,
+            group_ids,
+            max_concurrency,
+        } = poll;
+        let build_info = workbuddy::auth::BuildInfo {
+            platform: build.platform(),
+            app: build.app(),
+        };
+        let wait = std::time::Duration::from_millis(WORKBUDDY_LOGIN_POLL_MS);
+        let mut token = None;
+        loop {
+            tokio::time::sleep(wait).await;
+            if session.state().is_terminal() {
+                return;
+            }
+            if Utc::now() >= session.expires_at() {
+                session.finish(WorkbuddySessionState::Expired, Utc::now());
+                return;
+            }
+            if token.is_none() {
+                match client
+                    .poll_token(&provider.base_url, build_info, session.vendor_state())
+                    .await
+                {
+                    Ok(TokenPoll::Pending) => continue,
+                    Ok(TokenPoll::Ready(bundle)) => token = Some(bundle),
+                    Err(error) => {
+                        tracing::warn!(provider = %provider.name, %error, "WorkBuddy token poll failed");
+                        session.finish(
+                            WorkbuddySessionState::Failed {
+                                message: WORKBUDDY_LOGIN_BACKEND_MESSAGE.to_owned(),
+                            },
+                            Utc::now(),
+                        );
+                        return;
+                    }
+                }
+            }
+            let Some(bundle) = token.as_ref() else {
+                continue;
+            };
+            match client
+                .poll_account(
+                    &provider.base_url,
+                    build_info,
+                    session.vendor_state(),
+                    &bundle.access_token,
+                )
+                .await
+            {
+                Ok(AccountPoll::Pending) => {}
+                Ok(AccountPoll::Ready(uid)) => {
+                    let Some(mut bundle) = token.take() else {
+                        tracing::warn!(
+                            provider = %provider.name,
+                            "WorkBuddy account poll returned ready without a token"
+                        );
+                        session.finish(
+                            WorkbuddySessionState::Failed {
+                                message: WORKBUDDY_LOGIN_BACKEND_MESSAGE.to_owned(),
+                            },
+                            Utc::now(),
+                        );
+                        return;
+                    };
+                    bundle.uid = uid;
+                    let verdict = match self
+                        .finish_workbuddy_login(
+                            &provider,
+                            &label,
+                            key_id,
+                            &group_ids,
+                            max_concurrency,
+                            bundle,
+                        )
+                        .await
+                    {
+                        Ok(_key_id) => WorkbuddySessionState::Succeeded,
+                        Err(error) => {
+                            tracing::warn!(
+                                provider = %provider.name,
+                                error = %format!("{error:#}"),
+                                "WorkBuddy account login could not be committed"
+                            );
+                            WorkbuddySessionState::Failed {
+                                message: login_failure_message(&error),
+                            }
+                        }
+                    };
+                    session.finish(verdict, Utc::now());
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(provider = %provider.name, %error, "WorkBuddy account poll failed");
+                    session.finish(
+                        WorkbuddySessionState::Failed {
+                            message: WORKBUDDY_LOGIN_BACKEND_MESSAGE.to_owned(),
+                        },
+                        Utc::now(),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn finish_workbuddy_login(
+        &self,
+        provider: &store::ProviderRow,
+        label: &str,
+        key_id: Option<i64>,
+        group_ids: &[i64],
+        max_concurrency: Option<i32>,
+        bundle: WorkbuddyOAuth,
+    ) -> anyhow::Result<i64> {
+        bundle.validate()?;
+        let key_id = match key_id {
+            Some(key_id) => {
+                let Some(expected) = store::workbuddy_oauth(&self.pool, key_id).await? else {
+                    anyhow::bail!("WorkBuddy account key no longer exists")
+                };
+                if !store::replace_workbuddy_oauth(&self.pool, key_id, &expected, &bundle).await? {
+                    anyhow::bail!("WorkBuddy account key changed while login was completing")
+                }
+                key_id
+            }
+            None => {
+                store::insert_workbuddy_provider_key_with_groups(
+                    &self.pool,
+                    provider.id,
+                    label,
+                    bundle.clone(),
+                    max_concurrency,
+                    None,
+                    group_ids,
+                )
+                .await?
+            }
+        };
+        if let Some(tokens) = &self.workbuddy_tokens {
+            tokens.adopt(key_id, bundle.clone());
+            let key = store::list_keys_by_ids(&self.pool, &[key_id])
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("WorkBuddy account key disappeared"))?;
+            match self.probe_workbuddy_models(provider, &key).await {
+                Ok(models) => {
+                    if let Err(error) = store::update_key_models(&self.pool, key_id, &models).await
+                    {
+                        tracing::warn!(key_id, error = %format!("{error:#}"), "WorkBuddy model snapshot persistence failed after login");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(key_id, error = %format!("{error:#}"), "WorkBuddy model probe failed after login")
+                }
+            }
+        }
+        self.refresh_route_cache().await?;
+        self.activity.quota_refreshed();
+        Ok(key_id)
+    }
+
+    pub fn workbuddy_login_status(
+        &self,
+        session: &str,
+    ) -> anyhow::Result<Option<workbuddy::login::Status>> {
+        let id = Uuid::parse_str(session).map_err(|_| anyhow::anyhow!("invalid login session"))?;
+        let wiring = self
+            .workbuddy_login
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WorkBuddy login is not wired"))?;
+        Ok(wiring.logins.status(&id, Utc::now()))
+    }
+
+    pub fn cancel_workbuddy_login(&self, session: &str) -> anyhow::Result<bool> {
+        let id = Uuid::parse_str(session).map_err(|_| anyhow::anyhow!("invalid login session"))?;
+        let wiring = self
+            .workbuddy_login
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WorkBuddy login is not wired"))?;
+        Ok(wiring.logins.cancel(&id, Utc::now()))
     }
 
     /// Persist a key's model-list snapshot. The add-account flow already holds
@@ -2971,6 +3372,51 @@ fn is_transient_poll_failure(error: &auth::AuthError) -> bool {
 }
 
 // ---------- Cursor account login ----------
+
+const WORKBUDDY_LOGIN_POLL_MS: u64 = 500;
+const WORKBUDDY_LOGIN_LIFETIME_SECS: i64 = 600;
+const WORKBUDDY_LOGIN_BACKEND_MESSAGE: &str =
+    "the WorkBuddy backend answered the login poll unexpectedly; see the server log";
+
+#[derive(Clone)]
+struct WorkbuddyLogin {
+    client: Arc<workbuddy::Client>,
+    logins: workbuddy::WorkbuddyLogins,
+}
+
+struct WorkbuddyLoginPoll {
+    session: Arc<workbuddy::login::Session>,
+    client: Arc<workbuddy::Client>,
+    provider: store::ProviderRow,
+    build: crate::relay::capabilities::workbuddy::Build,
+    label: String,
+    key_id: Option<i64>,
+    group_ids: Vec<i64>,
+    max_concurrency: Option<i32>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WorkbuddyLoginStarted {
+    pub session: String,
+    pub login_url: String,
+    pub expires_in: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkbuddyLoginError {
+    #[error("provider {0} does not exist")]
+    ProviderNotFound(i64),
+    #[error("provider {0} is not a WorkBuddy provider")]
+    NotWorkbuddyProvider(i64),
+    #[error("key {0} does not exist on this provider or is not a WorkBuddy account")]
+    KeyNotFound(i64),
+    #[error("{0}")]
+    Invalid(String),
+    #[error("a key with label {0:?} already exists on this provider")]
+    LabelConflict(String),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
 
 /// The poll cadence (plan §2.1.2: 500ms).
 const CURSOR_LOGIN_POLL_MS: u64 = 500;

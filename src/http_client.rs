@@ -395,6 +395,39 @@ pub enum OpenaiResetOutcome {
     Unknown,
 }
 
+/// The body of `POST /api/providers/{id}/workbuddy-login`: the WorkBuddy
+/// account to start logging in. WorkBuddy login responses never contain an
+/// OAuth token.
+pub type WorkbuddyLoginRequest = OpencodeLoginRequest;
+
+/// The answer of `POST /api/providers/{id}/workbuddy-login`: the browser URL
+/// plus the session id to poll. It contains no OAuth token.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkbuddyLoginStart {
+    /// The login's registry id.
+    pub session: String,
+    /// Absolute WorkBuddy URL to open in a browser.
+    pub login_url: String,
+    /// Seconds the gateway keeps polling for the sign-in.
+    pub expires_in: u64,
+}
+
+/// The answer of `GET /api/workbuddy-logins/{session}`. It contains no OAuth
+/// token and mirrors `workbuddy::login::Status` exactly.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkbuddyLoginStatus {
+    /// The registry session id.
+    pub session: String,
+    /// `waiting`, `succeeded`, `failed`, `expired` or `cancelled`.
+    pub state: String,
+    /// Why a login failed; the server's wording is already display-safe.
+    pub message: Option<String>,
+    /// The browser URL, present only while `waiting`.
+    pub login_url: Option<String>,
+    /// Seconds remaining until the session expires.
+    pub expires_in: i64,
+}
+
 /// The body of `POST /api/providers/{id}/cursor-login`: the same shape as
 /// [`OpencodeLoginRequest`] (`key_id` re-authenticates an existing
 /// `cursor_oauth` account instead of creating one).
@@ -1168,6 +1201,39 @@ impl GatewayHttpClient {
         ok(self.delete(&format!("/api/opencode-logins/{session}"))).await
     }
 
+    // ---------- WorkBuddy account login ----------
+
+    /// Start a WorkBuddy browser login. The gateway polls WorkBuddy in the
+    /// background: follow it with [`Self::workbuddy_login_status`] and abandon a
+    /// waiting one with [`Self::cancel_workbuddy_login`]. Responses never
+    /// contain an OAuth token.
+    pub async fn start_workbuddy_login(
+        &self,
+        provider_id: i64,
+        body: &WorkbuddyLoginRequest,
+    ) -> Result<WorkbuddyLoginStart, ClientError> {
+        json(
+            self.post(&workbuddy_login_start_path(provider_id))
+                .json(body),
+        )
+        .await
+    }
+
+    /// One WorkBuddy browser login's state. Responses never contain an OAuth
+    /// token. An unknown session answers 404.
+    pub async fn workbuddy_login_status(
+        &self,
+        session: &str,
+    ) -> Result<WorkbuddyLoginStatus, ClientError> {
+        json(self.get(&workbuddy_login_status_path(session))).await
+    }
+
+    /// Cancel a waiting WorkBuddy browser login (204). A finished login is not
+    /// cancellable: the server answers 404 and this returns an error.
+    pub async fn cancel_workbuddy_login(&self, session: &str) -> Result<(), ClientError> {
+        ok(self.delete(&workbuddy_login_cancel_path(session))).await
+    }
+
     // ---------- OpenAI account login ----------
 
     /// Start an OpenAI Codex device login. The login continues server-side:
@@ -1638,6 +1704,35 @@ fn base_url(listen: &str) -> String {
     }
 }
 
+fn workbuddy_login_start_path(provider_id: i64) -> String {
+    format!("/api/providers/{provider_id}/workbuddy-login")
+}
+
+fn workbuddy_login_status_path(session: &str) -> String {
+    format!("/api/workbuddy-logins/{}", encode_path_segment(session))
+}
+
+fn workbuddy_login_cancel_path(session: &str) -> String {
+    workbuddy_login_status_path(session)
+}
+
+/// Encode an opaque value as exactly one RFC 3986 path segment. In particular,
+/// `/`, `?`, `#`, `%`, and control bytes cannot change the request target.
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
 /// RFC3339 with the `Z` spelling — human-diffable in logs; reqwest's query
 /// serializer percent-encodes whatever it gets, so the `+00:00` pitfall the
 /// handler tests document cannot bite here.
@@ -1773,6 +1868,67 @@ mod tests {
             .expect("activity request should build");
 
         assert_eq!(request.timeout(), None);
+    }
+
+    #[test]
+    fn workbuddy_login_request_matches_admin_body() {
+        let request = WorkbuddyLoginRequest {
+            label: "personal".to_owned(),
+            key_id: None,
+            group_ids: vec![7, 11],
+            max_concurrency: Some(3),
+        };
+
+        let body = serde_json::to_value(&request).expect("request should serialize");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "label": "personal",
+                "group_ids": [7, 11],
+                "max_concurrency": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn workbuddy_login_paths_match_admin_routes_and_encode_session_segment() {
+        assert_eq!(
+            workbuddy_login_start_path(42),
+            "/api/providers/42/workbuddy-login"
+        );
+        assert_eq!(
+            workbuddy_login_status_path("session-1"),
+            "/api/workbuddy-logins/session-1"
+        );
+        assert_eq!(
+            workbuddy_login_cancel_path("session-1"),
+            "/api/workbuddy-logins/session-1"
+        );
+        assert_eq!(
+            workbuddy_login_status_path("opaque/session?part%"),
+            "/api/workbuddy-logins/opaque%2Fsession%3Fpart%25"
+        );
+    }
+
+    #[test]
+    fn workbuddy_login_status_matches_admin_response_without_tokens() {
+        let status: WorkbuddyLoginStatus = serde_json::from_value(serde_json::json!({
+            "session": "550e8400-e29b-41d4-a716-446655440000",
+            "state": "waiting",
+            "message": null,
+            "login_url": "https://login.example.test",
+            "expires_in": 120,
+        }))
+        .expect("status should deserialize");
+
+        assert_eq!(status.state, "waiting");
+        assert_eq!(status.message, None);
+        assert_eq!(status.session, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(
+            status.login_url.as_deref(),
+            Some("https://login.example.test")
+        );
+        assert_eq!(status.expires_in, 120);
     }
 
     #[test]

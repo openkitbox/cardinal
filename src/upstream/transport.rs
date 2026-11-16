@@ -534,7 +534,40 @@ impl Transport {
         self.await_headers(request, &destination, remaining).await
     }
 
-    /// Open one full-duplex HTTP/2 request: `body` is streamed up for as long
+    /// Send a GET request with borrowed header/query values through the same
+    /// destination validation, DNS pinning, redirect policy, and deadline as
+    /// ordinary upstream requests.
+    pub async fn send_get_with_headers(
+        &self,
+        url: &str,
+        dns: Dns,
+        headers: &[(&'static str, String)],
+        query: &[(&'static str, String)],
+        deadline: Instant,
+    ) -> Result<reqwest::Response, TransportError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TransportError::Timeout);
+        }
+        let destination = validate_destination(
+            url,
+            self.resolvers.resolver(dns),
+            self.limits.allow_plaintext_loopback,
+            &self.limits.allowed_ports,
+            self.limits.allow_private_destinations,
+        )
+        .await?;
+        let client = self.client_for(url, &destination, Http::H1, dns)?;
+        let mut request = client.get(url).header("accept", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+        if !query.is_empty() {
+            request = request.query(query);
+        }
+        self.await_headers(request, &destination, remaining).await
+    }
+
     /// as it yields while the response streams back. Returns at the response
     /// headers, like [`Self::send_with_headers`]; the body stream keeps being
     /// polled by the connection task after that, and ends the request when it

@@ -20,6 +20,7 @@ pub mod kiro_tokens;
 pub mod openai_tokens;
 pub mod opencode_tokens;
 pub mod transport;
+pub mod workbuddy_tokens;
 
 pub use cursor_tokens::{CursorTokenError, CursorTokens};
 pub use cursor_usage::CursorUsage;
@@ -27,3 +28,4 @@ pub use dns::Dns;
 pub use kiro_tokens::{KiroCallContext, KiroProbeCredential, KiroTokenError, KiroTokens};
 pub use openai_tokens::{OpenaiBearer, OpenaiTokenError, OpenaiTokens};
 pub use opencode_tokens::{OpencodeTokenError, OpencodeTokens};
+pub use workbuddy_tokens::{WorkbuddyTokenError, WorkbuddyTokens};

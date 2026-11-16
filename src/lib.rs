@@ -50,6 +50,7 @@ pub mod tri_state;
 pub mod upstream;
 pub mod user_keys;
 pub mod user_usage;
+pub mod workbuddy;
 
 /// This crate's schema migrator (`migrations/`). Composition roots run it
 /// once at startup via `crate::db::Db::migrate("gateway", gateway::migrator())`.

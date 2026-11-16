@@ -5,6 +5,7 @@ use crate::kiro::KiroOAuth;
 use crate::openai::OpenaiOAuth;
 use crate::opencode::OpencodeOAuth;
 use crate::probe::ProbeModel;
+use crate::workbuddy::WorkbuddyOAuth;
 
 use super::key_group::AddKeyGroupsError;
 
@@ -15,7 +16,7 @@ pub struct ProviderKeyRow {
     pub label: String,
     /// The row-stored plaintext credential, for `auth_kind = 'static'` rows.
     /// NULL on an OAuth row (`kiro_oidc`, `opencode_oauth`, `cursor_oauth`,
-    /// `openai_oauth`) by constraint — its
+    /// `openai_oauth`, `workbuddy_oauth`) by constraint — its
     /// credential lives in `oauth`, and the relay resolves it by `auth_kind`
     /// instead; only a `static` row with no key is skipped with a warning.
     pub api_key: Option<String>,
@@ -135,6 +136,15 @@ impl ProviderKeyRow {
     #[must_use]
     pub fn openai_oauth(&self) -> Option<OpenaiOAuth> {
         if self.auth_kind != AuthKind::OpenaiOauth.as_str() {
+            return None;
+        }
+        decode_stored_bundle(self.oauth.as_ref()?)
+    }
+
+    /// The row's WorkBuddy account bundle in its typed form.
+    #[must_use]
+    pub fn workbuddy_oauth(&self) -> Option<WorkbuddyOAuth> {
+        if self.auth_kind != AuthKind::WorkbuddyOauth.as_str() {
             return None;
         }
         decode_stored_bundle(self.oauth.as_ref()?)
@@ -624,6 +634,7 @@ pub async fn insert_provider_key(
         KeyCredential::Static(api_key),
         max_concurrency,
         allowed_models,
+        None,
     )
     .await
 }
@@ -648,6 +659,7 @@ pub async fn insert_kiro_provider_key(
         KeyCredential::KiroOidc(oauth),
         max_concurrency,
         allowed_models,
+        None,
     )
     .await
 }
@@ -670,6 +682,7 @@ pub async fn insert_opencode_provider_key(
         KeyCredential::OpencodeOauth(oauth),
         max_concurrency,
         allowed_models,
+        None,
     )
     .await
 }
@@ -695,6 +708,7 @@ pub async fn insert_cursor_provider_key(
         KeyCredential::CursorOauth(oauth),
         max_concurrency,
         allowed_models,
+        None,
     )
     .await
 }
@@ -719,6 +733,55 @@ pub async fn insert_openai_provider_key(
         KeyCredential::OpenaiOauth(oauth),
         max_concurrency,
         allowed_models,
+        None,
+    )
+    .await
+}
+
+/// Insert a WorkBuddy account key: no api_key, the OAuth bundle stored under
+/// `auth_kind = "workbuddy_oauth"`, validated here as well.
+pub async fn insert_workbuddy_provider_key(
+    pool: &PgPool,
+    provider_id: i64,
+    label: &str,
+    oauth: WorkbuddyOAuth,
+    max_concurrency: Option<i32>,
+    allowed_models: Option<Vec<String>>,
+) -> anyhow::Result<i64> {
+    oauth.validate()?;
+    insert_key_row(
+        pool,
+        provider_id,
+        label,
+        KeyCredential::WorkbuddyOauth(oauth),
+        max_concurrency,
+        allowed_models,
+        None,
+    )
+    .await
+}
+
+/// Insert a WorkBuddy account key and attach its group memberships in one
+/// transaction. Any unknown group or database error rolls back the key row as
+/// well as the membership writes.
+pub async fn insert_workbuddy_provider_key_with_groups(
+    pool: &PgPool,
+    provider_id: i64,
+    label: &str,
+    oauth: WorkbuddyOAuth,
+    max_concurrency: Option<i32>,
+    allowed_models: Option<Vec<String>>,
+    group_ids: &[i64],
+) -> anyhow::Result<i64> {
+    oauth.validate()?;
+    insert_key_row(
+        pool,
+        provider_id,
+        label,
+        KeyCredential::WorkbuddyOauth(oauth),
+        max_concurrency,
+        allowed_models,
+        Some(group_ids),
     )
     .await
 }
@@ -921,6 +984,7 @@ async fn insert_key_row(
     credential: KeyCredential<'_>,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
+    group_ids: Option<&[i64]>,
 ) -> anyhow::Result<i64> {
     let (api_key, auth_kind, oauth) = match credential {
         KeyCredential::Static(api_key) => (Some(api_key), AuthKind::Static, None),
@@ -942,17 +1006,22 @@ async fn insert_key_row(
             AuthKind::OpenaiOauth,
             Some(serde_json::to_value(oauth)?),
         ),
+        KeyCredential::WorkbuddyOauth(oauth) => (
+            None,
+            AuthKind::WorkbuddyOauth,
+            Some(serde_json::to_value(oauth)?),
+        ),
     };
     anyhow::ensure!(!label.is_empty(), "label must not be empty");
     ensure_valid_max_concurrency(max_concurrency)?;
     let allowed_models = normalize_allowed_models(allowed_models)?;
     let mut tx = pool.begin().await?;
-    let provider: Option<(i64, String)> =
-        sqlx::query_as("SELECT id, protocol FROM gateway_providers WHERE id = $1 FOR UPDATE")
+    let provider: Option<(i64, String, String)> =
+        sqlx::query_as("SELECT id, name, protocol FROM gateway_providers WHERE id = $1 FOR UPDATE")
             .bind(provider_id)
             .fetch_optional(&mut *tx)
             .await?;
-    let Some((_, protocol)) = provider else {
+    let Some((_, provider_name, protocol)) = provider else {
         anyhow::bail!("provider {provider_id} does not exist");
     };
     match auth_kind {
@@ -982,6 +1051,14 @@ async fn insert_key_row(
             protocol == "openai_responses",
             "auth_kind \"openai_oauth\" requires a provider with protocol \"openai_responses\" (got {protocol:?})"
         ),
+        AuthKind::WorkbuddyOauth => {
+            let (vendor, _) = crate::relay::capabilities::provider_kind(&provider_name);
+            anyhow::ensure!(
+                vendor == "workbuddy"
+                    && matches!(protocol.as_str(), "openai_chat" | "anthropic_messages"),
+                "auth_kind \"workbuddy_oauth\" requires a WorkBuddy provider with protocol \"openai_chat\" or \"anthropic_messages\""
+            );
+        }
     }
     let duplicate: (bool,) = sqlx::query_as(
         "SELECT EXISTS(
@@ -1015,6 +1092,14 @@ async fn insert_key_row(
   .bind(allowed_models.map(serde_json::to_value).transpose()?)
   .fetch_one(&mut *tx)
   .await?;
+    if let Some(group_ids) = group_ids {
+        super::key_group::add_key_groups(&mut tx, id.0, group_ids)
+            .await
+            .map_err(|error| match error {
+                AddKeyGroupsError::UnknownGroup => anyhow::anyhow!("unknown group id"),
+                AddKeyGroupsError::Other(error) => anyhow::Error::new(error),
+            })?;
+    }
     tx.commit().await?;
     Ok(id.0)
 }
@@ -1226,6 +1311,62 @@ pub async fn openai_oauth(pool: &PgPool, key_id: i64) -> anyhow::Result<Option<O
             Ok(None)
         }
     }
+}
+
+/// One WorkBuddy account's stored bundle, read fresh from the row.
+pub async fn workbuddy_oauth(pool: &PgPool, key_id: i64) -> anyhow::Result<Option<WorkbuddyOAuth>> {
+    let stored: Option<(String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT auth_kind, oauth FROM gateway_provider_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((auth_kind, oauth)) = stored else {
+        return Ok(None);
+    };
+    if auth_kind != AuthKind::WorkbuddyOauth.as_str() {
+        return Ok(None);
+    }
+    let Some(value) = oauth else {
+        return Ok(None);
+    };
+    match serde_json::from_value::<WorkbuddyOAuth>(value) {
+        Ok(bundle) if bundle.validate().is_ok() => Ok(Some(bundle)),
+        Ok(_) => {
+            tracing::warn!(
+                key_id,
+                "stored WorkBuddy bundle failed validation; the account has no usable credential"
+            );
+            Ok(None)
+        }
+        Err(_) => {
+            tracing::warn!(
+                key_id,
+                "stored WorkBuddy bundle does not decode; the account has no usable credential"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Replace one WorkBuddy account's bundle when the stored one is still
+/// `expected` (compare-and-swap).
+pub async fn replace_workbuddy_oauth(
+    pool: &PgPool,
+    key_id: i64,
+    expected: &WorkbuddyOAuth,
+    next: &WorkbuddyOAuth,
+) -> anyhow::Result<bool> {
+    next.validate()?;
+    let result = sqlx::query(
+        "UPDATE gateway_provider_keys SET oauth = $3
+         WHERE id = $1 AND auth_kind = 'workbuddy_oauth' AND oauth = $2",
+    )
+    .bind(key_id)
+    .bind(serde_json::to_value(expected)?)
+    .bind(serde_json::to_value(next)?)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Replace one OpenAI Codex account's bundle when the stored one is still

@@ -112,6 +112,12 @@ struct Core {
     /// And for Cursor account rows: one bearer cache shared by dispatch and
     /// model probing (login-bundle refresh or API-key exchange).
     cursor_tokens: Arc<crate::upstream::CursorTokens>,
+    /// The WorkBuddy account bearer manager shared by dispatch and probes.
+    workbuddy_tokens: Arc<crate::upstream::WorkbuddyTokens>,
+    /// The WorkBuddy browser-login client.
+    workbuddy_client: Arc<crate::workbuddy::Client>,
+    /// In-flight WorkBuddy browser logins.
+    workbuddy_logins: crate::workbuddy::WorkbuddyLogins,
     /// The Cursor usage reconciler (dashboard events), shared by every
     /// settlement so an event is counted once process-wide.
     cursor_usage: Arc<crate::upstream::CursorUsage>,
@@ -234,6 +240,13 @@ impl Core {
         )));
         let cursor_tokens = Arc::new(crate::upstream::CursorTokens::new(transport.clone()));
         let cursor_usage = Arc::new(crate::upstream::CursorUsage::new(transport.clone()));
+        let workbuddy_client = Arc::new(crate::workbuddy::Client::new(
+            transport.clone(),
+            crate::upstream::Dns::Domestic,
+        ));
+        let workbuddy_tokens = Arc::new(crate::upstream::WorkbuddyTokens::new(Arc::clone(
+            &workbuddy_client,
+        )));
         Ok(Self {
             pool,
             transport,
@@ -244,6 +257,9 @@ impl Core {
             openai_logins: crate::openai::login::OpenaiLogins::new(),
             cursor_tokens,
             cursor_usage,
+            workbuddy_tokens,
+            workbuddy_client,
+            workbuddy_logins: crate::workbuddy::WorkbuddyLogins::new(),
             opencode_client,
             opencode_logins: crate::opencode::login::OpencodeLogins::new(),
             cursor_client: Arc::new(crate::cursor::Client::new()),
@@ -278,6 +294,7 @@ struct QuotaTokens {
     opencode: Arc<crate::upstream::OpencodeTokens>,
     cursor: Arc<crate::upstream::CursorTokens>,
     openai: Arc<crate::upstream::OpenaiTokens>,
+    workbuddy: Arc<crate::upstream::WorkbuddyTokens>,
 }
 
 /// Background vendor-quota prober: every [`QUOTA_PROBE_INTERVAL`], run the
@@ -320,10 +337,13 @@ async fn quota_prober(
                 &pool,
                 Some(&smart_cache),
                 &transport,
-                Some(&tokens.kiro),
-                Some(&tokens.opencode),
-                Some(&tokens.cursor),
-                Some(&tokens.openai),
+                &admin_ops::QuotaProbeTokens {
+                    kiro: Some(Arc::clone(&tokens.kiro)),
+                    opencode: Some(Arc::clone(&tokens.opencode)),
+                    cursor: Some(Arc::clone(&tokens.cursor)),
+                    openai: Some(Arc::clone(&tokens.openai)),
+                    workbuddy: Some(Arc::clone(&tokens.workbuddy)),
+                },
             )
             .await;
             if !rows.is_empty() {
@@ -427,27 +447,36 @@ impl Gateway {
         // Core at all (it is a separate process talking to the gateway over HTTP).
         // The prober honors `prober_cancel` (see `Gateway::shutdown`); the price
         // keeper has no shutdown signal — process exit aborts it.
-        //
-        // Price catalog keeper (models.dev): only the process that owns the port
-        // syncs prices; tests build routers directly and never fetch.
-        crate::prices::start(core.pool.clone(), core.price_cache.clone());
-        // Vendor-quota prober: keeps the snapshots the Smart route strategy ranks
-        // by fresh (relay dispatch reads them from the database per request).
-        let prober_handle = tokio::spawn(quota_prober(
-            core.pool.clone(),
-            core.smart_cache.clone(),
-            core.admin_snapshot.clone(),
-            QuotaTokens {
-                kiro: Arc::clone(&core.kiro_tokens),
-                opencode: Arc::clone(&core.opencode_tokens),
-                cursor: Arc::clone(&core.cursor_tokens),
-                openai: Arc::clone(&core.openai_tokens),
-            },
-            core.transport.clone(),
-            core.activity.clone(),
-            core.prober_cancel.clone(),
-        ));
-        *core.prober_join.lock().expect("prober_join poisoned") = Some(prober_handle);
+        {
+            let mut prober_join = match core.prober_join.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::warn!("quota prober join lock poisoned; refusing to start gateway");
+                    anyhow::bail!("quota prober state is unavailable")
+                }
+            };
+            // Price catalog keeper (models.dev): only the process that owns the port
+            // syncs prices; tests build routers directly and never fetch.
+            crate::prices::start(core.pool.clone(), core.price_cache.clone());
+            // Vendor-quota prober: keeps the snapshots the Smart route strategy ranks
+            // by fresh (relay dispatch reads them from the database per request).
+            let prober_handle = tokio::spawn(quota_prober(
+                core.pool.clone(),
+                core.smart_cache.clone(),
+                core.admin_snapshot.clone(),
+                QuotaTokens {
+                    kiro: Arc::clone(&core.kiro_tokens),
+                    opencode: Arc::clone(&core.opencode_tokens),
+                    cursor: Arc::clone(&core.cursor_tokens),
+                    openai: Arc::clone(&core.openai_tokens),
+                    workbuddy: Arc::clone(&core.workbuddy_tokens),
+                },
+                core.transport.clone(),
+                core.activity.clone(),
+                core.prober_cancel.clone(),
+            ));
+            *prober_join = Some(prober_handle);
+        }
         // Centralized dispatcher: owns all slot state and the pending queue,
         // atomically assigning requests to candidates.
         let (dispatcher_tx, dispatcher_rx) = dispatcher::channel();
@@ -482,6 +511,9 @@ impl Gateway {
             openai_client: Arc::clone(&core.openai_client),
             openai_logins: core.openai_logins.clone(),
             cursor_tokens: Arc::clone(&core.cursor_tokens),
+            workbuddy_tokens: Arc::clone(&core.workbuddy_tokens),
+            workbuddy_client: Arc::clone(&core.workbuddy_client),
+            workbuddy_logins: core.workbuddy_logins.clone(),
             cursor_usage: Arc::clone(&core.cursor_usage),
             opencode_client: Arc::clone(&core.opencode_client),
             opencode_logins: core.opencode_logins.clone(),
@@ -534,12 +566,15 @@ impl Gateway {
         // Stop the quota prober and wait for any in-flight round to finish
         // before the pool closes — no probe round ever races pool teardown.
         self.core.prober_cancel.cancel();
-        let prober = self
-            .core
-            .prober_join
-            .lock()
-            .expect("prober_join poisoned")
-            .take();
+        let prober = match self.core.prober_join.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => {
+                tracing::warn!(
+                    "quota prober join lock poisoned; continuing shutdown without joining"
+                );
+                None
+            }
+        };
         if let Some(handle) = prober {
             let _ = handle.await;
         }

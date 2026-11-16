@@ -21,6 +21,8 @@
 //!   a taken label → 409, a non-Cursor provider or unknown group → 400)
 //! - `GET /api/cursor-logins/:session` → `{state, key_id, email, team_id, message}` (same states as OpenCode; never a
 //!   token) / `DELETE` cancels a waiting login (204; 404 when unknown or finished)
+//! - `POST /api/providers/:id/workbuddy-login`, `GET/DELETE /api/workbuddy-logins/:session` — WorkBuddy browser login;
+//!   responses never contain OAuth tokens
 //! - `POST /api/openai-logins` `{provider_id, label, key_id?, group_ids?, max_concurrency?}` → 201 `{session, user_code,
 //!   verification_url, expires_in, interval}` — start an OpenAI Codex device login (`key_id` alone re-authenticates that
 //!   account; a taken label → 409, a non-Codex provider or unknown group → 400)
@@ -83,6 +85,7 @@ use crate::admin_ops::OpenaiLoginError;
 use crate::admin_ops::OpenaiLoginRequest;
 use crate::admin_ops::OpenaiResetError;
 use crate::admin_ops::OpencodeLoginError;
+use crate::admin_ops::WorkbuddyLoginError;
 use crate::agent;
 use crate::credentials::{AuthKind, KeyCredential, resolve_key_credential};
 use crate::key_terms;
@@ -216,6 +219,11 @@ pub(crate) fn admin_from_state(state: &crate::api::AppState) -> crate::admin_ops
     .with_opencode_tokens(Arc::clone(&state.opencode_tokens))
     .with_cursor_tokens(Arc::clone(&state.cursor_tokens))
     .with_openai_tokens(Arc::clone(&state.openai_tokens))
+    .with_workbuddy_tokens(Arc::clone(&state.workbuddy_tokens))
+    .with_workbuddy_login(
+        Arc::clone(&state.workbuddy_client),
+        state.workbuddy_logins.clone(),
+    )
     .with_openai_login(
         Arc::clone(&state.openai_client),
         state.openai_logins.clone(),
@@ -1883,6 +1891,12 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
                 .get(cursor_login_status)
                 .delete(cancel_cursor_login),
         )
+        .push(Router::with_path("providers/{id}/workbuddy-login").post(start_workbuddy_login))
+        .push(
+            Router::with_path("workbuddy-logins/{session}")
+                .get(workbuddy_login_status)
+                .delete(cancel_workbuddy_login),
+        )
         .push(
             Router::with_path("providers/{id}/keys/{key_id}")
                 .patch(patch_key)
@@ -2110,6 +2124,7 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         }
     };
     let credential = match resolve_key_credential(
+        &provider.name,
         &provider.protocol,
         body.auth_kind.as_deref(),
         body.api_key.as_deref(),
@@ -2128,7 +2143,8 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         KeyCredential::Static(_)
         | KeyCredential::OpencodeOauth(_)
         | KeyCredential::CursorOauth(_)
-        | KeyCredential::OpenaiOauth(_) => None,
+        | KeyCredential::OpenaiOauth(_)
+        | KeyCredential::WorkbuddyOauth(_) => None,
     };
     // The OpenCode bundle is adopted as imported: it came from this very
     // request, so there is no newer row to reconcile with and the first
@@ -2138,7 +2154,8 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         KeyCredential::Static(_)
         | KeyCredential::KiroOidc(_)
         | KeyCredential::CursorOauth(_)
-        | KeyCredential::OpenaiOauth(_) => None,
+        | KeyCredential::OpenaiOauth(_)
+        | KeyCredential::WorkbuddyOauth(_) => None,
     };
     // The OpenAI bundle is adopted as imported, for the same reason.
     let created_openai = match &credential {
@@ -2146,7 +2163,8 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         KeyCredential::Static(_)
         | KeyCredential::KiroOidc(_)
         | KeyCredential::OpencodeOauth(_)
-        | KeyCredential::CursorOauth(_) => None,
+        | KeyCredential::CursorOauth(_)
+        | KeyCredential::WorkbuddyOauth(_) => None,
     };
     match crate::admin_ops::create_key(
         pool,
@@ -2506,6 +2524,93 @@ async fn cancel_cursor_login(request: &mut Request, depot: &mut Depot, response:
     }
 }
 
+#[derive(serde::Deserialize)]
+struct WorkbuddyLoginBody {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    key_id: Option<i64>,
+    #[serde(default)]
+    group_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    max_concurrency: Option<i32>,
+}
+
+#[handler]
+async fn start_workbuddy_login(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(provider_id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid provider id");
+        return;
+    };
+    let Ok(body) = request.parse_json::<WorkbuddyLoginBody>().await else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid WorkBuddy login body");
+        return;
+    };
+    let groups = body.group_ids.unwrap_or_default();
+    match admin(depot)
+        .start_workbuddy_login(
+            provider_id,
+            &body.label,
+            body.key_id,
+            &groups,
+            body.max_concurrency,
+        )
+        .await
+    {
+        Ok(started) => {
+            response.status_code(StatusCode::CREATED);
+            json_response(response, &started);
+        }
+        Err(WorkbuddyLoginError::ProviderNotFound(_)) => not_found(response, "provider"),
+        Err(WorkbuddyLoginError::KeyNotFound(_)) => not_found(response, "WorkBuddy account key"),
+        Err(
+            error
+            @ (WorkbuddyLoginError::NotWorkbuddyProvider(_) | WorkbuddyLoginError::Invalid(_)),
+        ) => {
+            bad_request(response, anyhow::Error::new(error));
+        }
+        Err(WorkbuddyLoginError::LabelConflict(label)) => {
+            response.status_code(StatusCode::CONFLICT);
+            let _ = response.body(format!(
+                "a key with label {label:?} already exists on this provider"
+            ));
+        }
+        Err(WorkbuddyLoginError::Internal(error)) => internal(response, error),
+    }
+}
+
+#[handler]
+async fn workbuddy_login_status(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(session) = request.param::<String>("session") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid login session");
+        return;
+    };
+    match admin(depot).workbuddy_login_status(&session) {
+        Ok(Some(status)) => json_response(response, &status),
+        Ok(None) => not_found(response, "WorkBuddy login session"),
+        Err(error) => bad_request(response, error),
+    }
+}
+
+#[handler]
+async fn cancel_workbuddy_login(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(session) = request.param::<String>("session") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid login session");
+        return;
+    };
+    match admin(depot).cancel_workbuddy_login(&session) {
+        Ok(true) => {
+            response.status_code(StatusCode::NO_CONTENT);
+        }
+        Ok(false) => not_found(response, "WorkBuddy login session"),
+        Err(error) => bad_request(response, error),
+    }
+}
+
 #[handler]
 async fn upsert_kiro_key(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let Some(provider_id) = request.param::<i64>("id") else {
@@ -2618,6 +2723,9 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
             // And an OpenAI row's cached bundle: the next resolve rereads the
             // row instead of serving tokens the patch may have replaced.
             state(depot).openai_tokens.forget(key_id);
+            // WorkBuddy OAuth bundles are likewise invalid after a credential
+            // replacement; non-WorkBuddy rows make this a harmless no-op.
+            state(depot).workbuddy_tokens.forget(key_id);
             let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))
         }
@@ -2755,6 +2863,11 @@ async fn delete_key(request: &mut Request, depot: &mut Depot, response: &mut Res
                 // A deleted account must never authenticate again, and a
                 // cached bundle would keep serving it.
                 state(depot).openai_tokens.forget(key_id);
+            }
+            if auth_kind == AuthKind::WorkbuddyOauth.as_str() {
+                // A deleted WorkBuddy account must not leave its OAuth bundle or
+                // remembered refusal in the process-local cache.
+                state(depot).workbuddy_tokens.forget(key_id);
             }
             let _ = admin(depot).refresh_route_cache().await;
             json_response(response, &json!({"ok": true}))

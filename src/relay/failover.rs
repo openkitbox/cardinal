@@ -21,6 +21,7 @@ use crate::upstream::kiro_tokens::KiroTokenError;
 use crate::upstream::openai_tokens::OpenaiTokenError;
 use crate::upstream::opencode_tokens::OpencodeTokenError;
 use crate::upstream::transport::TransportError;
+use crate::upstream::workbuddy_tokens::WorkbuddyTokenError;
 
 /// Mapping transport failures → protocol error codes is orchestration policy, owned by the relay layer;
 /// upstream only reports transport facts and knows nothing about protocol error taxonomy.
@@ -70,6 +71,8 @@ pub enum AttemptError {
     /// bearer. Same contract as [`Self::KiroTokenError`]: a verdict, never a
     /// token.
     OpenaiTokenError(OpenaiTokenError),
+    /// The candidate's WorkBuddy account credential could not produce a bearer.
+    WorkbuddyTokenError(WorkbuddyTokenError),
     Protocol(ProtocolError),
 }
 
@@ -97,6 +100,7 @@ impl AttemptError {
             Self::OpencodeTokenError(error) => error.client_status(),
             Self::CursorTokenError(error) => error.client_status(),
             Self::OpenaiTokenError(error) => error.client_status(),
+            Self::WorkbuddyTokenError(_) => ProtocolError::UpstreamAuthenticationFailed.status(),
             Self::Protocol(error) => error.status(),
         }
     }
@@ -123,6 +127,7 @@ impl AttemptError {
             Self::OpencodeTokenError(error) => error.code(),
             Self::CursorTokenError(error) => error.code(),
             Self::OpenaiTokenError(error) => error.code(),
+            Self::WorkbuddyTokenError(_) => ProtocolError::UpstreamAuthenticationFailed.code(),
             Self::Protocol(error) => error.code(),
         }
     }
@@ -139,6 +144,7 @@ impl AttemptError {
             Self::OpencodeTokenError(error) => error.to_string(),
             Self::CursorTokenError(error) => error.to_string(),
             Self::OpenaiTokenError(error) => error.to_string(),
+            Self::WorkbuddyTokenError(error) => error.to_string(),
             Self::Protocol(ProtocolError::ToolPairingUnrepresentable) => {
                 "the request contains tool results that cannot be paired safely".to_owned()
             }
@@ -395,6 +401,12 @@ pub fn classify(error: &AttemptError) -> Failure {
                 OpenaiTokenError::Store
                 | OpenaiTokenError::Transport
                 | OpenaiTokenError::Client => Failure::Other,
+            };
+        }
+        AttemptError::WorkbuddyTokenError(error) => {
+            return match error {
+                WorkbuddyTokenError::Missing | WorkbuddyTokenError::Expired => Failure::Blameless,
+                WorkbuddyTokenError::Refresh => Failure::Other,
             };
         }
         // Request-shape problems: the request itself is at fault.

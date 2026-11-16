@@ -450,7 +450,8 @@ impl CursorTokens {
             // that hands one over has the wrong key.
             KeyCredential::KiroOidc(_)
             | KeyCredential::OpencodeOauth(_)
-            | KeyCredential::OpenaiOauth(_) => Err(CursorTokenError::Missing),
+            | KeyCredential::OpenaiOauth(_)
+            | KeyCredential::WorkbuddyOauth(_) => Err(CursorTokenError::Missing),
         };
         match outcome {
             Ok(bearer) => Ok(bearer),

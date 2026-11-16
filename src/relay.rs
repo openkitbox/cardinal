@@ -408,6 +408,14 @@ struct OpenaiDeps<'a> {
     key_id: i64,
 }
 
+#[derive(Clone, Copy)]
+struct WorkbuddyDeps<'a> {
+    tokens: &'a crate::upstream::WorkbuddyTokens,
+    pool: &'a sqlx::PgPool,
+    key_id: i64,
+    build: capabilities::Build,
+}
+
 /// Everything the Cursor credential plane needs for one candidate: the
 /// manager, the gateway database (bundle rereads and write-back), the key's id
 /// and the credential the row holds — a browser-login bundle, or a static API
@@ -467,8 +475,13 @@ struct AttemptContext<'a> {
     /// for every static key. Its presence also selects the Codex body
     /// adaptation (forced `store`/`stream`, defaulted `instructions`).
     openai: Option<OpenaiDeps<'a>>,
-    /// Cursor upstreams only: this candidate's bearer plumbing. `None` for
-    /// every other protocol.
+    /// WorkBuddy account rows only: this candidate's bearer plumbing.
+    workbuddy: Option<WorkbuddyDeps<'a>>,
+    /// WorkBuddy provider build, present for both static and OAuth rows.
+    workbuddy_build: Option<capabilities::Build>,
+    /// Static WorkBuddy key; OAuth candidates resolve their bearer in the manager.
+    workbuddy_key: Option<&'a str>,
+    /// Cursor upstreams only: this candidate's bearer plumbing.
     cursor: Option<CursorDeps<'a>>,
 }
 
@@ -547,6 +560,9 @@ async fn send_attempt(
         kiro,
         opencode,
         openai,
+        workbuddy,
+        workbuddy_build,
+        workbuddy_key,
         cursor,
     } = *ctx;
     // The selected capability IS the upstream protocol: passthrough when it
@@ -625,6 +641,15 @@ async fn send_attempt(
                 .resolve(deps.pool, deps.key_id)
                 .await
                 .map_err(failover::AttemptError::OpenaiTokenError)?,
+        ),
+        None => None,
+    };
+    let mut workbuddy_bundle = match workbuddy {
+        Some(deps) => Some(
+            deps.tokens
+                .resolve_with_build(deps.pool, deps.key_id, dns, deps.build)
+                .await
+                .map_err(failover::AttemptError::WorkbuddyTokenError)?,
         ),
         None => None,
     };
@@ -739,6 +764,7 @@ async fn send_attempt(
                 stream,
                 fields,
                 fixups.strip_glm_images,
+                chat_dialect(workbuddy_build.is_some(), protocol),
             )
             .map(|prepared| PreparedBody {
                 prepared,
@@ -758,6 +784,7 @@ async fn send_attempt(
                     supported_efforts,
                     route_efforts,
                     dial,
+                    chat_dialect: chat_dialect(workbuddy_build.is_some(), protocol),
                     kiro_profile_arn: profile_arn,
                     prompt_scope,
                     cursor_max_mode,
@@ -797,20 +824,43 @@ async fn send_attempt(
     // (the static-scheme placeholder, or a secret an operator typed on a Kiro
     // row) never goes upstream. The same holds for an OpenCode account row, whose
     // bearer is the resolved bundle's access token.
-    let mut headers = match (&kiro_call, &opencode_bundle, &openai_bundle) {
-        (_, _, Some(bundle)) => capabilities::codex::headers(bundle, session_seed),
-        (_, Some(bundle), None) => opencode_auth_headers(bundle),
-        (Some(call), None, None) => {
-            vec![("authorization", format!("Bearer {}", call.bearer()))]
+    let mut headers = if let Some(build) = workbuddy_build {
+        match (workbuddy_bundle.as_deref(), workbuddy_key) {
+            (Some(bundle), _) => capabilities::workbuddy_headers(
+                build,
+                capabilities::WorkbuddyCredential::Account {
+                    access_token: &bundle.access_token,
+                    uid: &bundle.uid,
+                    domain: bundle.domain.as_deref(),
+                },
+                session_seed,
+            ),
+            (None, Some(key)) => capabilities::workbuddy_headers(
+                build,
+                capabilities::WorkbuddyCredential::Key(key),
+                session_seed,
+            ),
+            (None, None) => credential.headers(),
         }
-        (None, None, None) => credential.headers(),
+    } else {
+        match (&kiro_call, &opencode_bundle, &openai_bundle) {
+            (_, _, Some(bundle)) => capabilities::codex::headers(bundle, session_seed),
+            (_, Some(bundle), None) => opencode_auth_headers(bundle),
+            (Some(call), None, None) => {
+                vec![("authorization", format!("Bearer {}", call.bearer()))]
+            }
+            (None, None, None) => credential.headers(),
+        }
     };
     if let Some(seed) = session_seed
         && is_opencode_upstream(&capability.endpoint)
     {
         headers.extend(opencode_headers(seed));
     }
-    let query_pairs = if kiro_call.is_some() || opencode_bundle.is_some() || openai_bundle.is_some()
+    let query_pairs = if kiro_call.is_some()
+        || opencode_bundle.is_some()
+        || openai_bundle.is_some()
+        || workbuddy_build.is_some()
     {
         Vec::new()
     } else {
@@ -821,6 +871,7 @@ async fn send_attempt(
     let mut kiro_retried = false;
     let mut opencode_retried = false;
     let mut openai_retried = false;
+    let mut workbuddy_retried = false;
     let mut use_fresh_connection = fresh_connection;
     loop {
         let fresh = use_fresh_connection;
@@ -862,6 +913,42 @@ async fn send_attempt(
             .read_body(response, transport::MAX_ERROR_BODY, deadline)
             .await
             .unwrap_or_default();
+        // WorkBuddy licences exactly one forced refresh after a 401, but only
+        // when the rejected bearer is still the one this attempt presented.
+        if !workbuddy_retried
+            && status == 401
+            && let Some(deps) = workbuddy
+            && let Some(presented) = workbuddy_bundle.as_deref()
+        {
+            workbuddy_retried = true;
+            let bundle = deps
+                .tokens
+                .resolve_forced_with_build(
+                    deps.pool,
+                    deps.key_id,
+                    &presented.access_token,
+                    dns,
+                    deps.build,
+                )
+                .await
+                .map_err(failover::AttemptError::WorkbuddyTokenError)?;
+            headers = capabilities::workbuddy_headers(
+                deps.build,
+                capabilities::WorkbuddyCredential::Account {
+                    access_token: &bundle.access_token,
+                    uid: &bundle.uid,
+                    domain: bundle.domain.as_deref(),
+                },
+                session_seed,
+            );
+            workbuddy_bundle = Some(bundle);
+            tracing::warn!(
+                key_id = deps.key_id,
+                status,
+                "WorkBuddy rejected the bearer; refreshed once, resending the same call"
+            );
+            continue;
+        }
         // OpenCode: the gateway's own 401 licences exactly one refresh-and-resend
         // of this same call. The wire body carries no bearer, so only the headers
         // are rebuilt — same request, one attempt later. Concurrent requests that
@@ -1016,6 +1103,11 @@ async fn send_attempt(
             .map(|bundle| bundle.access_token.as_str())
             .or_else(|| {
                 openai_bundle
+                    .as_deref()
+                    .map(|bundle| bundle.access_token.as_str())
+            })
+            .or_else(|| {
+                workbuddy_bundle
                     .as_deref()
                     .map(|bundle| bundle.access_token.as_str())
             });
@@ -1353,6 +1445,8 @@ struct WireTweaks<'a> {
     route_efforts: Option<&'a [Effort]>,
     /// 当前候选的 effort 方言。
     dial: capabilities::EffortDial,
+    /// Chat wire dialect for vendor-specific passthrough and translation.
+    chat_dialect: protocol::openai_chat::ChatDialect,
     /// Kiro only: the KAS body's `profileArn` — the live bundle's account
     /// identity, resolved by the token manager before preparing (a refresh may
     /// have rotated it). `None` for every other target, and also when this
@@ -1363,6 +1457,14 @@ struct WireTweaks<'a> {
     /// Cursor only: ask for Max Mode (set on the one retry after Cursor said
     /// the model requires it).
     cursor_max_mode: bool,
+}
+
+fn chat_dialect(workbuddy: bool, upstream: ProtocolId) -> protocol::openai_chat::ChatDialect {
+    if workbuddy && upstream == ProtocolId::OpenAiChat {
+        protocol::openai_chat::ChatDialect::WORKBUDDY
+    } else {
+        protocol::openai_chat::ChatDialect::NATIVE
+    }
 }
 
 /// A send the upstream accepted (2xx), still unread.
@@ -1584,6 +1686,7 @@ fn prepare_translated(
         stream,
         tweaks.skip,
         tweaks.fixups.strip_glm_images,
+        tweaks.chat_dialect,
     )
     .map(|prepared| PreparedBody {
         prepared,
@@ -1649,6 +1752,9 @@ enum Resolution {
 /// * `cursor_oauth` — the same shape, resolved per attempt by
 ///   [`crate::upstream::CursorTokens`] (a `static` key on a Cursor provider is
 ///   exchanged for a bearer by the same manager).
+/// * `workbuddy_oauth` — the same shape, resolved per attempt by
+///   [`crate::upstream::WorkbuddyTokens`]; a WorkBuddy key's account tokens are
+///   never carried in the candidate's placeholder secret.
 ///
 /// A row missing the credential its `auth_kind` requires is dropped from
 /// candidacy with a warning — never cooled, since a missing credential is not an
@@ -1710,6 +1816,18 @@ fn fetch_key_secrets(
                 tracing::warn!(
                     key_id = key.id,
                     "Cursor provider key has no OAuth bundle; skipped"
+                );
+            }
+            continue;
+        }
+        if key.auth_kind == "workbuddy_oauth" {
+            if key.workbuddy_oauth().is_some() {
+                resolved.push((key, SecretString::from(String::new())));
+            } else {
+                skipped += 1;
+                tracing::warn!(
+                    key_id = key.id,
+                    "WorkBuddy provider key has no OAuth bundle; skipped"
                 );
             }
             continue;
@@ -2261,6 +2379,8 @@ pub struct DispatchDeps<'a> {
     /// Per-key Cursor bearer manager (login-bundle refresh or API-key exchange,
     /// single-flight, write-back). The same instance backs model probing.
     pub cursor_tokens: &'a CursorTokens,
+    /// Per-key WorkBuddy account bearer manager, shared with admin probes.
+    pub workbuddy_tokens: &'a crate::upstream::WorkbuddyTokens,
     /// The Cursor usage reconciler (dashboard events, claimed-event table,
     /// unreadable accounts). `Arc`: the streaming settlement task outlives
     /// this call.
@@ -2422,6 +2542,7 @@ pub async fn dispatch_at(
         openai_tokens,
         cursor_tokens,
         cursor_usage,
+        workbuddy_tokens,
         trace_ring,
         smart_cache,
         rotate_cursors,
@@ -2918,6 +3039,29 @@ pub async fn dispatch_at(
         // `{model}` placeholder now that the candidate's target model is known.
         let capability = capabilities::resolve_for_model(capability, target_model);
         let capability = &capability;
+        let workbuddy_build = capabilities::workbuddy::is_workbuddy(&provider.name)
+            .then(|| capabilities::Build::of(&provider.name))
+            .flatten();
+        if let Some(build) = workbuddy_build {
+            let allowed = reqwest::Url::parse(&capability.endpoint)
+                .ok()
+                .and_then(|url| {
+                    url.host_str()
+                        .map(|host| capabilities::workbuddy::host_allowed(build, host))
+                })
+                .unwrap_or(false);
+            if !allowed {
+                tracing::warn!(
+                    provider = provider.name.as_str(),
+                    key = candidate.key.label.as_str(),
+                    "WorkBuddy endpoint host is not allowed; skipping candidate"
+                );
+                unserved = true;
+                drop(slot.take());
+                index += 1;
+                continue 'candidates;
+            }
+        }
         // A ChatGPT Codex account's key kind decides (one provider row can hold
         // many accounts). The backend only streams, and the gateway does not
         // aggregate its SSE into a JSON reply: a non-streaming client cannot be
@@ -2946,7 +3090,9 @@ pub async fn dispatch_at(
             index += 1;
             continue 'candidates;
         }
-        if session_seed.is_none() && (codex || is_opencode_upstream(&capability.endpoint)) {
+        if session_seed.is_none()
+            && (codex || is_opencode_upstream(&capability.endpoint) || workbuddy_build.is_some())
+        {
             session_seed = Some(conversation_seed(&request.body));
         }
         // The secret is exposed only here, at the injection point; AuthSchemeMaterial
@@ -3125,6 +3271,22 @@ pub async fn dispatch_at(
                             pool,
                             key_id: candidate.key.id,
                         }),
+                        // WorkBuddy OAuth rows authenticate through the shared
+                        // account bearer manager; static rows keep normal material.
+                        workbuddy: (candidate.key.auth_kind == "workbuddy_oauth")
+                            .then(|| {
+                                capabilities::Build::of(&provider.name).map(|build| WorkbuddyDeps {
+                                    tokens: workbuddy_tokens,
+                                    pool,
+                                    key_id: candidate.key.id,
+                                    build,
+                                })
+                            })
+                            .flatten(),
+                        workbuddy_build,
+                        workbuddy_key: (workbuddy_build.is_some()
+                            && candidate.key.auth_kind != "workbuddy_oauth")
+                            .then(|| candidate.credential().expose_secret()),
                         // Every Cursor Run authenticates through the manager.
                         cursor: cursor_credential.as_ref().map(|credential| CursorDeps {
                             tokens: cursor_tokens,
