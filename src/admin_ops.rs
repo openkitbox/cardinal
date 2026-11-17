@@ -1415,6 +1415,7 @@ impl Admin {
         &self,
         input: &ProviderInput<'_>,
         api_key: &str,
+        proxy: Option<&crate::upstream::ProxySpec>,
     ) -> anyhow::Result<Vec<probe::ProbeModel>> {
         self.validate_endpoint(input.name, input.base_url)?;
         if crate::relay::capabilities::workbuddy::is_workbuddy(input.name) {
@@ -1428,7 +1429,7 @@ impl Admin {
                 credential,
                 &self.transport,
                 input.dns,
-                None,
+                proxy,
             )
             .await
             .map_err(ProbeError::Regular)
@@ -1442,10 +1443,10 @@ impl Admin {
                 anyhow::bail!("Cursor 模型列表需要已接线的 token 管理器")
             };
             let bearer = tokens
-                .probe_static(api_key, input.dns, None)
+                .probe_static(api_key, input.dns, proxy)
                 .await
                 .map_err(|error| ProbeError::Regular(error.into()))?;
-            return probe::fetch_cursor_models(tokens.transport(), &bearer, input.dns, None)
+            return probe::fetch_cursor_models(tokens.transport(), &bearer, input.dns, proxy)
                 .await
                 .map_err(|error| ProbeError::Regular(error).into());
         }
@@ -1459,7 +1460,7 @@ impl Admin {
             },
             &self.transport,
             input.dns,
-            None,
+            proxy,
         )
         .await
         .map_err(ProbeError::Regular)?)

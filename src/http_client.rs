@@ -778,6 +778,7 @@ impl GatewayHttpClient {
         &self,
         input: &ProviderInput<'_>,
         api_key: &str,
+        proxy_url: Option<&str>,
     ) -> Result<Vec<ProbeModel>, ClientError> {
         let body = serde_json::json!({
           "name": input.name,
@@ -787,6 +788,7 @@ impl GatewayHttpClient {
           "enabled": input.enabled,
         "dns": input.dns,
           "api_key": api_key,
+          "proxy_url": proxy_url,
         });
         json(self.post("/api/keys/validate").json(&body)).await
     }
@@ -1116,12 +1118,14 @@ impl GatewayHttpClient {
         api_key: &str,
         max_concurrency: Option<i32>,
         allowed_models: Option<Vec<String>>,
+        proxy_url: Option<&str>,
     ) -> Result<i64, ClientError> {
         let body = serde_json::json!({
           "label": label,
           "api_key": api_key,
           "max_concurrency": max_concurrency,
           "allowed_models": allowed_models,
+          "proxy_url": proxy_url,
         });
         created_id(
             self.post(&format!("/api/providers/{provider_id}/keys"))
@@ -1143,6 +1147,7 @@ impl GatewayHttpClient {
         oauth: &KiroOAuth,
         group_ids: Option<&[i64]>,
         max_concurrency: Option<Option<i32>>,
+        proxy_url: Option<&str>,
     ) -> Result<(i64, bool), ClientError> {
         #[derive(serde::Serialize)]
         struct KiroUpsert<'a> {
@@ -1152,12 +1157,15 @@ impl GatewayHttpClient {
             group_ids: Option<&'a [i64]>,
             #[serde(skip_serializing_if = "Option::is_none")]
             max_concurrency: Option<Option<i32>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            proxy_url: Option<&'a str>,
         }
         let body = KiroUpsert {
             label,
             oauth,
             group_ids,
             max_concurrency,
+            proxy_url,
         };
         let result: KiroUpserted = json(
             self.post(&format!("/api/providers/{provider_id}/kiro-key"))
@@ -1179,6 +1187,7 @@ impl GatewayHttpClient {
         credentials: &serde_json::Value,
         group_ids: Option<&[i64]>,
         max_concurrency: Option<Option<i32>>,
+        proxy_url: Option<&str>,
     ) -> Result<(i64, bool), ClientError> {
         #[derive(serde::Serialize)]
         struct KiroImport<'a> {
@@ -1189,6 +1198,8 @@ impl GatewayHttpClient {
             group_ids: Option<&'a [i64]>,
             #[serde(skip_serializing_if = "Option::is_none")]
             max_concurrency: Option<Option<i32>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            proxy_url: Option<&'a str>,
         }
         let body = KiroImport {
             label,
@@ -1196,6 +1207,7 @@ impl GatewayHttpClient {
             credentials,
             group_ids,
             max_concurrency,
+            proxy_url,
         };
         let result: KiroUpserted = json(
             self.post(&format!("/api/providers/{provider_id}/kiro-import"))

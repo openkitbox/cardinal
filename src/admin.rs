@@ -988,6 +988,11 @@ struct ValidateKeyBody {
     #[serde(flatten)]
     spec: ProviderSpecBody,
     api_key: String,
+    /// Per-account egress proxy to carry through the first model probe. Absent
+    /// or null = direct egress; a bad URL is a 400 with a fixed message. The
+    /// value is a secret and is never echoed back.
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 /// Validate a not-yet-saved key against its provider's model list (the fetch
@@ -999,11 +1004,25 @@ struct ValidateKeyBody {
 async fn validate_key(request: &mut Request, depot: &mut Depot, response: &mut Response) {
     let Ok(body) = request.parse_json::<ValidateKeyBody>().await else {
         response.status_code(StatusCode::BAD_REQUEST);
-        let _ = response.body("invalid validate body (expected {name, protocol, base_url, auth_scheme?, enabled?, api_key})");
+        let _ = response.body("invalid validate body (expected {name, protocol, base_url, auth_scheme?, enabled?, api_key, proxy_url?})");
         return;
     };
+    // Validate and build the proxy spec before probing: a bad URL is a caller
+    // error with a fixed message (no URL/user/password in the response), and a
+    // valid one is carried into the first model probe so region-locked accounts
+    // authenticate through the same egress their saved key will use.
+    let proxy = match body.proxy_url.as_deref() {
+        Some(url) => match crate::upstream::ProxySpec::parse(url) {
+            Ok(spec) => Some(spec),
+            Err(error) => {
+                bad_request(response, anyhow::Error::new(error));
+                return;
+            }
+        },
+        None => None,
+    };
     match admin(depot)
-        .validate_key(&body.spec.input(), &body.api_key)
+        .validate_key(&body.spec.input(), &body.api_key, proxy.as_ref())
         .await
     {
         Ok(models) => json_response(response, &models),
