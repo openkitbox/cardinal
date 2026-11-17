@@ -37,10 +37,13 @@ use crate::relay::capabilities::Build;
 use crate::relay::capabilities::WorkbuddyCredential;
 use crate::relay::capabilities::workbuddy::host_allowed;
 use crate::relay::capabilities::workbuddy_headers;
+use crate::store;
 use crate::store::ProviderKeyRow;
 use crate::upstream::Dns;
 use crate::upstream::transport::Transport;
 use crate::upstream::workbuddy_tokens::WorkbuddyTokens;
+use crate::workbuddy::Client as WorkbuddyClient;
+use crate::workbuddy::WorkbuddyOAuth;
 use crate::workbuddy::auth::envelope;
 
 const MONTH_MINUTES: i64 = 30 * 1440;
@@ -109,6 +112,15 @@ pub async fn fetch_workbuddy_quota(
             "WorkBuddy quota probe: meter host not allowed for build"
         );
         return None;
+    }
+
+    // A key stored before `account_name` existed shows its machine uid on the
+    // account card. Backfill the human-readable name once, best-effort: the
+    // no-state `/v2/plugin/account` endpoint answers for an authenticated
+    // bundle, so no browser re-login is needed. A stored name is never
+    // overwritten, and any failure leaves the uid fallback in place.
+    if bundle.account_name.is_none() {
+        backfill_display_name(pool, tokens, &bundle, key.id, build, dns, transport).await;
     }
 
     let now = Utc::now();
@@ -185,6 +197,57 @@ pub async fn fetch_workbuddy_quota(
         );
     }
     quota
+}
+
+/// Fill in `account_name` for a legacy bundle once, best-effort.
+///
+/// Old WorkBuddy keys were stored before the display name existed and show
+/// their machine uid on the card. `/v2/plugin/account` returns the nickname for
+/// an authenticated bundle without a login `state`, so the periodic quota probe
+/// can recover it. Nothing here is authoritative for routing: any failure is
+/// logged with fixed messages and the uid fallback stays in place. A name is
+/// written only through CAS, so a concurrent token refresh cannot be lost.
+async fn backfill_display_name(
+    pool: &PgPool,
+    tokens: &WorkbuddyTokens,
+    bundle: &WorkbuddyOAuth,
+    key_id: i64,
+    build: Build,
+    dns: Dns,
+    transport: &Transport,
+) {
+    let client = WorkbuddyClient::new(transport.clone(), dns);
+    let name = match client
+        .fetch_display_name(build, &bundle.access_token, bundle.domain.as_deref())
+        .await
+    {
+        Ok(name) => name,
+        Err(error) => {
+            tracing::warn!(key_id, error = %error, "WorkBuddy name backfill: account read failed");
+            return;
+        }
+    };
+    if name.trim().is_empty() || name == bundle.uid {
+        return;
+    }
+    let mut next = bundle.clone();
+    next.account_name = Some(name);
+    match store::replace_workbuddy_oauth(pool, key_id, bundle, &next).await {
+        Ok(true) => {
+            // Drop the cached copy so the next resolve sees the backfilled name.
+            tokens.forget(key_id);
+            tracing::debug!(key_id, "WorkBuddy name backfill: stored display name");
+        }
+        Ok(false) => {
+            tracing::debug!(
+                key_id,
+                "WorkBuddy name backfill: bundle changed concurrently; retry next probe"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(key_id, error = %format!("{error:#}"), "WorkBuddy name backfill: store failed");
+        }
+    }
 }
 
 /// One POST to the billing meter, returning the envelope's `data`.

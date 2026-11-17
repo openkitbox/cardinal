@@ -70,7 +70,10 @@ pub enum TokenPoll {
 /// What one account poll returned.
 pub enum AccountPoll {
     Pending,
-    Ready(String),
+    Ready {
+        uid: String,
+        account_name: Option<String>,
+    },
 }
 
 /// Login URL and vendor state returned by [`Client::start`].
@@ -180,7 +183,41 @@ impl Client {
             Err(WorkbuddyError::Envelope { code: 12151, .. }) => return Ok(AccountPoll::Pending),
             Err(error) => return Err(error),
         };
-        account_from(&data).map(AccountPoll::Ready)
+        let uid = account_from(&data)?;
+        let account_name = account_name_from(&data, &uid);
+        Ok(AccountPoll::Ready { uid, account_name })
+    }
+
+    /// Fetch the human-readable account name for an already-authenticated
+    /// bundle. Unlike `login/account` this endpoint needs no login `state`, so
+    /// it can backfill the name of a key stored before `account_name` existed.
+    /// Best-effort: the caller ignores any error and keeps the stored name.
+    pub async fn fetch_display_name(
+        &self,
+        build: Build,
+        access_token: &str,
+        domain: Option<&str>,
+    ) -> Result<String, WorkbuddyError> {
+        let base = build.endpoint();
+        let data = self
+            .call_get(
+                "plugin/account",
+                &format!("{}/v2/plugin/account", trim_base(base)),
+                plugin_headers(
+                    BuildInfo {
+                        platform: build.platform(),
+                        app: build.app(),
+                    },
+                    Some(access_token),
+                    domain,
+                ),
+                Vec::new(),
+            )
+            .await?;
+        let uid = text_field(&data, "uid", "plugin/account")?;
+        account_name_from(&data, &uid).ok_or(WorkbuddyError::Shape {
+            operation: "plugin/account",
+        })
     }
 
     /// Refresh the current bundle, merging omitted token and identity fields
@@ -451,6 +488,7 @@ fn token_from(
                 operation: "auth/token",
             })?,
         uid: String::new(),
+        account_name: None,
         domain: domain.or_else(|| Some(endpoint_host(selected).to_owned())),
         token_type: optional_text(data, "tokenType"),
         enterprise_id: optional_text(data, "enterpriseId"),
@@ -492,6 +530,7 @@ fn merge_refresh(
         expires_at,
         refresh_expires_at,
         uid: current.uid.clone(),
+        account_name: current.account_name.clone(),
         domain,
         token_type: optional_text(data, "tokenType").or_else(|| current.token_type.clone()),
         enterprise_id: current.enterprise_id.clone(),
@@ -508,6 +547,34 @@ fn optional_text(data: &serde_json::Value, field: &str) -> Option<String> {
 
 fn account_from(data: &serde_json::Value) -> Result<String, WorkbuddyError> {
     text_field(data, "uid", "login/account")
+}
+
+/// Build the human-readable account name shown on the key card, following the
+/// vendor client's own rule: nickname, then phone number, then uid; an
+/// enterprise account appends ` · <enterprise name>` (or the enterprise id's
+/// last 6 digits when it names none). The uid stays in its own field for
+/// request headers and account identity — this string is display-only.
+fn account_name_from(data: &serde_json::Value, uid: &str) -> Option<String> {
+    let person = optional_text(data, "nickname")
+        .or_else(|| optional_text(data, "phoneNumber"))
+        .unwrap_or_else(|| uid.to_owned());
+    let enterprise = optional_text(data, "enterpriseId").map(|enterprise_id| {
+        optional_text(data, "enterpriseName").unwrap_or_else(|| {
+            let tail: String = enterprise_id
+                .chars()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("enterprise {tail}")
+        })
+    });
+    Some(match enterprise {
+        Some(enterprise) => format!("{person} · {enterprise}"),
+        None => person,
+    })
 }
 
 #[cfg(test)]

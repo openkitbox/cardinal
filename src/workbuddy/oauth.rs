@@ -13,6 +13,11 @@ pub struct WorkbuddyOAuth {
     pub expires_at: DateTime<Utc>,
     pub refresh_expires_at: Option<DateTime<Utc>>,
     pub uid: String,
+    /// Human-readable account name for display only (nickname / phone / uid,
+    /// with the enterprise suffix). Never used for request headers or identity;
+    /// optional so bundles stored before this field round-trip through CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_name: Option<String>,
     pub domain: Option<String>,
     pub token_type: Option<String>,
     pub enterprise_id: Option<String>,
@@ -25,6 +30,7 @@ impl std::fmt::Debug for WorkbuddyOAuth {
             .field("expires_at", &self.expires_at)
             .field("refresh_expires_at", &self.refresh_expires_at)
             .field("uid", &self.uid)
+            .field("account_name", &self.account_name)
             .field("domain", &self.domain)
             .field("token_type", &self.token_type)
             .field("enterprise_id", &self.enterprise_id)
@@ -83,6 +89,7 @@ mod tests {
             expires_at,
             refresh_expires_at: None,
             uid: "uid".to_owned(),
+            account_name: None,
             domain: None,
             token_type: None,
             enterprise_id: None,

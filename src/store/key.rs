@@ -188,15 +188,15 @@ pub struct ProviderKeyView {
     /// The key's model whitelist (None = unrestricted).
     pub allowed_models: Option<Vec<String>>,
     /// How the row authenticates upstream: `static`, `kiro_oidc`,
-    /// `opencode_oauth`, `cursor_oauth` or `openai_oauth`. Defaults to `static` for a payload
-    /// that predates the field (an older gateway never had anything else to
-    /// report).
+    /// `opencode_oauth`, `cursor_oauth`, `openai_oauth` or `workbuddy_oauth`.
+    /// Defaults to `static` for a payload that predates the field (an older
+    /// gateway never had anything else to report).
     #[serde(default = "static_auth_kind")]
     pub auth_kind: String,
-    /// The OpenCode, Cursor, or OpenAI account's e-mail, when its bundle
-    /// carries one. None for every other credential kind — and for an account
-    /// whose login could not read it, so a card falls back to the label rather
-    /// than to a blank.
+    /// The OpenCode, Cursor, or OpenAI account's e-mail, or a WorkBuddy
+    /// account's uid, when its bundle carries one. None for every other
+    /// credential kind — and for an account whose login could not read it, so a
+    /// card falls back to the label rather than to a blank.
     #[serde(default)]
     pub account: Option<String>,
     /// The OpenAI Codex account's e-mail, when its OAuth bundle carries one.
@@ -374,6 +374,13 @@ impl ProviderKeyView {
                     .and_then(openai_identity_projection)
                     .unwrap_or_default();
                 (None, None, email, plan_type)
+            } else if row.auth_kind == AuthKind::WorkbuddyOauth.as_str() {
+                let WorkbuddyIdentityProjection { name, uid } = row
+                    .oauth
+                    .as_ref()
+                    .and_then(workbuddy_identity_projection)
+                    .unwrap_or_default();
+                (name.or(uid), None, None, None)
             } else {
                 (None, None, None, None)
             };
@@ -461,6 +468,30 @@ fn openai_identity_projection(value: &serde_json::Value) -> Option<OpenaiIdentit
             .get("plan_type")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
+    })
+}
+
+/// The display-only identity of a WorkBuddy OAuth bundle: a human-readable
+/// account name, falling back to the uid. Like the other projections this never
+/// reads the secret token fields — only these two display strings reach the DTO.
+#[derive(Default)]
+struct WorkbuddyIdentityProjection {
+    name: Option<String>,
+    uid: Option<String>,
+}
+
+fn workbuddy_identity_projection(value: &serde_json::Value) -> Option<WorkbuddyIdentityProjection> {
+    let object = value.as_object()?;
+    let field = |key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    Some(WorkbuddyIdentityProjection {
+        name: field("account_name"),
+        uid: field("uid"),
     })
 }
 

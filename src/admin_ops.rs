@@ -1747,7 +1747,7 @@ impl Admin {
                 .await
             {
                 Ok(AccountPoll::Pending) => {}
-                Ok(AccountPoll::Ready(uid)) => {
+                Ok(AccountPoll::Ready { uid, account_name }) => {
                     let Some(mut bundle) = token.take() else {
                         tracing::warn!(
                             provider = %provider.name,
@@ -1762,6 +1762,7 @@ impl Admin {
                         return;
                     };
                     bundle.uid = uid;
+                    bundle.account_name = account_name;
                     let verdict = match self
                         .finish_workbuddy_login(
                             &provider,
