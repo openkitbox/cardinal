@@ -38,6 +38,7 @@ use crate::opencode::login;
 use crate::opencode::login::SessionState;
 use crate::probe::{self, ProbeModel};
 use crate::quota::{self, KeyQuota};
+use crate::relay::capabilities::Build;
 use crate::store::{self, ProviderInput};
 use crate::workbuddy;
 use crate::workbuddy::WorkbuddyOAuth;
@@ -549,6 +550,12 @@ pub async fn probe_all_quotas(
         /// The shared OpenAI token manager: the account's bearer, at the
         /// ChatGPT usage endpoint.
         Openai(Arc<crate::upstream::OpenaiTokens>),
+        /// The shared WorkBuddy token manager: the account's bearer, uid and
+        /// domain, at the vendor's billing meter host.
+        Workbuddy {
+            tokens: Arc<crate::upstream::WorkbuddyTokens>,
+            build: Build,
+        },
     }
     let providers = match store::list_providers(pool).await {
         Ok(providers) => providers,
@@ -567,11 +574,6 @@ pub async fn probe_all_quotas(
             std::collections::HashMap::new()
         });
     for provider in providers.iter().filter(|provider| provider.enabled) {
-        if crate::relay::capabilities::workbuddy::is_workbuddy(&provider.name) {
-            // WorkBuddy has no confirmed quota API; do not resolve its bearer or
-            // fall through to the speculative /v1/usage probe.
-            continue;
-        }
         let keys = match store::list_provider_keys(pool, provider.id).await {
             Ok(keys) => keys,
             Err(error) => {
@@ -585,10 +587,29 @@ pub async fn probe_all_quotas(
         for mut key in keys {
             let key_id = key.id;
             // Kiro's and Cursor's quota sources are decided by the provider's
-            // protocol, not by the presence of an api_key (an account row
-            // never carries one). Every other provider keeps the
-            // credential-or-nothing rule.
-            let source = if provider.protocol == "cursor" {
+            // protocol and WorkBuddy's by its name plus auth_kind, never by the
+            // presence of an api_key (an account row carries none). Every other
+            // provider keeps the credential-or-nothing rule.
+            let source = if crate::relay::capabilities::workbuddy::is_workbuddy(&provider.name) {
+                // WorkBuddy credits live on its billing meter, which needs the
+                // account's uid/domain: static keys cannot be read, so skip
+                // them quietly (quota is decorative).
+                if key.auth_kind != AuthKind::WorkbuddyOauth.as_str() {
+                    continue;
+                }
+                let Some(tokens) = tokens.workbuddy.as_ref() else {
+                    tracing::warn!(provider = %provider.name, "quota probe: no WorkBuddy token manager wired; skipping its keys");
+                    break;
+                };
+                // `is_workbuddy` is exactly `Build::of(...).is_some()`.
+                let Some(build) = Build::of(&provider.name) else {
+                    continue;
+                };
+                QuotaSource::Workbuddy {
+                    tokens: Arc::clone(tokens),
+                    build,
+                }
+            } else if provider.protocol == "cursor" {
                 // Same rule as Kiro: the bearer must come from the one live
                 // manager, or a second cache would race dispatch's refreshes.
                 let Some(tokens) = tokens.cursor.as_ref() else {
@@ -668,6 +689,9 @@ pub async fn probe_all_quotas(
                             None
                         }
                     },
+                    QuotaSource::Workbuddy { tokens, build } => {
+                        quota::fetch_workbuddy_quota(&pool, tokens, &key, *build, provider_dns, &transport).await
+                    }
                     QuotaSource::Static(api_key) => {
                         quota::fetch_quota(&provider_name, &base_url, api_key, None, provider_dns, &transport).await
                     }

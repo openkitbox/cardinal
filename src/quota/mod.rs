@@ -10,7 +10,9 @@
 //! monthly plan usage (Zen is pay-as-you-go — no source), a Cursor account
 //! its plan's included usage and on-demand spend (by protocol, like Kiro),
 //! an openai-codex (ChatGPT subscription) account its 5-hour and weekly usage
-//! windows from `wham/usage`; WorkBuddy has no confirmed quota source.
+//! windows from `wham/usage`; WorkBuddy's account credits come from its own
+//! billing meter through the dedicated [`fetch_workbuddy_quota`] path (the
+//! generic endpoint below deliberately does not handle it).
 //! Any other name has no vendor source and falls back to a speculative sub2api
 //! relay probe (`/v1/usage`) — except the official vendors (anthropic, openai,
 //! gemini, kiro), whose APIs expose no key balance.
@@ -35,6 +37,7 @@ mod monthly_anchor;
 mod openai_codex;
 mod opencode;
 mod sub2api;
+mod workbuddy;
 
 pub use balance::BalanceStep;
 pub use balance::classify;
@@ -56,3 +59,4 @@ pub use openai_codex::consume_openai_codex_reset;
 pub use openai_codex::fetch_openai_codex_quota;
 pub use openai_codex::fetch_openai_codex_resets;
 pub use openai_codex::validate_codex_reset_credit;
+pub use workbuddy::fetch_workbuddy_quota;
