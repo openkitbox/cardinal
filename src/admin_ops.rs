@@ -75,6 +75,11 @@ pub struct KeyView {
     pub auth_kind: String,
     /// When the account was archived (None = not archived).
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether an egress proxy is configured on this account. The proxy URL is
+    /// a secret and is never projected onto this (or any other) wire view;
+    /// `default` keeps older payloads decodable.
+    #[serde(default)]
+    pub proxy_configured: bool,
 }
 
 /// One concurrency-limited key with its live occupancy, for the health page.
@@ -349,7 +354,52 @@ pub fn key_view(row: &store::ProviderKeyRow, api_key: String) -> KeyView {
         allowed_models: row.allowed_models.clone(),
         auth_kind: row.auth_kind.clone(),
         archived_at: row.archived_at,
+        proxy_configured: row.proxy_url.is_some(),
     }
+}
+
+/// The proxy part of a Kiro import's PATCH decision, kept pure so the three
+/// states are testable without a database: an absent field skips the patch, a
+/// URL replaces the stored proxy, and `null` clears it.
+fn kiro_proxy_change(proxy_url: Option<Option<&str>>) -> Option<store::KeyPatch<'_>> {
+    proxy_url.map(|change| store::KeyPatch {
+        proxy_url: Some(change),
+        ..Default::default()
+    })
+}
+
+/// A login's two proxy roles: the URL its exchange traffic must use, and the
+/// URL the key editor is allowed to persist. They differ on a re-login without
+/// an explicit URL, where the stored proxy is reused for egress but the row is
+/// left untouched.
+struct LoginProxyChoice<'a> {
+    egress_url: Option<&'a str>,
+    persist_url: Option<&'a str>,
+}
+
+/// Resolve the two roles from the request and, for a re-login, the existing
+/// row. Pure so the fail-open case is testable without a database: an explicit
+/// request URL wins for both roles; absent, a re-login reuses the stored URL
+/// for egress only; a new account has no stored row and stays direct.
+fn resolve_login_proxy<'a>(
+    requested: Option<&'a str>,
+    stored: Option<&'a str>,
+) -> LoginProxyChoice<'a> {
+    LoginProxyChoice {
+        egress_url: requested.or(stored),
+        persist_url: requested,
+    }
+}
+
+/// The proxy a WorkBuddy model probe must use. A probe inside a login takes the
+/// login's already-resolved egress proxy: a fresh key has no stored proxy yet,
+/// and a re-login may change it before the probe, so the row is stale in both
+/// cases. A plain key-model listing has no login proxy and uses the row.
+fn workbuddy_probe_proxy<'a>(
+    login_egress: Option<&'a crate::upstream::ProxySpec>,
+    stored: Option<&'a crate::upstream::ProxySpec>,
+) -> Option<&'a crate::upstream::ProxySpec> {
+    login_egress.or(stored)
 }
 
 /// Create a key with the credential its create request resolved to: a static
@@ -366,6 +416,7 @@ pub async fn create_key(
     credential: KeyCredential<'_>,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
+    proxy_url: Option<&str>,
 ) -> anyhow::Result<i64> {
     match credential {
         KeyCredential::Static(api_key) => {
@@ -377,6 +428,7 @@ pub async fn create_key(
                 api_key,
                 max_concurrency,
                 allowed_models,
+                proxy_url,
             )
             .await
         }
@@ -388,6 +440,7 @@ pub async fn create_key(
                 oauth,
                 max_concurrency,
                 allowed_models,
+                proxy_url,
             )
             .await
         }
@@ -399,6 +452,7 @@ pub async fn create_key(
                 oauth,
                 max_concurrency,
                 allowed_models,
+                proxy_url,
             )
             .await
         }
@@ -410,6 +464,7 @@ pub async fn create_key(
                 oauth,
                 max_concurrency,
                 allowed_models,
+                proxy_url,
             )
             .await
         }
@@ -421,6 +476,7 @@ pub async fn create_key(
                 oauth,
                 max_concurrency,
                 allowed_models,
+                proxy_url,
             )
             .await
         }
@@ -432,6 +488,7 @@ pub async fn create_key(
                 oauth,
                 max_concurrency,
                 allowed_models,
+                proxy_url,
             )
             .await
         }
@@ -655,15 +712,20 @@ pub async fn probe_all_quotas(
             let base_url = provider.base_url.clone();
             let provider_dns = provider.dns;
             let anchor = anchors.get(&key_id).copied();
+            // Parse the account proxy once at the probe boundary; every send
+            // for this key (credential + vendor call) reuses it.
+            let key_proxy =
+                crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
             let pool = pool.clone();
             let transport = transport.clone();
             tasks.spawn(async move {
+                let proxy = key_proxy.as_ref();
                 let mut quota = match &source {
-                    QuotaSource::Kiro(tokens) => quota::fetch_kiro_quota(&pool, tokens, &key, provider_dns).await,
+                    QuotaSource::Kiro(tokens) => quota::fetch_kiro_quota(&pool, tokens, &key, provider_dns, proxy).await,
                     QuotaSource::Cursor(tokens) => {
-                        quota::fetch_cursor_quota(&pool, tokens, &key, provider_dns).await
+                        quota::fetch_cursor_quota(&pool, tokens, &key, provider_dns, proxy).await
                     }
-                    QuotaSource::Opencode(tokens) => match tokens.resolve(&pool, key_id).await {
+                    QuotaSource::Opencode(tokens) => match tokens.resolve(&pool, key_id, proxy).await {
                         Ok(bundle) => {
                             quota::fetch_quota(
                                 &provider_name,
@@ -672,6 +734,7 @@ pub async fn probe_all_quotas(
                                 bundle.org_id.as_deref(),
                                 provider_dns,
                                 &transport,
+                                proxy,
                             )
                             .await
                         }
@@ -682,8 +745,8 @@ pub async fn probe_all_quotas(
                             None
                         }
                     },
-                    QuotaSource::Openai(tokens) => match tokens.resolve(&pool, key_id).await {
-                        Ok(bearer) => quota::fetch_openai_codex_quota(&bearer, key_id, &transport, provider_dns).await,
+                    QuotaSource::Openai(tokens) => match tokens.resolve(&pool, key_id, proxy).await {
+                        Ok(bearer) => quota::fetch_openai_codex_quota(&bearer, key_id, &transport, provider_dns, proxy).await,
                         Err(error) => {
                             tracing::warn!(key_id, error = %error, "quota probe: OpenAI bearer unavailable");
                             None
@@ -693,7 +756,7 @@ pub async fn probe_all_quotas(
                         quota::fetch_workbuddy_quota(&pool, tokens, &key, *build, provider_dns, &transport).await
                     }
                     QuotaSource::Static(api_key) => {
-                        quota::fetch_quota(&provider_name, &base_url, api_key, None, provider_dns, &transport).await
+                        quota::fetch_quota(&provider_name, &base_url, api_key, None, provider_dns, &transport, proxy).await
                     }
                 };
                 // The vendor read's own instant, taken before any DB work: the
@@ -1213,19 +1276,25 @@ impl Admin {
         let Some(tokens) = &self.openai_tokens else {
             return Err(OpenaiResetError::ManagerUnavailable);
         };
-        let bearer = tokens.resolve(&self.pool, key.id).await.map_err(|error| {
-            tracing::warn!(
-                key_id,
-                "Codex reset details: OpenAI credentials unavailable"
-            );
-            OpenaiResetError::Credentials(error)
-        })?;
-        let details = quota::fetch_openai_codex_resets(&bearer, &self.transport, provider.dns)
+        let key_proxy = crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
+        let proxy = key_proxy.as_ref();
+        let bearer = tokens
+            .resolve(&self.pool, key.id, proxy)
             .await
-            .map_err(|_error| {
-                tracing::warn!(key_id, "Codex reset details: upstream request failed");
-                OpenaiResetError::Upstream
+            .map_err(|error| {
+                tracing::warn!(
+                    key_id,
+                    "Codex reset details: OpenAI credentials unavailable"
+                );
+                OpenaiResetError::Credentials(error)
             })?;
+        let details =
+            quota::fetch_openai_codex_resets(&bearer, &self.transport, provider.dns, proxy)
+                .await
+                .map_err(|_error| {
+                    tracing::warn!(key_id, "Codex reset details: upstream request failed");
+                    OpenaiResetError::Upstream
+                })?;
         Ok(OpenaiResetDetails {
             available_count: details.available_count,
             credits: details
@@ -1261,20 +1330,26 @@ impl Admin {
         let Some(tokens) = &self.openai_tokens else {
             return Err(OpenaiResetError::ManagerUnavailable);
         };
-        let bearer = tokens.resolve(&self.pool, key.id).await.map_err(|error| {
-            tracing::warn!(
-                key_id,
-                "Codex reset consume: OpenAI credentials unavailable"
-            );
-            OpenaiResetError::Credentials(error)
-        })?;
+        let key_proxy = crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
+        let proxy = key_proxy.as_ref();
+        let bearer = tokens
+            .resolve(&self.pool, key.id, proxy)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    key_id,
+                    "Codex reset consume: OpenAI credentials unavailable"
+                );
+                OpenaiResetError::Credentials(error)
+            })?;
         if credit_id.is_some() {
-            let details = quota::fetch_openai_codex_resets(&bearer, &self.transport, provider.dns)
-                .await
-                .map_err(|_error| {
-                    tracing::warn!(key_id, "Codex reset consume: upstream details failed");
-                    OpenaiResetError::Upstream
-                })?;
+            let details =
+                quota::fetch_openai_codex_resets(&bearer, &self.transport, provider.dns, proxy)
+                    .await
+                    .map_err(|_error| {
+                        tracing::warn!(key_id, "Codex reset consume: upstream details failed");
+                        OpenaiResetError::Upstream
+                    })?;
             quota::validate_codex_reset_credit(&details, credit_id.as_deref())
                 .map_err(|_| OpenaiResetError::CreditUnavailable)?;
         }
@@ -1282,7 +1357,7 @@ impl Admin {
             redeem_request_id,
             credit_id,
         };
-        quota::consume_openai_codex_reset(&bearer, &request, &self.transport, provider.dns)
+        quota::consume_openai_codex_reset(&bearer, &request, &self.transport, provider.dns, proxy)
             .await
             .map_err(|_error| {
                 tracing::warn!(key_id, "Codex reset consume: upstream request failed");
@@ -1353,6 +1428,7 @@ impl Admin {
                 credential,
                 &self.transport,
                 input.dns,
+                None,
             )
             .await
             .map_err(ProbeError::Regular)
@@ -1366,10 +1442,10 @@ impl Admin {
                 anyhow::bail!("Cursor 模型列表需要已接线的 token 管理器")
             };
             let bearer = tokens
-                .probe_static(api_key, input.dns)
+                .probe_static(api_key, input.dns, None)
                 .await
                 .map_err(|error| ProbeError::Regular(error.into()))?;
-            return probe::fetch_cursor_models(tokens.transport(), &bearer, input.dns)
+            return probe::fetch_cursor_models(tokens.transport(), &bearer, input.dns, None)
                 .await
                 .map_err(|error| ProbeError::Regular(error).into());
         }
@@ -1377,10 +1453,13 @@ impl Admin {
             input.base_url,
             input.protocol,
             input.resolved_auth_scheme(),
-            api_key,
-            None,
+            &probe::ProbeCredentials {
+                api_key,
+                org_id: None,
+            },
             &self.transport,
             input.dns,
+            None,
         )
         .await
         .map_err(ProbeError::Regular)?)
@@ -1410,7 +1489,14 @@ impl Admin {
         } else if provider.protocol == "cursor" {
             self.probe_cursor_models(&provider, &key).await?
         } else if crate::relay::capabilities::workbuddy::is_workbuddy(&provider.name) {
-            self.probe_workbuddy_models(&provider, &key).await?
+            let key_proxy =
+                crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
+            self.probe_workbuddy_models(
+                &provider,
+                &key,
+                workbuddy_probe_proxy(None, key_proxy.as_ref()),
+            )
+            .await?
         } else if key.auth_kind == AuthKind::OpencodeOauth.as_str() {
             self.probe_opencode_models(&provider, &key).await?
         } else if key.auth_kind == AuthKind::OpenaiOauth.as_str() {
@@ -1420,14 +1506,19 @@ impl Admin {
                 .api_key
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("key {key_id} has no api_key to probe with"))?;
+            let key_proxy =
+                crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
             probe::fetch_models(
                 &provider.base_url,
                 &provider.protocol,
                 &provider.auth_scheme,
-                api_key,
-                None,
+                &probe::ProbeCredentials {
+                    api_key,
+                    org_id: None,
+                },
                 &self.transport,
                 provider.dns,
+                key_proxy.as_ref(),
             )
             .await
             .map_err(ProbeError::Regular)?
@@ -1463,11 +1554,13 @@ impl Admin {
             // second cache would race dispatch's refresh-token rotation.
             anyhow::bail!("Kiro 模型列表需要已接线的 token 管理器")
         };
+        let key_proxy = crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
+        let proxy = key_proxy.as_ref();
         let context = tokens
-            .access_token(&self.pool, key, provider.dns)
+            .access_token(&self.pool, key, provider.dns, proxy)
             .await
             .map_err(|error| ProbeError::Kiro(error.into()))?;
-        probe::fetch_kiro_models(tokens.transport(), &context, provider.dns)
+        probe::fetch_kiro_models(tokens.transport(), &context, provider.dns, proxy)
             .await
             .map_err(|error| ProbeError::Kiro(error).into())
     }
@@ -1485,18 +1578,22 @@ impl Admin {
         let Some(tokens) = &self.opencode_tokens else {
             anyhow::bail!("OpenCode 模型列表需要已接线的 token 管理器")
         };
+        let key_proxy = crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
         let bundle = tokens
-            .resolve(&self.pool, key.id)
+            .resolve(&self.pool, key.id, key_proxy.as_ref())
             .await
             .map_err(|error| ProbeError::Regular(error.into()))?;
         probe::fetch_models(
             &provider.base_url,
             &provider.protocol,
             &provider.auth_scheme,
-            &bundle.access_token,
-            bundle.org_id.as_deref(),
+            &probe::ProbeCredentials {
+                api_key: &bundle.access_token,
+                org_id: bundle.org_id.as_deref(),
+            },
             &self.transport,
             provider.dns,
+            key_proxy.as_ref(),
         )
         .await
         .map_err(|error| ProbeError::Regular(error).into())
@@ -1514,11 +1611,12 @@ impl Admin {
         let Some(tokens) = &self.openai_tokens else {
             anyhow::bail!("OpenAI 模型列表需要已接线的 token 管理器")
         };
+        let key_proxy = crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
         let bearer = tokens
-            .resolve(&self.pool, key.id)
+            .resolve(&self.pool, key.id, key_proxy.as_ref())
             .await
             .map_err(|error| ProbeError::Regular(error.into()))?;
-        probe::fetch_openai_codex_models(&bearer, &self.transport, provider.dns)
+        probe::fetch_openai_codex_models(&bearer, &self.transport, provider.dns, key_proxy.as_ref())
             .await
             .map_err(|error| ProbeError::Regular(error).into())
     }
@@ -1542,19 +1640,32 @@ impl Admin {
                 anyhow::anyhow!("key {} has no credential to probe with", key.id)
             })?),
         };
+        let key_proxy = crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
         let bearer = tokens
-            .resolve(&self.pool, key.id, &credential, provider.dns)
+            .resolve(
+                &self.pool,
+                key.id,
+                &credential,
+                provider.dns,
+                key_proxy.as_ref(),
+            )
             .await
             .map_err(|error| ProbeError::Regular(error.into()))?;
-        probe::fetch_cursor_models(tokens.transport(), &bearer, provider.dns)
-            .await
-            .map_err(|error| ProbeError::Regular(error).into())
+        probe::fetch_cursor_models(
+            tokens.transport(),
+            &bearer,
+            provider.dns,
+            key_proxy.as_ref(),
+        )
+        .await
+        .map_err(|error| ProbeError::Regular(error).into())
     }
 
     async fn probe_workbuddy_models(
         &self,
         provider: &store::ProviderRow,
         key: &store::ProviderKeyRow,
+        proxy: Option<&crate::upstream::ProxySpec>,
     ) -> anyhow::Result<Vec<ProbeModel>> {
         let build = crate::relay::capabilities::workbuddy::Build::of(&provider.name)
             .ok_or_else(|| anyhow::anyhow!("invalid WorkBuddy provider name"))?;
@@ -1563,7 +1674,7 @@ impl Admin {
                 anyhow::bail!("WorkBuddy model list needs a wired token manager")
             };
             let bundle = tokens
-                .resolve_with_build(&self.pool, key.id, provider.dns, build)
+                .resolve_with_build(&self.pool, key.id, provider.dns, build, proxy)
                 .await
                 .map_err(|error| ProbeError::Regular(error.into()))?;
             return probe::fetch_workbuddy_models(
@@ -1576,6 +1687,7 @@ impl Admin {
                 },
                 &self.transport,
                 provider.dns,
+                proxy,
             )
             .await
             .map_err(ProbeError::Regular)
@@ -1593,6 +1705,7 @@ impl Admin {
             credential,
             &self.transport,
             provider.dns,
+            proxy,
         )
         .await
         .map_err(ProbeError::Regular)
@@ -1609,6 +1722,7 @@ impl Admin {
         key_id: Option<i64>,
         group_ids: &[i64],
         max_concurrency: Option<i32>,
+        proxy_url: Option<&str>,
     ) -> Result<WorkbuddyLoginStarted, WorkbuddyLoginError> {
         let wiring = self.workbuddy_login.as_ref().ok_or_else(|| {
             WorkbuddyLoginError::Internal(anyhow::anyhow!("WorkBuddy login is not wired"))
@@ -1625,7 +1739,7 @@ impl Admin {
             ));
         }
         let keys = store::list_provider_keys(&self.pool, provider_id).await?;
-        let (label, key_id, group_ids) = match key_id {
+        let (label, key_id, group_ids, egress_url, persist_url) = match key_id {
             Some(key_id) => {
                 let Some(existing) = keys.iter().find(|row| row.id == key_id) else {
                     return Err(WorkbuddyLoginError::KeyNotFound(key_id));
@@ -1633,7 +1747,14 @@ impl Admin {
                 if existing.auth_kind != AuthKind::WorkbuddyOauth.as_str() {
                     return Err(WorkbuddyLoginError::KeyNotFound(key_id));
                 }
-                (existing.label.clone(), Some(key_id), Vec::new())
+                let choice = resolve_login_proxy(proxy_url, existing.proxy_url.as_deref());
+                (
+                    existing.label.clone(),
+                    Some(key_id),
+                    Vec::new(),
+                    choice.egress_url.map(str::to_owned),
+                    choice.persist_url.map(str::to_owned),
+                )
             }
             None => {
                 let label = label.trim();
@@ -1648,10 +1769,18 @@ impl Admin {
                 if !store::key_groups_exist(&self.pool, group_ids).await? {
                     return Err(WorkbuddyLoginError::Invalid("unknown group id".to_owned()));
                 }
-                (label.to_owned(), None, group_ids.to_vec())
+                (
+                    label.to_owned(),
+                    None,
+                    group_ids.to_vec(),
+                    proxy_url.map(str::to_owned),
+                    proxy_url.map(str::to_owned),
+                )
             }
         };
         let client = Arc::new(wiring.client.with_dns(provider.dns));
+        let login_proxy =
+            crate::upstream::ProxySpec::from_stored(egress_url.as_deref(), key_id.unwrap_or(0));
         let started = client
             .start(
                 &provider.base_url,
@@ -1659,6 +1788,7 @@ impl Admin {
                     platform: build.platform(),
                     app: build.app(),
                 },
+                login_proxy.as_ref(),
             )
             .await
             .map_err(|error| WorkbuddyLoginError::Internal(anyhow::Error::new(error)))?;
@@ -1676,6 +1806,8 @@ impl Admin {
             key_id,
             group_ids,
             max_concurrency,
+            proxy_url: persist_url,
+            egress_proxy_url: egress_url,
         };
         tokio::spawn(self.clone().drive_workbuddy_login(poll));
         Ok(WorkbuddyLoginStarted {
@@ -1699,11 +1831,18 @@ impl Admin {
             key_id,
             group_ids,
             max_concurrency,
+            proxy_url,
+            egress_proxy_url,
         } = poll;
         let build_info = workbuddy::auth::BuildInfo {
             platform: build.platform(),
             app: build.app(),
         };
+        let login_proxy = crate::upstream::ProxySpec::from_stored(
+            egress_proxy_url.as_deref(),
+            key_id.unwrap_or(0),
+        );
+        let proxy = login_proxy.as_ref();
         let wait = std::time::Duration::from_millis(WORKBUDDY_LOGIN_POLL_MS);
         let mut token = None;
         loop {
@@ -1717,7 +1856,12 @@ impl Admin {
             }
             if token.is_none() {
                 match client
-                    .poll_token(&provider.base_url, build_info, session.vendor_state())
+                    .poll_token(
+                        &provider.base_url,
+                        build_info,
+                        session.vendor_state(),
+                        proxy,
+                    )
                     .await
                 {
                     Ok(TokenPoll::Pending) => continue,
@@ -1743,6 +1887,7 @@ impl Admin {
                     build_info,
                     session.vendor_state(),
                     &bundle.access_token,
+                    proxy,
                 )
                 .await
             {
@@ -1765,16 +1910,39 @@ impl Admin {
                     bundle.account_name = account_name;
                     let verdict = match self
                         .finish_workbuddy_login(
-                            &provider,
-                            &label,
-                            key_id,
-                            &group_ids,
-                            max_concurrency,
+                            &LoginCommitFields {
+                                provider: &provider,
+                                label: &label,
+                                key_id,
+                                group_ids: &group_ids,
+                                max_concurrency,
+                                proxy,
+                            },
                             bundle,
                         )
                         .await
                     {
-                        Ok(_key_id) => WorkbuddySessionState::Succeeded,
+                        Ok(landed_key_id) => {
+                            if let Some(url) = proxy_url.as_deref()
+                                && let Err(error) = store::patch_provider_key(
+                                    &self.pool,
+                                    provider.id,
+                                    landed_key_id,
+                                    store::KeyPatch {
+                                        proxy_url: Some(Some(url)),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    key_id = landed_key_id,
+                                    error = %format!("{error:#}"),
+                                    "WorkBuddy login key was created, but storing its proxy failed"
+                                );
+                            }
+                            WorkbuddySessionState::Succeeded
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 provider = %provider.name,
@@ -1805,13 +1973,17 @@ impl Admin {
 
     async fn finish_workbuddy_login(
         &self,
-        provider: &store::ProviderRow,
-        label: &str,
-        key_id: Option<i64>,
-        group_ids: &[i64],
-        max_concurrency: Option<i32>,
+        fields: &LoginCommitFields<'_>,
         bundle: WorkbuddyOAuth,
     ) -> anyhow::Result<i64> {
+        let LoginCommitFields {
+            provider,
+            label,
+            key_id,
+            group_ids,
+            max_concurrency,
+            proxy,
+        } = *fields;
         bundle.validate()?;
         let key_id = match key_id {
             Some(key_id) => {
@@ -1843,7 +2015,16 @@ impl Admin {
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("WorkBuddy account key disappeared"))?;
-            match self.probe_workbuddy_models(provider, &key).await {
+            let stored_proxy =
+                crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
+            match self
+                .probe_workbuddy_models(
+                    provider,
+                    &key,
+                    workbuddy_probe_proxy(proxy, stored_proxy.as_ref()),
+                )
+                .await
+            {
                 Ok(models) => {
                     if let Err(error) = store::update_key_models(&self.pool, key_id, &models).await
                     {
@@ -1923,6 +2104,7 @@ impl Admin {
         oauth: KiroOAuth,
         group_ids: Option<&[i64]>,
         max_concurrency: Option<Option<i32>>,
+        proxy_url: Option<Option<&str>>,
     ) -> anyhow::Result<(i64, bool)> {
         if label.is_empty() {
             return Err(
@@ -1939,6 +2121,13 @@ impl Admin {
                 "max_concurrency must be positive".to_owned(),
             )
             .into());
+        }
+        if let Some(Some(url)) = proxy_url
+            && crate::upstream::ProxySpec::parse(url).is_err()
+        {
+            return Err(
+                store::KiroUpsertError::InvalidInput("proxy URL is invalid".to_owned()).into(),
+            );
         }
         // Both regions become URL hosts (the OIDC token endpoint and the
         // control plane), so the grammar guard dispatch shares applies before
@@ -1977,13 +2166,19 @@ impl Admin {
             // a second cache would race dispatch's refresh-token rotation.
             anyhow::bail!("Kiro 模型列表需要已接线的 token 管理器")
         };
+        let import_proxy = crate::upstream::ProxySpec::from_stored(proxy_url.flatten(), 0);
         let candidate = tokens
-            .candidate_for_probe(oauth, provider.dns)
+            .candidate_for_probe(oauth, provider.dns, import_proxy.as_ref())
             .await
             .map_err(|error| ProbeError::Kiro(error.into()))?;
-        let models = probe::fetch_kiro_models(tokens.transport(), &candidate.call, provider.dns)
-            .await
-            .map_err(ProbeError::Kiro)?;
+        let models = probe::fetch_kiro_models(
+            tokens.transport(),
+            &candidate.call,
+            provider.dns,
+            import_proxy.as_ref(),
+        )
+        .await
+        .map_err(ProbeError::Kiro)?;
         let candidate_oauth = candidate.oauth;
         let (key_id, created) = store::upsert_kiro_key_by_label(
             &self.pool,
@@ -1995,6 +2190,20 @@ impl Admin {
             group_ids,
         )
         .await?;
+        // Three-state: absent leaves the row alone, a URL replaces it, and
+        // `null` (Some(None)) clears it. The URL was validated above, before
+        // the credential probe and the key write; a late DB failure degrades to
+        // a warning because the key is already committed.
+        if let Some(patch) = kiro_proxy_change(proxy_url)
+            && let Err(error) =
+                store::patch_provider_key(&self.pool, provider_id, key_id, patch).await
+        {
+            tracing::warn!(
+                key_id,
+                error = %format!("{error:#}"),
+                "Kiro key was created, but storing its proxy failed"
+            );
+        }
         // The catalogue answer also becomes the key's model snapshot. That is a
         // second write, so its failure must not fail an import whose credential
         // is already proven and adopted: losing the snapshot only defers the
@@ -2045,6 +2254,7 @@ impl Admin {
         key_id: Option<i64>,
         group_ids: &[i64],
         max_concurrency: Option<i32>,
+        proxy_url: Option<&str>,
     ) -> Result<OpencodeLoginStarted, OpencodeLoginError> {
         let wiring = self.opencode_login()?;
         let Some(provider) = store::get_provider(&self.pool, provider_id).await? else {
@@ -2057,7 +2267,7 @@ impl Admin {
             ));
         }
         let keys = store::list_provider_keys(&self.pool, provider_id).await?;
-        let (label, key_id, group_ids) = match key_id {
+        let (label, key_id, group_ids, egress_url, persist_url) = match key_id {
             Some(key_id) => {
                 let Some(existing) = keys.iter().find(|row| row.id == key_id) else {
                     return Err(OpencodeLoginError::KeyNotFound(key_id));
@@ -2068,8 +2278,15 @@ impl Admin {
                 // A re-login replaces the credential of an account that already
                 // exists and is configured: the key editor's PATCH owns its
                 // label and memberships, so the login neither reads nor rewrites
-                // them.
-                (existing.label.clone(), Some(key_id), Vec::new())
+                // them. The stored proxy is reused for egress only.
+                let choice = resolve_login_proxy(proxy_url, existing.proxy_url.as_deref());
+                (
+                    existing.label.clone(),
+                    Some(key_id),
+                    Vec::new(),
+                    choice.egress_url.map(str::to_owned),
+                    choice.persist_url.map(str::to_owned),
+                )
             }
             None => {
                 let label = label.trim();
@@ -2084,12 +2301,20 @@ impl Admin {
                 if !store::key_groups_exist(&self.pool, group_ids).await? {
                     return Err(OpencodeLoginError::Invalid("unknown group id".to_owned()));
                 }
-                (label.to_owned(), None, group_ids.to_vec())
+                (
+                    label.to_owned(),
+                    None,
+                    group_ids.to_vec(),
+                    proxy_url.map(str::to_owned),
+                    proxy_url.map(str::to_owned),
+                )
             }
         };
+        let login_proxy =
+            crate::upstream::ProxySpec::from_stored(egress_url.as_deref(), key_id.unwrap_or(0));
         let code = wiring
             .client
-            .device_code(auth::DEFAULT_SERVER)
+            .device_code(auth::DEFAULT_SERVER, login_proxy.as_ref())
             .await
             .context("starting an OpenCode device login")?;
         let auth::DeviceCode {
@@ -2116,6 +2341,8 @@ impl Admin {
             group_ids,
             max_concurrency,
             interval,
+            proxy_url: persist_url,
+            egress_proxy_url: egress_url,
         };
         tokio::spawn(self.clone().drive_opencode_login(poll));
         Ok(OpencodeLoginStarted {
@@ -2143,7 +2370,11 @@ impl Admin {
             group_ids,
             max_concurrency,
             interval,
+            proxy_url,
+            egress_proxy_url,
         } = poll;
+        let login_proxy = crate::upstream::ProxySpec::from_stored(egress_proxy_url.as_deref(), 0);
+        let proxy = login_proxy.as_ref();
         let mut wait = std::time::Duration::from_secs(interval.max(LOGIN_MIN_INTERVAL_SECS));
         loop {
             tokio::time::sleep(wait).await;
@@ -2157,7 +2388,7 @@ impl Admin {
                 return;
             }
             match client
-                .poll_device_token(auth::DEFAULT_SERVER, session.device_code())
+                .poll_device_token(auth::DEFAULT_SERVER, session.device_code(), proxy)
                 .await
             {
                 Ok(TokenGrant::Pending) => {}
@@ -2188,16 +2419,39 @@ impl Admin {
                     }
                     let verdict = match self
                         .finish_opencode_login(
-                            &provider,
-                            &label,
-                            session.key_id(),
-                            &group_ids,
-                            max_concurrency,
+                            &LoginCommitFields {
+                                provider: &provider,
+                                label: &label,
+                                key_id: session.key_id(),
+                                group_ids: &group_ids,
+                                max_concurrency,
+                                proxy,
+                            },
                             token,
                         )
                         .await
                     {
-                        Ok(key_id) => SessionState::Succeeded { key_id },
+                        Ok(key_id) => {
+                            if let Some(url) = proxy_url.as_deref()
+                                && let Err(error) = store::patch_provider_key(
+                                    &self.pool,
+                                    provider.id,
+                                    key_id,
+                                    store::KeyPatch {
+                                        proxy_url: Some(Some(url)),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    key_id,
+                                    error = %format!("{error:#}"),
+                                    "OpenCode login key was created, but storing its proxy failed"
+                                );
+                            }
+                            SessionState::Succeeded { key_id }
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 provider = %provider.name,
@@ -2245,13 +2499,17 @@ impl Admin {
     /// this step missed.
     async fn finish_opencode_login(
         &self,
-        provider: &store::ProviderRow,
-        label: &str,
-        key_id: Option<i64>,
-        group_ids: &[i64],
-        max_concurrency: Option<i32>,
+        fields: &LoginCommitFields<'_>,
         token: auth::ReadyToken,
     ) -> anyhow::Result<i64> {
+        let LoginCommitFields {
+            provider,
+            label,
+            key_id,
+            group_ids,
+            max_concurrency,
+            proxy,
+        } = *fields;
         let wiring = self.opencode_login()?;
         let expires_at = token.expires_at(Utc::now());
         let auth::ReadyToken {
@@ -2262,7 +2520,7 @@ impl Admin {
         } = token;
         let email = match wiring
             .client
-            .fetch_account(auth::DEFAULT_SERVER, &access_token)
+            .fetch_account(auth::DEFAULT_SERVER, &access_token, proxy)
             .await
         {
             Ok(account) => Some(account.email),
@@ -2276,7 +2534,7 @@ impl Admin {
         };
         let org_name = match wiring
             .client
-            .fetch_organizations(auth::DEFAULT_SERVER, &access_token)
+            .fetch_organizations(auth::DEFAULT_SERVER, &access_token, proxy)
             .await
         {
             Ok(organizations) => org_id.as_deref().and_then(|org_id| {
@@ -2320,10 +2578,13 @@ impl Admin {
             &provider.base_url,
             &provider.protocol,
             &provider.auth_scheme,
-            &bundle.access_token,
-            bundle.org_id.as_deref(),
+            &probe::ProbeCredentials {
+                api_key: &bundle.access_token,
+                org_id: bundle.org_id.as_deref(),
+            },
             &self.transport,
             provider.dns,
+            proxy,
         )
         .await
         {
@@ -2383,6 +2644,7 @@ impl Admin {
             label,
             bundle.clone(),
             max_concurrency,
+            None,
             None,
         )
         .await?;
@@ -2498,44 +2760,70 @@ impl Admin {
         target: OpenaiLoginTarget,
     ) -> Result<OpenaiLoginStarted, OpenaiLoginError> {
         let wiring = self.openai_login()?;
-        let (provider, label, key_id, group_ids, max_concurrency) = match target {
-            OpenaiLoginTarget::Relogin { key_id } => {
-                let existing = store::list_keys_by_ids(&self.pool, &[key_id]).await?;
-                let Some(existing) = existing
-                    .into_iter()
-                    .find(|row| row.auth_kind == AuthKind::OpenaiOauth.as_str())
-                else {
-                    return Err(OpenaiLoginError::KeyNotFound(key_id));
-                };
-                let Some(provider) = store::get_provider(&self.pool, existing.provider_id).await?
-                else {
-                    return Err(OpenaiLoginError::ProviderNotFound(existing.provider_id));
-                };
-                (provider, existing.label, Some(key_id), Vec::new(), None)
-            }
-            OpenaiLoginTarget::New {
-                provider_id,
-                label,
-                group_ids,
-                max_concurrency,
-            } => {
-                let Some(provider) = store::get_provider(&self.pool, provider_id).await? else {
-                    return Err(OpenaiLoginError::ProviderNotFound(provider_id));
-                };
-                let keys = store::list_provider_keys(&self.pool, provider_id).await?;
-                if keys.iter().any(|row| row.label == label) {
-                    return Err(OpenaiLoginError::LabelConflict(label));
+        let (provider, label, key_id, group_ids, max_concurrency, proxy_url, egress_url) =
+            match target {
+                OpenaiLoginTarget::Relogin { key_id, proxy_url } => {
+                    let existing = store::list_keys_by_ids(&self.pool, &[key_id]).await?;
+                    let Some(existing) = existing
+                        .into_iter()
+                        .find(|row| row.auth_kind == AuthKind::OpenaiOauth.as_str())
+                    else {
+                        return Err(OpenaiLoginError::KeyNotFound(key_id));
+                    };
+                    let Some(provider) =
+                        store::get_provider(&self.pool, existing.provider_id).await?
+                    else {
+                        return Err(OpenaiLoginError::ProviderNotFound(existing.provider_id));
+                    };
+                    let egress_url =
+                        resolve_login_proxy(proxy_url.as_deref(), existing.proxy_url.as_deref())
+                            .egress_url
+                            .map(str::to_owned);
+                    (
+                        provider,
+                        existing.label,
+                        Some(key_id),
+                        Vec::new(),
+                        None,
+                        proxy_url,
+                        egress_url,
+                    )
                 }
-                if !store::key_groups_exist(&self.pool, &group_ids).await? {
-                    return Err(OpenaiLoginError::Invalid("unknown group id".to_owned()));
+                OpenaiLoginTarget::New {
+                    provider_id,
+                    label,
+                    group_ids,
+                    max_concurrency,
+                    proxy_url,
+                } => {
+                    let Some(provider) = store::get_provider(&self.pool, provider_id).await? else {
+                        return Err(OpenaiLoginError::ProviderNotFound(provider_id));
+                    };
+                    let keys = store::list_provider_keys(&self.pool, provider_id).await?;
+                    if keys.iter().any(|row| row.label == label) {
+                        return Err(OpenaiLoginError::LabelConflict(label));
+                    }
+                    if !store::key_groups_exist(&self.pool, &group_ids).await? {
+                        return Err(OpenaiLoginError::Invalid("unknown group id".to_owned()));
+                    }
+                    let egress_url = proxy_url.clone();
+                    (
+                        provider,
+                        label,
+                        None,
+                        group_ids,
+                        max_concurrency,
+                        proxy_url,
+                        egress_url,
+                    )
                 }
-                (provider, label, None, group_ids, max_concurrency)
-            }
-        };
+            };
         ensure_openai_provider(&provider)?;
+        let login_proxy =
+            crate::upstream::ProxySpec::from_stored(egress_url.as_deref(), key_id.unwrap_or(0));
         let grant = wiring
             .client
-            .start_device()
+            .start_device(login_proxy.as_ref())
             .await
             .context("starting an OpenAI device login")?;
         let openai_auth::DeviceGrant {
@@ -2559,6 +2847,8 @@ impl Admin {
             label,
             group_ids,
             max_concurrency,
+            proxy_url,
+            egress_proxy_url: egress_url,
         };
         tokio::spawn(self.clone().drive_openai_login(poll));
         Ok(OpenaiLoginStarted {
@@ -2578,6 +2868,9 @@ impl Admin {
         let session = Arc::clone(&poll.session);
         let wait = openai_poll_wait(session.interval());
         let mut polls: u32 = 0;
+        let login_proxy =
+            crate::upstream::ProxySpec::from_stored(poll.egress_proxy_url.as_deref(), 0);
+        let proxy = login_proxy.as_ref();
         loop {
             tokio::time::sleep(wait).await;
             // Cancelled between ticks: the cancel already wrote the verdict.
@@ -2587,7 +2880,7 @@ impl Admin {
             polls += 1;
             let observation = match poll
                 .client
-                .poll_device(session.device_auth_id(), session.user_code())
+                .poll_device(session.device_auth_id(), session.user_code(), proxy)
                 .await
             {
                 Ok(openai_auth::PollVerdict::Pending) => PollObservation::Pending,
@@ -2650,7 +2943,13 @@ impl Admin {
         let failed = |message: &str| openai_login::SessionState::Failed {
             message: message.to_owned(),
         };
-        let tokens = match poll.client.exchange_code(&approval, Utc::now()).await {
+        let exchange_proxy =
+            crate::upstream::ProxySpec::from_stored(poll.egress_proxy_url.as_deref(), 0);
+        let tokens = match poll
+            .client
+            .exchange_code(&approval, Utc::now(), exchange_proxy.as_ref())
+            .await
+        {
             Ok(tokens) => tokens,
             Err(error) => {
                 tracing::warn!(provider = %provider.name, %error, "OpenAI code exchange failed");
@@ -2680,10 +2979,37 @@ impl Admin {
                 return failed(&openai_commit_failure_message(&error));
             }
         };
+        // A supplied proxy is persisted once the key exists; on a re-login an
+        // absent proxy leaves the row's existing proxy untouched (reuse).
+        if let Some(url) = poll.proxy_url.as_deref()
+            && let Err(error) = store::patch_provider_key(
+                &self.pool,
+                provider.id,
+                key_id,
+                store::KeyPatch {
+                    proxy_url: Some(Some(url)),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                key_id,
+                error = %format!("{error:#}"),
+                "OpenAI login key was created, but storing its proxy failed"
+            );
+        }
         // The credential is committed: everything below is best effort.
         if let Some(tokens) = &self.openai_tokens {
             let bearer = tokens.adopt(key_id, bundle);
-            match probe::fetch_openai_codex_models(&bearer, &self.transport, provider.dns).await {
+            match probe::fetch_openai_codex_models(
+                &bearer,
+                &self.transport,
+                provider.dns,
+                exchange_proxy.as_ref(),
+            )
+            .await
+            {
                 Ok(models) => {
                     if let Err(error) = store::update_key_models(&self.pool, key_id, &models).await
                     {
@@ -2743,6 +3069,7 @@ impl Admin {
             &poll.label,
             bundle.clone(),
             poll.max_concurrency,
+            None,
             None,
         )
         .await?;
@@ -2842,6 +3169,7 @@ impl Admin {
         key_id: Option<i64>,
         group_ids: &[i64],
         max_concurrency: Option<i32>,
+        proxy_url: Option<&str>,
     ) -> Result<CursorLoginStarted, CursorLoginError> {
         let wiring = self.cursor_login()?;
         let Some(provider) = store::get_provider(&self.pool, provider_id).await? else {
@@ -2854,7 +3182,7 @@ impl Admin {
             ));
         }
         let keys = store::list_provider_keys(&self.pool, provider_id).await?;
-        let (label, key_id, group_ids) = match key_id {
+        let (label, key_id, group_ids, egress_url, persist_url) = match key_id {
             Some(key_id) => {
                 let Some(existing) = keys.iter().find(|row| row.id == key_id) else {
                     return Err(CursorLoginError::KeyNotFound(key_id));
@@ -2862,7 +3190,14 @@ impl Admin {
                 if existing.auth_kind != AuthKind::CursorOauth.as_str() {
                     return Err(CursorLoginError::KeyNotFound(key_id));
                 }
-                (existing.label.clone(), Some(key_id), Vec::new())
+                let choice = resolve_login_proxy(proxy_url, existing.proxy_url.as_deref());
+                (
+                    existing.label.clone(),
+                    Some(key_id),
+                    Vec::new(),
+                    choice.egress_url.map(str::to_owned),
+                    choice.persist_url.map(str::to_owned),
+                )
             }
             None => {
                 let label = label.trim();
@@ -2877,7 +3212,13 @@ impl Admin {
                 if !store::key_groups_exist(&self.pool, group_ids).await? {
                     return Err(CursorLoginError::Invalid("unknown group id".to_owned()));
                 }
-                (label.to_owned(), None, group_ids.to_vec())
+                (
+                    label.to_owned(),
+                    None,
+                    group_ids.to_vec(),
+                    proxy_url.map(str::to_owned),
+                    proxy_url.map(str::to_owned),
+                )
             }
         };
         let challenge = cursor::auth::Challenge::new();
@@ -2896,6 +3237,8 @@ impl Admin {
             label,
             group_ids,
             max_concurrency,
+            proxy_url: persist_url,
+            egress_proxy_url: egress_url,
         };
         tokio::spawn(self.clone().drive_cursor_login(poll));
         Ok(CursorLoginStarted {
@@ -2916,7 +3259,11 @@ impl Admin {
             label,
             group_ids,
             max_concurrency,
+            proxy_url,
+            egress_proxy_url,
         } = poll;
+        let login_proxy = crate::upstream::ProxySpec::from_stored(egress_proxy_url.as_deref(), 0);
+        let proxy = login_proxy.as_ref();
         let wait = std::time::Duration::from_millis(CURSOR_LOGIN_POLL_MS);
         loop {
             tokio::time::sleep(wait).await;
@@ -2928,7 +3275,7 @@ impl Admin {
                 session.finish(cursor::login::SessionState::Expired, now);
                 return;
             }
-            match client.poll(session.challenge()).await {
+            match client.poll(session.challenge(), proxy).await {
                 Ok(cursor::auth::PollVerdict::Waiting) => {}
                 Ok(cursor::auth::PollVerdict::PolicyRefused) => {
                     tracing::warn!(
@@ -2957,15 +3304,39 @@ impl Admin {
                     }
                     let verdict = match self
                         .finish_cursor_login(
-                            &provider,
-                            &label,
-                            session.key_id(),
-                            &group_ids,
-                            max_concurrency,
+                            &LoginCommitFields {
+                                provider: &provider,
+                                label: &label,
+                                key_id: session.key_id(),
+                                group_ids: &group_ids,
+                                max_concurrency,
+                                proxy,
+                            },
                             token,
                         )
                         .await
                     {
+                        Ok(landed @ cursor::login::SessionState::Succeeded { key_id, .. }) => {
+                            if let Some(url) = proxy_url.as_deref()
+                                && let Err(error) = store::patch_provider_key(
+                                    &self.pool,
+                                    provider.id,
+                                    key_id,
+                                    store::KeyPatch {
+                                        proxy_url: Some(Some(url)),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    key_id,
+                                    error = %format!("{error:#}"),
+                                    "Cursor login key was created, but storing its proxy failed"
+                                );
+                            }
+                            landed
+                        }
                         Ok(landed) => landed,
                         Err(error) => {
                             // Fixed GUI text; the detail (which may quote the
@@ -3010,13 +3381,17 @@ impl Admin {
     /// cache and the GUI signal — all best effort once the row is committed.
     async fn finish_cursor_login(
         &self,
-        provider: &store::ProviderRow,
-        label: &str,
-        key_id: Option<i64>,
-        group_ids: &[i64],
-        max_concurrency: Option<i32>,
+        fields: &LoginCommitFields<'_>,
         token: cursor::auth::ReadyToken,
     ) -> anyhow::Result<cursor::login::SessionState> {
+        let LoginCommitFields {
+            provider,
+            label,
+            key_id,
+            group_ids,
+            max_concurrency,
+            proxy,
+        } = *fields;
         let wiring = self.cursor_login()?;
         let cursor::auth::ReadyToken {
             access_token,
@@ -3026,7 +3401,10 @@ impl Admin {
         let Some(expires_at) = crate::upstream::cursor_tokens::jwt_expiry(&access_token) else {
             anyhow::bail!("the issued Cursor access token carries no readable expiry");
         };
-        let email = wiring.client.email(&access_token, team_id.as_deref()).await;
+        let email = wiring
+            .client
+            .email(&access_token, team_id.as_deref(), proxy)
+            .await;
         let bundle = CursorOAuth {
             access_token,
             refresh_token,
@@ -3048,7 +3426,9 @@ impl Admin {
         match &self.cursor_tokens {
             Some(tokens) => {
                 let bearer = tokens.adopt(key_id, &bundle);
-                match probe::fetch_cursor_models(tokens.transport(), &bearer, provider.dns).await {
+                match probe::fetch_cursor_models(tokens.transport(), &bearer, provider.dns, proxy)
+                    .await
+                {
                     Ok(models) => {
                         if let Err(error) =
                             store::update_key_models(&self.pool, key_id, &models).await
@@ -3104,6 +3484,7 @@ impl Admin {
             label,
             bundle.clone(),
             max_concurrency,
+            None,
             None,
         )
         .await?;
@@ -3204,6 +3585,7 @@ impl Admin {
         credential: KeyCredential<'_>,
         max_concurrency: Option<i32>,
         allowed_models: Option<Vec<String>>,
+        proxy_url: Option<&str>,
     ) -> anyhow::Result<i64> {
         create_key(
             &self.pool,
@@ -3212,6 +3594,7 @@ impl Admin {
             credential,
             max_concurrency,
             allowed_models,
+            proxy_url,
         )
         .await
     }
@@ -3278,6 +3661,18 @@ struct OpencodeLogin {
     logins: login::OpencodeLogins,
 }
 
+/// The shared configuration a login's commit step needs, bundled so the finish
+/// functions stay under clippy's argument ceiling while the proxy is resolved
+/// once at the request boundary.
+struct LoginCommitFields<'a> {
+    provider: &'a store::ProviderRow,
+    label: &'a str,
+    key_id: Option<i64>,
+    group_ids: &'a [i64],
+    max_concurrency: Option<i32>,
+    proxy: Option<&'a crate::upstream::ProxySpec>,
+}
+
 /// Everything one spawned login needs to reach its verdict.
 struct LoginPoll {
     session: Arc<login::Session>,
@@ -3292,6 +3687,12 @@ struct LoginPoll {
     max_concurrency: Option<i32>,
     /// The console's poll cadence in seconds, before any `slow_down` backoff.
     interval: u64,
+    /// Explicit request proxy only: persisted on the key after commit, never
+    /// filled from the row so a re-login without a URL performs no DB write.
+    proxy_url: Option<String>,
+    /// The proxy the issuer exchange actually uses: the request URL, or a
+    /// re-login's stored URL when the GUI withheld it.
+    egress_proxy_url: Option<String>,
 }
 
 /// A started OpenCode device login: what
@@ -3418,6 +3819,12 @@ struct WorkbuddyLoginPoll {
     key_id: Option<i64>,
     group_ids: Vec<i64>,
     max_concurrency: Option<i32>,
+    /// Explicit request proxy only: persisted on the key after commit, never
+    /// filled from the row so a re-login without a URL performs no DB write.
+    proxy_url: Option<String>,
+    /// The proxy the issuer exchange actually uses: the request URL, or a
+    /// re-login's stored URL when the GUI withheld it.
+    egress_proxy_url: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -3474,6 +3881,12 @@ struct CursorLoginPoll {
     label: String,
     group_ids: Vec<i64>,
     max_concurrency: Option<i32>,
+    /// Explicit request proxy only: persisted on the key after commit, never
+    /// filled from the row so a re-login without a URL performs no DB write.
+    proxy_url: Option<String>,
+    /// The proxy the issuer exchange actually uses: the request URL, or a
+    /// re-login's stored URL when the GUI withheld it.
+    egress_proxy_url: Option<String>,
 }
 
 /// A started Cursor login: what `POST /api/providers/{id}/cursor-login`
@@ -3560,7 +3973,7 @@ const OPENAI_LOGIN_STORE_MESSAGE: &str =
 
 /// `POST /api/openai-logins` body: the account to create, or (with `key_id`) the
 /// existing account to re-authenticate.
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct OpenaiLoginRequest {
     /// The provider a new account belongs to. Ignored for a re-login, whose
     /// key row already names its provider.
@@ -3577,10 +3990,28 @@ pub struct OpenaiLoginRequest {
     pub group_ids: Vec<i64>,
     #[serde(default)]
     pub max_concurrency: Option<i32>,
+    /// Temporary egress proxy for this login's token exchange, also stored on
+    /// the resulting key. Absent on a re-login reuses the key's existing proxy.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+impl std::fmt::Debug for OpenaiLoginRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenaiLoginRequest")
+            .field("provider_id", &self.provider_id)
+            .field("label", &self.label)
+            .field("key_id", &self.key_id)
+            .field("group_ids", &self.group_ids)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// What a validated start request asks for.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum OpenaiLoginTarget {
     /// Create an account on `provider_id`.
     New {
@@ -3588,18 +4019,56 @@ pub enum OpenaiLoginTarget {
         label: String,
         group_ids: Vec<i64>,
         max_concurrency: Option<i32>,
+        proxy_url: Option<String>,
     },
     /// Replace the credential of an existing account; its label, groups and
     /// cap stay as the key editor left them.
-    Relogin { key_id: i64 },
+    Relogin {
+        key_id: i64,
+        proxy_url: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for OpenaiLoginTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::New {
+                provider_id,
+                label,
+                group_ids,
+                max_concurrency,
+                proxy_url,
+            } => formatter
+                .debug_struct("OpenaiLoginTarget::New")
+                .field("provider_id", provider_id)
+                .field("label", label)
+                .field("group_ids", group_ids)
+                .field("max_concurrency", max_concurrency)
+                .field("proxy_url", &proxy_url.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            Self::Relogin { key_id, proxy_url } => formatter
+                .debug_struct("OpenaiLoginTarget::Relogin")
+                .field("key_id", key_id)
+                .field("proxy_url", &proxy_url.as_ref().map(|_| "<redacted>"))
+                .finish(),
+        }
+    }
 }
 
 impl OpenaiLoginRequest {
     /// Check the request's shape (no I/O): which of the two flows it asks for
     /// and that the inputs of that flow are usable.
     pub fn into_target(self) -> Result<OpenaiLoginTarget, OpenaiLoginError> {
+        if let Some(url) = self.proxy_url.as_deref()
+            && crate::upstream::ProxySpec::parse(url).is_err()
+        {
+            return Err(OpenaiLoginError::Invalid("proxy URL is invalid".to_owned()));
+        }
         if let Some(key_id) = self.key_id {
-            return Ok(OpenaiLoginTarget::Relogin { key_id });
+            return Ok(OpenaiLoginTarget::Relogin {
+                key_id,
+                proxy_url: self.proxy_url,
+            });
         }
         let Some(provider_id) = self.provider_id else {
             return Err(OpenaiLoginError::Invalid(
@@ -3622,6 +4091,7 @@ impl OpenaiLoginRequest {
             label: label.to_owned(),
             group_ids: self.group_ids,
             max_concurrency: self.max_concurrency,
+            proxy_url: self.proxy_url,
         })
     }
 }
@@ -3723,6 +4193,12 @@ struct OpenaiLoginPoll {
     /// Groups to attach to a newly created key (ignored by a re-login).
     group_ids: Vec<i64>,
     max_concurrency: Option<i32>,
+    /// Explicit request proxy only: persisted on the key after commit, never
+    /// filled from the row so a re-login without a URL performs no DB write.
+    proxy_url: Option<String>,
+    /// The proxy the issuer exchange actually uses: the request URL, or a
+    /// re-login's stored URL when the GUI withheld it.
+    egress_proxy_url: Option<String>,
 }
 
 /// A started OpenAI device login: what `POST /api/openai-logins` answers with.

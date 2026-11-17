@@ -2001,6 +2001,11 @@ struct KeyBody {
     /// Model whitelist; absent or null = unrestricted.
     #[serde(default)]
     allowed_models: Option<Vec<String>>,
+    /// Per-account egress proxy for a newly created key. Absent/null = direct
+    /// egress; a URL is validated by the shared parser before any write. The
+    /// value is a secret and is never echoed back to this or any other API.
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2013,6 +2018,10 @@ struct KiroKeyBody {
     /// Groups to add the key to (append only); absent/null = untouched.
     #[serde(default)]
     group_ids: Option<Vec<i64>>,
+    /// Per-account egress proxy; absent/null = direct egress. Validated before
+    /// any write; never echoed back.
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 /// Raw Kiro import body. `credentials` stays a JSON value until the pure
@@ -2030,6 +2039,9 @@ struct KiroImportBody {
     /// Groups to add the key to (append only); absent/null = untouched.
     #[serde(default)]
     group_ids: Option<Vec<i64>>,
+    /// Three-state proxy: absent = untouched, null = clear, URL = set.
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
+    proxy_url: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -2063,6 +2075,10 @@ struct PatchKeyBody {
     /// account down on a rate limit. Only a Kiro provider accepts it.
     #[serde(default)]
     rest_on_429: Option<bool>,
+    /// Three-state proxy: absent = untouched, null = clear to direct egress,
+    /// URL = replace. A rejected URL leaves no partial write behind.
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
+    proxy_url: Option<Option<String>>,
 }
 
 /// `PUT /api/keys/order` body: positions are assigned sequentially in array order (0, 1, 2, …).
@@ -2110,6 +2126,14 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         let _ = response.body("invalid key body");
         return;
     };
+    // Validate the proxy URL before touching anything: a bad URL is caller
+    // error with a fixed message (no URL/user/password in the response).
+    if let Some(url) = body.proxy_url.as_deref()
+        && let Err(error) = crate::upstream::ProxySpec::parse(url)
+    {
+        bad_request(response, anyhow::Error::new(error));
+        return;
+    }
     // The credential shape depends on the provider's protocol, so read the
     // row first: a Kiro OIDC key is only valid under a `kiro` provider.
     let provider = match store::get_provider(pool, provider_id).await {
@@ -2173,6 +2197,7 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         credential,
         body.max_concurrency,
         body.allowed_models,
+        body.proxy_url.as_deref(),
     )
     .await
     {
@@ -2229,6 +2254,7 @@ async fn import_kiro_key(request: &mut Request, depot: &mut Depot, response: &mu
             oauth,
             body.group_ids.as_deref(),
             body.max_concurrency,
+            body.proxy_url.as_ref().map(|inner| inner.as_deref()),
         )
         .await
     {
@@ -2276,6 +2302,11 @@ struct OpencodeLoginBody {
     group_ids: Option<Vec<i64>>,
     #[serde(default)]
     max_concurrency: Option<i32>,
+    /// Temporary egress proxy for this login's token exchange, also stored on
+    /// the resulting key. Absent on a re-login = reuse the key's existing proxy.
+    /// Validated before the login starts; never echoed back.
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 /// `POST /api/providers/{id}/opencode-login`: start a device login and answer
@@ -2294,6 +2325,12 @@ async fn start_opencode_login(request: &mut Request, depot: &mut Depot, response
         return;
     };
     let group_ids = body.group_ids.unwrap_or_default();
+    if let Some(url) = body.proxy_url.as_deref()
+        && let Err(error) = crate::upstream::ProxySpec::parse(url)
+    {
+        bad_request(response, anyhow::Error::new(error));
+        return;
+    }
     match admin(depot)
         .start_opencode_login(
             provider_id,
@@ -2301,6 +2338,7 @@ async fn start_opencode_login(request: &mut Request, depot: &mut Depot, response
             body.key_id,
             &group_ids,
             body.max_concurrency,
+            body.proxy_url.as_deref(),
         )
         .await
     {
@@ -2443,6 +2481,9 @@ struct CursorLoginBody {
     group_ids: Option<Vec<i64>>,
     #[serde(default)]
     max_concurrency: Option<i32>,
+    /// Temporary egress proxy for this login and the resulting key.
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 /// `POST /api/providers/{id}/cursor-login`: start a browser login and answer
@@ -2460,6 +2501,12 @@ async fn start_cursor_login(request: &mut Request, depot: &mut Depot, response: 
         return;
     };
     let group_ids = body.group_ids.unwrap_or_default();
+    if let Some(url) = body.proxy_url.as_deref()
+        && let Err(error) = crate::upstream::ProxySpec::parse(url)
+    {
+        bad_request(response, anyhow::Error::new(error));
+        return;
+    }
     match admin(depot)
         .start_cursor_login(
             provider_id,
@@ -2467,6 +2514,7 @@ async fn start_cursor_login(request: &mut Request, depot: &mut Depot, response: 
             body.key_id,
             &group_ids,
             body.max_concurrency,
+            body.proxy_url.as_deref(),
         )
         .await
     {
@@ -2534,6 +2582,9 @@ struct WorkbuddyLoginBody {
     group_ids: Option<Vec<i64>>,
     #[serde(default)]
     max_concurrency: Option<i32>,
+    /// Temporary egress proxy for this login and the resulting key.
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 #[handler]
@@ -2549,6 +2600,12 @@ async fn start_workbuddy_login(request: &mut Request, depot: &mut Depot, respons
         return;
     };
     let groups = body.group_ids.unwrap_or_default();
+    if let Some(url) = body.proxy_url.as_deref()
+        && let Err(error) = crate::upstream::ProxySpec::parse(url)
+    {
+        bad_request(response, anyhow::Error::new(error));
+        return;
+    }
     match admin(depot)
         .start_workbuddy_login(
             provider_id,
@@ -2556,6 +2613,7 @@ async fn start_workbuddy_login(request: &mut Request, depot: &mut Depot, respons
             body.key_id,
             &groups,
             body.max_concurrency,
+            body.proxy_url.as_deref(),
         )
         .await
     {
@@ -2630,6 +2688,7 @@ async fn upsert_kiro_key(request: &mut Request, depot: &mut Depot, response: &mu
             body.oauth,
             body.group_ids.as_deref(),
             body.max_concurrency,
+            body.proxy_url.as_deref().map(Some),
         )
         .await
     {
@@ -2698,6 +2757,7 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
             group_ids: body.group_ids.as_deref(),
             archived: body.archived,
             rest_on_429: body.rest_on_429,
+            proxy_url: body.proxy_url.as_ref().map(|inner| inner.as_deref()),
         },
     )
     .await

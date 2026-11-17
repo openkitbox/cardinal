@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::relay::capabilities::workbuddy::{Build, normalize_credential_origin};
 use crate::store;
+use crate::upstream::ProxySpec;
 use crate::workbuddy::WorkbuddyOAuth;
 use crate::workbuddy::auth::Client;
 use crate::workbuddy::auth::WorkbuddyError;
@@ -79,6 +80,7 @@ impl WorkbuddyTokens {
         key_id: i64,
         dns: crate::upstream::Dns,
         build: Build,
+        proxy: Option<&ProxySpec>,
     ) -> Result<Arc<WorkbuddyOAuth>, WorkbuddyTokenError> {
         if self.dead.contains_key(&key_id) {
             return Err(WorkbuddyTokenError::Expired);
@@ -88,7 +90,7 @@ impl WorkbuddyTokens {
         {
             return Ok(Arc::clone(bundle.value()));
         }
-        self.resolve_slow(pool, key_id, dns, build).await
+        self.resolve_slow(pool, key_id, dns, build, proxy).await
     }
 
     /// Adopt a bundle written by login or credential replacement.
@@ -106,19 +108,22 @@ impl WorkbuddyTokens {
         presented_access_token: &str,
         dns: crate::upstream::Dns,
         build: Build,
+        proxy: Option<&ProxySpec>,
     ) -> Result<Arc<WorkbuddyOAuth>, WorkbuddyTokenError> {
         let Some(cached) = self
             .bundles
             .get(&key_id)
             .map(|bundle| Arc::clone(bundle.value()))
         else {
-            return self.resolve_with_build(pool, key_id, dns, build).await;
+            return self
+                .resolve_with_build(pool, key_id, dns, build, proxy)
+                .await;
         };
         if cached.access_token != presented_access_token {
             return Ok(cached);
         }
         self.bundles.remove(&key_id);
-        self.resolve_slow(pool, key_id, dns, build).await
+        self.resolve_slow(pool, key_id, dns, build, proxy).await
     }
 
     /// Forget the process-local state for one key.
@@ -133,6 +138,7 @@ impl WorkbuddyTokens {
         key_id: i64,
         dns: crate::upstream::Dns,
         build: Build,
+        proxy: Option<&ProxySpec>,
     ) -> Result<Arc<WorkbuddyOAuth>, WorkbuddyTokenError> {
         let gate = if let Some(gate) = self.gates.get(&key_id) {
             Arc::clone(gate.value())
@@ -172,7 +178,7 @@ impl WorkbuddyTokens {
         let refreshed = self
             .client
             .with_dns(dns)
-            .refresh(&refresh_base, &stored)
+            .refresh(&refresh_base, &stored, proxy)
             .await;
         let next = match refreshed {
             Ok(bundle) => bundle,

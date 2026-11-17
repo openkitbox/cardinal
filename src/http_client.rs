@@ -147,6 +147,10 @@ pub struct KeyUpdate<'a> {
     /// limit from cooling the account down.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rest_on_429: Option<bool>,
+    /// Egress proxy, three-state: `None` leaves it untouched, `Some(None)`
+    /// sends `null` (clear), `Some(Some(url))` sends the URL (replace).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<Option<String>>,
 }
 
 /// Which callers the usage endpoints aggregate over. One variant per
@@ -268,7 +272,7 @@ pub use crate::store::ReconcileReport;
 /// to start logging in. `key_id` re-authenticates an existing account instead
 /// of creating one (the server then ignores `label` and `group_ids`, which the
 /// row already owns).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub struct OpencodeLoginRequest {
     /// The label of the account a fresh login creates.
     pub label: String,
@@ -280,6 +284,22 @@ pub struct OpencodeLoginRequest {
     pub group_ids: Vec<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<i32>,
+    /// Temporary egress proxy for this login and the resulting key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+}
+
+impl std::fmt::Debug for OpencodeLoginRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpencodeLoginRequest")
+            .field("label", &self.label)
+            .field("key_id", &self.key_id)
+            .field("group_ids", &self.group_ids)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// The answer of `POST /api/providers/{id}/opencode-login`: the browser half of
@@ -312,7 +332,7 @@ pub struct OpencodeLoginStatus {
 /// The body of `POST /api/openai-logins`. `key_id` alone re-authenticates an
 /// existing `openai_oauth` account (the server then ignores the rest, which the
 /// row already owns); otherwise `provider_id` and `label` create one.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub struct OpenaiLoginRequest {
     /// The provider a new account belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -327,6 +347,23 @@ pub struct OpenaiLoginRequest {
     pub group_ids: Vec<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<i32>,
+    /// Temporary egress proxy for this login and the resulting key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+}
+
+impl std::fmt::Debug for OpenaiLoginRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenaiLoginRequest")
+            .field("provider_id", &self.provider_id)
+            .field("label", &self.label)
+            .field("key_id", &self.key_id)
+            .field("group_ids", &self.group_ids)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// The answer of `POST /api/openai-logins`: the code to type plus the session
@@ -1877,6 +1914,7 @@ mod tests {
             key_id: None,
             group_ids: vec![7, 11],
             max_concurrency: Some(3),
+            proxy_url: None,
         };
 
         let body = serde_json::to_value(&request).expect("request should serialize");

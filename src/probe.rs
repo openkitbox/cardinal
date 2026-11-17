@@ -14,6 +14,7 @@ use anyhow::Context as _;
 
 use crate::relay::capabilities::codex::CLIENT_VERSION as CODEX_CLIENT_VERSION;
 use crate::relay::capabilities::{Build, WorkbuddyCredential, workbuddy_headers};
+use crate::upstream::ProxySpec;
 
 /// One probe attempt's budget (matches the magnitude the relay allows for
 /// opening a response).
@@ -88,23 +89,48 @@ where
 /// `None` (the header is meaningless there). Without it the gateway answers the
 /// organization's default scope, so the catalogue probe would cache the wrong
 /// account's models.
+/// Credentials for a model-list probe. The optional org id only affects
+/// OpenCode upstreams (`x-opencode-org-id`); bundling it with the key keeps
+/// [`fetch_models`] under clippy's argument ceiling.
+pub struct ProbeCredentials<'a> {
+    pub api_key: &'a str,
+    pub org_id: Option<&'a str>,
+}
+
 pub async fn fetch_models(
     base_url: &str,
     protocol: &str,
     auth_scheme: &str,
-    api_key: &str,
-    org_id: Option<&str>,
+    credentials: &ProbeCredentials<'_>,
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     let urls = model_list_urls(base_url, protocol)?;
-    let client = reqwest::Client::builder()
-        .dns_resolver(std::sync::Arc::clone(transport.resolver(dns)))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let resolver = transport.resolver(dns);
+    if let Some(spec) = proxy {
+        crate::upstream::transport::validate_proxy_endpoint(spec, resolver).await?;
+    }
+    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    let builder = crate::upstream::proxy::configure_client_builder(
+        builder,
+        std::sync::Arc::clone(resolver),
+        PROBE_TIMEOUT,
+        proxy,
+    )?;
+    let client = builder.build()?;
     let mut errors = Vec::new();
     for url in &urls {
-        match fetch_at(&client, url, protocol, auth_scheme, api_key, org_id).await {
+        match fetch_at(
+            &client,
+            url,
+            protocol,
+            auth_scheme,
+            credentials.api_key,
+            credentials.org_id,
+        )
+        .await
+        {
             Ok(models) if !models.is_empty() => return Ok(models),
             Ok(_) => errors.push(format!("{url}: no models listed")),
             Err(error) => errors.push(format!("{error:#}")),
@@ -490,6 +516,7 @@ pub async fn fetch_kiro_models(
     transport: &crate::upstream::transport::Transport,
     context: &crate::upstream::KiroCallContext,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     anyhow::ensure!(
         crate::kiro::valid_region(&context.api_region),
@@ -519,7 +546,7 @@ pub async fn fetch_kiro_models(
     let auth = [("authorization", format!("Bearer {}", context.bearer()))];
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     let response = transport
-        .send_with_headers(&prepared, dns, &auth, &[], deadline)
+        .send_with_headers_with_proxy(&prepared, dns, &auth, &[], proxy, deadline)
         .await
         .map_err(|_| anyhow::anyhow!("模型目录服务请求失败"))?;
     let status = response.status();
@@ -619,6 +646,7 @@ pub async fn fetch_cursor_models(
     transport: &crate::upstream::transport::Transport,
     bearer: &crate::upstream::cursor_tokens::CursorBearer,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     use crate::protocol::cursor::request as cursor_request;
     let prepared = cursor_request::unary_json(
@@ -628,7 +656,7 @@ pub async fn fetch_cursor_models(
     let headers = cursor_request::unary_headers(bearer.access_token(), bearer.team_id());
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     let response = transport
-        .send_with_headers(&prepared, dns, &headers, &[], deadline)
+        .send_with_headers_with_proxy(&prepared, dns, &headers, &[], proxy, deadline)
         .await
         .map_err(|_| anyhow::anyhow!("模型目录服务请求失败"))?;
     let status = response.status();
@@ -652,6 +680,7 @@ pub async fn fetch_workbuddy_models(
     credential: WorkbuddyCredential<'_>,
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     let base = base.trim_end_matches('/');
     anyhow::ensure!(!base.is_empty(), "WorkBuddy endpoint is empty");
@@ -667,7 +696,7 @@ pub async fn fetch_workbuddy_models(
     let headers = workbuddy_headers(build, credential, None);
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     let response = transport
-        .send_get_with_headers(&url, dns, &headers, &[], deadline)
+        .send_get_with_headers_with_proxy(&url, dns, &headers, &[], proxy, deadline)
         .await
         .map_err(|_| anyhow::anyhow!("WorkBuddy model catalogue request failed"))?;
     let status = response.status();
@@ -853,8 +882,9 @@ pub(crate) async fn codex_get(
     bearer: &crate::openai::OpenaiOAuth,
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
 ) -> anyhow::Result<(u16, String)> {
-    let client = codex_client(transport, dns)?;
+    let client = codex_client(transport, dns, proxy).await?;
     let response = codex_request(&client, reqwest::Method::GET, url, bearer, None)
         .send()
         .await
@@ -874,9 +904,10 @@ pub(crate) async fn codex_post(
     body: &[u8],
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
 ) -> anyhow::Result<(u16, String)> {
     anyhow::ensure!(body.len() <= 16 * 1024, "Codex request is too large");
-    let client = codex_client(transport, dns)?;
+    let client = codex_client(transport, dns, proxy).await?;
     let response = codex_request(&client, reqwest::Method::POST, url, bearer, Some(body))
         .send()
         .await
@@ -888,15 +919,23 @@ pub(crate) async fn codex_post(
     Ok((status, body))
 }
 
-fn codex_client(
+async fn codex_client(
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
 ) -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .dns_resolver(std::sync::Arc::clone(transport.resolver(dns)))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| anyhow::anyhow!("Codex probe client unavailable"))
+    let resolver = transport.resolver(dns);
+    if let Some(spec) = proxy {
+        crate::upstream::transport::validate_proxy_endpoint(spec, resolver).await?;
+    }
+    crate::upstream::proxy::configure_client_builder(
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        std::sync::Arc::clone(resolver),
+        PROBE_TIMEOUT,
+        proxy,
+    )?
+    .build()
+    .map_err(|_| anyhow::anyhow!("Codex probe client unavailable"))
 }
 
 /// Build one Codex request without performing I/O. Keeping this separate from
@@ -931,12 +970,14 @@ pub async fn fetch_openai_codex_models(
     bearer: &crate::upstream::OpenaiBearer,
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
 ) -> anyhow::Result<Vec<ProbeModel>> {
     let (status, body) = codex_get(
         &format!("{CODEX_MODELS_URL}?client_version={CODEX_CLIENT_VERSION}"),
         bearer,
         transport,
         dns,
+        proxy,
     )
     .await?;
     if !(200..300).contains(&status) {

@@ -10,6 +10,8 @@
 //! origin is ever dialed ([`is_opencode_console_url`]), and no token reaches an
 //! error message or a log line: the persisted bundle is built by the caller.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -18,6 +20,7 @@ use chrono::Utc;
 use reqwest::StatusCode;
 
 use super::is_opencode_console_url;
+use crate::upstream::ProxySpec;
 
 /// The OAuth client the console knows. It is the vendor CLI's id, so a login
 /// started here is indistinguishable from `opencode auth login` on the
@@ -557,14 +560,20 @@ fn parse_device_code(
     })
 }
 
-/// One console HTTP client.
+/// One console HTTP client pool.
 ///
 /// Stateless on purpose: the server, the device code and the tokens are
 /// per-call arguments, because the login registry and the credential cache each
-/// decide which account a call is for and when it happens. The client holds
-/// only the connection pool and the timeout.
+/// decide which account a call is for and when it happens. The pool holds only
+/// connection pools and resolvers, keyed by proxy identity — one client per
+/// distinct proxy (and one for no proxy) so proxied accounts never share a
+/// pool with direct ones, and clients are reused across refreshes.
 pub struct Client {
-    http: Option<reqwest::Client>,
+    /// The fixed overseas resolver. `None` means encrypted DNS setup failed;
+    /// there is no system-DNS fallback and every request is unavailable.
+    overseas: Option<Arc<crate::upstream::dns::HickoryResolver>>,
+    /// One client per proxy identity; the empty key is the no-proxy client.
+    clients: std::sync::RwLock<HashMap<String, reqwest::Client>>,
 }
 
 impl Default for Client {
@@ -574,52 +583,85 @@ impl Default for Client {
 }
 
 impl Client {
-    /// Build the console client. Resolver or HTTP client construction failure
-    /// leaves the client unavailable: encrypted DNS is mandatory, so there is
-    /// no system-DNS fallback.
+    /// Build the console client pool. Resolver construction failure leaves the
+    /// client unavailable: encrypted DNS is mandatory, so there is no
+    /// system-DNS fallback. Clients themselves are built lazily per proxy on
+    /// first use ([`Self::http`]).
     pub fn new() -> Self {
-        let http = match crate::upstream::dns::Resolvers::new() {
-            Ok(resolvers) => reqwest::Client::builder()
-                .timeout(CONSOLE_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(std::sync::Arc::clone(
-                    // The OpenCode console is fixed overseas; login has no provider row yet.
-                    resolvers.resolver(crate::upstream::Dns::Overseas),
-                ))
-                .build()
-                .map_err(|error| anyhow::anyhow!(error)),
-            Err(error) => Err(error),
-        };
-        let http = match http {
-            Ok(http) => Some(http),
+        let overseas = match crate::upstream::dns::Resolvers::new() {
+            Ok(resolvers) => Some(Arc::clone(
+                // The OpenCode console is fixed overseas; login has no provider row yet.
+                resolvers.resolver(crate::upstream::Dns::Overseas),
+            )),
             Err(error) => {
                 tracing::warn!(%error, "OpenCode console client is unavailable: encrypted resolver setup failed");
                 None
             }
         };
-        Self { http }
+        Self {
+            overseas,
+            clients: std::sync::RwLock::new(HashMap::new()),
+        }
     }
 
-    fn http(&self, operation: &'static str, origin: &str) -> Result<&reqwest::Client, AuthError> {
-        self.http.as_ref().ok_or_else(|| AuthError::Unavailable {
+    /// The pooled client for `proxy`, building and caching it on first use.
+    /// With no proxy this keeps the direct, environment-proxy-free policy.
+    async fn http(
+        &self,
+        operation: &'static str,
+        origin: &str,
+        proxy: Option<&ProxySpec>,
+    ) -> Result<reqwest::Client, AuthError> {
+        let unavailable = || AuthError::Unavailable {
             operation,
             origin: origin.to_owned(),
-        })
+        };
+        let overseas = self.overseas.as_ref().ok_or_else(unavailable)?;
+        let identity = proxy.map_or_else(String::new, |spec| spec.identity().to_owned());
+        if let Ok(clients) = self.clients.read()
+            && let Some(client) = clients.get(&identity)
+        {
+            return Ok(client.clone());
+        }
+        if let Some(spec) = proxy {
+            crate::upstream::transport::validate_proxy_endpoint(spec, overseas)
+                .await
+                .map_err(|_| unavailable())?;
+        }
+        let builder = reqwest::Client::builder()
+            .timeout(CONSOLE_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none());
+        let builder = crate::upstream::proxy::configure_client_builder(
+            builder,
+            Arc::clone(overseas),
+            CONSOLE_TIMEOUT,
+            proxy,
+        )
+        .map_err(|_| unavailable())?;
+        let client = builder.build().map_err(|_| unavailable())?;
+        // Pool lock recovery is fail-soft: a poisoned lock simply serves the
+        // freshly built client without caching it.
+        if let Ok(mut clients) = self.clients.write() {
+            clients.entry(identity).or_insert_with(|| client.clone());
+        }
+        Ok(client)
     }
 
     /// Start a device-code login: the caller shows `user_code` and
     /// `verification_url`, then polls [`Self::poll_device_token`] every
     /// `interval` seconds until the grant resolves or `expires_in` passes.
-    pub async fn device_code(&self, server: &str) -> Result<DeviceCode, AuthError> {
+    pub async fn device_code(
+        &self,
+        server: &str,
+        proxy: Option<&ProxySpec>,
+    ) -> Result<DeviceCode, AuthError> {
         let origin = console_origin(server, OP_DEVICE_CODE)?;
         let body = serde_json::json!({
             "client_id": CLIENT_ID,
             "supports_org_scope": true,
         });
-        let request = self
-            .http(OP_DEVICE_CODE, origin)?
-            .post(format!("{origin}/{OP_DEVICE_CODE}"))
-            .json(&body);
+        let http = self.http(OP_DEVICE_CODE, origin, proxy).await?;
+        let request = http.post(format!("{origin}/{OP_DEVICE_CODE}")).json(&body);
         let (status, text) = self.round_trip(OP_DEVICE_CODE, origin, request).await?;
         parse_device_code(status, &text, origin)
     }
@@ -629,6 +671,7 @@ impl Client {
         &self,
         server: &str,
         device_code: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<TokenGrant, AuthError> {
         let origin = console_origin(server, OP_TOKEN)?;
         let body = serde_json::json!({
@@ -636,7 +679,7 @@ impl Client {
             "device_code": device_code,
             "client_id": CLIENT_ID,
         });
-        self.token_request(origin, body).await
+        self.token_request(origin, body, proxy).await
     }
 
     /// Exchange a refresh token for a new pair.
@@ -650,6 +693,7 @@ impl Client {
         &self,
         server: &str,
         refresh_token: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<TokenGrant, AuthError> {
         let origin = console_origin(server, OP_TOKEN)?;
         let body = serde_json::json!({
@@ -657,7 +701,7 @@ impl Client {
             "refresh_token": refresh_token,
             "client_id": CLIENT_ID,
         });
-        self.token_request(origin, body).await
+        self.token_request(origin, body, proxy).await
     }
 
     /// Fetch the account the token belongs to (email/id for display).
@@ -665,9 +709,12 @@ impl Client {
         &self,
         server: &str,
         access_token: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<Account, AuthError> {
         let origin = console_origin(server, OP_ACCOUNT)?;
-        let text = self.bearer_get(origin, OP_ACCOUNT, access_token).await?;
+        let text = self
+            .bearer_get(origin, OP_ACCOUNT, access_token, proxy)
+            .await?;
         serde_json::from_str(&text).map_err(|error| AuthError::Decode {
             operation: OP_ACCOUNT,
             origin: origin.to_owned(),
@@ -680,9 +727,12 @@ impl Client {
         &self,
         server: &str,
         access_token: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<Vec<Organization>, AuthError> {
         let origin = console_origin(server, OP_ORGS)?;
-        let text = self.bearer_get(origin, OP_ORGS, access_token).await?;
+        let text = self
+            .bearer_get(origin, OP_ORGS, access_token, proxy)
+            .await?;
         serde_json::from_str(&text).map_err(|error| AuthError::Decode {
             operation: OP_ORGS,
             origin: origin.to_owned(),
@@ -695,11 +745,10 @@ impl Client {
         &self,
         origin: &str,
         body: serde_json::Value,
+        proxy: Option<&ProxySpec>,
     ) -> Result<TokenGrant, AuthError> {
-        let request = self
-            .http(OP_TOKEN, origin)?
-            .post(format!("{origin}/{OP_TOKEN}"))
-            .json(&body);
+        let http = self.http(OP_TOKEN, origin, proxy).await?;
+        let request = http.post(format!("{origin}/{OP_TOKEN}")).json(&body);
         let (status, text) = self.round_trip(OP_TOKEN, origin, request).await?;
         parse_token_grant(status, &text, origin)
     }
@@ -711,9 +760,10 @@ impl Client {
         origin: &str,
         operation: &'static str,
         access_token: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<String, AuthError> {
-        let request = self
-            .http(operation, origin)?
+        let http = self.http(operation, origin, proxy).await?;
+        let request = http
             .get(format!("{origin}/{operation}"))
             .bearer_auth(access_token);
         let (status, text) = self.round_trip(operation, origin, request).await?;

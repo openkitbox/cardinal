@@ -60,6 +60,7 @@ use crate::protocol::cursor::uplink::{self, Outbound};
 use crate::protocol::usage::UsageCounts;
 use crate::protocol::wire::WireFrame;
 use crate::protocol::{Prepared, ProtocolId};
+use crate::upstream::ProxySpec;
 use crate::upstream::transport::{self, Transport, TransportError};
 
 /// Appends in flight at once (the reference's `H1.atOnce`).
@@ -157,13 +158,14 @@ impl Run {
 pub async fn open(
     transport: &Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
     prepared: &Prepared,
     auth: &[(&'static str, String)],
     deadline: Instant,
 ) -> Result<Run, TransportError> {
     let plan = prepared.cursor.clone().ok_or(TransportError::InvalidBody)?;
     if bidi_enabled() {
-        match open_bidi(transport, dns, prepared, &plan, auth, deadline).await {
+        match open_bidi(transport, dns, proxy, prepared, &plan, auth, deadline).await {
             Ok(run) => return Ok(run),
             Err(Opening::Refused(error)) => return Err(error),
             Err(Opening::Fallback(error)) => {
@@ -175,7 +177,7 @@ pub async fn open(
             }
         }
     }
-    open_split(transport, dns, &plan, auth, deadline).await
+    open_split(transport, dns, proxy, &plan, auth, deadline).await
 }
 
 /// Which transport a Run opens on, as the relay reports it.
@@ -231,6 +233,7 @@ enum Opening {
 async fn open_bidi(
     transport: &Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
     prepared: &Prepared,
     plan: &Arc<RunPlan>,
     auth: &[(&'static str, String)],
@@ -259,7 +262,7 @@ async fn open_bidi(
         Some((frame, inbox))
     });
     let response = match transport
-        .send_bidi(prepared, dns, auth, body, deadline)
+        .send_bidi_with_proxy(prepared, dns, auth, body, proxy, deadline)
         .await
     {
         Ok(response) => response,
@@ -306,6 +309,7 @@ async fn open_bidi(
 async fn open_split(
     transport: &Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&ProxySpec>,
     plan: &Arc<RunPlan>,
     auth: &[(&'static str, String)],
     deadline: Instant,
@@ -321,7 +325,7 @@ async fn open_split(
         cursor: None,
     };
     let response = transport
-        .send_with_headers(&downlink, dns, auth, &[], deadline)
+        .send_with_headers_with_proxy(&downlink, dns, auth, &[], proxy, deadline)
         .await?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
@@ -341,6 +345,7 @@ async fn open_split(
     let appender = Appender {
         transport: transport.clone(),
         dns,
+        proxy: proxy.cloned(),
         url: plan.append_url.clone(),
         headers: append_headers(&plan.request_id, auth),
         request_id: plan.request_id.clone(),
@@ -769,6 +774,9 @@ fn error_end(failure: &Failure) -> Frame {
 struct Appender {
     transport: Transport,
     dns: crate::upstream::Dns,
+    /// Owned so the uplink task can outlive the borrow of the opening context.
+    /// Cloned once at the split-leg boundary, never per append.
+    proxy: Option<ProxySpec>,
     url: String,
     headers: Vec<(&'static str, String)>,
     request_id: String,
@@ -846,7 +854,7 @@ impl Appender {
         };
         let sent = tokio::select! {
             () = self.cancel.cancelled() => return Ok(()),
-            sent = self.transport.send_with_headers(&prepared, self.dns, &self.headers, &[], deadline) => sent,
+            sent = self.transport.send_with_headers_with_proxy(&prepared, self.dns, &self.headers, &[], self.proxy.as_ref(), deadline) => sent,
         };
         let response = match sent {
             Ok(response) => response,

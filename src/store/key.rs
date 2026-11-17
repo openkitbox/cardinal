@@ -62,6 +62,13 @@ pub struct ProviderKeyRow {
     /// When the account was archived; None = not archived. Independent of
     /// `enabled` and of group membership (migrations/0011).
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The per-account egress proxy endpoint (https/socks5), stored verbatim
+    /// with optional credentials (migrations/0028). It is a live secret: the
+    /// type-level `serde(skip)` keeps it out of every JSON surface, the manual
+    /// `Debug` prints only a boolean, and the non-secret projection is
+    /// [`ProviderKeyView::proxy_configured`].
+    #[serde(skip)]
+    pub proxy_url: Option<String>,
 }
 
 /// The row as diagnostics see it: every field except the credentials.
@@ -86,6 +93,7 @@ impl std::fmt::Debug for ProviderKeyRow {
             .field("auth_kind", &self.auth_kind)
             .field("oauth", &self.oauth.as_ref().map(|_| "<redacted>"))
             .field("archived_at", &self.archived_at)
+            .field("proxy_configured", &self.proxy_url.is_some())
             .finish()
     }
 }
@@ -162,6 +170,17 @@ where
     T::deserialize(value).ok()
 }
 
+/// Validate a proxy URL before it is persisted. This is the one save-time
+/// check every create/patch path calls; it delegates entirely to the shared
+/// pure parser so there is a single set of accepted schemes and shapes. The
+/// returned error's `Display` is a fixed, input-free message — no host, user
+/// or password ever reaches a response or a log.
+pub(crate) fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
+    crate::upstream::ProxySpec::parse(url)
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
 /// Public view of ProviderKeyRow: hides api_key. `inflight` is the live
 /// semaphore occupancy (`Some` only for limited keys), filled by the caller
 /// from the concurrency registry.
@@ -213,6 +232,12 @@ pub struct ProviderKeyView {
     /// When the account was archived (None = not archived).
     #[serde(default)]
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether this account has an egress proxy configured. The proxy URL is a
+    /// secret and never appears here; this boolean is the only proxy state the
+    /// list/bootstrap/reveal surfaces expose. `default` keeps older gateways'
+    /// payloads decodable by an older/newer client.
+    #[serde(default)]
+    pub proxy_configured: bool,
 }
 
 #[cfg(test)]
@@ -245,6 +270,7 @@ mod tests {
             auth_kind: AuthKind::OpenaiOauth.as_str().to_owned(),
             oauth: Some(serde_json::to_value(bundle).expect("OAuth bundle serializes")),
             archived_at: None,
+            proxy_url: None,
         };
 
         let view = ProviderKeyView::new(&row, None);
@@ -281,6 +307,7 @@ mod tests {
                 "plan_type": "pro"
             })),
             archived_at: None,
+            proxy_url: None,
         };
 
         let view = ProviderKeyView::new(&row, None);
@@ -305,6 +332,7 @@ mod tests {
             auth_kind: auth_kind.as_str().to_owned(),
             oauth: Some(oauth),
             archived_at: None,
+            proxy_url: None,
         };
 
         let opencode = common(
@@ -401,6 +429,7 @@ impl ProviderKeyView {
             plan_type,
             organization,
             archived_at: row.archived_at,
+            proxy_configured: row.proxy_url.is_some(),
         }
     }
 }
@@ -507,7 +536,7 @@ pub async fn list_provider_keys(
     provider_id: i64,
 ) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, rest_on_429, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, rest_on_429, models, allowed_models, auth_kind, oauth, archived_at, proxy_url FROM gateway_provider_keys
          WHERE provider_id = $1 ORDER BY position, id",
   )
   .bind(provider_id)
@@ -520,7 +549,7 @@ pub async fn list_provider_keys(
 /// /v1/models route-object derivation resolves route entries against it.
 pub async fn list_all_keys(pool: &PgPool) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, rest_on_429, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, rest_on_429, models, allowed_models, auth_kind, oauth, archived_at, proxy_url FROM gateway_provider_keys
          ORDER BY position, id",
   )
   .fetch_all(pool)
@@ -589,7 +618,7 @@ pub async fn list_enabled_key_models(pool: &PgPool) -> anyhow::Result<Vec<Enable
 /// (`relay::route_cache::RouteCache::keys_by_ids`).
 pub async fn list_keys_by_ids(pool: &PgPool, ids: &[i64]) -> anyhow::Result<Vec<ProviderKeyRow>> {
     let rows = sqlx::query_as::<_, ProviderKeyRow>(
-    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, rest_on_429, models, allowed_models, auth_kind, oauth, archived_at FROM gateway_provider_keys
+    "SELECT id, provider_id, label, api_key, enabled, position, max_concurrency, rest_on_429, models, allowed_models, auth_kind, oauth, archived_at, proxy_url FROM gateway_provider_keys
          WHERE id = ANY($1) ORDER BY position, id",
   )
   .bind(ids)
@@ -657,6 +686,7 @@ pub async fn insert_provider_key(
     api_key: &str,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
+    proxy_url: Option<&str>,
 ) -> anyhow::Result<i64> {
     insert_key_row(
         pool,
@@ -665,7 +695,10 @@ pub async fn insert_provider_key(
         KeyCredential::Static(api_key),
         max_concurrency,
         allowed_models,
-        None,
+        NewKeyExtras {
+            proxy_url,
+            group_ids: None,
+        },
     )
     .await
 }
@@ -681,6 +714,7 @@ pub async fn insert_kiro_provider_key(
     oauth: KiroOAuth,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
+    proxy_url: Option<&str>,
 ) -> anyhow::Result<i64> {
     oauth.validate()?;
     insert_key_row(
@@ -690,7 +724,10 @@ pub async fn insert_kiro_provider_key(
         KeyCredential::KiroOidc(oauth),
         max_concurrency,
         allowed_models,
-        None,
+        NewKeyExtras {
+            proxy_url,
+            group_ids: None,
+        },
     )
     .await
 }
@@ -704,6 +741,7 @@ pub async fn insert_opencode_provider_key(
     oauth: OpencodeOAuth,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
+    proxy_url: Option<&str>,
 ) -> anyhow::Result<i64> {
     oauth.validate()?;
     insert_key_row(
@@ -713,7 +751,10 @@ pub async fn insert_opencode_provider_key(
         KeyCredential::OpencodeOauth(oauth),
         max_concurrency,
         allowed_models,
-        None,
+        NewKeyExtras {
+            proxy_url,
+            group_ids: None,
+        },
     )
     .await
 }
@@ -730,6 +771,7 @@ pub async fn insert_cursor_provider_key(
     oauth: CursorOAuth,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
+    proxy_url: Option<&str>,
 ) -> anyhow::Result<i64> {
     oauth.validate()?;
     insert_key_row(
@@ -739,7 +781,10 @@ pub async fn insert_cursor_provider_key(
         KeyCredential::CursorOauth(oauth),
         max_concurrency,
         allowed_models,
-        None,
+        NewKeyExtras {
+            proxy_url,
+            group_ids: None,
+        },
     )
     .await
 }
@@ -755,6 +800,7 @@ pub async fn insert_openai_provider_key(
     oauth: OpenaiOAuth,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
+    proxy_url: Option<&str>,
 ) -> anyhow::Result<i64> {
     oauth.validate()?;
     insert_key_row(
@@ -764,7 +810,10 @@ pub async fn insert_openai_provider_key(
         KeyCredential::OpenaiOauth(oauth),
         max_concurrency,
         allowed_models,
-        None,
+        NewKeyExtras {
+            proxy_url,
+            group_ids: None,
+        },
     )
     .await
 }
@@ -778,6 +827,7 @@ pub async fn insert_workbuddy_provider_key(
     oauth: WorkbuddyOAuth,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
+    proxy_url: Option<&str>,
 ) -> anyhow::Result<i64> {
     oauth.validate()?;
     insert_key_row(
@@ -787,7 +837,10 @@ pub async fn insert_workbuddy_provider_key(
         KeyCredential::WorkbuddyOauth(oauth),
         max_concurrency,
         allowed_models,
-        None,
+        NewKeyExtras {
+            proxy_url,
+            group_ids: None,
+        },
     )
     .await
 }
@@ -812,7 +865,10 @@ pub async fn insert_workbuddy_provider_key_with_groups(
         KeyCredential::WorkbuddyOauth(oauth),
         max_concurrency,
         allowed_models,
-        Some(group_ids),
+        NewKeyExtras {
+            proxy_url: None,
+            group_ids: Some(group_ids),
+        },
     )
     .await
 }
@@ -1005,6 +1061,13 @@ pub struct LabelTaken {
     pub provider_id: i64,
 }
 
+/// Optional columns of a new key row, grouped so the shared insert stays
+/// within Rust's argument budget without suppressing the lint.
+struct NewKeyExtras<'a> {
+    proxy_url: Option<&'a str>,
+    group_ids: Option<&'a [i64]>,
+}
+
 /// Shared insert body for every credential shape: validates, normalizes and
 /// appends under the position lock. The credential variant itself names the
 /// `auth_kind` that is written, so the column and the payload cannot disagree.
@@ -1015,8 +1078,12 @@ async fn insert_key_row(
     credential: KeyCredential<'_>,
     max_concurrency: Option<i32>,
     allowed_models: Option<Vec<String>>,
-    group_ids: Option<&[i64]>,
+    extras: NewKeyExtras<'_>,
 ) -> anyhow::Result<i64> {
+    let NewKeyExtras {
+        proxy_url,
+        group_ids,
+    } = extras;
     let (api_key, auth_kind, oauth) = match credential {
         KeyCredential::Static(api_key) => (Some(api_key), AuthKind::Static, None),
         KeyCredential::KiroOidc(oauth) => {
@@ -1044,6 +1111,9 @@ async fn insert_key_row(
         ),
     };
     anyhow::ensure!(!label.is_empty(), "label must not be empty");
+    if let Some(url) = proxy_url {
+        validate_proxy_url(url)?;
+    }
     ensure_valid_max_concurrency(max_concurrency)?;
     let allowed_models = normalize_allowed_models(allowed_models)?;
     let mut tx = pool.begin().await?;
@@ -1111,8 +1181,8 @@ async fn insert_key_row(
         .execute(&mut *tx)
         .await?;
     let id: (i64,) = sqlx::query_as(
-    "INSERT INTO gateway_provider_keys (provider_id, label, api_key, auth_kind, oauth, position, max_concurrency, allowed_models)
-         VALUES ($1, $2, $3, $4, $5, (SELECT COALESCE(MAX(position) + 1, 0) FROM gateway_provider_keys), $6, $7) RETURNING id",
+    "INSERT INTO gateway_provider_keys (provider_id, label, api_key, auth_kind, oauth, position, max_concurrency, allowed_models, proxy_url)
+         VALUES ($1, $2, $3, $4, $5, (SELECT COALESCE(MAX(position) + 1, 0) FROM gateway_provider_keys), $6, $7, $8) RETURNING id",
   )
   .bind(provider_id)
   .bind(label)
@@ -1121,6 +1191,7 @@ async fn insert_key_row(
   .bind(oauth)
   .bind(max_concurrency)
   .bind(allowed_models.map(serde_json::to_value).transpose()?)
+  .bind(proxy_url)
   .fetch_one(&mut *tx)
   .await?;
     if let Some(group_ids) = group_ids {
@@ -1457,7 +1528,7 @@ fn normalize_allowed_models(models: Option<Vec<String>>) -> anyhow::Result<Optio
 /// The fields of a key PATCH besides the row identity, plus an optional
 /// credential replacement. Three-state options keep PATCH semantics: outer
 /// `None` = untouched, inner `None` = clear to the default.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct KeyPatch<'a> {
     pub label: Option<&'a str>,
     pub enabled: Option<bool>,
@@ -1475,6 +1546,36 @@ pub struct KeyPatch<'a> {
     /// account down on a rate limit (retry in place, then fail over). Only a
     /// Kiro provider's keys accept it.
     pub rest_on_429: Option<bool>,
+    /// Egress proxy: outer `None` = untouched, `Some(None)` = clear to NULL,
+    /// `Some(Some(url))` = replace. Non-empty/valid URL is required by
+    /// [`validate_proxy_url`] before the write; an empty string is rejected.
+    pub proxy_url: Option<Option<&'a str>>,
+}
+
+impl std::fmt::Debug for KeyPatch<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyPatch")
+            .field("label", &self.label)
+            .field("enabled", &self.enabled)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("allowed_models", &self.allowed_models)
+            .field("oauth", &self.oauth.as_ref().map(|_| "<redacted>"))
+            .field("group_ids", &self.group_ids)
+            .field("archived", &self.archived)
+            .field("rest_on_429", &self.rest_on_429)
+            .field(
+                "proxy_url",
+                &self.proxy_url.map(|change| {
+                    if change.is_some() {
+                        "<redacted>"
+                    } else {
+                        "<clear>"
+                    }
+                }),
+            )
+            .finish()
+    }
 }
 
 /// Partial update (PATCH semantics) that may also rotate the credential:
@@ -1495,6 +1596,11 @@ pub async fn patch_provider_key(
 ) -> anyhow::Result<bool> {
     if let Some(label) = patch.label {
         anyhow::ensure!(!label.is_empty(), "label must not be empty");
+    }
+    // Validate before opening the transaction: a rejected URL must leave no
+    // partial write (credential rotation or group change) behind.
+    if let Some(Some(url)) = patch.proxy_url {
+        validate_proxy_url(url)?;
     }
     ensure_valid_max_concurrency(patch.max_concurrency.flatten())?;
     let allowed_models = match patch.allowed_models {
@@ -1558,7 +1664,8 @@ pub async fn patch_provider_key(
            archived_at = CASE WHEN $11::boolean IS NULL THEN archived_at
                               WHEN $11 THEN COALESCE(archived_at, now())
                               ELSE NULL END,
-           rest_on_429 = COALESCE($12, rest_on_429)
+           rest_on_429 = COALESCE($12, rest_on_429),
+           proxy_url = CASE WHEN $13 THEN $14 ELSE proxy_url END
          WHERE id = $1 AND provider_id = $2
            AND (NOT $9 OR auth_kind = 'kiro_oidc')",
     )
@@ -1579,6 +1686,8 @@ pub async fn patch_provider_key(
     .bind(oauth)
     .bind(patch.archived)
     .bind(patch.rest_on_429)
+    .bind(patch.proxy_url.is_some())
+    .bind(patch.proxy_url.flatten())
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
@@ -1632,6 +1741,7 @@ pub async fn update_provider_key(
             group_ids: None,
             archived: None,
             rest_on_429: None,
+            proxy_url: None,
         },
     )
     .await

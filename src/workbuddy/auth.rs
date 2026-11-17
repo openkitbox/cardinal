@@ -6,6 +6,7 @@ use chrono::Utc;
 
 use crate::protocol::Prepared;
 use crate::upstream::Dns;
+use crate::upstream::ProxySpec;
 use crate::upstream::transport::Transport;
 
 use crate::relay::capabilities::workbuddy::Build;
@@ -101,7 +102,12 @@ impl Client {
     }
 
     /// Start a browser login using the requested desktop build identity.
-    pub async fn start(&self, base: &str, build: BuildInfo) -> Result<LoginStart, WorkbuddyError> {
+    pub async fn start(
+        &self,
+        base: &str,
+        build: BuildInfo,
+        proxy: Option<&ProxySpec>,
+    ) -> Result<LoginStart, WorkbuddyError> {
         validate_base(base, build)?;
         let data = self
             .call(
@@ -110,6 +116,7 @@ impl Client {
                 serde_json::json!({}),
                 plugin_headers(build, None, None),
                 vec![("platform", build.platform.to_owned())],
+                proxy,
             )
             .await?;
         let state = text_field(&data, "state", "auth/state")?;
@@ -136,6 +143,7 @@ impl Client {
         base: &str,
         build: BuildInfo,
         state: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<TokenPoll, WorkbuddyError> {
         validate_base(base, build)?;
         let result = self
@@ -144,6 +152,7 @@ impl Client {
                 &format!("{}/v2/plugin/auth/token", trim_base(base)),
                 plugin_headers(build, None, None),
                 vec![("state", state.to_owned())],
+                proxy,
             )
             .await;
         let data = match result {
@@ -161,6 +170,7 @@ impl Client {
         build: BuildInfo,
         state: &str,
         access_token: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<AccountPoll, WorkbuddyError> {
         validate_base(base, build)?;
         let result = self
@@ -176,6 +186,7 @@ impl Client {
                     )),
                 ),
                 vec![("state", state.to_owned())],
+                proxy,
             )
             .await;
         let data = match result {
@@ -197,6 +208,7 @@ impl Client {
         build: Build,
         access_token: &str,
         domain: Option<&str>,
+        proxy: Option<&ProxySpec>,
     ) -> Result<String, WorkbuddyError> {
         let base = build.endpoint();
         let data = self
@@ -212,6 +224,7 @@ impl Client {
                     domain,
                 ),
                 Vec::new(),
+                proxy,
             )
             .await?;
         let uid = text_field(&data, "uid", "plugin/account")?;
@@ -227,6 +240,7 @@ impl Client {
         &self,
         base: &str,
         current: &WorkbuddyOAuth,
+        proxy: Option<&ProxySpec>,
     ) -> Result<WorkbuddyOAuth, WorkbuddyError> {
         let build = crate::relay::capabilities::workbuddy::host_build_from_value(base)
             .ok_or_else(|| invalid_host("WorkBuddy base URL"))?;
@@ -258,6 +272,7 @@ impl Client {
                     ),
                 ],
                 Vec::new(),
+                proxy,
             )
             .await?;
         merge_refresh(&data, current, build, domain.as_deref(), Utc::now())
@@ -270,8 +285,10 @@ impl Client {
         body: serde_json::Value,
         headers: Vec<(&'static str, String)>,
         query: Vec<(&'static str, String)>,
+        proxy: Option<&ProxySpec>,
     ) -> Result<serde_json::Value, WorkbuddyError> {
-        self.call_raw(operation, url, body, headers, query).await
+        self.call_raw(operation, url, body, headers, query, proxy)
+            .await
     }
 
     async fn call_raw(
@@ -281,6 +298,7 @@ impl Client {
         body: serde_json::Value,
         headers: Vec<(&'static str, String)>,
         query: Vec<(&'static str, String)>,
+        proxy: Option<&ProxySpec>,
     ) -> Result<serde_json::Value, WorkbuddyError> {
         let prepared = Prepared {
             protocol: crate::protocol::ProtocolId::OpenAiChat,
@@ -294,7 +312,7 @@ impl Client {
         let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
         let response = self
             .transport
-            .send_with_headers(&prepared, self.dns, &headers, &query, deadline)
+            .send_with_headers_with_proxy(&prepared, self.dns, &headers, &query, proxy, deadline)
             .await
             .map_err(|_| WorkbuddyError::Transport { operation })?;
         self.finish(operation, response, deadline).await
@@ -310,11 +328,12 @@ impl Client {
         url: &str,
         headers: Vec<(&'static str, String)>,
         query: Vec<(&'static str, String)>,
+        proxy: Option<&ProxySpec>,
     ) -> Result<serde_json::Value, WorkbuddyError> {
         let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
         let response = self
             .transport
-            .send_get_with_headers(url, self.dns, &headers, &query, deadline)
+            .send_get_with_headers_with_proxy(url, self.dns, &headers, &query, proxy, deadline)
             .await
             .map_err(|_| WorkbuddyError::Transport { operation })?;
         self.finish(operation, response, deadline).await

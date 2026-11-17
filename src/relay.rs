@@ -55,6 +55,7 @@ use crate::protocol::{self, ProtocolError, TargetView};
 use crate::store::{self, AttemptLog};
 use crate::translation;
 use crate::translation::ir::Effort;
+use crate::upstream::ProxySpec;
 use crate::upstream::cursor_run;
 use crate::upstream::cursor_tokens::{CursorBearer, CursorTokenError, CursorTokens};
 use crate::upstream::cursor_usage::CursorUsage;
@@ -280,10 +281,19 @@ async fn probe_quota_reset(
     api_key: Option<&str>,
     dns: crate::upstream::Dns,
     transport: &crate::upstream::transport::Transport,
+    proxy: Option<&ProxySpec>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let api_key = api_key?;
-    let quota =
-        crate::quota::fetch_quota(provider_name, base_url, api_key, None, dns, transport).await?;
+    let quota = crate::quota::fetch_quota(
+        provider_name,
+        base_url,
+        api_key,
+        None,
+        dns,
+        transport,
+        proxy,
+    )
+    .await?;
     let now = chrono::Utc::now();
     let reset = quota
         .windows
@@ -431,6 +441,8 @@ struct CursorDeps<'a> {
     /// The usage reconciler the settlement reads the dashboard with.
     usage: &'a std::sync::Arc<CursorUsage>,
     dns: crate::upstream::Dns,
+    /// The account's egress proxy, parsed once at the request boundary.
+    proxy: Option<&'a ProxySpec>,
 }
 
 /// The unchanging surroundings of one dispatch attempt: transport, the chosen
@@ -445,6 +457,10 @@ struct AttemptContext<'a> {
     unfit: &'a optional::Unfit,
     provider_id: i64,
     dns: crate::upstream::Dns,
+    /// This candidate's egress proxy, parsed once at the resolve boundary.
+    /// Every account-level send (pooled, fresh, stream, bidi, token refresh)
+    /// uses this same value; failover rebuilds the context for the next candidate.
+    proxy: Option<&'a ProxySpec>,
     vendor_skip: &'a [&'static str],
     /// The conversation seed (the serialized first user message), computed once
     /// per dispatch; `None` when no OpenCode or Codex upstream is in play.
@@ -548,6 +564,7 @@ async fn send_attempt(
         unfit,
         provider_id,
         dns,
+        proxy,
         vendor_skip,
         session_seed,
         fixups,
@@ -576,7 +593,7 @@ async fn send_attempt(
     let cursor_bearer = match (protocol, cursor) {
         (ProtocolId::Cursor, Some(deps)) => Some(
             deps.tokens
-                .resolve(deps.pool, deps.key_id, deps.credential, dns)
+                .resolve(deps.pool, deps.key_id, deps.credential, dns, proxy)
                 .await
                 .map_err(failover::AttemptError::CursorTokenError)?,
         ),
@@ -605,7 +622,7 @@ async fn send_attempt(
             // host before and after resolving it; fail closed on a mismatch.
             let call = deps
                 .tokens
-                .access_token_for_endpoint(deps.pool, deps.key, &capability.endpoint, dns)
+                .access_token_for_endpoint(deps.pool, deps.key, &capability.endpoint, dns, proxy)
                 .await
                 .map_err(failover::AttemptError::KiroTokenError)?;
             Some(call)
@@ -628,7 +645,7 @@ async fn send_attempt(
     let mut opencode_bundle = match opencode {
         Some(deps) => Some(
             deps.tokens
-                .resolve(deps.pool, deps.key_id)
+                .resolve(deps.pool, deps.key_id, proxy)
                 .await
                 .map_err(failover::AttemptError::OpencodeTokenError)?,
         ),
@@ -638,7 +655,7 @@ async fn send_attempt(
     let mut openai_bundle = match openai {
         Some(deps) => Some(
             deps.tokens
-                .resolve(deps.pool, deps.key_id)
+                .resolve(deps.pool, deps.key_id, proxy)
                 .await
                 .map_err(failover::AttemptError::OpenaiTokenError)?,
         ),
@@ -647,7 +664,7 @@ async fn send_attempt(
     let mut workbuddy_bundle = match workbuddy {
         Some(deps) => Some(
             deps.tokens
-                .resolve_with_build(deps.pool, deps.key_id, dns, deps.build)
+                .resolve_with_build(deps.pool, deps.key_id, dns, deps.build, proxy)
                 .await
                 .map_err(failover::AttemptError::WorkbuddyTokenError)?,
         ),
@@ -803,7 +820,6 @@ async fn send_attempt(
     if let (Some(bearer), Some(deps)) = (cursor_bearer, cursor) {
         return send_cursor(
             transport,
-            dns,
             deps,
             bearer,
             prepared,
@@ -878,11 +894,25 @@ async fn send_attempt(
         use_fresh_connection = false;
         let response = if fresh {
             transport
-                .send_with_headers_fresh(&prepared, dns, &headers, &query_pairs, deadline)
+                .send_with_headers_with_proxy_fresh(
+                    &prepared,
+                    dns,
+                    &headers,
+                    &query_pairs,
+                    proxy,
+                    deadline,
+                )
                 .await
         } else {
             transport
-                .send_with_headers(&prepared, dns, &headers, &query_pairs, deadline)
+                .send_with_headers_with_proxy(
+                    &prepared,
+                    dns,
+                    &headers,
+                    &query_pairs,
+                    proxy,
+                    deadline,
+                )
                 .await
         }
         .map_err(failover::AttemptError::Transport)?;
@@ -929,6 +959,7 @@ async fn send_attempt(
                     &presented.access_token,
                     dns,
                     deps.build,
+                    proxy,
                 )
                 .await
                 .map_err(failover::AttemptError::WorkbuddyTokenError)?;
@@ -963,7 +994,7 @@ async fn send_attempt(
             opencode_retried = true;
             let bundle = deps
                 .tokens
-                .resolve_forced(deps.pool, deps.key_id, &presented.access_token)
+                .resolve_forced(deps.pool, deps.key_id, &presented.access_token, proxy)
                 .await
                 .map_err(failover::AttemptError::OpencodeTokenError)?;
             headers = opencode_auth_headers(&bundle);
@@ -988,7 +1019,7 @@ async fn send_attempt(
             openai_retried = true;
             let bundle = deps
                 .tokens
-                .resolve_forced(deps.pool, deps.key_id, &presented.access_token)
+                .resolve_forced(deps.pool, deps.key_id, &presented.access_token, proxy)
                 .await
                 .map_err(failover::AttemptError::OpenaiTokenError)?;
             headers = capabilities::codex::headers(&bundle, session_seed);
@@ -1020,6 +1051,7 @@ async fn send_attempt(
                     &capability.endpoint,
                     call.bearer(),
                     dns,
+                    proxy,
                 )
                 .await
                 .map_err(failover::AttemptError::KiroTokenError)?;
@@ -1145,7 +1177,6 @@ async fn send_attempt(
 /// refusal is the attempt's error, with the bearer excised from Cursor's words.
 async fn send_cursor(
     transport: &Transport,
-    dns: crate::upstream::Dns,
     deps: CursorDeps<'_>,
     mut bearer: std::sync::Arc<CursorBearer>,
     mut prepared: protocol::Prepared,
@@ -1156,7 +1187,11 @@ async fn send_cursor(
     let mut refreshed = false;
     let mut max_mode = false;
     loop {
-        let error = match cursor_run::open(transport, dns, &prepared, &headers, deadline).await {
+        let error = match cursor_run::open(
+            transport, deps.dns, deps.proxy, &prepared, &headers, deadline,
+        )
+        .await
+        {
             Ok(run) => {
                 return Ok(Sent {
                     status: run.status,
@@ -1182,7 +1217,8 @@ async fn send_cursor(
                     deps.key_id,
                     deps.credential,
                     bearer.access_token(),
-                    dns,
+                    deps.dns,
+                    deps.proxy,
                 )
                 .await
                 .map_err(failover::AttemptError::CursorTokenError)?;
@@ -3004,6 +3040,9 @@ pub async fn dispatch_at(
         let is_last = index + 1 == candidates.len();
         let provider = &candidate.provider;
         let target_model = candidate.upstream_model.as_str();
+        // Parse the account's proxy once at the resolve boundary; the parsed
+        // spec is borrowed by AttemptContext and every send on this candidate.
+        let proxy = candidate.proxy();
         // Per-candidate protocol selection, passthrough-first: an exact protocol
         // match relays natively at the capability's endpoint; otherwise the
         // capability table's preferred translation target (a candidate that can
@@ -3235,6 +3274,7 @@ pub async fn dispatch_at(
                         unfit: failover.unfit(),
                         provider_id: provider.id,
                         dns: provider.dns,
+                        proxy: proxy.as_ref(),
                         vendor_skip,
                         session_seed: session_seed.as_deref(),
                         fixups,
@@ -3295,6 +3335,7 @@ pub async fn dispatch_at(
                             credential,
                             usage: cursor_usage,
                             dns: candidate.provider.dns,
+                            proxy: proxy.as_ref(),
                         }),
                     },
                     target_model,
@@ -3643,6 +3684,7 @@ pub async fn dispatch_at(
                                     candidate.key.api_key.as_deref(),
                                     provider.dns,
                                     transport,
+                                    proxy.as_ref(),
                                 )
                                 .await,
                             }

@@ -16,6 +16,8 @@
 //! `registry/oauth/openai-codex.ts`) and have not been exercised against the
 //! live issuer.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -26,6 +28,7 @@ use reqwest::StatusCode;
 
 use super::OpenaiOAuth;
 use super::token_identity;
+use crate::upstream::ProxySpec;
 
 /// The Codex CLI's public OAuth client; a login started here is a Codex CLI
 /// login as far as the issuer can tell.
@@ -319,10 +322,15 @@ fn form_body(fields: &[(&str, &str)]) -> String {
     scratch.query().unwrap_or_default().to_owned()
 }
 
-/// The issuer HTTP client: a connection pool, a timeout and the issuer origin.
-/// Stateless otherwise — every account-specific value is a call argument.
+/// The issuer HTTP client pool: one connection pool per proxy identity, plus
+/// the timeout and issuer origin. Stateless otherwise — every account-specific
+/// value is a call argument.
 pub struct Client {
-    http: Option<reqwest::Client>,
+    /// The fixed overseas resolver. `None` means setup failed and every request
+    /// is unavailable (no system-DNS fallback).
+    overseas: Option<Arc<crate::upstream::dns::HickoryResolver>>,
+    /// One client per proxy identity; the empty key is the no-proxy client.
+    clients: std::sync::RwLock<HashMap<String, reqwest::Client>>,
     issuer: String,
 }
 
@@ -333,49 +341,77 @@ impl Default for Client {
 }
 
 impl Client {
-    /// Build the client against the production issuer. Resolver or HTTP client
+    /// Build the client pool against the production issuer. Resolver
     /// construction failure leaves the client unavailable: encrypted DNS is
-    /// mandatory, so there is no system-DNS fallback.
+    /// mandatory, so there is no system-DNS fallback. Clients are built lazily
+    /// per proxy on first use ([`Self::http`]).
     #[must_use]
     pub fn new() -> Self {
         Self::with_issuer(ISSUER)
     }
 
     fn with_issuer(issuer: &str) -> Self {
-        let http = match crate::upstream::dns::Resolvers::new() {
-            Ok(resolvers) => reqwest::Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(std::sync::Arc::clone(
-                    // The OpenAI issuer is fixed overseas; login has no provider row yet.
-                    resolvers.resolver(crate::upstream::Dns::Overseas),
-                ))
-                .build()
-                .map_err(|error| anyhow::anyhow!(error)),
-            Err(error) => Err(error),
-        };
-        let http = match http {
-            Ok(http) => Some(http),
+        let overseas = match crate::upstream::dns::Resolvers::new() {
+            Ok(resolvers) => Some(Arc::clone(
+                // The OpenAI issuer is fixed overseas; login has no provider row yet.
+                resolvers.resolver(crate::upstream::Dns::Overseas),
+            )),
             Err(error) => {
                 tracing::warn!(%error, "OpenAI auth client is unavailable: encrypted resolver setup failed");
                 None
             }
         };
         Self {
-            http,
+            overseas,
+            clients: std::sync::RwLock::new(HashMap::new()),
             issuer: issuer.trim_end_matches('/').to_owned(),
         }
     }
 
-    fn http(&self, operation: &'static str) -> Result<&reqwest::Client, AuthError> {
-        self.http.as_ref().ok_or(AuthError::Transport { operation })
+    /// The pooled client for `proxy`, building and caching it on first use.
+    /// With no proxy this keeps the direct, environment-proxy-free policy.
+    async fn http(
+        &self,
+        operation: &'static str,
+        proxy: Option<&ProxySpec>,
+    ) -> Result<reqwest::Client, AuthError> {
+        let unavailable = || AuthError::Transport { operation };
+        let overseas = self.overseas.as_ref().ok_or_else(unavailable)?;
+        let identity = proxy.map_or_else(String::new, |spec| spec.identity().to_owned());
+        if let Ok(clients) = self.clients.read()
+            && let Some(client) = clients.get(&identity)
+        {
+            return Ok(client.clone());
+        }
+        if let Some(spec) = proxy {
+            crate::upstream::transport::validate_proxy_endpoint(spec, overseas)
+                .await
+                .map_err(|_| unavailable())?;
+        }
+        let builder = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none());
+        let builder = crate::upstream::proxy::configure_client_builder(
+            builder,
+            Arc::clone(overseas),
+            REQUEST_TIMEOUT,
+            proxy,
+        )
+        .map_err(|_| unavailable())?;
+        let client = builder.build().map_err(|_| unavailable())?;
+        // Pool lock recovery is fail-soft: a poisoned lock serves the fresh
+        // client without caching it.
+        if let Ok(mut clients) = self.clients.write() {
+            clients.entry(identity).or_insert_with(|| client.clone());
+        }
+        Ok(client)
     }
 
     /// Start a device login: show the operator `user_code` and
     /// [`VERIFICATION_URL`], then call [`Self::poll_device`] every `interval`.
-    pub async fn start_device(&self) -> Result<DeviceGrant, AuthError> {
-        let request = self
-            .http(OP_USERCODE)?
+    pub async fn start_device(&self, proxy: Option<&ProxySpec>) -> Result<DeviceGrant, AuthError> {
+        let http = self.http(OP_USERCODE, proxy).await?;
+        let request = http
             .post(format!("{}{USERCODE_PATH}", self.issuer))
             .json(&UsercodeRequest {
                 client_id: CLIENT_ID,
@@ -399,9 +435,10 @@ impl Client {
         &self,
         device_auth_id: &str,
         user_code: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<PollVerdict, AuthError> {
-        let request = self
-            .http(OP_DEVICE_TOKEN)?
+        let http = self.http(OP_DEVICE_TOKEN, proxy).await?;
+        let request = http
             .post(format!("{}{DEVICE_TOKEN_PATH}", self.issuer))
             .json(&DevicePollRequest {
                 device_auth_id,
@@ -427,6 +464,7 @@ impl Client {
         &self,
         approval: &DeviceApproval,
         now: DateTime<Utc>,
+        proxy: Option<&ProxySpec>,
     ) -> Result<TokenSet, AuthError> {
         let form = form_body(&[
             ("grant_type", "authorization_code"),
@@ -435,7 +473,7 @@ impl Client {
             ("code_verifier", &approval.code_verifier),
             ("redirect_uri", DEVICE_REDIRECT_URI),
         ]);
-        let body = self.token_request(OP_EXCHANGE, form).await?;
+        let body = self.token_request(OP_EXCHANGE, form, proxy).await?;
         parse_token_set(&body, OP_EXCHANGE, now, None)
     }
 
@@ -448,13 +486,14 @@ impl Client {
         &self,
         refresh_token: &str,
         now: DateTime<Utc>,
+        proxy: Option<&ProxySpec>,
     ) -> Result<TokenSet, AuthError> {
         let form = form_body(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("client_id", CLIENT_ID),
         ]);
-        let body = self.token_request(OP_REFRESH, form).await?;
+        let body = self.token_request(OP_REFRESH, form, proxy).await?;
         parse_token_set(&body, OP_REFRESH, now, Some(refresh_token))
     }
 
@@ -463,9 +502,10 @@ impl Client {
         &self,
         operation: &'static str,
         form: String,
+        proxy: Option<&ProxySpec>,
     ) -> Result<Vec<u8>, AuthError> {
-        let request = self
-            .http(operation)?
+        let http = self.http(operation, proxy).await?;
+        let request = http
             .post(format!("{}{TOKEN_PATH}", self.issuer))
             .header(
                 reqwest::header::CONTENT_TYPE,

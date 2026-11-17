@@ -43,6 +43,7 @@ use crate::openai::OpenaiOAuth;
 use crate::openai::auth::AuthError;
 use crate::openai::auth::Client;
 use crate::store;
+use crate::upstream::ProxySpec;
 
 /// The margin a bundle must keep before its `expires_at` to count as fresh.
 /// A request never races the expiry: inside the skew the bundle is refreshed
@@ -169,6 +170,7 @@ impl OpenaiTokens {
         &self,
         pool: &PgPool,
         key_id: i64,
+        proxy: Option<&ProxySpec>,
     ) -> Result<OpenaiBearer, OpenaiTokenError> {
         if let Some(verdict) = self.dead_verdict(key_id) {
             return Err(verdict);
@@ -176,7 +178,8 @@ impl OpenaiTokens {
         if let Some(bundle) = self.fresh_cached(key_id) {
             return Ok(bundle);
         }
-        self.resolve_locked(pool, key_id, Freshness::Check).await
+        self.resolve_locked(pool, key_id, Freshness::Check, proxy)
+            .await
     }
 
     /// Resolve past the freshness check: the upstream just rejected `rejected`,
@@ -189,11 +192,12 @@ impl OpenaiTokens {
         pool: &PgPool,
         key_id: i64,
         rejected: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<OpenaiBearer, OpenaiTokenError> {
         if let Some(verdict) = self.dead_verdict(key_id) {
             return Err(verdict);
         }
-        self.resolve_locked(pool, key_id, Freshness::Force { rejected })
+        self.resolve_locked(pool, key_id, Freshness::Force { rejected }, proxy)
             .await
     }
 
@@ -257,6 +261,7 @@ impl OpenaiTokens {
         pool: &PgPool,
         key_id: i64,
         mode: Freshness<'_>,
+        proxy: Option<&ProxySpec>,
     ) -> Result<OpenaiBearer, OpenaiTokenError> {
         let gate = self.gate(key_id);
         let _guard = gate.lock().await;
@@ -288,7 +293,11 @@ impl OpenaiTokens {
         if adoptable {
             return Ok(self.adopt(key_id, stored));
         }
-        let tokens = match self.client.refresh(&stored.refresh_token, Utc::now()).await {
+        let tokens = match self
+            .client
+            .refresh(&stored.refresh_token, Utc::now(), proxy)
+            .await
+        {
             Ok(tokens) => tokens,
             Err(error) => {
                 let verdict = map_auth_error(&error);

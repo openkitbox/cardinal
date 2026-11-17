@@ -19,6 +19,7 @@ pub(crate) mod dns;
 pub mod kiro_tokens;
 pub mod openai_tokens;
 pub mod opencode_tokens;
+pub mod proxy;
 pub mod transport;
 pub mod workbuddy_tokens;
 
@@ -28,4 +29,5 @@ pub use dns::Dns;
 pub use kiro_tokens::{KiroCallContext, KiroProbeCredential, KiroTokenError, KiroTokens};
 pub use openai_tokens::{OpenaiBearer, OpenaiTokenError, OpenaiTokens};
 pub use opencode_tokens::{OpencodeTokenError, OpencodeTokens};
+pub use proxy::{ProxyError, ProxySpec};
 pub use workbuddy_tokens::{WorkbuddyTokenError, WorkbuddyTokens};

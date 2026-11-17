@@ -38,6 +38,7 @@ use crate::opencode::auth::AuthError;
 use crate::opencode::auth::Client;
 use crate::opencode::auth::TokenGrant;
 use crate::store;
+use crate::upstream::ProxySpec;
 
 /// The margin a bundle must keep before its `expires_at` to count as fresh.
 /// A request never races the expiry: inside the skew the bundle is refreshed
@@ -160,6 +161,7 @@ impl OpencodeTokens {
         &self,
         pool: &PgPool,
         key_id: i64,
+        proxy: Option<&ProxySpec>,
     ) -> Result<Arc<OpencodeOAuth>, OpencodeTokenError> {
         if let Some(verdict) = self.dead_verdict(key_id) {
             return Err(verdict);
@@ -167,7 +169,8 @@ impl OpencodeTokens {
         if let Some(bundle) = self.fresh_cached(key_id) {
             return Ok(bundle);
         }
-        self.resolve_locked(pool, key_id, Freshness::Check).await
+        self.resolve_locked(pool, key_id, Freshness::Check, proxy)
+            .await
     }
 
     /// Resolve past the freshness check: the upstream just rejected `rejected`,
@@ -180,11 +183,12 @@ impl OpencodeTokens {
         pool: &PgPool,
         key_id: i64,
         rejected: &str,
+        proxy: Option<&ProxySpec>,
     ) -> Result<Arc<OpencodeOAuth>, OpencodeTokenError> {
         if let Some(verdict) = self.dead_verdict(key_id) {
             return Err(verdict);
         }
-        self.resolve_locked(pool, key_id, Freshness::Force { rejected })
+        self.resolve_locked(pool, key_id, Freshness::Force { rejected }, proxy)
             .await
     }
 
@@ -248,6 +252,7 @@ impl OpencodeTokens {
         pool: &PgPool,
         key_id: i64,
         mode: Freshness<'_>,
+        proxy: Option<&ProxySpec>,
     ) -> Result<Arc<OpencodeOAuth>, OpencodeTokenError> {
         let gate = self.gate(key_id);
         let _guard = gate.lock().await;
@@ -281,7 +286,7 @@ impl OpencodeTokens {
         }
         let grant = self
             .client
-            .refresh(&stored.server, &stored.refresh_token)
+            .refresh(&stored.server, &stored.refresh_token, proxy)
             .await;
         let ready = match grant {
             Ok(TokenGrant::Ready(ready)) => ready,

@@ -43,14 +43,30 @@ pub async fn fetch_quota(
     org_id: Option<&str>,
     dns: crate::upstream::Dns,
     transport: &crate::upstream::transport::Transport,
+    proxy: Option<&crate::upstream::ProxySpec>,
 ) -> Option<KeyQuota> {
     let endpoint = quota_endpoint(provider_name, base_url)?;
     let resolvers = transport.resolver(dns);
-    let client = match reqwest::Client::builder()
-        .dns_resolver(std::sync::Arc::clone(resolvers))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+    if let Some(spec) = proxy
+        && let Err(error) =
+            crate::upstream::transport::validate_proxy_endpoint(spec, resolvers).await
     {
+        tracing::warn!(%error, "quota probe: proxy endpoint rejected");
+        return None;
+    }
+    let builder = match crate::upstream::proxy::configure_client_builder(
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        std::sync::Arc::clone(resolvers),
+        PROBE_TIMEOUT,
+        proxy,
+    ) {
+        Ok(builder) => builder,
+        Err(error) => {
+            tracing::warn!(%error, "quota probe: client build failed");
+            return None;
+        }
+    };
+    let client = match builder.build() {
         Ok(client) => client,
         Err(error) => {
             tracing::warn!(%error, "quota probe: client build failed");

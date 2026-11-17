@@ -9,6 +9,7 @@
 //! - transport performs exactly one send; retry policy belongs to the relay.
 
 use super::dns::{Dns, HickoryResolver, Resolvers};
+use super::proxy::{ProxySpec, configure_client_builder};
 use crate::protocol::Prepared;
 use crate::protocol::ProtocolId;
 use crate::protocol::wire::{WireError, WireFrame, WireFramer};
@@ -197,8 +198,10 @@ enum Http {
 /// Per-destination clients keyed by validated address and HTTP version. The
 /// address is part of the pool identity so connections are never reused across
 /// a re-resolved host; the version, so a bidi stream never lands on an HTTP/1.1
-/// connection.
-type ClientKey = (String, String, u16, Vec<IpAddr>, Http, Dns);
+/// connection. The final component is the proxy identity (`None` for the
+/// no-proxy path), so proxied clients are isolated from each other and from the
+/// direct path without ever putting the proxy URL in a cache key.
+type ClientKey = (String, String, u16, Vec<IpAddr>, Http, Dns, Option<String>);
 /// Process-wide outbound transport.
 #[derive(Clone)]
 pub struct Transport {
@@ -393,10 +396,46 @@ pub(crate) fn is_global_unicast(ip: IpAddr) -> bool {
     }
 }
 
+/// Validate a proxy endpoint's resolved addresses against the global-unicast
+/// allowlist. Every egress client that configures a proxy must call this before
+/// building its client: the secure resolver performs DNS only and never filters
+/// answers, so a domain-type proxy could otherwise reach a private address.
+/// Fail closed on a resolution error, an empty answer or any disallowed answer.
+/// IP literals were pre-checked in `ProxySpec::parse`, and `resolve_all`
+/// short-circuits them identically.
+pub(crate) async fn validate_proxy_endpoint(
+    spec: &ProxySpec,
+    resolver: &HickoryResolver,
+) -> Result<(), TransportError> {
+    let resolved = resolver
+        .resolve_all(spec.host())
+        .await
+        .map_err(|_| TransportError::Connect)?;
+    if !proxy_endpoint_addresses_allowed(&resolved) {
+        return Err(TransportError::Connect);
+    }
+    Ok(())
+}
+
+/// A proxy endpoint's DNS answers must all pass the same global-unicast
+/// allowlist as an upstream target. An empty answer and a single private answer
+/// both fail closed; `HickoryResolver::resolve_all` does not filter addresses.
+fn proxy_endpoint_addresses_allowed(addresses: &[IpAddr]) -> bool {
+    !addresses.is_empty() && addresses.iter().all(|ip| is_global_unicast(*ip))
+}
+
 #[derive(Clone, Copy)]
 enum ClientMode {
     Pooled,
     Fresh,
+}
+
+/// Pool/fresh decision and the account proxy travel together through the two
+/// `send_with_headers` entry points into the shared send path.
+#[derive(Clone, Copy)]
+struct SendOptions<'a> {
+    proxy: Option<&'a ProxySpec>,
+    mode: ClientMode,
 }
 
 impl Transport {
@@ -415,18 +454,24 @@ impl Transport {
         // transport fails fast instead of on the first request. Per-destination
         // clients are built lazily in `client_for`.
         let resolvers = Resolvers::new()?;
-        reqwest::Client::builder()
-            .dns_resolver(Arc::clone(resolvers.default_resolver()))
-            // Destination safety must not be delegated to an un-audited proxy.
-            .no_proxy()
-            // A redirect to another authority would carry the injected credential
-            // headers (reqwest only strips authorization/cookie) and would bypass
-            // the destination policy entirely (B §3.3 item 5).
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(64)
-            .tcp_keepalive(Duration::from_secs(60))
-            .connect_timeout(limits.connect)
-            .build()?;
+        // The startup check uses the same shared builder policy as the send path
+        // (secure resolver, no environment proxy, connect deadline), so a
+        // misconfigured transport fails fast. Per-destination clients are built
+        // lazily in `client_for_mode`.
+        configure_client_builder(
+            reqwest::Client::builder(),
+            Arc::clone(resolvers.default_resolver()),
+            limits.connect,
+            None,
+        )
+        .map_err(|_| anyhow::anyhow!("upstream client configuration failed"))?
+        // A redirect to another authority would carry the injected credential
+        // headers (reqwest only strips authorization/cookie) and would bypass
+        // the destination policy entirely (B §3.3 item 5).
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(64)
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()?;
         Ok(Self {
             clients: Arc::new(Mutex::new(HashMap::new())),
             resolvers,
@@ -465,8 +510,33 @@ impl Transport {
         query: &[(&'static str, String)],
         deadline: Instant,
     ) -> Result<reqwest::Response, TransportError> {
-        self.send_with_headers_mode(prepared, dns, headers, query, deadline, ClientMode::Pooled)
+        self.send_with_headers_with_proxy(prepared, dns, headers, query, None, deadline)
             .await
+    }
+
+    /// [`Self::send_with_headers`] with an optional account-level egress proxy.
+    /// `None` is byte-for-byte the direct path above.
+    pub async fn send_with_headers_with_proxy(
+        &self,
+        prepared: &Prepared,
+        dns: Dns,
+        headers: &[(&'static str, String)],
+        query: &[(&'static str, String)],
+        proxy: Option<&ProxySpec>,
+        deadline: Instant,
+    ) -> Result<reqwest::Response, TransportError> {
+        self.send_with_headers_mode(
+            prepared,
+            dns,
+            headers,
+            query,
+            deadline,
+            SendOptions {
+                proxy,
+                mode: ClientMode::Pooled,
+            },
+        )
+        .await
     }
 
     /// Send one prepared HTTP/1.1 request through a client that is never placed
@@ -481,8 +551,33 @@ impl Transport {
         query: &[(&'static str, String)],
         deadline: Instant,
     ) -> Result<reqwest::Response, TransportError> {
-        self.send_with_headers_mode(prepared, dns, headers, query, deadline, ClientMode::Fresh)
+        self.send_with_headers_with_proxy_fresh(prepared, dns, headers, query, None, deadline)
             .await
+    }
+
+    /// [`Self::send_with_headers_fresh`] with an optional account-level egress
+    /// proxy. A fresh retry must reuse the same proxy as its original attempt.
+    pub async fn send_with_headers_with_proxy_fresh(
+        &self,
+        prepared: &Prepared,
+        dns: Dns,
+        headers: &[(&'static str, String)],
+        query: &[(&'static str, String)],
+        proxy: Option<&ProxySpec>,
+        deadline: Instant,
+    ) -> Result<reqwest::Response, TransportError> {
+        self.send_with_headers_mode(
+            prepared,
+            dns,
+            headers,
+            query,
+            deadline,
+            SendOptions {
+                proxy,
+                mode: ClientMode::Fresh,
+            },
+        )
+        .await
     }
 
     async fn send_with_headers_mode(
@@ -492,8 +587,9 @@ impl Transport {
         headers: &[(&'static str, String)],
         query: &[(&'static str, String)],
         deadline: Instant,
-        mode: ClientMode,
+        options: SendOptions<'_>,
     ) -> Result<reqwest::Response, TransportError> {
+        let SendOptions { proxy, mode } = options;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(TransportError::Timeout);
@@ -509,8 +605,14 @@ impl Transport {
         )
         .await?;
         let client = match mode {
-            ClientMode::Pooled => self.client_for(&prepared.url, &destination, Http::H1, dns)?,
-            ClientMode::Fresh => self.fresh_client_for(&prepared.url, &destination, dns)?,
+            ClientMode::Pooled => {
+                self.client_for(&prepared.url, &destination, Http::H1, dns, proxy)
+                    .await?
+            }
+            ClientMode::Fresh => {
+                self.fresh_client_for(&prepared.url, &destination, dns, proxy)
+                    .await?
+            }
         };
         let mut request = client
             .post(&prepared.url)
@@ -545,6 +647,21 @@ impl Transport {
         query: &[(&'static str, String)],
         deadline: Instant,
     ) -> Result<reqwest::Response, TransportError> {
+        self.send_get_with_headers_with_proxy(url, dns, headers, query, None, deadline)
+            .await
+    }
+
+    /// [`Self::send_get_with_headers`] with an optional account-level egress
+    /// proxy. Used by quota/probe token planes bound to a specific account.
+    pub async fn send_get_with_headers_with_proxy(
+        &self,
+        url: &str,
+        dns: Dns,
+        headers: &[(&'static str, String)],
+        query: &[(&'static str, String)],
+        proxy: Option<&ProxySpec>,
+        deadline: Instant,
+    ) -> Result<reqwest::Response, TransportError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(TransportError::Timeout);
@@ -557,7 +674,9 @@ impl Transport {
             self.limits.allow_private_destinations,
         )
         .await?;
-        let client = self.client_for(url, &destination, Http::H1, dns)?;
+        let client = self
+            .client_for(url, &destination, Http::H1, dns, proxy)
+            .await?;
         let mut request = client.get(url).header("accept", "application/json");
         for (name, value) in headers {
             request = request.header(*name, value);
@@ -582,6 +701,22 @@ impl Transport {
         body: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
         deadline: Instant,
     ) -> Result<reqwest::Response, TransportError> {
+        self.send_bidi_with_proxy(prepared, dns, headers, body, None, deadline)
+            .await
+    }
+
+    /// [`Self::send_bidi`] with an optional account-level egress proxy. The H2
+    /// client carries the same proxy identity as the relay's pooled/fresh H1
+    /// clients for that account.
+    pub async fn send_bidi_with_proxy(
+        &self,
+        prepared: &Prepared,
+        dns: Dns,
+        headers: &[(&'static str, String)],
+        body: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+        proxy: Option<&ProxySpec>,
+        deadline: Instant,
+    ) -> Result<reqwest::Response, TransportError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(TransportError::Timeout);
@@ -594,7 +729,9 @@ impl Transport {
             self.limits.allow_private_destinations,
         )
         .await?;
-        let client = self.client_for(&prepared.url, &destination, Http::H2, dns)?;
+        let client = self
+            .client_for(&prepared.url, &destination, Http::H2, dns, proxy)
+            .await?;
         let mut request = client
             .post(&prepared.url)
             .header(CONTENT_TYPE, prepared.content_type)
@@ -669,65 +806,87 @@ impl Transport {
         }
     }
 
-    /// Client pinned to the validated address for one destination. The pool key
-    /// is `(scheme, host, port, validated address, HTTP version)`, so a
-    /// re-resolved host gets a different client instead of reusing an
-    /// already-authorized connection.
-    fn client_for(
+    /// Client for one destination and HTTP version. This is the single place
+    /// that decides how a proxy changes client construction: it partitions the
+    /// pool by proxy identity and skips upstream-address pinning when a proxy is
+    /// configured (the proxy resolves its own CONNECT target). The four send
+    /// paths only supply a destination and `Option<&ProxySpec>`.
+    async fn client_for(
         &self,
         url: &str,
         destination: &Destination,
         http: Http,
         dns: Dns,
+        proxy: Option<&ProxySpec>,
     ) -> Result<reqwest::Client, TransportError> {
-        self.client_for_mode(url, destination, http, dns, ClientMode::Pooled)
+        self.client_for_mode(url, destination, http, dns, ClientMode::Pooled, proxy)
+            .await
     }
 
-    fn fresh_client_for(
+    async fn fresh_client_for(
         &self,
         url: &str,
         destination: &Destination,
         dns: Dns,
+        proxy: Option<&ProxySpec>,
     ) -> Result<reqwest::Client, TransportError> {
-        self.client_for_mode(url, destination, Http::H1, dns, ClientMode::Fresh)
+        self.client_for_mode(url, destination, Http::H1, dns, ClientMode::Fresh, proxy)
+            .await
     }
 
-    fn client_for_mode(
+    async fn client_for_mode(
         &self,
         url: &str,
         destination: &Destination,
         http: Http,
         dns: Dns,
         mode: ClientMode,
+        proxy: Option<&ProxySpec>,
     ) -> Result<reqwest::Client, TransportError> {
         let parsed = reqwest::Url::parse(url).map_err(|_| TransportError::Connect)?;
+        // A proxied socket reaches the proxy, not the upstream address, so the
+        // upstream DNS answer is irrelevant to that client's pool identity.
+        let pinned = if proxy.is_some() {
+            Vec::new()
+        } else {
+            destination.addresses.clone()
+        };
         let key: ClientKey = (
             parsed.scheme().to_owned(),
             destination.host.clone(),
             destination.port,
-            destination.addresses.clone(),
+            pinned,
             http,
             dns,
+            proxy.map(|spec| spec.identity().to_owned()),
         );
         if matches!(mode, ClientMode::Pooled)
             && let Some(client) = self.clients_lock().get(&key)
         {
             return Ok(client.clone());
         }
+        // A configured proxy is an independent second authority. Its hostname
+        // must resolve to global-unicast addresses under the same allowlist as
+        // an upstream target: see `validate_proxy_endpoint`.
+        if let Some(spec) = proxy {
+            validate_proxy_endpoint(spec, self.resolvers.resolver(dns)).await?;
+        }
         let mut builder = reqwest::Client::builder()
-            // Hygiene: the client resolves through the same preset that validated
-            // the destination (inert in practice — `resolve_to_addrs` below pins
-            // every address and redirects are disabled).
-            .dns_resolver(Arc::clone(self.resolvers.resolver(dns)))
+            // A redirect to another authority would carry the injected credential
+            // headers and bypass the destination policy.
             .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(if matches!(mode, ClientMode::Fresh) {
                 0
             } else {
                 64
             })
-            .tcp_keepalive(Duration::from_secs(60))
-            .connect_timeout(self.limits.connect)
-            .resolve_to_addrs(
+            .tcp_keepalive(Duration::from_secs(60));
+        // Pin the validated upstream addresses to the socket only on the direct
+        // path. With a proxy the CONNECT target is resolved proxy-side, so
+        // `resolve_to_addrs` would neither be honoured nor desirable. The
+        // destination itself was already validated by `validate_destination`.
+        if proxy.is_none() {
+            builder = builder.resolve_to_addrs(
                 &destination.host,
                 &destination
                     .addresses
@@ -735,7 +894,7 @@ impl Transport {
                     .map(|address| SocketAddr::new(*address, destination.port))
                     .collect::<Vec<_>>(),
             );
-        builder = builder.no_proxy();
+        }
         builder = match http {
             Http::H1 => builder.http1_only(),
             // Keep-alive pings on the stream's connection, at the cadence the
@@ -747,6 +906,15 @@ impl Transport {
                 .http2_keep_alive_timeout(Duration::from_secs(20))
                 .http2_keep_alive_while_idle(true),
         };
+        // One shared policy for the secure resolver, the connect deadline and
+        // proxy-vs-`.no_proxy()`; environment proxies stay ignored.
+        let builder = configure_client_builder(
+            builder,
+            Arc::clone(self.resolvers.resolver(dns)),
+            self.limits.connect,
+            proxy,
+        )
+        .map_err(|_| TransportError::Connect)?;
         let client = builder.build().map_err(|_| TransportError::Connect)?;
         if matches!(mode, ClientMode::Pooled) {
             let mut clients = self.clients_lock();
@@ -1008,8 +1176,8 @@ impl From<WireError> for TransportError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fresh_client_does_not_touch_shared_pool() {
+    #[tokio::test]
+    async fn fresh_client_does_not_touch_shared_pool() {
         let transport = Transport::new(Limits::default()).expect("transport should build");
         let destination = Destination {
             host: "api.example.com".to_owned(),
@@ -1019,7 +1187,8 @@ mod tests {
         };
 
         let client = transport
-            .fresh_client_for("https://api.example.com", &destination, Dns::Overseas)
+            .fresh_client_for("https://api.example.com", &destination, Dns::Overseas, None)
+            .await
             .expect("fresh client should build");
         drop(client);
 

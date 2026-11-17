@@ -40,6 +40,7 @@ use crate::relay::capabilities::workbuddy_headers;
 use crate::store;
 use crate::store::ProviderKeyRow;
 use crate::upstream::Dns;
+use crate::upstream::ProxySpec;
 use crate::upstream::transport::Transport;
 use crate::upstream::workbuddy_tokens::WorkbuddyTokens;
 use crate::workbuddy::Client as WorkbuddyClient;
@@ -64,7 +65,14 @@ pub async fn fetch_workbuddy_quota(
     dns: Dns,
     transport: &Transport,
 ) -> Option<KeyQuota> {
-    let bundle = match tokens.resolve_with_build(pool, key.id, dns, build).await {
+    // Every account-level egress in this probe shares the key's own proxy:
+    // resolve it once here and pass the same spec to the credential resolution
+    // and the display-name backfill.
+    let proxy = ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
+    let bundle = match tokens
+        .resolve_with_build(pool, key.id, dns, build, proxy.as_ref())
+        .await
+    {
         Ok(bundle) => bundle,
         Err(error) => {
             tracing::warn!(key_id = key.id, error = %error, "WorkBuddy quota probe: credential unavailable");
@@ -120,20 +128,34 @@ pub async fn fetch_workbuddy_quota(
     // bundle, so no browser re-login is needed. A stored name is never
     // overwritten, and any failure leaves the uid fallback in place.
     if bundle.account_name.is_none() {
-        backfill_display_name(pool, tokens, &bundle, key.id, build, dns, transport).await;
+        backfill_display_name(DisplayNameBackfill {
+            pool,
+            tokens,
+            bundle: &bundle,
+            key_id: key.id,
+            build,
+            dns,
+            transport,
+            proxy: proxy.as_ref(),
+        })
+        .await;
     }
 
     let now = Utc::now();
-    let summary = post_meter(
+    let meter = MeterProbe {
         transport,
         dns,
-        &format!("{base}/billing/meter/get-user-resource-summary"),
-        &serde_json::json!({}),
-        &headers,
-        key.id,
-        "resource summary",
-    )
-    .await?;
+        headers: &headers,
+        key_id: key.id,
+        proxy: proxy.as_ref(),
+    };
+    let summary = meter
+        .post(
+            &format!("{base}/billing/meter/get-user-resource-summary"),
+            &serde_json::json!({}),
+            "resource summary",
+        )
+        .await?;
     let has_packages = field(&summary, "Packages")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|packages| !packages.is_empty());
@@ -148,46 +170,37 @@ pub async fn fetch_workbuddy_quota(
             return None;
         }
         let day = (now + TimeDelta::hours(8)).format("%Y-%m-%d").to_string();
-        let paid = post_meter(
-            transport,
-            dns,
-            &format!("{base}/billing/meter/get-user-resource-paid-packages"),
-            &serde_json::json!({
-                "PageNumber": 1, "PageSize": 200, "Status": [0, 3],
-                "PackageCodes": codes, "NeedRenewInfo": true,
-            }),
-            &headers,
-            key.id,
-            "paid packages",
-        )
-        .await?;
-        let free = post_meter(
-            transport,
-            dns,
-            &format!("{base}/billing/meter/get-user-resource-free-packages"),
-            &serde_json::json!({
-                "PageNumber": 1, "PageSize": 200, "Status": [0, 3],
-                "PackageCodes": codes,
-                "SlicePeriodStartTime": format!("{day} 00:00:00"),
-                "SlicePeriodEndTime": format!("{day} 23:59:59"),
-            }),
-            &headers,
-            key.id,
-            "free packages",
-        )
-        .await?;
+        let paid = meter
+            .post(
+                &format!("{base}/billing/meter/get-user-resource-paid-packages"),
+                &serde_json::json!({
+                    "PageNumber": 1, "PageSize": 200, "Status": [0, 3],
+                    "PackageCodes": codes, "NeedRenewInfo": true,
+                }),
+                "paid packages",
+            )
+            .await?;
+        let free = meter
+            .post(
+                &format!("{base}/billing/meter/get-user-resource-free-packages"),
+                &serde_json::json!({
+                    "PageNumber": 1, "PageSize": 200, "Status": [0, 3],
+                    "PackageCodes": codes,
+                    "SlicePeriodStartTime": format!("{day} 00:00:00"),
+                    "SlicePeriodEndTime": format!("{day} 23:59:59"),
+                }),
+                "free packages",
+            )
+            .await?;
         parse_personal_quota(&summary, &paid, &free, now)
     } else {
-        let usage = post_meter(
-            transport,
-            dns,
-            &format!("{base}/billing/meter/get-enterprise-user-usage"),
-            &serde_json::json!({}),
-            &headers,
-            key.id,
-            "enterprise usage",
-        )
-        .await?;
+        let usage = meter
+            .post(
+                &format!("{base}/billing/meter/get-enterprise-user-usage"),
+                &serde_json::json!({}),
+                "enterprise usage",
+            )
+            .await?;
         parse_enterprise_quota(&usage, now)
     };
     if quota.is_none() {
@@ -199,6 +212,19 @@ pub async fn fetch_workbuddy_quota(
     quota
 }
 
+/// The probe's shared inputs for a best-effort display-name backfill. Bundled
+/// so the helper stays under clippy's argument ceiling without an allow.
+struct DisplayNameBackfill<'a> {
+    pool: &'a PgPool,
+    tokens: &'a WorkbuddyTokens,
+    bundle: &'a WorkbuddyOAuth,
+    key_id: i64,
+    build: Build,
+    dns: Dns,
+    transport: &'a Transport,
+    proxy: Option<&'a ProxySpec>,
+}
+
 /// Fill in `account_name` for a legacy bundle once, best-effort.
 ///
 /// Old WorkBuddy keys were stored before the display name existed and show
@@ -207,18 +233,20 @@ pub async fn fetch_workbuddy_quota(
 /// can recover it. Nothing here is authoritative for routing: any failure is
 /// logged with fixed messages and the uid fallback stays in place. A name is
 /// written only through CAS, so a concurrent token refresh cannot be lost.
-async fn backfill_display_name(
-    pool: &PgPool,
-    tokens: &WorkbuddyTokens,
-    bundle: &WorkbuddyOAuth,
-    key_id: i64,
-    build: Build,
-    dns: Dns,
-    transport: &Transport,
-) {
+async fn backfill_display_name(input: DisplayNameBackfill<'_>) {
+    let DisplayNameBackfill {
+        pool,
+        tokens,
+        bundle,
+        key_id,
+        build,
+        dns,
+        transport,
+        proxy,
+    } = input;
     let client = WorkbuddyClient::new(transport.clone(), dns);
     let name = match client
-        .fetch_display_name(build, &bundle.access_token, bundle.domain.as_deref())
+        .fetch_display_name(build, &bundle.access_token, bundle.domain.as_deref(), proxy)
         .await
     {
         Ok(name) => name,
@@ -250,72 +278,90 @@ async fn backfill_display_name(
     }
 }
 
-/// One POST to the billing meter, returning the envelope's `data`.
-///
-/// Only the request URL, status and byte count may reach a log line: the
-/// vendor's error bodies can echo account metadata, and the headers carry the
-/// OAuth token.
-async fn post_meter(
-    transport: &Transport,
+/// One probe's shared meter inputs. Bundled so every meter call carries the
+/// account's proxy without pushing the send helper past clippy's argument
+/// ceiling (no lint allow).
+struct MeterProbe<'a> {
+    transport: &'a Transport,
     dns: Dns,
-    url: &str,
-    body: &serde_json::Value,
-    headers: &[(&'static str, String)],
+    headers: &'a [(&'static str, String)],
     key_id: i64,
-    operation: &'static str,
-) -> Option<serde_json::Value> {
-    let prepared = Prepared {
-        protocol: ProtocolId::OpenAiChat,
-        url: url.to_owned(),
-        content_type: "application/json",
-        body: bytes::Bytes::from(body.to_string()),
-        stream: false,
-        headers: Vec::new(),
-        cursor: None,
-    };
-    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
-    let response = match transport
-        .send_with_headers(&prepared, dns, headers, &[], deadline)
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!(key_id, operation, %error, "WorkBuddy quota probe: meter send failed");
+    proxy: Option<&'a ProxySpec>,
+}
+
+impl MeterProbe<'_> {
+    /// One POST to the billing meter, returning the envelope's `data`.
+    ///
+    /// Only the request URL, status and byte count may reach a log line: the
+    /// vendor's error bodies can echo account metadata, and the headers carry
+    /// the OAuth token.
+    async fn post(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        operation: &'static str,
+    ) -> Option<serde_json::Value> {
+        let prepared = Prepared {
+            protocol: ProtocolId::OpenAiChat,
+            url: url.to_owned(),
+            content_type: "application/json",
+            body: bytes::Bytes::from(body.to_string()),
+            stream: false,
+            headers: Vec::new(),
+            cursor: None,
+        };
+        let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+        let response = match self
+            .transport
+            .send_with_headers_with_proxy(
+                &prepared,
+                self.dns,
+                self.headers,
+                &[],
+                self.proxy,
+                deadline,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(key_id = self.key_id, operation, %error, "WorkBuddy quota probe: meter send failed");
+                return None;
+            }
+        };
+        let status = response.status().as_u16();
+        let bytes = match self.transport.read_body(response, MAX_BODY, deadline).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(key_id = self.key_id, operation, status, %error, "WorkBuddy quota probe: meter response unreadable");
+                return None;
+            }
+        };
+        if !(200..300).contains(&status) {
+            tracing::warn!(
+                key_id = self.key_id,
+                operation,
+                status,
+                bytes = bytes.len(),
+                "WorkBuddy quota probe: meter rejected the call"
+            );
             return None;
         }
-    };
-    let status = response.status().as_u16();
-    let bytes = match transport.read_body(response, MAX_BODY, deadline).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(key_id, operation, status, %error, "WorkBuddy quota probe: meter response unreadable");
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            tracing::warn!(
+                key_id = self.key_id,
+                operation,
+                bytes = bytes.len(),
+                "WorkBuddy quota probe: meter response is not UTF-8"
+            );
             return None;
-        }
-    };
-    if !(200..300).contains(&status) {
-        tracing::warn!(
-            key_id,
-            operation,
-            status,
-            bytes = bytes.len(),
-            "WorkBuddy quota probe: meter rejected the call"
-        );
-        return None;
-    }
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        tracing::warn!(
-            key_id,
-            operation,
-            bytes = bytes.len(),
-            "WorkBuddy quota probe: meter response is not UTF-8"
-        );
-        return None;
-    };
-    match envelope(text) {
-        Ok(data) => Some(data),
-        Err(error) => {
-            tracing::debug!(key_id, operation, %error, "WorkBuddy quota probe: meter returned no data");
-            None
+        };
+        match envelope(text) {
+            Ok(data) => Some(data),
+            Err(error) => {
+                tracing::debug!(key_id = self.key_id, operation, %error, "WorkBuddy quota probe: meter returned no data");
+                None
+            }
         }
     }
 }

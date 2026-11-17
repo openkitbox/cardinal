@@ -115,6 +115,7 @@ mod tests {
             &[0; 16 * 1024 + 1],
             &transport,
             crate::upstream::Dns::Overseas,
+            None,
         )
         .await
         .expect_err("oversized reset request must be rejected");
@@ -336,14 +337,16 @@ pub async fn fetch_openai_codex_quota(
     key_id: i64,
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&crate::upstream::ProxySpec>,
 ) -> Option<KeyQuota> {
-    let (status, body) = match crate::probe::codex_get(USAGE_URL, bearer, transport, dns).await {
-        Ok(answer) => answer,
-        Err(error) => {
-            tracing::warn!(key_id, %error, "Codex quota probe: request failed");
-            return None;
-        }
-    };
+    let (status, body) =
+        match crate::probe::codex_get(USAGE_URL, bearer, transport, dns, proxy).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                tracing::warn!(key_id, %error, "Codex quota probe: request failed");
+                return None;
+            }
+        };
     if !(200..300).contains(&status) {
         tracing::warn!(
             key_id,
@@ -362,7 +365,7 @@ pub async fn fetch_openai_codex_quota(
         );
         return None;
     };
-    match fetch_openai_codex_resets(bearer, transport, dns).await {
+    match fetch_openai_codex_resets(bearer, transport, dns, proxy).await {
         Ok(details) => {
             quota.codex_resets = Some(CodexResetSummary {
                 available_count: details.available_count,
@@ -390,8 +393,10 @@ pub async fn fetch_openai_codex_resets(
     bearer: &OpenaiBearer,
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&crate::upstream::ProxySpec>,
 ) -> anyhow::Result<CodexResetDetails> {
-    let (status, body) = crate::probe::codex_get(RESET_DETAILS_URL, bearer, transport, dns).await?;
+    let (status, body) =
+        crate::probe::codex_get(RESET_DETAILS_URL, bearer, transport, dns, proxy).await?;
     if !(200..300).contains(&status) {
         anyhow::bail!("Codex reset-credit service rejected the request (HTTP {status})");
     }
@@ -405,11 +410,12 @@ pub async fn consume_openai_codex_reset(
     request: &CodexResetConsumeRequest,
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
+    proxy: Option<&crate::upstream::ProxySpec>,
 ) -> anyhow::Result<CodexResetOutcome> {
     let body =
         serde_json::to_vec(request).map_err(|_| anyhow::anyhow!("Codex reset request invalid"))?;
     let (status, response) =
-        crate::probe::codex_post(RESET_CONSUME_URL, bearer, &body, transport, dns).await?;
+        crate::probe::codex_post(RESET_CONSUME_URL, bearer, &body, transport, dns, proxy).await?;
     if !(200..300).contains(&status) {
         anyhow::bail!("Codex reset-credit service rejected the request (HTTP {status})");
     }

@@ -25,6 +25,7 @@ use secrecy::SecretString;
 use super::trace::SkipReason;
 use crate::store::{ProviderKeyRow, ProviderRow, RouteEntry};
 use crate::translation::ir::Effort;
+use crate::upstream::ProxySpec;
 
 /// One triable candidate: the route entry's account (key row), the provider it
 /// belongs to, and the upstream model to request.
@@ -68,6 +69,13 @@ impl Candidate {
     /// Credential injection material (expose only at the injection point).
     pub fn credential(&self) -> &SecretString {
         &self.secret
+    }
+
+    /// The account's egress proxy, parsed once at the resolve boundary from the
+    /// route-cache row (never re-read from the database, never cloned per
+    /// token/chunk). `None` degrades to the direct transport path.
+    pub fn proxy(&self) -> Option<ProxySpec> {
+        ProxySpec::from_stored(self.key.proxy_url.as_deref(), self.key.id)
     }
 }
 
