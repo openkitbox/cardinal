@@ -24,7 +24,8 @@ The companion native macOS management dashboard is available in the [Cardinal GU
 ### Prerequisites
 
 - Rust stable toolchain
-- PostgreSQL
+- PostgreSQL 18+
+- TimescaleDB 2.31.0+ installed and enabled in the database (the migration intentionally does not create the extension)
 
 ### Configuration
 

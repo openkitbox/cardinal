@@ -17,6 +17,7 @@ mod request;
 mod rest;
 mod route;
 mod usage;
+mod usage_source;
 mod user;
 
 pub use balance_history::{BalanceHistoryPoint, balance_history_record, list_balance_history};

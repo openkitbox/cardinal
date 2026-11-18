@@ -1,3 +1,4 @@
+use crate::store::usage_source::{self, SourcePlan};
 use crate::store::user::OWNER_LOGIN;
 use sqlx::PgPool;
 
@@ -58,27 +59,33 @@ pub async fn usage_by_day(
     caller: Option<CallerFilter>,
 ) -> anyhow::Result<Vec<UsageRow>> {
     let binds = CallerBinds::from(caller);
-    let rows = sqlx::query_as::<_, UsageRow>(
-        "SELECT to_char((ts AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, alias,
-            COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
-            COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
-            COALESCE(SUM(cached_input_tokens), 0)::bigint AS cached_input_tokens,
-            COUNT(*)::bigint AS requests,
-            SUM(cost_usd)::float8 AS cost_usd
-         FROM gateway_requests
-         WHERE ts > now() - make_interval(days => $1)
-           AND ($2::text IS NULL
-                OR ($2 = 'null' AND caller_key IS NULL)
-                OR ($2 = 'key' AND gateway_key_id = $3)
-                OR ($2 = 'user' AND user_id = $3))
-         GROUP BY day, alias
-         ORDER BY day DESC, alias",
-    )
-    .bind(days)
-    .bind(binds.kind)
-    .bind(binds.id)
-    .fetch_all(pool)
-    .await?;
+    let source = usage_source::daily_source();
+    let sql = format!(
+        "{source}, daily AS (
+             SELECT date_trunc('day', hour AT TIME ZONE 'UTC') AS day, alias,
+                    SUM(input_tokens) AS input_tokens,
+                    SUM(output_tokens) AS output_tokens,
+                    SUM(cached_input_tokens) AS cached_input_tokens,
+                    SUM(requests) AS requests,
+                    SUM(cost_usd) AS cost_usd
+               FROM source
+              GROUP BY 1, 2
+         )
+         SELECT to_char(day, 'YYYY-MM-DD') AS day, alias,
+                COALESCE(input_tokens, 0)::bigint AS input_tokens,
+                COALESCE(output_tokens, 0)::bigint AS output_tokens,
+                COALESCE(cached_input_tokens, 0)::bigint AS cached_input_tokens,
+                COALESCE(requests, 0)::bigint AS requests,
+                cost_usd::float8 AS cost_usd
+           FROM daily
+          ORDER BY day DESC, alias"
+    );
+    let rows = sqlx::query_as::<_, UsageRow>(sqlx::AssertSqlSafe(sql))
+        .bind(days)
+        .bind(binds.kind)
+        .bind(binds.id)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
@@ -219,6 +226,64 @@ pub async fn usage_trend(
             Some(OWNER_LOGIN),
         ),
     };
+    if usage_source::can_use_cagg_trend(local_offset) {
+        let (plan, left_end, right_start) = usage_source::source_plan(since, until);
+        let source = usage_source::trend_source(plan);
+        let owner_placeholder = if matches!(plan, SourcePlan::Split { .. }) {
+            "$8"
+        } else {
+            "$6"
+        };
+        let category = category.replace("$6", owner_placeholder);
+        let bucket = if hourly_buckets(since, until) {
+            "to_char(date_trunc('hour', r.hour AT TIME ZONE 'UTC' + $3), 'YYYY-MM-DD HH24:00')"
+        } else {
+            "to_char(date_trunc('day', r.hour AT TIME ZONE 'UTC' + $3), 'YYYY-MM-DD')"
+        };
+        let sql = format!(
+            "WITH source AS ({source}), additive AS (
+                 SELECT hour, alias, served_model, provider_id, caller_key, gateway_key_id,
+                        user_id, agent, SUM(requests) AS requests, SUM(failed) AS failed,
+                        SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+                        SUM(cached_input_tokens) AS cached_input_tokens,
+                        SUM(charged_microus) AS charged_microus, SUM(cost_usd) AS cost_usd,
+                        SUM(timed_output) AS timed_output, SUM(timed_ms) AS timed_ms,
+                        SUM(decode_ms) AS decode_ms
+                   FROM source
+                  GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+             )
+             SELECT {bucket} AS bucket, {category} AS category,
+                    COALESCE(SUM(r.input_tokens), 0)::bigint AS input_tokens,
+                    COALESCE(SUM(r.output_tokens), 0)::bigint AS output_tokens,
+                    COALESCE(SUM(r.cached_input_tokens), 0)::bigint AS cached_input_tokens,
+                    COALESCE(SUM(r.requests), 0)::bigint AS requests,
+                    COALESCE(SUM(r.failed), 0)::bigint AS failed,
+                    SUM(r.cost_usd)::float8 AS cost_usd,
+                    COALESCE(SUM(r.charged_microus), 0)::bigint AS charged_microus,
+                    COALESCE(SUM(r.timed_output), 0)::bigint AS timed_output,
+                    COALESCE(SUM(r.timed_ms), 0)::bigint AS timed_ms,
+                    COALESCE(SUM(r.decode_ms), 0)::bigint AS decode_ms
+               FROM additive r {join}
+              WHERE TRUE
+                {filter}
+              GROUP BY 1, 2
+              ORDER BY 1"
+        );
+        let binds = CallerBinds::from(caller);
+        let mut query = sqlx::query_as::<_, TrendRow>(sqlx::AssertSqlSafe(sql))
+            .bind(since)
+            .bind(until)
+            .bind(local_offset)
+            .bind(binds.kind)
+            .bind(binds.id);
+        if let SourcePlan::Split { .. } = plan {
+            query = query.bind(left_end).bind(right_start);
+        }
+        if let Some(owner_login) = owner_login {
+            query = query.bind(owner_login);
+        }
+        return Ok(query.fetch_all(pool).await?);
+    }
     let sql = format!(
     "SELECT {bucket} AS bucket, {category} AS category,
             COALESCE(SUM(r.input_tokens), 0)::bigint AS input_tokens,
@@ -296,30 +361,39 @@ pub async fn usage_window(
     caller: Option<CallerFilter>,
 ) -> anyhow::Result<UsageWindow> {
     let binds = CallerBinds::from(caller);
-    let window = sqlx::query_as::<_, UsageWindow>(
-    "SELECT COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
-            COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
-            COALESCE(SUM(cached_input_tokens), 0)::bigint AS cached_input_tokens,
-            COUNT(*)::bigint AS requests,
-            COUNT(*) FILTER (WHERE error IS NOT NULL)::bigint AS failed,
-            SUM(cost_usd)::float8 AS cost_usd,
-            COALESCE(SUM(charged_microus), 0)::bigint AS charged_microus,
-            COUNT(*) FILTER (WHERE error IS NULL AND input_tokens IS NOT NULL AND cost_usd IS NULL)::bigint AS unpriced,
-            COALESCE(SUM(output_tokens) FILTER (WHERE error IS NULL), 0)::bigint AS timed_output,
-            COALESCE(SUM(total_ms) FILTER (WHERE error IS NULL), 0)::bigint AS timed_ms,
-            COALESCE(SUM(GREATEST(total_ms - COALESCE(ttft_ms, 0), 0)) FILTER (WHERE error IS NULL), 0)::bigint AS decode_ms
-         FROM gateway_requests
-         WHERE ts >= $1 AND ts < $2
-           AND ($3::text IS NULL
-                OR ($3 = 'null' AND caller_key IS NULL)
-                OR ($3 = 'key' AND gateway_key_id = $4)
-                OR ($3 = 'user' AND user_id = $4))",
-  )
-  .bind(since)
-  .bind(until)
-  .bind(binds.kind)
-  .bind(binds.id)
-  .fetch_one(pool)
-  .await?;
+    let (plan, left_end, right_start) = usage_source::source_plan(since, until);
+    let source = usage_source::window_source(plan);
+    let sql = format!(
+        "WITH source AS ({source}), additive AS (
+             SELECT SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+                    SUM(cached_input_tokens) AS cached_input_tokens, SUM(requests) AS requests,
+                    SUM(failed) AS failed, SUM(cost_usd) AS cost_usd,
+                    SUM(unpriced) AS unpriced, SUM(charged_microus) AS charged_microus,
+                    SUM(timed_output) AS timed_output, SUM(timed_ms) AS timed_ms,
+                    SUM(decode_ms) AS decode_ms
+               FROM source
+         )
+         SELECT COALESCE(input_tokens, 0)::bigint AS input_tokens,
+                COALESCE(output_tokens, 0)::bigint AS output_tokens,
+                COALESCE(cached_input_tokens, 0)::bigint AS cached_input_tokens,
+                COALESCE(requests, 0)::bigint AS requests,
+                COALESCE(failed, 0)::bigint AS failed,
+                cost_usd::float8 AS cost_usd,
+                COALESCE(charged_microus, 0)::bigint AS charged_microus,
+                COALESCE(unpriced, 0)::bigint AS unpriced,
+                COALESCE(timed_output, 0)::bigint AS timed_output,
+                COALESCE(timed_ms, 0)::bigint AS timed_ms,
+                COALESCE(decode_ms, 0)::bigint AS decode_ms
+           FROM additive"
+    );
+    let mut query = sqlx::query_as::<_, UsageWindow>(sqlx::AssertSqlSafe(sql))
+        .bind(since)
+        .bind(until)
+        .bind(binds.kind)
+        .bind(binds.id);
+    if let SourcePlan::Split { .. } = plan {
+        query = query.bind(left_end).bind(right_start);
+    }
+    let window = query.fetch_one(pool).await?;
     Ok(window)
 }
