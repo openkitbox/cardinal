@@ -1,0 +1,17 @@
+target/
+.git/
+.gitignore
+.ox/
+.github/
+config.toml
+config.example.toml
+cardinal-gui/
+worktrees/
+tmp/
+temp/
+*.log
+*.tmp
+*.swp
+.DS_Store
+__pycache__/
+*.pyc

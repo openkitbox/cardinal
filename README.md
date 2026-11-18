@@ -79,6 +79,32 @@ A single instance still has a gap of a few seconds during a restart when new
 connections are refused. Zero-downtime restarts would need several instances
 with socket handoff, which is not implemented.
 
+## Docker（新环境一键体验）
+
+For a quick trial in a new environment, a single public image is all you need —
+PostgreSQL 18 + TimescaleDB and the Cardinal binary are all inside this one
+image:
+
+```bash
+docker run -d --name cardinal \
+  -p 8787:8787 \
+  -v cardinal-data:/data \
+  -e GATEWAY_KEY=<your-admin-key> \
+  ghcr.io/openkitbox/cardinal:latest
+```
+
+`GATEWAY_KEY` is required and the value you enter must match `[A-Za-z0-9_-]+`.
+
+Only data lives in the `cardinal-data` volume; no Compose file and no external
+database are needed. View logs with `docker logs cardinal`. Stop with
+`docker stop -t 150 cardinal` — Cardinal drains in-flight work and settles the
+ledger for up to ~140s, so the 10s default stop timeout would cut it off. If an
+admin GUI outside the container must reach `/api/*`, also pass
+`-e ADMIN_REMOTE=true`.
+
+This is for new-environment one-click trials only and does not replace the
+systemd deployment above. cloudflared is not included in the image.
+
 ## API Overview
 
 | Endpoint | Description |
