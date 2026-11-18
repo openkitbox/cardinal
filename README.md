@@ -105,6 +105,11 @@ admin GUI outside the container must reach `/api/*`, also pass
 This is for new-environment one-click trials only and does not replace the
 systemd deployment above. cloudflared is not included in the image.
 
+The image is built only when a `v*` tag is pushed (for example
+`git tag v1.0.0 && git push origin v1.0.0`) or the Docker workflow is triggered
+manually; ordinary pushes to `main` do not start a CI build. A tag build also
+updates the `latest` tag.
+
 ## API Overview
 
 | Endpoint | Description |
