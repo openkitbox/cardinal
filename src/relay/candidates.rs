@@ -208,7 +208,8 @@ pub struct Expansion {
 /// times with different models, and one entry never expands to another
 /// account. Candidates keep the entries' STORED order (the order the user
 /// arranged in the GUI); key position never reorders a route. A dangling entry
-/// (its account is gone from `keys`) is skipped silently. An inactive account
+/// (its account is gone from `keys`) is skipped silently. A paused entry is
+/// excluded as `Paused` without counting as a window skip. An inactive account
 /// or a disabled provider excludes the entry as `Disabled`, a whitelist that
 /// lacks the entry's model as `ModelNotAllowed`, and an entry whose
 /// availability rules deny `now` as `WindowSkipped`.
@@ -235,7 +236,12 @@ pub fn expand_route(
         // `fetch_key_secrets` hands inactive rows through on purpose, so a
         // route entry naming a disabled or archived account is reported here
         // instead of vanishing as a dangling entry.
-        let skip = if !provider.enabled || !key.active() {
+        let skip = if entry.paused {
+            // Paused entries keep their full candidate identity for the trace,
+            // but never dispatch and never count as a window skip. They do not
+            // rest and do not touch the weighted schedule incarnation.
+            Some(SkipReason::Paused)
+        } else if !provider.enabled || !key.active() {
             Some(SkipReason::Disabled)
         } else if !serves_model(key, &entry.model) {
             Some(SkipReason::ModelNotAllowed)

@@ -40,7 +40,8 @@
 //! - `GET/PUT /api/keys/:id/models` — a key's model list: GET re-probes the provider, PUT persists a list as the snapshot
 //! - `GET /api/routes`, `GET/PUT/DELETE /api/routes/:alias` — route = named list of (account, model) entries exposed to clients
 //!   as a model id; each entry names one account (`gateway_provider_keys` row) and the model it serves;
-//!   PUT body `{entries: [{key_id, model}], context_window?, strategy?}` (`strategy` = `ordered`|`smart`|`rotate`, absent = `ordered`;
+//!   PUT body `{entries: [{key_id, model, paused?}], context_window?, strategy?}` (`paused` default false; a paused entry stays in the route but is never dispatched;
+//!   `strategy` = `ordered`|`smart`|`rotate`, absent = `ordered`;
 //!   400 when the body is malformed, a referenced key does not exist, or a (key, model) pair repeats). PUT is a full
 //!   replace: a strategy-preserving client MUST send it back, or the save resets to `ordered`
 //! - `GET /api/rests`, `DELETE /api/rests/keys/:key_id`, `DELETE /api/rests/providers/:provider_id` — cooldowns, identity = key

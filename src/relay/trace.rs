@@ -28,6 +28,8 @@ pub struct CandidateTrace {
 pub enum SkipReason {
     /// Key disabled or archived, or provider disabled.
     Disabled,
+    /// Entry is paused by the operator: kept in config, never dispatched.
+    Paused,
     /// Entry's availability window denies this time.
     WindowSkipped,
     /// Key is resting (cooldown).

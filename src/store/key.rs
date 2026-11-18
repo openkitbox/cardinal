@@ -1866,10 +1866,20 @@ pub struct RouteEntry {
     /// rows written before rules existed; writes never emit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_window: Option<ActiveWindow>,
+    /// Operator pause: the entry stays in the route config but is never
+    /// dispatched. Availability, not identity — it does not change the
+    /// weighted schedule incarnation. Omitted on write when false so legacy
+    /// JSON stays untouched.
+    #[serde(default, skip_serializing_if = "is_not_paused")]
+    pub paused: bool,
 }
 
 fn default_route_weight() -> u16 {
     1
+}
+
+fn is_not_paused(paused: &bool) -> bool {
+    !*paused
 }
 
 impl RouteEntry {

@@ -2555,6 +2555,24 @@ pub async fn dispatch(
     dispatch_at(deps, observability, request, chrono::Local::now()).await
 }
 
+/// Detail fragment for the "no active entry" 503, from the expansion's skip
+/// counts. `None` means neither pause nor a window deny explains the empty
+/// result, so the caller falls through to the generic 404. The window-only
+/// wording is preserved verbatim; paused entries add their own count (and a
+/// combined wording when both are present).
+fn no_active_entry_detail(paused: usize, window_skipped: usize) -> Option<String> {
+    match (paused, window_skipped) {
+        (0, 0) => None,
+        (0, skipped) => Some(format!(
+            "at this time ({skipped} outside their time window)"
+        )),
+        (paused, 0) => Some(format!("({paused} paused)")),
+        (paused, skipped) => Some(format!(
+            "({paused} paused, {skipped} outside their time window)"
+        )),
+    }
+}
+
 /// Test affordance: dispatch with an explicit local time so route active
 /// windows (time-of-day AND weekday) can be exercised deterministically.
 /// Production calls use [`dispatch`], which reads the clock once per request.
@@ -2783,14 +2801,17 @@ pub async fn dispatch_at(
         if let Some((state, generation)) = &weighted {
             state.order(*generation, Vec::new());
         }
-        // All entries filtered by their time window is a temporary state, not a
-        // missing route — say so plainly instead of the generic 404.
-        if window_skipped > 0 {
+        let paused = excluded
+            .iter()
+            .filter(|(_, reason)| matches!(reason, trace::SkipReason::Paused))
+            .count();
+        // Paused entries and entries denied by their time window are a
+        // temporary state, not a missing route — say so plainly instead of the
+        // generic 404.
+        if let Some(detail) = no_active_entry_detail(paused, window_skipped) {
             return DispatchOutcome::Failed {
                 status: 503,
-                message: format!(
-                    "route {model} has no active entry at this time ({window_skipped} outside their time window)"
-                ),
+                message: format!("route {model} has no active entry {detail}"),
                 retry_after_secs: None,
             };
         }

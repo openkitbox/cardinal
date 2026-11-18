@@ -161,13 +161,19 @@ pub fn gemini_model_object(route: &RouteRow, keys: &[KeyModels]) -> Value {
 /// entry with a key fails to resolve, or when no entry contributed a member.
 /// Empty routes are a real state (key deletion cascades entries out, the
 /// emptied route keeps its alias so it can be re-pointed) and resolve to no
-/// attributes.
+/// attributes. Paused entries are skipped exactly as dispatch skips them, so
+/// they cannot lower a derived context window or narrow derived efforts.
 fn resolve_members<'a>(route: &RouteRow, keys: &'a [KeyModels]) -> Option<Vec<&'a ProbeModel>> {
     if route.entries.is_empty() {
         return None;
     }
     let mut members: Vec<&'a ProbeModel> = Vec::new();
     for entry in &route.entries {
+        if entry.paused {
+            // Kept in the route config but never dispatched; it must not
+            // contribute derived attributes either.
+            continue;
+        }
         let Some(key) = keys.iter().find(|key| key.id == entry.key_id) else {
             // Dangling entry, or an account that is disabled/archived: the
             // cache's key-model snapshot (`servable_key_models`) drops it, so it
