@@ -38,6 +38,7 @@
 //! - `PUT /api/keys/order` `{ids: [..]}` — assign global positions sequentially in array order (one transaction)
 //! - `POST /api/keys/validate` `{name, protocol, base_url, auth_scheme?, enabled?, api_key}` — probe a not-yet-saved credential
 //! - `GET/PUT /api/keys/:id/models` — a key's model list: GET re-probes the provider, PUT persists a list as the snapshot
+//! - `GET /api/keys/:id/quota` — re-probe ONE account's quota (archived/disabled keys included); `null` when no reading
 //! - `GET /api/routes`, `GET/PUT/DELETE /api/routes/:alias` — route = named list of (account, model) entries exposed to clients
 //!   as a model id; each entry names one account (`gateway_provider_keys` row) and the model it serves;
 //!   PUT body `{entries: [{key_id, model, paused?}], context_window?, strategy?}` (`paused` default false; a paused entry stays in the route but is never dispatched;
@@ -1123,6 +1124,31 @@ async fn quotas(depot: &mut Depot, response: &mut Response) {
     json_response(response, &json!({ "items": admin(depot).quotas().await }));
 }
 
+/// `GET /api/keys/{id}/quota`: re-probe one key's vendor quota, persist that
+/// key's reading and update only its Smart-cache entry. 404 = no such key;
+/// `null` = a decorative probe with no reading (no credential, unwired token
+/// manager, or no vendor data); 500 = store failure. Unlike [`quotas`], this
+/// works for archived and disabled keys too.
+#[handler]
+async fn key_quota(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("bad id");
+        return;
+    };
+    match admin(depot).refresh_key_quota(id).await {
+        Ok(quota) => json_response(response, &quota),
+        Err(error)
+            if error
+                .downcast_ref::<crate::admin_ops::NoSuchKey>()
+                .is_some() =>
+        {
+            not_found(response, "key")
+        }
+        Err(error) => internal(response, error),
+    }
+}
+
 /// The stored quota snapshots (pure read, no vendor probing).
 #[handler]
 async fn quota_snapshots(depot: &mut Depot, response: &mut Response) {
@@ -1982,6 +2008,7 @@ pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Route
                 .get(list_key_models)
                 .put(save_key_models),
         )
+        .push(Router::with_path("keys/{id}/quota").get(key_quota))
         .push(Router::with_path("chat-models").get(chat_models))
         .push(Router::with_path("concurrency").get(concurrency_usage))
         .push(Router::with_path("quotas").get(quotas))

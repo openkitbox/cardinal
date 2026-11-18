@@ -741,6 +741,13 @@ impl GatewayHttpClient {
         items(self.get("/api/quotas")).await
     }
 
+    /// Re-probe one account's quota (archived and disabled keys included).
+    /// `Ok(None)` means the probe produced no reading; the stored snapshot is
+    /// left untouched in that case.
+    pub async fn key_quota(&self, key_id: i64) -> Result<Option<KeyQuotaRow>, ClientError> {
+        json(self.get(&format!("/api/keys/{key_id}/quota"))).await
+    }
+
     /// Stored quota snapshots (pure read, no vendor probing).
     pub async fn quota_snapshots(&self) -> Result<Vec<KeyQuotaSnapshotRow>, ClientError> {
         items(self.get("/api/quota-snapshots")).await

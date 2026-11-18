@@ -587,33 +587,220 @@ pub struct QuotaProbeTokens {
     pub workbuddy: Option<Arc<crate::upstream::WorkbuddyTokens>>,
 }
 
+/// Which credential a key's probe uses.
+enum QuotaSource {
+    /// The row's own api_key, at its provider's vendor endpoint.
+    Static(String),
+    /// The shared Kiro token manager, at the credential's region host.
+    Kiro(Arc<crate::upstream::KiroTokens>),
+    /// The shared OpenCode token manager: the account's bearer, with the
+    /// workspace header an organization-scoped login requires.
+    Opencode(Arc<crate::upstream::OpencodeTokens>),
+    /// The shared Cursor bearer cache, at the Cursor dashboard.
+    Cursor(Arc<crate::upstream::CursorTokens>),
+    /// The shared OpenAI token manager: the account's bearer, at the
+    /// ChatGPT usage endpoint.
+    Openai(Arc<crate::upstream::OpenaiTokens>),
+    /// The shared WorkBuddy token manager: the account's bearer, uid and
+    /// domain, at the vendor's billing meter host.
+    Workbuddy {
+        tokens: Arc<crate::upstream::WorkbuddyTokens>,
+        build: Build,
+    },
+}
+
+/// The decision is shared by the full fan-out and the single-key refresh:
+/// `SkipKey` is that loop's `continue`, `SkipProvider` its `break` (a missing
+/// shared manager makes every remaining key of the provider unprobed).
+enum QuotaSourceDecision {
+    Source(QuotaSource),
+    SkipKey,
+    SkipProvider,
+}
+
+/// Decide which credential a key's probe uses. Kiro's and Cursor's sources are
+/// decided by the provider's protocol and WorkBuddy's by its name plus
+/// auth_kind, never by the presence of an api_key (an account row carries
+/// none). Every other provider keeps the credential-or-nothing rule.
+fn quota_source(
+    key: &mut store::ProviderKeyRow,
+    provider: &store::ProviderRow,
+    tokens: &QuotaProbeTokens,
+) -> QuotaSourceDecision {
+    if crate::relay::capabilities::workbuddy::is_workbuddy(&provider.name) {
+        // WorkBuddy credits live on its billing meter, which needs the
+        // account's uid/domain: static keys cannot be read, so skip
+        // them quietly (quota is decorative).
+        if key.auth_kind != AuthKind::WorkbuddyOauth.as_str() {
+            return QuotaSourceDecision::SkipKey;
+        }
+        let Some(tokens) = tokens.workbuddy.as_ref() else {
+            tracing::warn!(provider = %provider.name, "quota probe: no WorkBuddy token manager wired; skipping its keys");
+            return QuotaSourceDecision::SkipProvider;
+        };
+        // `is_workbuddy` is exactly `Build::of(...).is_some()`.
+        let Some(build) = Build::of(&provider.name) else {
+            return QuotaSourceDecision::SkipKey;
+        };
+        QuotaSourceDecision::Source(QuotaSource::Workbuddy {
+            tokens: Arc::clone(tokens),
+            build,
+        })
+    } else if provider.protocol == "cursor" {
+        // Same rule as Kiro: the bearer must come from the one live
+        // manager, or a second cache would race dispatch's refreshes.
+        let Some(tokens) = tokens.cursor.as_ref() else {
+            tracing::warn!(provider = %provider.name, "quota probe: no Cursor token manager wired; skipping its keys");
+            return QuotaSourceDecision::SkipProvider;
+        };
+        QuotaSourceDecision::Source(QuotaSource::Cursor(Arc::clone(tokens)))
+    } else if provider.protocol == "kiro" {
+        let Some(tokens) = tokens.kiro.as_ref() else {
+            // Without the live manager there is no bearer to reuse, and
+            // minting a second cache would race dispatch's refreshes.
+            // Kiro quotas stay unprobed (decorative, and the GUI's last
+            // snapshot remains) instead of spending vendor traffic.
+            tracing::warn!(provider = %provider.name, "quota probe: no Kiro token manager wired; skipping its keys");
+            return QuotaSourceDecision::SkipProvider;
+        };
+        QuotaSourceDecision::Source(QuotaSource::Kiro(Arc::clone(tokens)))
+    } else if key.auth_kind == AuthKind::OpencodeOauth.as_str() {
+        // Same rule for an OpenCode account row: no api_key by
+        // construction, and minting a second token cache would race
+        // dispatch's refreshes (which would lock the account out, since
+        // the console rotates the refresh token).
+        let Some(tokens) = tokens.opencode.as_ref() else {
+            tracing::warn!(provider = %provider.name, "quota probe: no OpenCode token manager wired; skipping its keys");
+            return QuotaSourceDecision::SkipProvider;
+        };
+        QuotaSourceDecision::Source(QuotaSource::Opencode(Arc::clone(tokens)))
+    } else if key.auth_kind == AuthKind::OpenaiOauth.as_str() {
+        // Same rule for an OpenAI account row: no api_key, and the
+        // refresh token rotates, so only the shared manager may refresh.
+        let Some(tokens) = tokens.openai.as_ref() else {
+            tracing::warn!(provider = %provider.name, "quota probe: no OpenAI token manager wired; skipping its keys");
+            return QuotaSourceDecision::SkipProvider;
+        };
+        QuotaSourceDecision::Source(QuotaSource::Openai(Arc::clone(tokens)))
+    } else {
+        match key.api_key.take() {
+            Some(api_key) => QuotaSourceDecision::Source(QuotaSource::Static(api_key)),
+            None => QuotaSourceDecision::SkipKey, // no credential — nothing to probe
+        }
+    }
+}
+
+/// One key's vendor read, with the vendor's own instant taken before any DB
+/// work. All token-manager and proxy rules stay in this single probe body so
+/// the full fan-out and the single-key refresh cannot drift apart.
+async fn probe_key_reading(
+    pool: &PgPool,
+    transport: &crate::upstream::transport::Transport,
+    key: &store::ProviderKeyRow,
+    provider: &store::ProviderRow,
+    source: QuotaSource,
+    anchor: Option<u32>,
+    proxy: Option<&crate::upstream::ProxySpec>,
+) -> (i64, chrono::DateTime<chrono::Utc>, Option<KeyQuota>) {
+    let key_id = key.id;
+    let provider_dns = provider.dns;
+    let mut quota = match &source {
+        QuotaSource::Kiro(tokens) => {
+            quota::fetch_kiro_quota(pool, tokens, key, provider_dns, proxy).await
+        }
+        QuotaSource::Cursor(tokens) => {
+            quota::fetch_cursor_quota(pool, tokens, key, provider_dns, proxy).await
+        }
+        QuotaSource::Opencode(tokens) => match tokens.resolve(pool, key_id, proxy).await {
+            Ok(bundle) => {
+                quota::fetch_quota(
+                    &provider.name,
+                    &provider.base_url,
+                    &bundle.access_token,
+                    bundle.org_id.as_deref(),
+                    provider_dns,
+                    transport,
+                    proxy,
+                )
+                .await
+            }
+            Err(error) => {
+                // Quota is decorative: a credential-plane failure
+                // only costs this round's reading.
+                tracing::warn!(key_id, error = %error, "quota probe: OpenCode bearer unavailable");
+                None
+            }
+        },
+        QuotaSource::Openai(tokens) => match tokens.resolve(pool, key_id, proxy).await {
+            Ok(bearer) => {
+                quota::fetch_openai_codex_quota(&bearer, key_id, transport, provider_dns, proxy)
+                    .await
+            }
+            Err(error) => {
+                tracing::warn!(key_id, error = %error, "quota probe: OpenAI bearer unavailable");
+                None
+            }
+        },
+        QuotaSource::Workbuddy { tokens, build } => {
+            quota::fetch_workbuddy_quota(pool, tokens, key, *build, provider_dns, transport).await
+        }
+        QuotaSource::Static(api_key) => {
+            quota::fetch_quota(
+                &provider.name,
+                &provider.base_url,
+                api_key,
+                None,
+                provider_dns,
+                transport,
+                proxy,
+            )
+            .await
+        }
+    };
+    // The vendor read's own instant, taken before any DB work: the
+    // balance history orders readings by it, so a probe that
+    // finishes late cannot overwrite a newer one.
+    let probed_at = chrono::Utc::now();
+    if let (Some(day), Some(quota)) = (anchor, quota.as_mut()) {
+        quota::apply_monthly_anchor(quota, day, probed_at);
+    }
+    (key_id, probed_at, quota)
+}
+
+/// Persist the three decorative series of one successful reading. A store
+/// failure never loses the reading itself (the response and Smart cache carry
+/// it), so every failure is only logged. The table-wide history prune stays
+/// in [`probe_all_quotas`], once per round.
+async fn persist_quota_reading(
+    pool: &PgPool,
+    key_id: i64,
+    probed_at: chrono::DateTime<chrono::Utc>,
+    quota: &KeyQuota,
+) {
+    if let Err(error) = store::quota_snapshot_upsert(pool, key_id, quota, probed_at).await {
+        tracing::warn!(key_id, error = %format!("{error:#}"), "quota snapshot upsert failed");
+    }
+    // The trend chart's series: one row per window, in one statement
+    // per probe. A failure never loses the reading itself (the
+    // snapshot above and the in-memory cache below still carry it).
+    if let Err(error) = store::quota_history_insert(pool, key_id, quota).await {
+        tracing::warn!(key_id, error = %format!("{error:#}"), "quota history insert failed");
+    }
+    // The balance chart's series: written only when the amount
+    // changed. A failure never loses the reading itself.
+    if let Some(balance) = &quota.balance
+        && let Err(error) = store::balance_history_record(pool, key_id, balance, probed_at).await
+    {
+        tracing::warn!(key_id, error = %format!("{error:#}"), "balance history record failed");
+    }
+}
+
 pub async fn probe_all_quotas(
     pool: &PgPool,
     smart_cache: Option<&crate::relay::SmartCache>,
     transport: &crate::upstream::transport::Transport,
     tokens: &QuotaProbeTokens,
 ) -> Vec<KeyQuotaRow> {
-    /// Which credential a key's probe uses.
-    enum QuotaSource {
-        /// The row's own api_key, at its provider's vendor endpoint.
-        Static(String),
-        /// The shared Kiro token manager, at the credential's region host.
-        Kiro(Arc<crate::upstream::KiroTokens>),
-        /// The shared OpenCode token manager: the account's bearer, with the
-        /// workspace header an organization-scoped login requires.
-        Opencode(Arc<crate::upstream::OpencodeTokens>),
-        /// The shared Cursor bearer cache, at the Cursor dashboard.
-        Cursor(Arc<crate::upstream::CursorTokens>),
-        /// The shared OpenAI token manager: the account's bearer, at the
-        /// ChatGPT usage endpoint.
-        Openai(Arc<crate::upstream::OpenaiTokens>),
-        /// The shared WorkBuddy token manager: the account's bearer, uid and
-        /// domain, at the vendor's billing meter host.
-        Workbuddy {
-            tokens: Arc<crate::upstream::WorkbuddyTokens>,
-            build: Build,
-        },
-    }
     let providers = match store::list_providers(pool).await {
         Ok(providers) => providers,
         Err(error) => {
@@ -642,76 +829,13 @@ pub async fn probe_all_quotas(
         // a disabled or archived key never costs a vendor call.
         let keys: Vec<_> = keys.into_iter().filter(|key| key.active()).collect();
         for mut key in keys {
-            let key_id = key.id;
-            // Kiro's and Cursor's quota sources are decided by the provider's
-            // protocol and WorkBuddy's by its name plus auth_kind, never by the
-            // presence of an api_key (an account row carries none). Every other
-            // provider keeps the credential-or-nothing rule.
-            let source = if crate::relay::capabilities::workbuddy::is_workbuddy(&provider.name) {
-                // WorkBuddy credits live on its billing meter, which needs the
-                // account's uid/domain: static keys cannot be read, so skip
-                // them quietly (quota is decorative).
-                if key.auth_kind != AuthKind::WorkbuddyOauth.as_str() {
-                    continue;
-                }
-                let Some(tokens) = tokens.workbuddy.as_ref() else {
-                    tracing::warn!(provider = %provider.name, "quota probe: no WorkBuddy token manager wired; skipping its keys");
-                    break;
-                };
-                // `is_workbuddy` is exactly `Build::of(...).is_some()`.
-                let Some(build) = Build::of(&provider.name) else {
-                    continue;
-                };
-                QuotaSource::Workbuddy {
-                    tokens: Arc::clone(tokens),
-                    build,
-                }
-            } else if provider.protocol == "cursor" {
-                // Same rule as Kiro: the bearer must come from the one live
-                // manager, or a second cache would race dispatch's refreshes.
-                let Some(tokens) = tokens.cursor.as_ref() else {
-                    tracing::warn!(provider = %provider.name, "quota probe: no Cursor token manager wired; skipping its keys");
-                    break;
-                };
-                QuotaSource::Cursor(Arc::clone(tokens))
-            } else if provider.protocol == "kiro" {
-                let Some(tokens) = tokens.kiro.as_ref() else {
-                    // Without the live manager there is no bearer to reuse, and
-                    // minting a second cache would race dispatch's refreshes.
-                    // Kiro quotas stay unprobed (decorative, and the GUI's last
-                    // snapshot remains) instead of spending vendor traffic.
-                    tracing::warn!(provider = %provider.name, "quota probe: no Kiro token manager wired; skipping its keys");
-                    break;
-                };
-                QuotaSource::Kiro(Arc::clone(tokens))
-            } else if key.auth_kind == AuthKind::OpencodeOauth.as_str() {
-                // Same rule for an OpenCode account row: no api_key by
-                // construction, and minting a second token cache would race
-                // dispatch's refreshes (which would lock the account out, since
-                // the console rotates the refresh token).
-                let Some(tokens) = tokens.opencode.as_ref() else {
-                    tracing::warn!(provider = %provider.name, "quota probe: no OpenCode token manager wired; skipping its keys");
-                    break;
-                };
-                QuotaSource::Opencode(Arc::clone(tokens))
-            } else if key.auth_kind == AuthKind::OpenaiOauth.as_str() {
-                // Same rule for an OpenAI account row: no api_key, and the
-                // refresh token rotates, so only the shared manager may refresh.
-                let Some(tokens) = tokens.openai.as_ref() else {
-                    tracing::warn!(provider = %provider.name, "quota probe: no OpenAI token manager wired; skipping its keys");
-                    break;
-                };
-                QuotaSource::Openai(Arc::clone(tokens))
-            } else {
-                match key.api_key.take() {
-                    Some(api_key) => QuotaSource::Static(api_key),
-                    None => continue, // no credential — nothing to probe
-                }
+            let source = match quota_source(&mut key, provider, tokens) {
+                QuotaSourceDecision::Source(source) => source,
+                QuotaSourceDecision::SkipKey => continue,
+                QuotaSourceDecision::SkipProvider => break,
             };
-            let provider_name = provider.name.clone();
-            let base_url = provider.base_url.clone();
-            let provider_dns = provider.dns;
-            let anchor = anchors.get(&key_id).copied();
+            let provider = provider.clone();
+            let anchor = anchors.get(&key.id).copied();
             // Parse the account proxy once at the probe boundary; every send
             // for this key (credential + vendor call) reuses it.
             let key_proxy =
@@ -719,54 +843,16 @@ pub async fn probe_all_quotas(
             let pool = pool.clone();
             let transport = transport.clone();
             tasks.spawn(async move {
-                let proxy = key_proxy.as_ref();
-                let mut quota = match &source {
-                    QuotaSource::Kiro(tokens) => quota::fetch_kiro_quota(&pool, tokens, &key, provider_dns, proxy).await,
-                    QuotaSource::Cursor(tokens) => {
-                        quota::fetch_cursor_quota(&pool, tokens, &key, provider_dns, proxy).await
-                    }
-                    QuotaSource::Opencode(tokens) => match tokens.resolve(&pool, key_id, proxy).await {
-                        Ok(bundle) => {
-                            quota::fetch_quota(
-                                &provider_name,
-                                &base_url,
-                                &bundle.access_token,
-                                bundle.org_id.as_deref(),
-                                provider_dns,
-                                &transport,
-                                proxy,
-                            )
-                            .await
-                        }
-                        Err(error) => {
-                            // Quota is decorative: a credential-plane failure
-                            // only costs this round's reading.
-                            tracing::warn!(key_id, error = %error, "quota probe: OpenCode bearer unavailable");
-                            None
-                        }
-                    },
-                    QuotaSource::Openai(tokens) => match tokens.resolve(&pool, key_id, proxy).await {
-                        Ok(bearer) => quota::fetch_openai_codex_quota(&bearer, key_id, &transport, provider_dns, proxy).await,
-                        Err(error) => {
-                            tracing::warn!(key_id, error = %error, "quota probe: OpenAI bearer unavailable");
-                            None
-                        }
-                    },
-                    QuotaSource::Workbuddy { tokens, build } => {
-                        quota::fetch_workbuddy_quota(&pool, tokens, &key, *build, provider_dns, &transport).await
-                    }
-                    QuotaSource::Static(api_key) => {
-                        quota::fetch_quota(&provider_name, &base_url, api_key, None, provider_dns, &transport, proxy).await
-                    }
-                };
-                // The vendor read's own instant, taken before any DB work: the
-                // balance history orders readings by it, so a probe that
-                // finishes late cannot overwrite a newer one.
-                let probed_at = chrono::Utc::now();
-                if let (Some(day), Some(quota)) = (anchor, quota.as_mut()) {
-                    quota::apply_monthly_anchor(quota, day, probed_at);
-                }
-                (key_id, probed_at, quota)
+                probe_key_reading(
+                    &pool,
+                    &transport,
+                    &key,
+                    &provider,
+                    source,
+                    anchor,
+                    key_proxy.as_ref(),
+                )
+                .await
             });
         }
     }
@@ -774,27 +860,7 @@ pub async fn probe_all_quotas(
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((key_id, probed_at, Some(quota))) => {
-                // Persist the snapshot for the GUI's instant first paint; a store
-                // failure must not lose the reading itself (quota is decorative).
-                if let Err(error) =
-                    store::quota_snapshot_upsert(pool, key_id, &quota, probed_at).await
-                {
-                    tracing::warn!(key_id, error = %format!("{error:#}"), "quota snapshot upsert failed");
-                }
-                // The trend chart's series: one row per window, in one statement
-                // per probe. A failure never loses the reading itself (the
-                // snapshot above and the in-memory cache below still carry it).
-                if let Err(error) = store::quota_history_insert(pool, key_id, &quota).await {
-                    tracing::warn!(key_id, error = %format!("{error:#}"), "quota history insert failed");
-                }
-                // The balance chart's series: written only when the amount
-                // changed. A failure never loses the reading itself.
-                if let Some(balance) = &quota.balance
-                    && let Err(error) =
-                        store::balance_history_record(pool, key_id, balance, probed_at).await
-                {
-                    tracing::warn!(key_id, error = %format!("{error:#}"), "balance history record failed");
-                }
+                persist_quota_reading(pool, key_id, probed_at, &quota).await;
                 quotas.push(KeyQuotaRow { key_id, quota });
             }
             Ok((key_id, _, None)) => tracing::debug!(key_id, "quota probe: no reading"),
@@ -1240,6 +1306,69 @@ impl Admin {
             self.activity.quota_refreshed();
         }
         rows
+    }
+
+    /// Probe one key's vendor quota on demand and persist the same snapshot,
+    /// history and balance artifacts as a full round — for this key only.
+    /// Returns `None` when no reading could be taken (no credential, unwired
+    /// token manager, or a vendor with no data): quota is decorative, so this
+    /// is a normal, read-only-looking answer rather than an error.
+    ///
+    /// Unlike [`Self::quotas`] and [`probe_all_quotas`], this deliberately does
+    /// NOT check `key.active()` or `provider.enabled`. Archived and disabled
+    /// accounts remain refreshable from their cards even though the full
+    /// fan-out never probes them; the decision helpers are otherwise the same
+    /// ones the fan-out uses. Only this key's Smart-cache entry changes, but
+    /// the bootstrap snapshot and the activity event are refreshed so other
+    /// clients converge on the persisted reading. The table-wide history
+    /// prune stays with the full round.
+    pub async fn refresh_key_quota(&self, key_id: i64) -> anyhow::Result<Option<KeyQuotaRow>> {
+        let keys = store::list_keys_by_ids(&self.pool, &[key_id]).await?;
+        let Some(mut key) = keys.into_iter().next() else {
+            return Err(NoSuchKey(key_id).into());
+        };
+        let Some(provider) = store::get_provider(&self.pool, key.provider_id).await? else {
+            anyhow::bail!("key {key_id} 的 provider {} 不存在", key.provider_id)
+        };
+        let tokens = QuotaProbeTokens {
+            kiro: self.kiro_tokens.clone(),
+            opencode: self.opencode_tokens.clone(),
+            cursor: self.cursor_tokens.clone(),
+            openai: self.openai_tokens.clone(),
+            workbuddy: self.workbuddy_tokens.clone(),
+        };
+        let source = match quota_source(&mut key, &provider, &tokens) {
+            QuotaSourceDecision::Source(source) => source,
+            QuotaSourceDecision::SkipKey | QuotaSourceDecision::SkipProvider => return Ok(None),
+        };
+        let anchor = store::list_quota_reset_anchors(&self.pool)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %format!("{error:#}"), "quota probe: reset anchors unavailable");
+                std::collections::HashMap::new()
+            })
+            .get(&key_id)
+            .copied();
+        let key_proxy = crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
+        let (key_id, probed_at, quota) = probe_key_reading(
+            &self.pool,
+            &self.transport,
+            &key,
+            &provider,
+            source,
+            anchor,
+            key_proxy.as_ref(),
+        )
+        .await;
+        if let Some(quota) = &quota {
+            persist_quota_reading(&self.pool, key_id, probed_at, quota).await;
+        } else {
+            tracing::debug!(key_id, "single-key quota probe: no reading");
+        }
+        self.smart_cache.refresh_one(key_id, quota.clone());
+        self.invalidate_snapshot().await;
+        self.activity.quota_refreshed();
+        Ok(quota.map(|quota| KeyQuotaRow { key_id, quota }))
     }
 
     /// Stored quota snapshots (key id, last reading, probe time) for the GUI's
@@ -4374,5 +4503,90 @@ mod codex_reset_contract_tests {
                 expected
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod quota_source_tests {
+    use super::{QuotaProbeTokens, QuotaSource, QuotaSourceDecision, quota_source};
+    use crate::credentials::AuthKind;
+    use crate::store::{ProviderKeyRow, ProviderRow};
+
+    fn provider(name: &str, protocol: &str) -> ProviderRow {
+        ProviderRow {
+            id: 7,
+            name: name.to_owned(),
+            protocol: protocol.to_owned(),
+            base_url: "https://example.test".to_owned(),
+            auth_scheme: "bearer".to_owned(),
+            enabled: true,
+            dns: Default::default(),
+        }
+    }
+
+    fn key(auth_kind: AuthKind, api_key: Option<&str>) -> ProviderKeyRow {
+        ProviderKeyRow {
+            id: 42,
+            provider_id: 7,
+            label: "account".to_owned(),
+            api_key: api_key.map(str::to_owned),
+            enabled: true,
+            position: 0,
+            max_concurrency: None,
+            rest_on_429: true,
+            models: None,
+            allowed_models: None,
+            auth_kind: auth_kind.as_str().to_owned(),
+            oauth: None,
+            archived_at: None,
+            proxy_url: None,
+        }
+    }
+
+    fn tokens() -> QuotaProbeTokens {
+        QuotaProbeTokens {
+            kiro: None,
+            opencode: None,
+            cursor: None,
+            openai: None,
+            workbuddy: None,
+        }
+    }
+
+    #[test]
+    fn static_key_uses_its_own_credential() {
+        let mut row = key(AuthKind::Static, Some("secret"));
+
+        let decision = quota_source(&mut row, &provider("generic", "openai"), &tokens());
+
+        assert!(
+            matches!(decision, QuotaSourceDecision::Source(QuotaSource::Static(credential)) if credential == "secret"),
+            "static key must probe with its own api_key"
+        );
+        assert!(row.api_key.is_none(), "credential is moved into the source");
+    }
+
+    #[test]
+    fn credentialless_static_key_is_skipped() {
+        let mut row = key(AuthKind::Static, None);
+
+        let decision = quota_source(&mut row, &provider("generic", "openai"), &tokens());
+
+        assert!(
+            matches!(decision, QuotaSourceDecision::SkipKey),
+            "no credential means no vendor call"
+        );
+    }
+
+    #[test]
+    fn missing_token_manager_skips_the_rest_of_the_provider() {
+        let mut row = key(AuthKind::KiroOidc, None);
+
+        let decision = quota_source(&mut row, &provider("kiro", "kiro"), &tokens());
+
+        assert!(
+            matches!(decision, QuotaSourceDecision::SkipProvider),
+            "an unwired shared manager must skip every key of this provider"
+        );
     }
 }
