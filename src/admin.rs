@@ -829,6 +829,9 @@ struct GatewayKeyCreateBody {
     /// Cumulative cap as a decimal USD string; absent/null = unlimited.
     #[serde(default)]
     quota_usd: Option<String>,
+    /// Absent/null = inherit the owner's user visibility; array = whitelist.
+    #[serde(default)]
+    route_aliases: Option<Vec<String>>,
 }
 
 /// `POST /api/gateway-keys`: create a new gateway key and return its
@@ -849,6 +852,7 @@ async fn create_gateway_key(request: &mut Request, depot: &mut Depot, response: 
         &body.label,
         body.expires_at,
         body.quota_usd.as_deref(),
+        body.route_aliases.as_deref(),
         chrono::Utc::now(),
     );
     let (label, terms) = match terms {
@@ -912,7 +916,7 @@ async fn patch_gateway_key(request: &mut Request, depot: &mut Depot, response: &
         json_response(response, &json!({ "error": "missing id" }));
         return;
     };
-    let body: key_terms::PatchBody = match request.parse_json().await {
+    let body: key_terms::AdminPatchBody = match request.parse_json().await {
         Ok(body) => body,
         Err(_) => {
             response.status_code(StatusCode::BAD_REQUEST);
@@ -920,7 +924,7 @@ async fn patch_gateway_key(request: &mut Request, depot: &mut Depot, response: &
             return;
         }
     };
-    let patch = match key_terms::patch(&body, chrono::Utc::now()) {
+    let patch = match key_terms::admin_patch(&body, chrono::Utc::now()) {
         Ok(patch) => patch,
         Err(message) => {
             json_error(response, StatusCode::BAD_REQUEST, message);
@@ -1316,6 +1320,9 @@ struct UserCreateBody {
     rate_bp: Option<i64>,
     #[serde(default)]
     max_concurrent: Option<i32>,
+    /// Absent/null = inherit the group visibility; array = whitelist.
+    #[serde(default)]
+    route_aliases: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1332,6 +1339,10 @@ struct UserPatchBody {
     rate_bp: Option<Option<i64>>,
     #[serde(default)]
     max_concurrent: Option<i32>,
+    /// Three-state: absent = untouched, null = inherit the group, array =
+    /// whitelist.
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
+    route_aliases: Option<Option<Vec<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -1441,6 +1452,7 @@ async fn create_user(request: &mut Request, depot: &mut Depot, response: &mut Re
         group_id,
         rate_bp: body.rate_bp,
         max_concurrent: body.max_concurrent,
+        route_aliases: body.route_aliases.as_deref().map(Some),
     };
     match store::create_user(pool, user).await {
         Ok(id) => {
@@ -1491,6 +1503,10 @@ async fn patch_user(request: &mut Request, depot: &mut Depot, response: &mut Res
         group_id: body.group_id,
         rate_bp: body.rate_bp,
         max_concurrent: body.max_concurrent,
+        route_aliases: body
+            .route_aliases
+            .as_ref()
+            .map(|aliases| aliases.as_deref()),
     };
     match store::patch_user(pool, id, patch).await {
         Ok(true) => {

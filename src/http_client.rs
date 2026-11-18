@@ -195,6 +195,8 @@ pub struct UserCreate<'a> {
     pub rate_bp: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_aliases: Option<&'a [String]>,
 }
 
 /// `PATCH /api/users/{id}` body: `None` leaves a field untouched.
@@ -212,6 +214,9 @@ pub struct UserUpdate<'a> {
     pub rate_bp: Option<Option<i64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<i32>,
+    /// Three-state: absent = untouched, null = inherit the group, array = whitelist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_aliases: Option<Option<&'a [String]>>,
 }
 
 /// `POST /api/user-groups` body. `rate_bp` `None` = 1.0×; `route_aliases`
@@ -251,6 +256,9 @@ pub struct GatewayKeyUpdate<'a> {
     pub expires_at: Option<Option<DateTime<Utc>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_usd: Option<Option<&'a str>>,
+    /// Three-state: absent = untouched, null = inherit the user, array = whitelist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_aliases: Option<Option<&'a [String]>>,
 }
 
 /// The answer of `POST /api/users/{id}/topup` and `/adjust`: the written
@@ -976,6 +984,7 @@ impl GatewayHttpClient {
         label: &str,
         expires_at: Option<DateTime<Utc>>,
         quota_usd: Option<&str>,
+        route_aliases: Option<&[String]>,
     ) -> Result<String, ClientError> {
         #[derive(serde::Serialize)]
         struct KeyCreateBody<'a> {
@@ -986,12 +995,15 @@ impl GatewayHttpClient {
             expires_at: Option<DateTime<Utc>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             quota_usd: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            route_aliases: Option<&'a [String]>,
         }
         let body = KeyCreateBody {
             label,
             user_id,
             expires_at,
             quota_usd,
+            route_aliases,
         };
         let response: GatewayKeyCreateResponse =
             json(self.post("/api/gateway-keys").json(&body)).await?;

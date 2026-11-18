@@ -97,6 +97,7 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         &body.label,
         body.expires_at,
         body.quota_usd.as_deref(),
+        None,
         chrono::Utc::now(),
     ) {
         Ok(valid) => valid,

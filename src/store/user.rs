@@ -40,7 +40,11 @@ pub struct Principal {
     pub balance_microus: i64,
     pub max_concurrent: i32,
     /// Route whitelist from the group; `None` means every route is visible.
-    pub route_aliases: Option<Vec<String>>,
+    pub group_route_aliases: Option<Vec<String>>,
+    /// User-level route whitelist; `None` inherits the group.
+    pub user_route_aliases: Option<Vec<String>>,
+    /// Key-level route whitelist; `None` inherits the user.
+    pub key_route_aliases: Option<Vec<String>>,
 }
 
 /// Look up the principal behind a plaintext gateway key. Returns `None` when
@@ -53,7 +57,9 @@ pub async fn authenticate_principal(pool: &PgPool, key: &str) -> anyhow::Result<
                 k.spent_microus AS key_spent_microus, u.id AS user_id, u.login,
                 u.enabled AS user_enabled, g.id AS group_id, g.rate_bp AS group_rate_bp,
                 u.rate_bp AS user_rate_bp, u.balance_microus, u.max_concurrent,
-                g.route_aliases
+                g.route_aliases AS group_route_aliases,
+                u.route_aliases AS user_route_aliases,
+                k.route_aliases AS key_route_aliases
          FROM gateway_keys k
          JOIN users u ON u.id = k.user_id
          JOIN user_groups g ON g.id = u.group_id
@@ -92,6 +98,7 @@ pub struct UserRow {
     pub max_concurrent: i32,
     pub rpm: Option<i32>,
     pub created_at: DateTime<Utc>,
+    pub route_aliases: Option<Vec<String>>,
 }
 
 /// One user group with its member count. `route_aliases` `None` means every
@@ -116,6 +123,7 @@ pub struct NewUser<'a> {
     pub group_id: i64,
     pub rate_bp: Option<i64>,
     pub max_concurrent: Option<i32>,
+    pub route_aliases: Option<Option<&'a [String]>>,
 }
 
 /// Partial user update: `None` leaves a field untouched. `rate_bp` is
@@ -128,6 +136,7 @@ pub struct UserPatch<'a> {
     pub group_id: Option<i64>,
     pub rate_bp: Option<Option<i64>>,
     pub max_concurrent: Option<i32>,
+    pub route_aliases: Option<Option<&'a [String]>>,
 }
 
 /// Partial group update: `None` leaves a field untouched. `route_aliases`
@@ -144,7 +153,8 @@ async fn select_users(pool: &PgPool, id: Option<i64>) -> sqlx::Result<Vec<UserRo
     sqlx::query_as::<_, UserRow>(
         "SELECT u.id, u.login, u.display_name, u.enabled, u.group_id,
                 g.name AS group_name, u.rate_bp, g.rate_bp AS group_rate_bp,
-                u.balance_microus, u.max_concurrent, u.rpm, u.created_at
+                u.balance_microus, u.max_concurrent, u.rpm, u.created_at,
+                u.route_aliases
          FROM users u JOIN user_groups g ON g.id = u.group_id
          WHERE $1::bigint IS NULL OR u.id = $1
          ORDER BY u.id",
@@ -169,8 +179,8 @@ pub async fn get_user(pool: &PgPool, id: i64) -> anyhow::Result<Option<UserRow>>
 /// violation ([`is_unknown_group`]).
 pub async fn create_user(pool: &PgPool, user: NewUser<'_>) -> anyhow::Result<i64> {
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO users (login, display_name, group_id, rate_bp, max_concurrent)
-         VALUES ($1, $2, $3, $4, COALESCE($5, 4))
+        "INSERT INTO users (login, display_name, group_id, rate_bp, max_concurrent, route_aliases)
+         VALUES ($1, $2, $3, $4, COALESCE($5, 4), $6)
          RETURNING id",
     )
     .bind(user.login)
@@ -178,6 +188,7 @@ pub async fn create_user(pool: &PgPool, user: NewUser<'_>) -> anyhow::Result<i64
     .bind(user.group_id)
     .bind(user.rate_bp)
     .bind(user.max_concurrent)
+    .bind(user.route_aliases.flatten())
     .fetch_one(pool)
     .await?;
     Ok(id)
@@ -191,7 +202,8 @@ pub async fn patch_user(pool: &PgPool, id: i64, patch: UserPatch<'_>) -> anyhow:
              enabled = COALESCE($3, enabled),
              group_id = COALESCE($4, group_id),
              rate_bp = CASE WHEN $5 THEN $6 ELSE rate_bp END,
-             max_concurrent = COALESCE($7, max_concurrent)
+             max_concurrent = COALESCE($7, max_concurrent),
+             route_aliases = CASE WHEN $8 THEN $9 ELSE route_aliases END
          WHERE id = $1",
     )
     .bind(id)
@@ -201,6 +213,8 @@ pub async fn patch_user(pool: &PgPool, id: i64, patch: UserPatch<'_>) -> anyhow:
     .bind(patch.rate_bp.is_some())
     .bind(patch.rate_bp.flatten())
     .bind(patch.max_concurrent)
+    .bind(patch.route_aliases.is_some())
+    .bind(patch.route_aliases.flatten())
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)

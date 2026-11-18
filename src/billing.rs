@@ -267,6 +267,22 @@ pub enum Deny {
     KeyQuotaExhausted,
 }
 
+/// Whether an alias is allowed by all configured visibility scopes.
+///
+/// `None` inherits the parent scope, while an array is an exact-match
+/// whitelist. Intersecting the scopes ensures a user or key can only narrow
+/// the group permission.
+#[must_use]
+pub fn route_is_allowed(principal: &Principal, alias: &str) -> bool {
+    fn scope_allows(scope: Option<&[String]>, alias: &str) -> bool {
+        scope.is_none_or(|aliases| aliases.iter().any(|candidate| candidate == alias))
+    }
+
+    scope_allows(principal.group_route_aliases.as_deref(), alias)
+        && scope_allows(principal.user_route_aliases.as_deref(), alias)
+        && scope_allows(principal.key_route_aliases.as_deref(), alias)
+}
+
 impl Deny {
     /// HTTP status for the client response.
     #[must_use]
@@ -301,9 +317,7 @@ impl Deny {
 /// listed. The key quota applies whatever the rate; free users (rate 0)
 /// skip only the balance check.
 pub fn admit(principal: &Principal, model: &str) -> Result<(), Deny> {
-    if let Some(aliases) = &principal.route_aliases
-        && !aliases.iter().any(|alias| alias == model)
-    {
+    if !route_is_allowed(principal, model) {
         return Err(Deny::RouteNotAllowed);
     }
     if principal

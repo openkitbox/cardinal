@@ -13,6 +13,14 @@ use crate::relay::{self, RelayRequest};
 use crate::store::Principal;
 use crate::upstream::transport;
 
+fn retain_allowed_routes<T>(
+    routes: &mut Vec<T>,
+    principal: &Principal,
+    alias: impl Fn(&T) -> &str,
+) {
+    routes.retain(|route| crate::billing::route_is_allowed(principal, alias(route)));
+}
+
 /// Shared in-process state.
 pub struct AppState {
     pub pool: sqlx::PgPool,
@@ -111,8 +119,12 @@ async fn health() -> &'static str {
 /// chat-shaped attribute on an embeddings id is a lie a picker would trust.
 #[handler]
 async fn list_models(depot: &mut Depot, response: &mut Response) {
+    let principal = depot
+        .remove_typed::<Principal>()
+        .expect("gateway_auth principal");
     let state = depot.get_typed::<Arc<AppState>>().expect("state");
-    let routes = state.route_cache.routes_with_kind();
+    let mut routes = state.route_cache.routes_with_kind();
+    retain_allowed_routes(&mut routes, &principal, |(route, _)| &route.alias);
     let keys = state.route_cache.all_key_models();
     let data: Vec<Value> = routes
         .iter()
@@ -518,8 +530,12 @@ async fn gemini_generate(request: &mut Request, response: &mut Response, depot: 
 /// `generateContent`, which a retrieval route cannot serve.
 #[handler]
 async fn list_gemini_models(depot: &mut Depot, response: &mut Response) {
+    let principal = depot
+        .remove_typed::<Principal>()
+        .expect("gateway_auth principal");
     let state = depot.get_typed::<Arc<AppState>>().expect("state");
-    let routes = state.route_cache.chat_routes();
+    let mut routes = state.route_cache.chat_routes();
+    retain_allowed_routes(&mut routes, &principal, |route| &route.alias);
     let keys = state.route_cache.all_key_models();
     let data: Vec<Value> = routes
         .iter()

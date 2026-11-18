@@ -62,12 +62,14 @@ pub fn create<'a>(
     label_text: &'a str,
     expires_at: Option<DateTime<Utc>>,
     quota_usd: Option<&str>,
+    route_aliases: Option<&[String]>,
     now: DateTime<Utc>,
 ) -> Result<(&'a str, KeyTerms), &'static str> {
     let label = label(label_text)?;
     let terms = KeyTerms {
         expires_at: expiry(expires_at, now)?,
         quota_microus: quota(quota_usd)?,
+        route_aliases: route_aliases.map(<[String]>::to_vec),
     };
     Ok((label, terms))
 }
@@ -89,6 +91,27 @@ pub struct PatchBody {
     pub quota_usd: Option<Option<String>>,
 }
 
+/// The JSON body of an administrator gateway-key PATCH. Unlike the
+/// self-service [`PatchBody`], administrators may change the key's route
+/// whitelist.
+#[derive(Debug, Deserialize)]
+pub struct AdminPatchBody {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Three-state: absent = untouched, null = never expires, RFC 3339 = set.
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
+    pub expires_at: Option<Option<DateTime<Utc>>>,
+    /// Three-state: absent = untouched, null = unlimited, decimal USD
+    /// string = set the cap.
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
+    pub quota_usd: Option<Option<String>>,
+    /// Three-state: absent = untouched, null = inherit, array = whitelist.
+    #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
+    pub route_aliases: Option<Option<Vec<String>>>,
+}
+
 /// Validate a key PATCH body into a store patch, or the 400 message.
 pub fn patch(body: &PatchBody, now: DateTime<Utc>) -> Result<GatewayKeyPatch<'_>, &'static str> {
     Ok(GatewayKeyPatch {
@@ -103,5 +126,30 @@ pub fn patch(body: &PatchBody, now: DateTime<Utc>) -> Result<GatewayKeyPatch<'_>
             .as_ref()
             .map(|cap| quota(cap.as_deref()))
             .transpose()?,
+        route_aliases: None,
+    })
+}
+
+/// Validate an administrator key PATCH body into a store patch.
+pub fn admin_patch(
+    body: &AdminPatchBody,
+    now: DateTime<Utc>,
+) -> Result<GatewayKeyPatch<'_>, &'static str> {
+    Ok(GatewayKeyPatch {
+        label: body.label.as_deref().map(label).transpose()?,
+        enabled: body.enabled,
+        expires_at: body
+            .expires_at
+            .map(|expires_at| expiry(expires_at, now))
+            .transpose()?,
+        quota_microus: body
+            .quota_usd
+            .as_ref()
+            .map(|cap| quota(cap.as_deref()))
+            .transpose()?,
+        route_aliases: body
+            .route_aliases
+            .as_ref()
+            .map(|aliases| aliases.as_deref()),
     })
 }

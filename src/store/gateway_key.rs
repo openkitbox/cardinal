@@ -11,7 +11,8 @@ macro_rules! key_row_columns {
          k.created_at, k.created_by,
          (SELECT max(r.ts) FROM gateway_requests r WHERE r.gateway_key_id = k.id)
              AS last_used_at,
-         k.disabled_at, k.expires_at, k.quota_microus, k.spent_microus"
+         k.disabled_at, k.expires_at, k.quota_microus, k.spent_microus,
+          k.route_aliases"
     };
 }
 
@@ -58,6 +59,7 @@ pub struct GatewayKeyRow {
     /// Micro-USD charged through this key so far (the sum of its charge
     /// entries, kept by settlement).
     pub spent_microus: i64,
+    pub route_aliases: Option<Vec<String>>,
 }
 
 /// List gateway keys, newest first: every key, or only those `user_id` owns.
@@ -79,12 +81,14 @@ pub async fn list_gateway_keys(
 }
 
 /// The terms a key is created with, already validated (`crate::key_terms`).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct KeyTerms {
     /// `None` = never expires.
     pub expires_at: Option<DateTime<Utc>>,
     /// Cumulative cap in micro-USD; `None` = unlimited.
     pub quota_microus: Option<i64>,
+    /// Route visibility: `None` inherits, an array is a whitelist.
+    pub route_aliases: Option<Vec<String>>,
 }
 
 /// A fresh key secret: `sk-` plus 50 lowercase letters and digits (no
@@ -110,8 +114,8 @@ pub async fn create_gateway_key(
     let key = new_key_secret();
     sqlx::query(
         "INSERT INTO gateway_keys
-             (key_plaintext, label, created_by, user_id, expires_at, quota_microus)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+             (key_plaintext, label, created_by, user_id, expires_at, quota_microus, route_aliases)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&key)
     .bind(label)
@@ -119,6 +123,7 @@ pub async fn create_gateway_key(
     .bind(user_id)
     .bind(terms.expires_at)
     .bind(terms.quota_microus)
+    .bind(terms.route_aliases)
     .execute(pool)
     .await?;
     Ok(key)
@@ -190,6 +195,7 @@ pub struct GatewayKeyPatch<'a> {
     pub enabled: Option<bool>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
     pub quota_microus: Option<Option<i64>>,
+    pub route_aliases: Option<Option<&'a [String]>>,
 }
 
 /// Apply a partial update to key `id`; with `owner = Some(user_id)` only a
@@ -211,7 +217,8 @@ pub async fn update_gateway_key(
                                 WHEN enabled THEN now()
                                 ELSE disabled_at END,
              expires_at = CASE WHEN $5 THEN $6 ELSE expires_at END,
-             quota_microus = CASE WHEN $7 THEN $8 ELSE quota_microus END
+             quota_microus = CASE WHEN $7 THEN $8 ELSE quota_microus END,
+             route_aliases = CASE WHEN $9 THEN $10 ELSE route_aliases END
          WHERE id = $1 AND ($2::bigint IS NULL OR user_id = $2)",
     )
     .bind(id)
@@ -222,6 +229,8 @@ pub async fn update_gateway_key(
     .bind(patch.expires_at.flatten())
     .bind(patch.quota_microus.is_some())
     .bind(patch.quota_microus.flatten())
+    .bind(patch.route_aliases.is_some())
+    .bind(patch.route_aliases.flatten())
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
