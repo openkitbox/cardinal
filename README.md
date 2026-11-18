@@ -2,6 +2,8 @@
 
 A headless LLM gateway that routes requests across multiple AI providers with failover, quota awareness, and usage metering.
 
+The companion native macOS management dashboard is available in the [Cardinal GUI](https://github.com/openkitbox/cardinal-gui) repository. It connects to a running Cardinal gateway over the HTTP API and SSE activity stream.
+
 ## Features
 
 - **Multi-provider routing** — Route requests to multiple providers (Kimi, DeepSeek, GLM, OpenAI-compatible, Anthropic, etc.) with ordered or quota-aware (smart) strategies
