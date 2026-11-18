@@ -453,6 +453,7 @@ struct CursorDeps<'a> {
 struct AttemptContext<'a> {
     transport: &'a Transport,
     capability: &'a capabilities::Capability,
+    provider_name: &'a str,
     credential: &'a crate::providers::AuthSchemeMaterial<'a>,
     unfit: &'a optional::Unfit,
     provider_id: i64,
@@ -561,6 +562,7 @@ async fn send_attempt(
     let AttemptContext {
         transport,
         capability,
+        provider_name,
         credential,
         unfit,
         provider_id,
@@ -783,7 +785,13 @@ async fn send_attempt(
                 stream,
                 fields,
                 fixups.strip_glm_images,
-                chat_dialect(workbuddy_build.is_some(), protocol),
+                chat_dialect(
+                    provider_name,
+                    target_model,
+                    passthrough_body,
+                    workbuddy_build.is_some(),
+                    protocol,
+                ),
             )
             .map(|prepared| PreparedBody {
                 prepared,
@@ -803,7 +811,13 @@ async fn send_attempt(
                     supported_efforts,
                     route_efforts,
                     dial,
-                    chat_dialect: chat_dialect(workbuddy_build.is_some(), protocol),
+                    chat_dialect: chat_dialect(
+                        provider_name,
+                        target_model,
+                        &request.body,
+                        workbuddy_build.is_some(),
+                        protocol,
+                    ),
                     kiro_profile_arn: profile_arn,
                     prompt_scope,
                     cursor_max_mode,
@@ -1507,9 +1521,17 @@ struct WireTweaks<'a> {
     cursor_max_mode: bool,
 }
 
-fn chat_dialect(workbuddy: bool, upstream: ProtocolId) -> protocol::openai_chat::ChatDialect {
+fn chat_dialect(
+    provider_name: &str,
+    target_model: &str,
+    body: &Value,
+    workbuddy: bool,
+    upstream: ProtocolId,
+) -> protocol::openai_chat::ChatDialect {
     if workbuddy && upstream == ProtocolId::OpenAiChat {
         protocol::openai_chat::ChatDialect::WORKBUDDY
+    } else if upstream == ProtocolId::OpenAiChat {
+        capabilities::openai::chat_dialect(provider_name, target_model, body)
     } else {
         protocol::openai_chat::ChatDialect::NATIVE
     }
@@ -3305,6 +3327,7 @@ pub async fn dispatch_at(
                     &AttemptContext {
                         transport,
                         capability,
+                        provider_name: &provider.name,
                         credential: &credential,
                         unfit: failover.unfit(),
                         provider_id: provider.id,

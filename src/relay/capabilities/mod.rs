@@ -26,6 +26,7 @@ mod deepseek;
 mod gemini;
 mod glm;
 mod kimi;
+pub(crate) mod openai;
 mod opencode;
 pub(crate) mod workbuddy;
 pub(crate) use workbuddy::{Build, WorkbuddyCredential, headers as workbuddy_headers};

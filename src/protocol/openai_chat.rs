@@ -27,6 +27,10 @@ pub struct ChatDialect {
     pub developer_as_system: bool,
     /// Write the client's `max_completion_tokens` as `max_tokens`.
     pub max_tokens_only: bool,
+    /// Write the client's `max_tokens` as `max_completion_tokens`.
+    pub max_completion_tokens_only: bool,
+    /// Omit sampling and logprob controls for an engaged reasoning request.
+    pub omit_reasoning_sampling: bool,
 }
 
 impl ChatDialect {
@@ -35,6 +39,8 @@ impl ChatDialect {
         system_first: false,
         developer_as_system: false,
         max_tokens_only: false,
+        max_completion_tokens_only: false,
+        omit_reasoning_sampling: false,
     };
 
     /// WorkBuddy's chat endpoint (see the module doc of `relay::capabilities::workbuddy`).
@@ -42,6 +48,8 @@ impl ChatDialect {
         system_first: true,
         developer_as_system: true,
         max_tokens_only: true,
+        max_completion_tokens_only: false,
+        omit_reasoning_sampling: false,
     };
 }
 
@@ -150,7 +158,21 @@ pub fn prepare(
         if skip.contains(&field.as_str()) {
             continue;
         }
+        if dialect.omit_reasoning_sampling
+            && matches!(
+                field.as_str(),
+                "temperature" | "top_p" | "logprobs" | "top_logprobs"
+            )
+        {
+            continue;
+        }
         if dialect.max_tokens_only
+            && field == "max_completion_tokens"
+            && object.contains_key("max_tokens")
+        {
+            continue;
+        }
+        if dialect.max_completion_tokens_only
             && field == "max_completion_tokens"
             && object.contains_key("max_tokens")
         {
@@ -162,6 +184,8 @@ pub fn prepare(
         first = false;
         let output_field = if dialect.max_tokens_only && field == "max_completion_tokens" {
             "max_tokens"
+        } else if dialect.max_completion_tokens_only && field == "max_tokens" {
+            "max_completion_tokens"
         } else {
             field
         };
