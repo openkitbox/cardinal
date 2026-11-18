@@ -693,7 +693,7 @@ impl Decoder {
     /// Cold path only: one allocation on the interruption branch, nothing on
     /// the normal stream.
     pub fn stream_error_frames(&self, message: &str) -> Vec<sse::RawFrame> {
-        let created = chrono::Utc::now().timestamp();
+        let created = jiff::Timestamp::now().as_second();
         match self {
             Self::Chat(decoder) => openai_chat::stream_error_frames(
                 decoder.upstream_id(),

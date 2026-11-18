@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use super::KeyQuota;
 use super::QuotaWindow;
@@ -58,7 +58,7 @@ fn kiro_usage_request(
         1,
         1,
         false,
-        chrono::Utc::now(),
+        Timestamp::now(),
     ));
     Some(KiroUsageCall {
         prepared: crate::protocol::Prepared {
@@ -246,7 +246,7 @@ fn amount(precision: Option<f64>, integer: Option<f64>) -> Option<f64> {
 }
 
 /// The vendor's Unix-seconds instant, as a number or a numeric string.
-fn unix_seconds(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+fn unix_seconds(value: &serde_json::Value) -> Option<Timestamp> {
     let seconds = match value {
         serde_json::Value::Number(number) => number
             .as_i64()
@@ -255,7 +255,7 @@ fn unix_seconds(value: &serde_json::Value) -> Option<DateTime<Utc>> {
         _ => return None,
     };
     (seconds > 0)
-        .then(|| DateTime::from_timestamp(seconds, 0))
+        .then(|| Timestamp::from_second(seconds).ok())
         .flatten()
 }
 
@@ -340,7 +340,7 @@ fn bonus_details(bonuses: &[Bonus]) -> Vec<String> {
                 credit_amount(limit)
             );
             if let Some(expiry) = bonus.expires_at.as_ref().and_then(unix_seconds) {
-                line.push_str(&format!(" · {} 到期", expiry.format("%Y-%m-%d")));
+                line.push_str(&format!(" · {} 到期", expiry.strftime("%Y-%m-%d")));
             }
             Some(line)
         })

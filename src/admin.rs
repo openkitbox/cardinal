@@ -625,14 +625,17 @@ async fn usage(request: &mut Request, depot: &mut Depot, response: &mut Response
 /// struct buffers every value as a string, breaking the typed i32/DateTime
 /// fields. Only the resolution logic is shared.)
 fn resolve_window(
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    until: Option<chrono::DateTime<chrono::Utc>>,
+    since: Option<jiff::Timestamp>,
+    until: Option<jiff::Timestamp>,
     days: Option<i32>,
-) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
-    let until = until.unwrap_or_else(chrono::Utc::now);
+) -> (jiff::Timestamp, jiff::Timestamp) {
+    let until = until.unwrap_or_else(jiff::Timestamp::now);
     let since = match since {
         Some(since) => since,
-        None => until - chrono::Duration::days(i64::from(days.unwrap_or(7).clamp(1, 365))),
+        None => {
+            until
+                - jiff::SignedDuration::from_hours(24 * i64::from(days.unwrap_or(7).clamp(1, 365)))
+        }
     };
     (since, until)
 }
@@ -646,9 +649,9 @@ fn resolve_window(
 #[derive(Deserialize)]
 struct TrendQuery {
     #[serde(default)]
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    since: Option<jiff::Timestamp>,
     #[serde(default)]
-    until: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<jiff::Timestamp>,
     #[serde(default)]
     days: Option<i32>,
     #[serde(default)]
@@ -691,7 +694,7 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
         let _ = response.body("offset_seconds must be within ±14 hours");
         return;
     }
-    let offset = chrono::Duration::seconds(offset_seconds);
+    let offset = jiff::SignedDuration::from_secs(offset_seconds);
     let caller = match usage_scope(query.caller.as_deref(), query.key_id, query.user_id) {
         Ok(caller) => caller,
         Err(message) => {
@@ -733,9 +736,9 @@ fn usage_scope(
 #[derive(Deserialize)]
 struct WindowQuery {
     #[serde(default)]
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    since: Option<jiff::Timestamp>,
     #[serde(default)]
-    until: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<jiff::Timestamp>,
     #[serde(default)]
     days: Option<i32>,
     #[serde(default)]
@@ -825,7 +828,7 @@ struct GatewayKeyCreateBody {
     user_id: Option<i64>,
     /// RFC 3339; absent/null = never expires.
     #[serde(default)]
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    expires_at: Option<jiff::Timestamp>,
     /// Cumulative cap as a decimal USD string; absent/null = unlimited.
     #[serde(default)]
     quota_usd: Option<String>,
@@ -853,7 +856,7 @@ async fn create_gateway_key(request: &mut Request, depot: &mut Depot, response: 
         body.expires_at,
         body.quota_usd.as_deref(),
         body.route_aliases.as_deref(),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     let (label, terms) = match terms {
         Ok(valid) => valid,
@@ -924,7 +927,7 @@ async fn patch_gateway_key(request: &mut Request, depot: &mut Depot, response: &
             return;
         }
     };
-    let patch = match key_terms::admin_patch(&body, chrono::Utc::now()) {
+    let patch = match key_terms::admin_patch(&body, jiff::Timestamp::now()) {
         Ok(patch) => patch,
         Err(message) => {
             json_error(response, StatusCode::BAD_REQUEST, message);
@@ -1714,7 +1717,7 @@ async fn reconcile_user(request: &mut Request, depot: &mut Depot, response: &mut
         json_error(response, StatusCode::BAD_REQUEST, "invalid user id");
         return;
     };
-    let settled_before = chrono::Utc::now() - crate::relay::ledger_writer::SETTLEMENT_GRACE;
+    let settled_before = jiff::Timestamp::now() - crate::relay::ledger_writer::SETTLEMENT_GRACE;
     match store::reconcile_user(pool, id, settled_before).await {
         // Serialized as the type the GUI deserializes (it flattens the
         // reconciliation), so a new field there needs no edit here.

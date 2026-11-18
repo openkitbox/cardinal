@@ -50,10 +50,9 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 
-use chrono::DateTime;
-use chrono::Duration;
-use chrono::Utc;
 use dashmap::DashMap;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
@@ -189,7 +188,7 @@ impl std::error::Error for CursorTokenError {}
 /// for diagnostics that need the coordinates.
 pub struct CursorBearer {
     access_token: String,
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
     team_id: Option<String>,
 }
 
@@ -376,7 +375,7 @@ impl CursorTokens {
     fn adoptable(&self, key_id: i64, mode: Freshness<'_>) -> Option<Arc<CursorBearer>> {
         let bearer = self.bearers.get(&key_id)?;
         let usable = match mode {
-            Freshness::Check => bearer.fresh_for(Utc::now(), skew()),
+            Freshness::Check => bearer.fresh_for(Timestamp::now(), skew()),
             Freshness::Force { rejected } => bearer.access_token != rejected,
         };
         usable.then(|| Arc::clone(bearer.value()))
@@ -397,7 +396,7 @@ impl CursorTokens {
         &self,
         key_id: i64,
         access_token: String,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
         team_id: Option<String>,
     ) -> Arc<CursorBearer> {
         let bearer = Arc::new(CursorBearer {
@@ -448,7 +447,7 @@ impl CursorTokens {
                 Freshness::Check => true,
                 Freshness::Force { rejected } => bundle.access_token != rejected,
             };
-            if usable && bundle.expires_at - Utc::now() > skew() {
+            if usable && bundle.expires_at - Timestamp::now() > skew() {
                 return Ok(self.adopt(key_id, bundle));
             }
         }
@@ -641,7 +640,7 @@ impl CursorTokens {
 
 impl CursorBearer {
     /// Whether this bearer keeps more than `skew` of validity at `now`.
-    fn fresh_for(&self, now: DateTime<Utc>, skew: Duration) -> bool {
+    fn fresh_for(&self, now: Timestamp, skew: SignedDuration) -> bool {
         self.expires_at - now > skew
     }
 }
@@ -718,12 +717,12 @@ fn classify_exchange(status: u16, body: &[u8]) -> Result<String, CursorTokenErro
 /// the backend's judgement, never this claim's, so an unverified `exp` cannot
 /// widen any authorization. Any malformed segment is `None`, and callers fail
 /// closed rather than caching a token with no known expiry.
-pub(crate) fn jwt_expiry(token: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn jwt_expiry(token: &str) -> Option<Timestamp> {
     let payload = token.split('.').nth(1)?;
     let decoded = base64url_decode(payload)?;
     let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
     let seconds = claims.get("exp")?.as_i64()?;
-    DateTime::from_timestamp(seconds, 0)
+    Timestamp::from_second(seconds).ok()
 }
 
 /// Decode one base64url segment (RFC 4648 §5: `-`/`_`, padding optional).
@@ -793,6 +792,6 @@ fn map_transport_error(error: TransportError) -> CursorTokenError {
 }
 
 /// The shared refresh margin as a duration.
-fn skew() -> Duration {
-    Duration::seconds(REFRESH_SKEW_SECS)
+fn skew() -> SignedDuration {
+    SignedDuration::from_secs(REFRESH_SKEW_SECS)
 }

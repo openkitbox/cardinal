@@ -1,5 +1,3 @@
-use chrono::{DateTime, Utc};
-
 use super::KeyQuota;
 use super::QuotaWindow;
 
@@ -35,8 +33,7 @@ pub(super) fn parse_opencode_go_quota(body: &str) -> Option<KeyQuota> {
             window
                 .resets_at
                 .as_deref()
-                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-                .map(|reset| reset.with_timezone(&Utc))
+                .and_then(|text| text.parse().ok())
         } else {
             None
         };

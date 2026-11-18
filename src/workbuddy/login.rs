@@ -1,9 +1,8 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use chrono::DateTime;
-use chrono::Utc;
 use dashmap::DashMap;
+use jiff::Timestamp;
 use uuid::Uuid;
 
 const TERMINAL_RETENTION_SECS: i64 = 600;
@@ -50,17 +49,17 @@ pub struct Status {
 pub struct Session {
     vendor_state: String,
     login_url: String,
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
     outcome: Mutex<Outcome>,
 }
 
 struct Outcome {
     state: SessionState,
-    finished_at: Option<DateTime<Utc>>,
+    finished_at: Option<Timestamp>,
 }
 
 impl Session {
-    fn new(vendor_state: String, login_url: String, expires_at: DateTime<Utc>) -> Self {
+    fn new(vendor_state: String, login_url: String, expires_at: Timestamp) -> Self {
         Self {
             vendor_state,
             login_url,
@@ -86,7 +85,7 @@ impl Session {
 
     /// The polling deadline.
     #[must_use]
-    pub fn expires_at(&self) -> DateTime<Utc> {
+    pub fn expires_at(&self) -> Timestamp {
         self.expires_at
     }
 
@@ -98,7 +97,7 @@ impl Session {
 
     /// Render this session as an admin status document.
     #[must_use]
-    pub fn status(&self, session: Uuid, now: DateTime<Utc>) -> Status {
+    pub fn status(&self, session: Uuid, now: Timestamp) -> Status {
         let outcome = self.lock();
         let message = match &outcome.state {
             SessionState::Failed { message } => Some(message.clone()),
@@ -106,7 +105,7 @@ impl Session {
         };
         let login_url =
             matches!(&outcome.state, SessionState::Waiting).then(|| self.login_url.clone());
-        let expires_in = (self.expires_at - now).num_seconds().max(0);
+        let expires_in = (self.expires_at - now).as_secs().max(0);
         Status {
             session,
             state: outcome.state.as_str(),
@@ -118,7 +117,7 @@ impl Session {
 
     /// Complete a waiting session exactly once. Returns false for a terminal
     /// session or a non-terminal transition.
-    pub fn finish(&self, next: SessionState, now: DateTime<Utc>) -> bool {
+    pub fn finish(&self, next: SessionState, now: Timestamp) -> bool {
         if !next.is_terminal() {
             return false;
         }
@@ -131,10 +130,10 @@ impl Session {
         true
     }
 
-    fn is_stale(&self, now: DateTime<Utc>) -> bool {
+    fn is_stale(&self, now: Timestamp) -> bool {
         let outcome = self.lock();
         outcome.finished_at.is_some_and(|finished_at| {
-            now.signed_duration_since(finished_at).num_seconds() > TERMINAL_RETENTION_SECS
+            now.duration_since(finished_at).as_secs() > TERMINAL_RETENTION_SECS
         })
     }
 
@@ -167,8 +166,8 @@ impl WorkbuddyLogins {
         &self,
         vendor_state: String,
         login_url: String,
-        expires_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        expires_at: Timestamp,
+        now: Timestamp,
     ) -> (Uuid, Arc<Session>) {
         self.expire(now);
         let id = Uuid::new_v4();
@@ -179,33 +178,33 @@ impl WorkbuddyLogins {
 
     /// Look up a session, expiring overdue and stale entries first.
     #[must_use]
-    pub fn get(&self, id: &Uuid, now: DateTime<Utc>) -> Option<Arc<Session>> {
+    pub fn get(&self, id: &Uuid, now: Timestamp) -> Option<Arc<Session>> {
         self.expire(now);
         self.sessions.get(id).map(|entry| Arc::clone(entry.value()))
     }
 
     /// Render a status document for a public session id.
     #[must_use]
-    pub fn status(&self, id: &Uuid, now: DateTime<Utc>) -> Option<Status> {
+    pub fn status(&self, id: &Uuid, now: Timestamp) -> Option<Status> {
         self.get(id, now).map(|session| session.status(*id, now))
     }
 
-    pub fn finish(&self, id: &Uuid, state: SessionState, now: DateTime<Utc>) -> bool {
+    pub fn finish(&self, id: &Uuid, state: SessionState, now: Timestamp) -> bool {
         self.get(id, now)
             .is_some_and(|session| session.finish(state, now))
     }
 
-    pub fn fail(&self, id: &Uuid, message: String, now: DateTime<Utc>) -> bool {
+    pub fn fail(&self, id: &Uuid, message: String, now: Timestamp) -> bool {
         self.finish(id, SessionState::Failed { message }, now)
     }
 
-    pub fn cancel(&self, id: &Uuid, now: DateTime<Utc>) -> bool {
+    pub fn cancel(&self, id: &Uuid, now: Timestamp) -> bool {
         self.finish(id, SessionState::Cancelled, now)
     }
 
     /// Expire waiting sessions and remove terminal sessions older than ten
     /// minutes. Collection precedes removal to avoid DashMap shard deadlocks.
-    pub fn expire(&self, now: DateTime<Utc>) {
+    pub fn expire(&self, now: Timestamp) {
         let mut waiting = Vec::new();
         let mut stale = Vec::new();
         for entry in self.sessions.iter() {

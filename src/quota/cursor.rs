@@ -52,7 +52,7 @@
 use std::time::Instant;
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use super::KeyQuota;
@@ -233,7 +233,7 @@ pub async fn fetch_cursor_quota(
     let mut details = Vec::new();
     details.push(format!("本周期消费 ${:.2}", spent / 100.));
     if let Some(resets_at) = epoch_millis(end) {
-        details.push(format!("重置 {}", resets_at.format("%m-%d")));
+        details.push(format!("重置 {}", resets_at.strftime("%m-%d")));
     }
     Some(KeyQuota {
         windows: Vec::new(),
@@ -617,8 +617,8 @@ fn number(value: &Value) -> Option<f64> {
 }
 
 /// Milliseconds since the epoch as an instant; zero or negative is "unknown".
-fn epoch_millis(millis: f64) -> Option<DateTime<Utc>> {
+fn epoch_millis(millis: f64) -> Option<Timestamp> {
     (millis > 0.)
-        .then(|| DateTime::from_timestamp_millis(millis as i64))
+        .then(|| Timestamp::from_millisecond(millis as i64).ok())
         .flatten()
 }

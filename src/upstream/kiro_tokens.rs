@@ -79,6 +79,8 @@
 //!   AWS endpoints. The body remains sensitive: it is read only to classify,
 //!   never logged and never forwarded.
 
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -194,7 +196,7 @@ impl KiroTokenError {
     }
 
     /// The upstream's `Retry-After` ask, parsed for the relay's backoff.
-    pub fn retry_after(&self) -> Option<chrono::Duration> {
+    pub fn retry_after(&self) -> Option<SignedDuration> {
         match self {
             Self::Status {
                 retry_after: Some(raw),
@@ -525,7 +527,7 @@ impl KiroTokens {
         dns: crate::upstream::Dns,
         proxy: Option<&ProxySpec>,
     ) -> Result<KiroProbeCredential, KiroTokenError> {
-        let now = chrono::Utc::now().timestamp();
+        let now = Timestamp::now().as_second();
         let oauth = if candidate.fresh_for(now) {
             candidate
         } else {
@@ -624,7 +626,7 @@ impl KiroTokens {
                 let guard = state.lock().await;
                 snapshot(&guard)
             };
-            let now = chrono::Utc::now().timestamp();
+            let now = Timestamp::now().as_second();
             if before.oauth.fresh_for(now) {
                 if !before.persisted {
                     self.persist_snapshot(pool, key.provider_id, key.id, &state, &before)
@@ -730,7 +732,7 @@ impl KiroTokens {
                 let guard = state.lock().await;
                 return Ok(call_context(&guard.oauth));
             }
-            let now = chrono::Utc::now().timestamp();
+            let now = Timestamp::now().as_second();
             // Reconcile the row snapshot with a short state-lock commit. The lock
             // is deliberately not held during the database or refresh awaits.
             let mut base = before;
@@ -833,7 +835,7 @@ impl KiroTokens {
                     return Err(KiroTokenError::Invalidated);
                 };
                 if stored.access_token != before.oauth.access_token
-                    && stored.fresh_for(chrono::Utc::now().timestamp())
+                    && stored.fresh_for(Timestamp::now().as_second())
                 {
                     return Ok((stored.clone(), stored));
                 }
@@ -992,7 +994,7 @@ impl KiroTokens {
                 return Err(error);
             }
         };
-        let now = chrono::Utc::now().timestamp();
+        let now = Timestamp::now().as_second();
         let expires_at =
             match refresh_expiry(current.effective_auth_method(), answer.expires_in, now) {
                 Ok(expires_at) => expires_at,
@@ -1067,7 +1069,7 @@ impl KiroTokens {
             1,
             OIDC_MAX_ATTEMPTS,
             false,
-            chrono::Utc::now(),
+            Timestamp::now(),
         );
         if oauth.effective_auth_method() == AuthMethod::Social {
             headers.splice(0..0, profile::social_static_headers());

@@ -33,7 +33,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use super::candidates::Candidate;
 use crate::quota::{KeyQuota, QuotaWindow};
@@ -58,7 +58,7 @@ pub struct SmartVerdict {
 pub fn order(
     candidates: Vec<Candidate>,
     snapshots: &HashMap<i64, KeyQuota>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<(Candidate, SmartVerdict)> {
     let mut ranked: Vec<(Candidate, SmartVerdict, Option<f64>)> = candidates
         .into_iter()
@@ -88,7 +88,7 @@ pub fn order(
 pub fn verdicts(
     candidates: &[Candidate],
     snapshots: &HashMap<i64, KeyQuota>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<String> {
     candidates
         .iter()
@@ -99,13 +99,13 @@ pub fn verdicts(
 /// One window's surplus in percentage points, or `None` when the window
 /// carries no time anchor. A renewed window (reset in the past) reads 0:
 /// quota and time are both full again.
-fn window_surplus(window: &QuotaWindow, now: DateTime<Utc>) -> Option<f64> {
+fn window_surplus(window: &QuotaWindow, now: Timestamp) -> Option<f64> {
     let resets_at = window.resets_at?;
     if resets_at <= now {
         return Some(0.0);
     }
     let period = window.period_minutes.unwrap_or(DEFAULT_PERIOD_MINUTES);
-    let remaining_minutes = (resets_at - now).num_seconds() as f64 / 60.0;
+    let remaining_minutes = resets_at.duration_since(now).as_secs() as f64 / 60.0;
     let remaining_time_pct = (remaining_minutes / period as f64 * 100.0).clamp(0.0, 100.0);
     Some(100.0 - window.used_pct - remaining_time_pct)
 }
@@ -113,7 +113,7 @@ fn window_surplus(window: &QuotaWindow, now: DateTime<Utc>) -> Option<f64> {
 /// The key's verdict and ranking surplus: the min across its windows (the
 /// tightest window is the binding constraint), `None` when no window can
 /// rank the key.
-fn evaluate(snapshot: Option<&KeyQuota>, now: DateTime<Utc>) -> (SmartVerdict, Option<f64>) {
+fn evaluate(snapshot: Option<&KeyQuota>, now: Timestamp) -> (SmartVerdict, Option<f64>) {
     let windows = snapshot
         .map(|snapshot| snapshot.windows.as_slice())
         .filter(|windows| !windows.is_empty());

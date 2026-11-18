@@ -20,6 +20,7 @@
 //!
 //! There is no delete: disabling a key is the way to retire it.
 
+use jiff::Timestamp;
 use salvo::http::StatusCode;
 use salvo::prelude::*;
 use serde::Deserialize;
@@ -68,7 +69,7 @@ struct CreateBody {
     label: String,
     /// RFC 3339; absent/null = never expires.
     #[serde(default)]
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    expires_at: Option<Timestamp>,
     /// Cumulative cap as a decimal USD string; absent/null = unlimited.
     #[serde(default)]
     quota_usd: Option<String>,
@@ -98,7 +99,7 @@ async fn create_key(request: &mut Request, depot: &mut Depot, response: &mut Res
         body.expires_at,
         body.quota_usd.as_deref(),
         None,
-        chrono::Utc::now(),
+        Timestamp::now(),
     ) {
         Ok(valid) => valid,
         Err(message) => {
@@ -139,7 +140,7 @@ async fn patch_key(request: &mut Request, depot: &mut Depot, response: &mut Resp
         json_error(response, StatusCode::BAD_REQUEST, "invalid JSON body");
         return;
     };
-    let patch = match key_terms::patch(&body, chrono::Utc::now()) {
+    let patch = match key_terms::patch(&body, Timestamp::now()) {
         Ok(patch) => patch,
         Err(message) => {
             json_error(response, StatusCode::BAD_REQUEST, message);

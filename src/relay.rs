@@ -267,7 +267,7 @@ pub(crate) struct RequestCapture {
     request_text: String,
     request_truncated: bool,
     streaming: bool,
-    started: chrono::DateTime<chrono::Utc>,
+    started: jiff::Timestamp,
 }
 
 /// Ask the vendor's own quota endpoint when a quota-refused key's window
@@ -282,7 +282,7 @@ async fn probe_quota_reset(
     dns: crate::upstream::Dns,
     transport: &crate::upstream::transport::Transport,
     proxy: Option<&ProxySpec>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+) -> Option<jiff::Timestamp> {
     let api_key = api_key?;
     let quota = crate::quota::fetch_quota(
         provider_name,
@@ -294,7 +294,7 @@ async fn probe_quota_reset(
         proxy,
     )
     .await?;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let reset = quota
         .windows
         .iter()
@@ -1916,7 +1916,7 @@ fn fetch_key_secrets(
 fn resolve(
     route_cache: &route_cache::RouteCache,
     model: &str,
-    now: chrono::DateTime<chrono::Local>,
+    now: jiff::ZonedDateTime,
 ) -> anyhow::Result<Resolution> {
     if let Some((prefix, upstream_model)) = model.split_once('/') {
         if upstream_model.is_empty() {
@@ -2508,7 +2508,7 @@ fn order_ready(
     weighted: Option<&weighted::Snapshot>,
     alias: Option<&str>,
     ready: Vec<candidates::Candidate>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> (Vec<candidates::Candidate>, VerdictReasons) {
     smart_cache.with_snapshots(|quotas| {
         if quotas.is_empty() {
@@ -2587,7 +2587,7 @@ pub async fn dispatch(
     observability: &Observability<'_>,
     request: RelayRequest,
 ) -> DispatchOutcome {
-    dispatch_at(deps, observability, request, chrono::Local::now()).await
+    dispatch_at(deps, observability, request, jiff::ZonedDateTime::now()).await
 }
 
 /// Detail fragment for the "no active entry" 503, from the expansion's skip
@@ -2616,7 +2616,7 @@ pub async fn dispatch_at(
     deps: &DispatchDeps<'_>,
     observability: &Observability<'_>,
     request: RelayRequest,
-    now: chrono::DateTime<chrono::Local>,
+    now: jiff::ZonedDateTime,
 ) -> DispatchOutcome {
     let &DispatchDeps {
         pool,
@@ -2739,7 +2739,7 @@ pub async fn dispatch_at(
             request_text,
             request_truncated,
             streaming: request.stream,
-            started: chrono::Utc::now(),
+            started: jiff::Timestamp::now(),
         }
     });
 
@@ -2906,7 +2906,7 @@ pub async fn dispatch_at(
         weighted.as_ref(),
         alias.as_deref(),
         ready,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     debug_assert!(
         reasons.is_empty() || reasons.len() == ready.len(),
@@ -3832,7 +3832,7 @@ pub async fn dispatch_at(
                         1
                     };
                     let Some(rest_target) =
-                        failure.rest_target(rate_policy, consecutive, chrono::Utc::now())
+                        failure.rest_target(rate_policy, consecutive, jiff::Timestamp::now())
                     else {
                         // Nobody rests: either the class says so (Credit/Quota/Rate all
                         // rest; Blameless and Request never reach here) or this account's
@@ -3857,7 +3857,7 @@ pub async fn dispatch_at(
                         failover::RestTarget::Key(duration) => (duration, None),
                         failover::RestTarget::KeyModel(duration) => (duration, Some(target_model)),
                     };
-                    let until = chrono::Utc::now() + duration;
+                    let until = jiff::Timestamp::now() + duration;
                     let _ = rest_cache
                         .insert(key_id, rest_model, until, error.code())
                         .await;
@@ -4013,6 +4013,6 @@ fn build_trace(inputs: TraceInputs<'_>) -> trace::DispatchTrace {
         alias: alias.map(str::to_owned),
         strategy: format!("{strategy:?}").to_lowercase(),
         candidates: trace_candidates,
-        ts: chrono::Utc::now(),
+        ts: jiff::Timestamp::now(),
     }
 }

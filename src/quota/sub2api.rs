@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use super::Balance;
 use super::KeyQuota;
@@ -35,7 +35,7 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
         #[serde(rename = "planName")]
         plan_name: Option<String>,
         status: Option<String>,
-        expires_at: Option<DateTime<Utc>>,
+        expires_at: Option<Timestamp>,
         unit: Option<String>,
         balance: Option<f64>,
         quota: Option<Quota>,
@@ -69,7 +69,7 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
         window: String,
         limit: f64,
         used: f64,
-        reset_at: Option<DateTime<Utc>>,
+        reset_at: Option<Timestamp>,
     }
     #[derive(serde::Deserialize)]
     struct Subscription {
@@ -82,8 +82,8 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
         daily_limit_usd: Option<f64>,
         weekly_limit_usd: Option<f64>,
         monthly_limit_usd: Option<f64>,
-        weekly_window_start: Option<DateTime<Utc>>,
-        expires_at: Option<DateTime<Utc>>,
+        weekly_window_start: Option<Timestamp>,
+        expires_at: Option<Timestamp>,
     }
     let response: Response = serde_json::from_str(body).ok()?;
     let unit = response.unit.as_deref().unwrap_or("USD");
@@ -122,10 +122,10 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
         windows.extend(window("总额度", quota.used, quota.limit, None, None));
     }
     if let Some(subscription) = &response.subscription {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let weekly_reset = subscription
             .weekly_window_start
-            .map(|start| start + chrono::Duration::days(7))
+            .map(|start| start + jiff::SignedDuration::from_hours(7 * 24))
             .filter(|reset| *reset > now);
         for (name, used, limit, resets_at, period_minutes) in [
             (
@@ -163,7 +163,7 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
             other => format!("{other} "),
         },
     });
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut details = Vec::new();
     // Plan line: name, a non-active status, and the expiry with days left.
     let expires_at = response
@@ -183,8 +183,8 @@ pub(super) fn parse_sub2api_usage(body: &str) -> Option<KeyQuota> {
         _ => {}
     }
     if let Some(expires_at) = expires_at {
-        let days = (expires_at - now).num_days();
-        let date = expires_at.format("%Y-%m-%d");
+        let days = (expires_at - now).as_secs() / (24 * 60 * 60);
+        let date = expires_at.strftime("%Y-%m-%d");
         plan.push(match days {
             d if d < 0 => format!("{date} 到期（已过期）"),
             d => format!("{date} 到期（剩 {d} 天）"),

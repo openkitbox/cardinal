@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use jiff::ZonedDateTime;
 use secrecy::SecretString;
 
 use super::trace::SkipReason;
@@ -217,7 +218,7 @@ pub fn expand_route(
     entries: &[RouteEntry],
     keys: Vec<(Arc<ProviderKeyRow>, SecretString)>,
     providers: &HashMap<i64, ProviderRow>,
-    now: chrono::DateTime<chrono::Local>,
+    now: ZonedDateTime,
 ) -> Expansion {
     let keys_by_id: HashMap<i64, (Arc<ProviderKeyRow>, SecretString)> = keys
         .into_iter()
@@ -245,7 +246,7 @@ pub fn expand_route(
             Some(SkipReason::Disabled)
         } else if !serves_model(key, &entry.model) {
             Some(SkipReason::ModelNotAllowed)
-        } else if !entry.is_available(now) {
+        } else if !entry.is_available(&now) {
             // One candidate per entry, so one denied entry is one skip.
             window_skipped += 1;
             Some(SkipReason::WindowSkipped)

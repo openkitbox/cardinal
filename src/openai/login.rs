@@ -18,9 +18,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chrono::DateTime;
-use chrono::Utc;
 use dashmap::DashMap;
+use jiff::Timestamp;
 use uuid::Uuid;
 
 /// The page the operator types the user code into.
@@ -116,7 +115,7 @@ pub struct Session {
     /// residency: [`OpenaiLogins::prune`] turns a still-waiting session past
     /// this instant `Expired`, and how long a finished session stays readable
     /// is the separate [`TERMINAL_RETENTION_SECS`] window.
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
     /// The existing account key this login replaces (a re-login); `None` means
     /// the login creates a new key once the issuer grants tokens.
     key_id: Option<i64>,
@@ -128,7 +127,7 @@ pub struct Session {
 /// A session's state plus when it reached a terminal one.
 struct Outcome {
     state: SessionState,
-    finished_at: Option<DateTime<Utc>>,
+    finished_at: Option<Timestamp>,
 }
 
 impl Session {
@@ -139,7 +138,7 @@ impl Session {
         device_auth_id: String,
         user_code: String,
         interval: Duration,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
         key_id: Option<i64>,
     ) -> Self {
         Self {
@@ -175,7 +174,7 @@ impl Session {
 
     /// When the grant stops being redeemable.
     #[must_use]
-    pub fn expires_at(&self) -> DateTime<Utc> {
+    pub fn expires_at(&self) -> Timestamp {
         self.expires_at
     }
 
@@ -234,7 +233,7 @@ impl Session {
     /// false when the session was already terminal (or `next` is not terminal):
     /// the poller, the expiry check and a cancel race, and only the first
     /// verdict stands.
-    pub fn finish(&self, next: SessionState, now: DateTime<Utc>) -> bool {
+    pub fn finish(&self, next: SessionState, now: Timestamp) -> bool {
         if !next.is_terminal() {
             tracing::warn!(
                 state = next.as_str(),
@@ -253,10 +252,10 @@ impl Session {
 
     /// Whether this session is terminal and its verdict is older than the
     /// retention window.
-    fn is_stale(&self, now: DateTime<Utc>) -> bool {
+    fn is_stale(&self, now: Timestamp) -> bool {
         let outcome = self.lock();
         outcome.finished_at.is_some_and(|finished_at| {
-            now.signed_duration_since(finished_at).num_seconds() > TERMINAL_RETENTION_SECS
+            now.duration_since(finished_at).as_secs() > TERMINAL_RETENTION_SECS
         })
     }
 
@@ -293,7 +292,7 @@ impl OpenaiLogins {
 
     /// Register a started login and return the id the GUI polls with, together
     /// with the shared session the poller will drive.
-    pub fn insert(&self, session: Session, now: DateTime<Utc>) -> (Uuid, Arc<Session>) {
+    pub fn insert(&self, session: Session, now: Timestamp) -> (Uuid, Arc<Session>) {
         self.prune(now);
         let id = Uuid::new_v4();
         let session = Arc::new(session);
@@ -305,14 +304,14 @@ impl OpenaiLogins {
     /// finished session older than the retention window can never answer as if
     /// it were live.
     #[must_use]
-    pub fn get(&self, id: &Uuid, now: DateTime<Utc>) -> Option<Arc<Session>> {
+    pub fn get(&self, id: &Uuid, now: Timestamp) -> Option<Arc<Session>> {
         self.prune(now);
         self.sessions.get(id).map(|entry| Arc::clone(entry.value()))
     }
 
     /// Cancel a waiting session; false when the id is unknown or the login had
     /// already reached a verdict.
-    pub fn cancel(&self, id: &Uuid, now: DateTime<Utc>) -> bool {
+    pub fn cancel(&self, id: &Uuid, now: Timestamp) -> bool {
         self.get(id, now)
             .is_some_and(|session| session.finish(SessionState::Cancelled, now))
     }
@@ -323,7 +322,7 @@ impl OpenaiLogins {
     /// `waiting` login that no grant can ever finish. Called from the paths
     /// that touch the registry (`insert`, `get`), so the map never needs a
     /// cleanup task of its own.
-    pub fn prune(&self, now: DateTime<Utc>) {
+    pub fn prune(&self, now: Timestamp) {
         // Collect first: removing while iterating a DashMap can deadlock on a
         // shard this thread already holds.
         let mut expired: Vec<(Uuid, Arc<Session>)> = Vec::new();

@@ -8,6 +8,8 @@
 
 use std::path::PathBuf;
 
+use jiff::{SignedDuration, Timestamp};
+
 /// Per-side truncation limit, in bytes.
 /// Shared with relay.rs's bounded payload render, which stops one small slack
 /// above this limit (the render's cut is byte-aligned; the capture re-cuts on
@@ -36,7 +38,7 @@ pub struct CapturedBodies {
     pub response_truncated: bool,
     /// The response was an SSE stream (the body is the frames, `\n\n`-separated).
     pub streaming: bool,
-    pub captured_at: chrono::DateTime<chrono::Utc>,
+    pub captured_at: Timestamp,
 }
 
 /// One NDJSON line: the dispatch request id (`req_<uuid>`) plus the captured
@@ -80,11 +82,11 @@ impl BodyLog {
 
     /// Hourly file for a capture timestamp: `<dir>/<date>/<hour>.ndjson`,
     /// bucketed in local time (the operator thinks in wall-clock hours).
-    fn file_for(&self, at: chrono::DateTime<chrono::Utc>) -> PathBuf {
-        let local = at.with_timezone(&chrono::Local);
+    fn file_for(&self, at: Timestamp) -> PathBuf {
+        let local = at.to_zoned_datetime(jiff::tz::TimeZone::system());
         self.dir()
-            .join(local.format("%Y-%m-%d").to_string())
-            .join(format!("{}.ndjson", local.format("%H")))
+            .join(local.strftime("%Y-%m-%d").to_string())
+            .join(format!("{}.ndjson", local.strftime("%H")))
     }
 
     /// Append one request's bodies, keyed by its dispatch request id
@@ -132,13 +134,9 @@ impl BodyLog {
     /// started shortly before or after the row was persisted, so up to three
     /// hour files are scanned. Returns `None` when payloads are off or the
     /// request is out of that window.
-    pub fn get_near(
-        &self,
-        request_id: &str,
-        near: chrono::DateTime<chrono::Utc>,
-    ) -> Option<CapturedBodies> {
+    pub fn get_near(&self, request_id: &str, near: Timestamp) -> Option<CapturedBodies> {
         [0, -1, 1].iter().find_map(|offset| {
-            let file = self.file_for(near + chrono::Duration::hours(*offset));
+            let file = self.file_for(near + SignedDuration::from_hours(i64::from(*offset)));
             let text = std::fs::read_to_string(file).ok()?;
             text.lines().rev().find_map(|line| {
                 let row: CapturedRow = serde_json::from_str(line).ok()?;

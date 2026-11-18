@@ -11,9 +11,8 @@
 pub mod auth;
 pub mod login;
 
-use chrono::DateTime;
-use chrono::Duration;
-use chrono::Utc;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 
 /// One OpenCode Console account's OAuth bundle, persisted as snake_case JSON
 /// with an RFC3339 `expires_at`.
@@ -31,7 +30,7 @@ pub struct OpencodeOAuth {
     /// Console refresh token, rotated on every refresh (secret).
     pub refresh_token: String,
     /// UTC instant at which `access_token` stops being accepted.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// The console origin that minted the bundle (`https://opencode.ai/console`);
     /// every login and refresh call goes only here.
     pub server: String,
@@ -48,7 +47,7 @@ impl OpencodeOAuth {
     /// the refresh margin every caller shares. A bundle expiring inside the
     /// skew counts as stale, so a request never races the expiry.
     #[must_use]
-    pub fn fresh_for(&self, now: DateTime<Utc>, skew: Duration) -> bool {
+    pub fn fresh_for(&self, now: Timestamp, skew: SignedDuration) -> bool {
         self.expires_at - now > skew
     }
 

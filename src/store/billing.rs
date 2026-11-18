@@ -11,6 +11,8 @@
 
 use std::collections::HashMap;
 
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use sqlx::PgPool;
 
 /// The [`EntryRow`] column list, shared by every query that returns entries
@@ -263,7 +265,7 @@ pub async fn settle_charges(
 pub async fn reconcile_user(
     pool: &PgPool,
     user_id: i64,
-    settled_before: chrono::DateTime<chrono::Utc>,
+    settled_before: Timestamp,
 ) -> Result<Option<Reconciliation>, sqlx::Error> {
     let row: Option<(i64, i64)> = sqlx::query_as(
         "SELECT u.balance_microus,
@@ -282,7 +284,7 @@ pub async fn reconcile_user(
           WHERE user_id = $1 AND charged_microus > 0 AND ts < $2",
     )
     .bind(user_id)
-    .bind(settled_before)
+    .bind(settled_before.to_sqlx())
     .fetch_one(pool)
     .await?;
     let charged_total_microus: i64 = sqlx::query_scalar(
@@ -290,7 +292,7 @@ pub async fn reconcile_user(
           WHERE user_id = $1 AND kind = 'charge' AND created_at < $2",
     )
     .bind(user_id)
-    .bind(settled_before)
+    .bind(settled_before.to_sqlx())
     .fetch_one(pool)
     .await?;
     let keys = sqlx::query_as::<_, KeyReconciliation>(
@@ -352,7 +354,8 @@ pub struct EntryRow {
     pub gateway_key_id: Option<i64>,
     pub note: String,
     pub operator: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub created_at: Timestamp,
 }
 
 /// Why a [`credit`] could not be written.

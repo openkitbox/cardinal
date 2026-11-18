@@ -1,6 +1,5 @@
-use chrono::DateTime;
-use chrono::Duration;
-use chrono::Utc;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 
 use crate::relay::capabilities::workbuddy::host_build_from_value;
 
@@ -10,8 +9,8 @@ use crate::relay::capabilities::workbuddy::host_build_from_value;
 pub struct WorkbuddyOAuth {
     pub access_token: String,
     pub refresh_token: String,
-    pub expires_at: DateTime<Utc>,
-    pub refresh_expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Timestamp,
+    pub refresh_expires_at: Option<Timestamp>,
     pub uid: String,
     /// Human-readable account name for display only (nickname / phone / uid,
     /// with the enterprise suffix). Never used for request headers or identity;
@@ -51,9 +50,9 @@ impl WorkbuddyOAuth {
         if self.refresh_token.trim().is_empty() {
             anyhow::bail!("WorkBuddy refresh token is empty");
         }
-        let bound = Utc::now()
-            .checked_add_signed(Duration::days(730))
-            .ok_or_else(|| anyhow::anyhow!("WorkBuddy expiry bound overflowed"))?;
+        let bound = Timestamp::now()
+            .checked_add(SignedDuration::from_hours(24 * 730))
+            .map_err(|_| anyhow::anyhow!("WorkBuddy expiry bound overflowed"))?;
         if self.expires_at > bound {
             anyhow::bail!("WorkBuddy access expiry is too far in the future");
         }

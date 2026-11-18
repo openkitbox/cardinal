@@ -1,4 +1,4 @@
-use chrono::DateTime;
+use jiff::Timestamp;
 
 use super::KeyQuota;
 use super::QuotaWindow;
@@ -46,7 +46,7 @@ pub(super) fn parse_glm_quota(body: &str) -> Option<KeyQuota> {
             let used_pct = limit.percentage?.clamp(0., 100.);
             let resets_at = limit
                 .next_reset_time
-                .and_then(DateTime::from_timestamp_millis);
+                .and_then(|millis| Timestamp::from_millisecond(millis).ok());
             // TIME_LIMIT rows are the monthly MCP tool-call quota — kept as its own
             // window; unit-3/unit-6 rows are the model-token windows.
             let (name, period_minutes) = match (limit.kind.as_deref(), limit.unit?) {

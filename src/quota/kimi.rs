@@ -1,5 +1,3 @@
-use chrono::{DateTime, Utc};
-
 use super::Balance;
 use super::KeyQuota;
 use super::QuotaWindow;
@@ -117,8 +115,7 @@ pub(super) fn parse_kimi_code_usages(body: &str) -> Option<KeyQuota> {
         let resets_at = window
             .reset_time
             .as_deref()
-            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-            .map(|reset| reset.with_timezone(&Utc));
+            .and_then(|text| text.parse().ok());
         Some(QuotaWindow {
             name,
             used_pct: (used / limit * 100.).clamp(0., 100.),
@@ -159,8 +156,7 @@ pub(super) fn parse_kimi_code_usages(body: &str) -> Option<KeyQuota> {
         let resets_at = ratio
             .reset_time
             .as_deref()
-            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-            .map(|reset| reset.with_timezone(&Utc));
+            .and_then(|text| text.parse().ok());
         Some(QuotaWindow {
             name: name.to_string(),
             used_pct: (ratio.used_ratio? * 100.).clamp(0., 100.),

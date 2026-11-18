@@ -13,6 +13,8 @@ use super::proxy::{ProxySpec, configure_client_builder};
 use crate::protocol::Prepared;
 use crate::protocol::ProtocolId;
 use crate::protocol::wire::{WireError, WireFrame, WireFramer};
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER};
 use std::{
     collections::{HashMap, VecDeque},
@@ -110,29 +112,26 @@ pub enum TransportError {
 
 /// `Retry-After` header value → relative duration. Integer or float seconds
 /// (the HTTP-date form is not parsed — no vendor in evidence sends it).
-pub fn parse_retry_after(raw: &str) -> Option<chrono::Duration> {
+pub fn parse_retry_after(raw: &str) -> Option<SignedDuration> {
     let secs = raw.trim().parse::<f64>().ok()?;
-    (secs > 0.).then(|| chrono::Duration::milliseconds((secs * 1000.) as i64))
+    (secs > 0.).then(|| SignedDuration::from_millis((secs * 1000.) as i64))
 }
 
 /// A vendor reset header (`*reset*ratelimit*`) → absolute reset time. RFC 3339
 /// timestamp, epoch seconds (>1e9) or milliseconds (>1e12), or a single-unit
 /// duration (`26s`, `5m`, `1h`) anchored at `now`.
-pub fn parse_reset_header(
-    raw: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+pub fn parse_reset_header(raw: &str, now: Timestamp) -> Option<Timestamp> {
     let raw = raw.trim();
-    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(raw) {
-        return Some(t.with_timezone(&chrono::Utc));
+    if let Ok(t) = raw.parse::<Timestamp>() {
+        return Some(t);
     }
     if let Ok(n) = raw.parse::<i64>() {
         let t = if n > 1_000_000_000_000 {
-            chrono::DateTime::from_timestamp_millis(n)
+            Timestamp::from_millisecond(n).ok()
         } else {
-            chrono::DateTime::from_timestamp(n, 0)
+            Timestamp::from_second(n).ok()
         };
-        return t.map(|t| t.with_timezone(&chrono::Utc));
+        return t;
     }
     // Single-unit duration: "<float><s|m|h>".
     let (digits, unit) = raw.split_at(raw.len().saturating_sub(1));
@@ -144,12 +143,12 @@ pub fn parse_reset_header(
     };
     let secs = digits.parse::<f64>().ok()?;
     (secs > 0.)
-        .then(|| now + chrono::Duration::milliseconds((secs * 1000. * multiplier as f64) as i64))
+        .then(|| now + SignedDuration::from_millis((secs * 1000. * multiplier as f64) as i64))
 }
 
 impl TransportError {
     /// The upstream's `Retry-After` ask, parsed from the raw capture.
-    pub fn retry_after(&self) -> Option<chrono::Duration> {
+    pub fn retry_after(&self) -> Option<SignedDuration> {
         match self {
             Self::Status {
                 retry_after: Some(raw),

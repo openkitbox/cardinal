@@ -1,6 +1,6 @@
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// One quota window of a vendor plan (e.g. a 5-hour token window or the
 /// weekly window): how much of the allowance is spent and when it resets.
@@ -13,7 +13,7 @@ pub struct QuotaWindow {
     /// Share of the window already used, 0–100.
     pub used_pct: f64,
     /// When the window resets, when the vendor says so.
-    pub resets_at: Option<DateTime<Utc>>,
+    pub resets_at: Option<Timestamp>,
     /// Approximate window length in minutes — a SORT KEY only (a month is not
     /// a fixed number of minutes), so cards render shortest period first
     /// regardless of which vendor/parser produced the reading. Snapshots
@@ -98,8 +98,8 @@ pub struct CodexResetSummary {
 pub struct CodexResetDisplay {
     pub status: String,
     pub reset_type: Option<String>,
-    pub granted_at: Option<DateTime<Utc>>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub granted_at: Option<Timestamp>,
+    pub expires_at: Option<Timestamp>,
     pub title: Option<String>,
     pub description: Option<String>,
 }

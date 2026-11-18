@@ -13,7 +13,7 @@
 //! their reset-credit details are still retained when the endpoint supplies them.
 //! The `additional_rate_limits` meters (Spark) are not read.
 
-use chrono::{DateTime, Duration, TimeZone as _, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 
 use super::KeyQuota;
@@ -52,8 +52,8 @@ pub struct CodexResetCredit {
     pub id: String,
     pub status: String,
     pub reset_type: Option<String>,
-    pub granted_at: Option<DateTime<Utc>>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub granted_at: Option<Timestamp>,
+    pub expires_at: Option<Timestamp>,
     pub title: Option<String>,
     pub description: Option<String>,
 }
@@ -77,7 +77,7 @@ pub struct CodexResetDetails {
 /// overage nor the spend control reached): Codex keeps serving such an account
 /// past its plan windows, and a card showing it exhausted would park it in
 /// Smart routing until the weekly reset.
-pub(crate) fn parse_codex_usage(body: &[u8], now: DateTime<Utc>) -> Option<KeyQuota> {
+pub(crate) fn parse_codex_usage(body: &[u8], now: Timestamp) -> Option<KeyQuota> {
     let root: Value = serde_json::from_slice(body).ok()?;
     if root.get("rate_limit").is_some_and(Value::is_null)
         && root.get("spend_control").is_some_and(Value::is_object)
@@ -145,7 +145,7 @@ pub async fn fetch_openai_codex_quota(
         );
         return None;
     }
-    let Some(mut quota) = parse_codex_usage(body.as_bytes(), Utc::now()) else {
+    let Some(mut quota) = parse_codex_usage(body.as_bytes(), Timestamp::now()) else {
         tracing::warn!(
             key_id,
             status,
@@ -291,12 +291,11 @@ fn string_field(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_owned)
 }
 
-fn date_field(value: &Value, field: &str) -> Option<DateTime<Utc>> {
+fn date_field(value: &Value, field: &str) -> Option<Timestamp> {
     value
         .get(field)
         .and_then(Value::as_str)
-        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-        .map(|date| date.with_timezone(&Utc))
+        .and_then(|text| text.parse().ok())
 }
 
 /// Convert the small, documented result vocabulary to a body-free domain value.
@@ -329,7 +328,7 @@ pub fn parse_codex_reset_outcome(body: &[u8]) -> anyhow::Result<CodexResetOutcom
     })
 }
 
-fn window(value: &Value, fallback_name: &str, now: DateTime<Utc>) -> Option<QuotaWindow> {
+fn window(value: &Value, fallback_name: &str, now: Timestamp) -> Option<QuotaWindow> {
     let used_pct = value.get("used_percent")?.as_f64()?.clamp(0., 100.);
     let period_seconds = value
         .get("limit_window_seconds")
@@ -361,19 +360,20 @@ fn window_name(seconds: f64) -> String {
 
 /// `reset_at` is an epoch instant (seconds, or milliseconds above 1e12 — the
 /// reference accepts both); `reset_after_seconds` is relative to `now`.
-fn reset_time(value: &Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn reset_time(value: &Value, now: Timestamp) -> Option<Timestamp> {
     if let Some(reset_at) = value.get("reset_at").and_then(Value::as_f64) {
         let millis = if reset_at > 1e12 {
             reset_at
         } else {
             reset_at * 1000.
         };
-        if let Some(instant) = Utc.timestamp_millis_opt(millis as i64).single() {
+        if let Ok(instant) = Timestamp::from_millisecond(millis as i64) {
             return Some(instant);
         }
     }
     let after = value.get("reset_after_seconds").and_then(Value::as_f64)?;
-    now.checked_add_signed(Duration::milliseconds((after * 1000.) as i64))
+    now.checked_add(SignedDuration::from_millis((after * 1000.) as i64))
+        .ok()
 }
 
 fn credits_fund_overage(root: &Value) -> bool {

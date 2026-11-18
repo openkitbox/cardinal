@@ -10,6 +10,7 @@ use super::ir::{
     IrToolChoice,
 };
 use crate::protocol::ProtocolError;
+use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 const DROPPED_FIELDS: &[&str] = &[
@@ -656,9 +657,9 @@ pub fn emit_response_json(response: &super::ir::IrResponse) -> Result<Vec<u8>, P
     choice.insert("message".to_owned(), Value::Object(message));
     choice.insert("finish_reason".to_owned(), finish_reason);
     let mut body = serde_json::json!({
-      "id": format!("chatcmpl-{:032x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().unsigned_abs()),
+      "id": format!("chatcmpl-{:032x}", Timestamp::now().as_nanosecond().unsigned_abs()),
       "object": "chat.completion",
-      "created": chrono::Utc::now().timestamp(),
+      "created": Timestamp::now().as_second(),
       "model": response.model,
     });
     body["choices"] = Value::Array(vec![Value::Object(choice)]);

@@ -18,8 +18,8 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context;
-use chrono::Duration;
-use chrono::Utc;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -74,7 +74,7 @@ pub struct KeyView {
     /// can label the account instead of guessing from the api_key shape.
     pub auth_kind: String,
     /// When the account was archived (None = not archived).
-    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub archived_at: Option<jiff::Timestamp>,
     /// Whether an egress proxy is configured on this account. The proxy URL is
     /// a secret and is never projected onto this (or any other) wire view;
     /// `default` keeps older payloads decodable.
@@ -110,7 +110,7 @@ pub struct KeyQuotaSnapshotRow {
     pub key_id: i64,
     pub quota: KeyQuota,
     /// When the reading was probed (the snapshot row's `probed_at`).
-    pub fetched_at: chrono::DateTime<chrono::Utc>,
+    pub fetched_at: jiff::Timestamp,
 }
 
 /// The admin UI's bootstrap document: every parameterless admin read the
@@ -278,8 +278,8 @@ pub struct OpenaiResetCredit {
     pub id: String,
     pub status: String,
     pub reset_type: Option<String>,
-    pub granted_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub granted_at: Option<jiff::Timestamp>,
+    pub expires_at: Option<jiff::Timestamp>,
     pub title: Option<String>,
     pub description: Option<String>,
 }
@@ -712,7 +712,7 @@ async fn probe_key_reading(
     source: QuotaSource,
     anchor: Option<u32>,
     proxy: Option<&crate::upstream::ProxySpec>,
-) -> (i64, chrono::DateTime<chrono::Utc>, Option<KeyQuota>) {
+) -> (i64, jiff::Timestamp, Option<KeyQuota>) {
     let key_id = key.id;
     let provider_dns = provider.dns;
     let mut quota = match &source {
@@ -782,7 +782,7 @@ async fn probe_key_reading(
     // The vendor read's own instant, taken before any DB work: the
     // balance history orders readings by it, so a probe that
     // finishes late cannot overwrite a newer one.
-    let probed_at = chrono::Utc::now();
+    let probed_at = jiff::Timestamp::now();
     if let (Some(day), Some(quota)) = (anchor, quota.as_mut()) {
         quota::apply_monthly_anchor(quota, day, probed_at);
     }
@@ -796,7 +796,7 @@ async fn probe_key_reading(
 async fn persist_quota_reading(
     pool: &PgPool,
     key_id: i64,
-    probed_at: chrono::DateTime<chrono::Utc>,
+    probed_at: jiff::Timestamp,
     quota: &KeyQuota,
 ) {
     if let Err(error) = store::quota_snapshot_upsert(pool, key_id, quota, probed_at).await {
@@ -894,7 +894,7 @@ pub async fn probe_all_quotas(
     // keeps the series bounded whoever triggered the probe (background prober
     // or admin refresh). A failure only means the rows outlive 45 days by one
     // interval — the chart never reads past 35.
-    if QUOTA_HISTORY_PRUNE.claim(Utc::now().timestamp_millis()) {
+    if QUOTA_HISTORY_PRUNE.claim(jiff::Timestamp::now().as_millisecond()) {
         match store::quota_history_prune(pool).await {
             Ok(0) => {}
             Ok(deleted) => tracing::debug!(deleted, "quota history: rows past retention pruned"),
@@ -1277,13 +1277,13 @@ impl Admin {
     /// `caller` restricts the window to one caller identity (None = all).
     pub async fn usage_window(
         &self,
-        since: chrono::DateTime<chrono::Utc>,
-        until: chrono::DateTime<chrono::Utc>,
+        since: jiff::Timestamp,
+        until: jiff::Timestamp,
         caller: Option<store::CallerFilter>,
     ) -> anyhow::Result<store::UsageWindow> {
         store::usage_window(
             &self.pool,
-            since.clamp(until - chrono::Duration::days(370), until),
+            since.clamp(until - jiff::SignedDuration::from_hours(24 * 370), until),
             until,
             caller,
         )
@@ -1296,13 +1296,13 @@ impl Admin {
     /// the aggregates to one caller identity (None = all).
     pub async fn usage_trend(
         &self,
-        since: chrono::DateTime<chrono::Utc>,
-        until: chrono::DateTime<chrono::Utc>,
+        since: jiff::Timestamp,
+        until: jiff::Timestamp,
         split: store::TrendSplit,
-        local_offset: chrono::Duration,
+        local_offset: SignedDuration,
         caller: Option<store::CallerFilter>,
     ) -> anyhow::Result<Vec<store::TrendRow>> {
-        let since = since.clamp(until - chrono::Duration::days(370), until);
+        let since = since.clamp(until - jiff::SignedDuration::from_hours(24 * 370), until);
         store::usage_trend(&self.pool, since, until, split, local_offset, caller).await
     }
 
@@ -2034,8 +2034,8 @@ impl Admin {
             )
             .await
             .map_err(|error| WorkbuddyLoginError::Internal(anyhow::Error::new(error)))?;
-        let now = Utc::now();
-        let expires_at = now + Duration::seconds(WORKBUDDY_LOGIN_LIFETIME_SECS);
+        let now = Timestamp::now();
+        let expires_at = now + jiff::SignedDuration::from_secs(WORKBUDDY_LOGIN_LIFETIME_SECS);
         let (id, session) = wiring
             .logins
             .start(started.state, started.auth_url, expires_at, now);
@@ -2092,8 +2092,8 @@ impl Admin {
             if session.state().is_terminal() {
                 return;
             }
-            if Utc::now() >= session.expires_at() {
-                session.finish(WorkbuddySessionState::Expired, Utc::now());
+            if Timestamp::now() >= session.expires_at() {
+                session.finish(WorkbuddySessionState::Expired, Timestamp::now());
                 return;
             }
             if token.is_none() {
@@ -2107,14 +2107,14 @@ impl Admin {
                     .await
                 {
                     Ok(TokenPoll::Pending) => continue,
-                    Ok(TokenPoll::Ready(bundle)) => token = Some(bundle),
+                    Ok(TokenPoll::Ready(bundle)) => token = Some(*bundle),
                     Err(error) => {
                         tracing::warn!(provider = %provider.name, %error, "WorkBuddy token poll failed");
                         session.finish(
                             WorkbuddySessionState::Failed {
                                 message: WORKBUDDY_LOGIN_BACKEND_MESSAGE.to_owned(),
                             },
-                            Utc::now(),
+                            Timestamp::now(),
                         );
                         return;
                     }
@@ -2144,7 +2144,7 @@ impl Admin {
                             WorkbuddySessionState::Failed {
                                 message: WORKBUDDY_LOGIN_BACKEND_MESSAGE.to_owned(),
                             },
-                            Utc::now(),
+                            Timestamp::now(),
                         );
                         return;
                     };
@@ -2196,7 +2196,7 @@ impl Admin {
                             }
                         }
                     };
-                    session.finish(verdict, Utc::now());
+                    session.finish(verdict, Timestamp::now());
                     return;
                 }
                 Err(error) => {
@@ -2205,7 +2205,7 @@ impl Admin {
                         WorkbuddySessionState::Failed {
                             message: WORKBUDDY_LOGIN_BACKEND_MESSAGE.to_owned(),
                         },
-                        Utc::now(),
+                        Timestamp::now(),
                     );
                     return;
                 }
@@ -2292,7 +2292,7 @@ impl Admin {
             .workbuddy_login
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WorkBuddy login is not wired"))?;
-        Ok(wiring.logins.status(&id, Utc::now()))
+        Ok(wiring.logins.status(&id, Timestamp::now()))
     }
 
     pub fn cancel_workbuddy_login(&self, session: &str) -> anyhow::Result<bool> {
@@ -2301,7 +2301,7 @@ impl Admin {
             .workbuddy_login
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WorkBuddy login is not wired"))?;
-        Ok(wiring.logins.cancel(&id, Utc::now()))
+        Ok(wiring.logins.cancel(&id, Timestamp::now()))
     }
 
     /// Persist a key's model-list snapshot. The add-account flow already holds
@@ -2572,8 +2572,12 @@ impl Admin {
         let lifetime = i64::try_from(expires_in)
             .unwrap_or(i64::MAX)
             .min(LOGIN_MAX_LIFETIME_SECS);
-        let now = Utc::now();
-        let session = login::Session::new(device_code, now + Duration::seconds(lifetime), key_id);
+        let now = Timestamp::now();
+        let session = login::Session::new(
+            device_code,
+            now + jiff::SignedDuration::from_secs(lifetime),
+            key_id,
+        );
         let (id, session) = wiring.logins.insert(session, now);
         let poll = LoginPoll {
             session,
@@ -2624,7 +2628,7 @@ impl Admin {
             if session.is_terminal() {
                 return;
             }
-            let now = Utc::now();
+            let now = Timestamp::now();
             if now >= session.expires_at() {
                 session.finish(SessionState::Expired, now);
                 return;
@@ -2640,7 +2644,7 @@ impl Admin {
                     );
                 }
                 Ok(TokenGrant::Expired) => {
-                    session.finish(SessionState::Expired, Utc::now());
+                    session.finish(SessionState::Expired, Timestamp::now());
                     return;
                 }
                 Ok(TokenGrant::Ready(token)) => {
@@ -2649,7 +2653,7 @@ impl Admin {
                     // report `expired` must not leave a key behind. Re-check
                     // before committing and drop the grant when it lost the
                     // race; the token itself never reaches a log line.
-                    let approved_at = Utc::now();
+                    let approved_at = Timestamp::now();
                     if approved_at >= session.expires_at() {
                         tracing::warn!(
                             provider = %provider.name,
@@ -2708,7 +2712,7 @@ impl Admin {
                             }
                         }
                     };
-                    session.finish(verdict, Utc::now());
+                    session.finish(verdict, Timestamp::now());
                     return;
                 }
                 Err(error) if is_transient_poll_failure(&error) => {
@@ -2722,7 +2726,7 @@ impl Admin {
                         SessionState::Failed {
                             message: error.to_string(),
                         },
-                        Utc::now(),
+                        Timestamp::now(),
                     );
                     return;
                 }
@@ -2753,7 +2757,7 @@ impl Admin {
             proxy,
         } = *fields;
         let wiring = self.opencode_login()?;
-        let expires_at = token.expires_at(Utc::now());
+        let expires_at = token.expires_at(Timestamp::now());
         let auth::ReadyToken {
             access_token,
             refresh_token,
@@ -2958,7 +2962,7 @@ impl Admin {
             Ok(id) => id,
             Err(_) => return Ok(None),
         };
-        let now = Utc::now();
+        let now = Timestamp::now();
         let Some(session) = wiring.logins.get(&id, now) else {
             return Ok(None);
         };
@@ -2979,7 +2983,7 @@ impl Admin {
             Ok(id) => id,
             Err(_) => return Ok(false),
         };
-        Ok(wiring.logins.cancel(&id, Utc::now()))
+        Ok(wiring.logins.cancel(&id, Timestamp::now()))
     }
 
     /// The wired login dependencies, or a configuration error: every login
@@ -3073,12 +3077,12 @@ impl Admin {
             user_code,
             interval,
         } = grant;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let session = openai_login::Session::new(
             device_auth_id,
             user_code.clone(),
             interval,
-            now + Duration::seconds(OPENAI_LOGIN_LIFETIME_SECS),
+            now + jiff::SignedDuration::from_secs(OPENAI_LOGIN_LIFETIME_SECS),
             key_id,
         );
         let (id, session) = wiring.logins.insert(session, now);
@@ -3130,7 +3134,7 @@ impl Admin {
                     // The poll's own round trip may have outlived the grant: a
                     // session the registry will report `expired` must not leave
                     // a key behind.
-                    let approved_at = Utc::now();
+                    let approved_at = Timestamp::now();
                     if approved_at >= session.expires_at() {
                         tracing::warn!(
                             provider = %poll.provider.name,
@@ -3141,7 +3145,7 @@ impl Admin {
                         return;
                     }
                     let verdict = self.finish_openai_login(&poll, approval).await;
-                    session.finish(verdict, Utc::now());
+                    session.finish(verdict, Timestamp::now());
                     return;
                 }
                 Err(error) => {
@@ -3149,10 +3153,10 @@ impl Admin {
                     observe_openai_failure(&error)
                 }
             };
-            match decide_poll(observation, Utc::now(), session.expires_at(), polls) {
+            match decide_poll(observation, Timestamp::now(), session.expires_at(), polls) {
                 PollDecision::Continue => {}
                 PollDecision::Expire => {
-                    session.finish(openai_login::SessionState::Expired, Utc::now());
+                    session.finish(openai_login::SessionState::Expired, Timestamp::now());
                     return;
                 }
                 PollDecision::Fail(message) => {
@@ -3160,7 +3164,7 @@ impl Admin {
                         openai_login::SessionState::Failed {
                             message: message.to_owned(),
                         },
-                        Utc::now(),
+                        Timestamp::now(),
                     );
                     return;
                 }
@@ -3189,7 +3193,7 @@ impl Admin {
             crate::upstream::ProxySpec::from_stored(poll.egress_proxy_url.as_deref(), 0);
         let tokens = match poll
             .client
-            .exchange_code(&approval, Utc::now(), exchange_proxy.as_ref())
+            .exchange_code(&approval, Timestamp::now(), exchange_proxy.as_ref())
             .await
         {
             Ok(tokens) => tokens,
@@ -3382,7 +3386,7 @@ impl Admin {
         };
         Ok(wiring
             .logins
-            .get(&id, Utc::now())
+            .get(&id, Timestamp::now())
             .map(|session| session.status()))
     }
 
@@ -3393,7 +3397,7 @@ impl Admin {
         let Ok(id) = session.parse::<Uuid>() else {
             return Ok(false);
         };
-        Ok(wiring.logins.cancel(&id, Utc::now()))
+        Ok(wiring.logins.cancel(&id, Timestamp::now()))
     }
 
     /// The wired login dependencies, or a configuration error: every login
@@ -3472,10 +3476,10 @@ impl Admin {
         };
         let challenge = cursor::auth::Challenge::new();
         let login_url = challenge.login_url();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let session = cursor::login::Session::new(
             challenge,
-            now + Duration::seconds(CURSOR_LOGIN_LIFETIME_SECS),
+            now + jiff::SignedDuration::from_secs(CURSOR_LOGIN_LIFETIME_SECS),
             key_id,
         );
         let (id, session) = wiring.logins.insert(session, now);
@@ -3519,7 +3523,7 @@ impl Admin {
             if session.is_terminal() {
                 return;
             }
-            let now = Utc::now();
+            let now = Timestamp::now();
             if now >= session.expires_at() {
                 session.finish(cursor::login::SessionState::Expired, now);
                 return;
@@ -3536,12 +3540,12 @@ impl Admin {
                         cursor::login::SessionState::Failed {
                             message: CURSOR_LOGIN_POLICY_MESSAGE.to_owned(),
                         },
-                        Utc::now(),
+                        Timestamp::now(),
                     );
                     return;
                 }
                 Ok(cursor::auth::PollVerdict::Ready(token)) => {
-                    let landed_at = Utc::now();
+                    let landed_at = Timestamp::now();
                     if landed_at >= session.expires_at() {
                         tracing::warn!(
                             provider = %provider.name,
@@ -3600,7 +3604,7 @@ impl Admin {
                             }
                         }
                     };
-                    session.finish(verdict, Utc::now());
+                    session.finish(verdict, Timestamp::now());
                     return;
                 }
                 Err(error) if error.is_transient() => {
@@ -3615,7 +3619,7 @@ impl Admin {
                         cursor::login::SessionState::Failed {
                             message: CURSOR_LOGIN_BACKEND_MESSAGE.to_owned(),
                         },
-                        Utc::now(),
+                        Timestamp::now(),
                     );
                     return;
                 }
@@ -3793,7 +3797,7 @@ impl Admin {
             Ok(id) => id,
             Err(_) => return Ok(None),
         };
-        let now = Utc::now();
+        let now = Timestamp::now();
         let Some(session) = wiring.logins.get(&id, now) else {
             return Ok(None);
         };
@@ -3813,7 +3817,7 @@ impl Admin {
             Ok(id) => id,
             Err(_) => return Ok(false),
         };
-        Ok(wiring.logins.cancel(&id, Utc::now()))
+        Ok(wiring.logins.cancel(&id, Timestamp::now()))
     }
 
     fn cursor_login(&self) -> anyhow::Result<&CursorLogin> {
@@ -4388,8 +4392,8 @@ fn openai_poll_wait(interval: std::time::Duration) -> std::time::Duration {
 /// the login; otherwise the deadline and the poll budget end it as expired.
 fn decide_poll(
     observation: PollObservation,
-    now: chrono::DateTime<Utc>,
-    expires_at: chrono::DateTime<Utc>,
+    now: Timestamp,
+    expires_at: Timestamp,
     polls: u32,
 ) -> PollDecision {
     if observation == PollObservation::Rejected {

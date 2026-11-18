@@ -44,8 +44,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use jiff::Timestamp;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -87,8 +87,8 @@ const UPLINK_CHANNEL: usize = 64;
 #[derive(Clone, Debug)]
 pub struct RunReport {
     pub conversation_id: String,
-    pub started_at: DateTime<Utc>,
-    pub closed_at: DateTime<Utc>,
+    pub started_at: Timestamp,
+    pub closed_at: Timestamp,
     /// Characters of the rendered prompt.
     pub prompt_chars: u64,
     /// Characters the model produced (text, reasoning, tool arguments).
@@ -239,7 +239,7 @@ async fn open_bidi(
     auth: &[(&'static str, String)],
     deadline: Instant,
 ) -> Result<Run, Opening> {
-    let started_at = Utc::now();
+    let started_at = Timestamp::now();
     let (uplink_tx, uplink_rx) = mpsc::channel::<Outbound>(UPLINK_CHANNEL);
     // The first message is the run request; the channel has room, so this
     // never waits.
@@ -314,7 +314,7 @@ async fn open_split(
     auth: &[(&'static str, String)],
     deadline: Instant,
 ) -> Result<Run, TransportError> {
-    let started_at = Utc::now();
+    let started_at = Timestamp::now();
     let downlink = Prepared {
         protocol: ProtocolId::Cursor,
         url: plan.sse_url.clone(),
@@ -390,7 +390,7 @@ struct Opened {
     /// uplink failures surface on the response body).
     fail_rx: Option<oneshot::Receiver<Failure>>,
     cancel: CancellationToken,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 }
 
 /// The part of opening both legs share: start the driver on the 2xx response
@@ -494,7 +494,7 @@ struct Driver {
     uplink_tx: mpsc::Sender<Outbound>,
     first_tx: Option<oneshot::Sender<Result<(), Failure>>>,
     heard: Arc<AtomicBool>,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
     deadline: Instant,
 }
 
@@ -637,7 +637,7 @@ async fn drive(
     let _ = report_tx.send(RunReport {
         conversation_id: plan.conversation_id.clone(),
         started_at,
-        closed_at: Utc::now(),
+        closed_at: Timestamp::now(),
         prompt_chars: plan.prompt_chars,
         output_chars: decoder.output_chars() as u64,
         inline_usage: decoder.usage(),

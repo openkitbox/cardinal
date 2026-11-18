@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use super::Balance;
 use super::KeyQuota;
@@ -50,12 +50,10 @@ pub(super) fn parse_commandcode_quota(body: &str) -> Option<KeyQuota> {
             _ => None,
         }
     }
-    fn reset_time(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+    fn reset_time(value: &serde_json::Value) -> Option<Timestamp> {
         let millis = match value {
             serde_json::Value::String(text) => {
-                return DateTime::parse_from_rfc3339(text)
-                    .ok()
-                    .map(|time| time.with_timezone(&Utc));
+                return text.parse().ok();
             }
             serde_json::Value::Number(number) => number.as_i64()? as f64,
             _ => return None,
@@ -68,7 +66,7 @@ pub(super) fn parse_commandcode_quota(body: &str) -> Option<KeyQuota> {
         } else {
             millis
         };
-        DateTime::from_timestamp_millis(millis as i64)
+        Timestamp::from_millisecond(millis as i64).ok()
     }
     let response: Response = serde_json::from_str(body).ok()?;
     // The two rate windows. The vendor sizes them as fixed fractions of the

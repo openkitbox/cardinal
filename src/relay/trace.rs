@@ -11,6 +11,8 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use jiff::Timestamp;
+
 /// One candidate's trace entry: who it was and why it was/wasn't picked.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CandidateTrace {
@@ -52,7 +54,7 @@ pub struct DispatchTrace {
     pub alias: Option<String>,
     pub strategy: String,
     pub candidates: Vec<CandidateTrace>,
-    pub ts: chrono::DateTime<chrono::Utc>,
+    pub ts: Timestamp,
 }
 
 /// Ring buffer for recent traces. Capacity is fixed; oldest entries are evicted.

@@ -3,8 +3,7 @@
 //! A group is the product (pricing rate and route visibility); a user owns
 //! keys and a balance. Neither touches upstream account scheduling.
 
-use chrono::DateTime;
-use chrono::Utc;
+use jiff::Timestamp;
 use sqlx::PgPool;
 
 /// Login of the built-in user that owns pre-existing and config-seeded keys
@@ -19,12 +18,12 @@ pub const OWNER_LOGIN: &str = "owner";
 /// Authenticated caller identity: one gateway key joined with its owning user
 /// and that user's group, read in a single query so auth, admission and
 /// pricing all see the same snapshot.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct Principal {
     pub key_id: i64,
     pub key_label: String,
     pub key_enabled: bool,
-    pub key_expires_at: Option<DateTime<Utc>>,
+    pub key_expires_at: Option<Timestamp>,
     /// The key's cumulative spending cap, micro-USD; `None` = unlimited.
     pub key_quota_microus: Option<i64>,
     /// Micro-USD charged through the key so far (lags settlement by up to
@@ -45,6 +44,33 @@ pub struct Principal {
     pub user_route_aliases: Option<Vec<String>>,
     /// Key-level route whitelist; `None` inherits the user.
     pub key_route_aliases: Option<Vec<String>>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for Principal {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(Self {
+            key_id: row.try_get("key_id")?,
+            key_label: row.try_get("key_label")?,
+            key_enabled: row.try_get("key_enabled")?,
+            key_expires_at: row
+                .try_get::<Option<jiff_sqlx::Timestamp>, _>("key_expires_at")?
+                .map(jiff_sqlx::Timestamp::to_jiff),
+            key_quota_microus: row.try_get("key_quota_microus")?,
+            key_spent_microus: row.try_get("key_spent_microus")?,
+            user_id: row.try_get("user_id")?,
+            login: row.try_get("login")?,
+            user_enabled: row.try_get("user_enabled")?,
+            group_id: row.try_get("group_id")?,
+            group_rate_bp: row.try_get("group_rate_bp")?,
+            user_rate_bp: row.try_get("user_rate_bp")?,
+            balance_microus: row.try_get("balance_microus")?,
+            max_concurrent: row.try_get("max_concurrent")?,
+            group_route_aliases: row.try_get("group_route_aliases")?,
+            user_route_aliases: row.try_get("user_route_aliases")?,
+            key_route_aliases: row.try_get("key_route_aliases")?,
+        })
+    }
 }
 
 /// Look up the principal behind a plaintext gateway key. Returns `None` when
@@ -97,7 +123,8 @@ pub struct UserRow {
     pub balance_microus: i64,
     pub max_concurrent: i32,
     pub rpm: Option<i32>,
-    pub created_at: DateTime<Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub created_at: Timestamp,
     pub route_aliases: Option<Vec<String>>,
 }
 
@@ -116,7 +143,7 @@ pub struct GroupRow {
 
 /// Fields of a new user. The balance always starts at zero: money only
 /// enters through a ledger entry.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NewUser<'a> {
     pub login: &'a str,
     pub display_name: &'a str,
@@ -129,7 +156,7 @@ pub struct NewUser<'a> {
 /// Partial user update: `None` leaves a field untouched. `rate_bp` is
 /// three-state: `Some(None)` clears the override back to the group rate.
 /// The balance is deliberately absent; it changes only with a ledger entry.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct UserPatch<'a> {
     pub display_name: Option<&'a str>,
     pub enabled: Option<bool>,

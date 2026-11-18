@@ -20,10 +20,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::DateTime;
-use chrono::TimeDelta;
-use chrono::Utc;
 use futures::StreamExt as _;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use reqwest::StatusCode;
 
 use super::OpenaiOAuth;
@@ -160,7 +159,7 @@ pub struct TokenSet {
     /// The OIDC ID token, when the issuer sent one (it may carry the plan).
     pub id_token: Option<String>,
     /// When `access_token` stops being accepted.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
 }
 
 impl std::fmt::Debug for TokenSet {
@@ -288,7 +287,7 @@ fn parse_interval(value: Option<&serde_json::Value>) -> Duration {
 fn parse_token_set(
     body: &[u8],
     operation: &'static str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     fallback_refresh: Option<&str>,
 ) -> Result<TokenSet, AuthError> {
     let protocol = || AuthError::Protocol { operation };
@@ -302,9 +301,9 @@ fn parse_token_set(
         .expires_in
         .filter(|seconds| *seconds > 0)
         .and_then(|seconds| i64::try_from(seconds).ok())
-        .and_then(TimeDelta::try_seconds)
+        .map(SignedDuration::from_secs)
         .ok_or_else(protocol)?;
-    let expires_at = now.checked_add_signed(expires_in).ok_or_else(protocol)?;
+    let expires_at = now.checked_add(expires_in).map_err(|_| protocol())?;
     Ok(TokenSet {
         access_token,
         refresh_token,
@@ -463,7 +462,7 @@ impl Client {
     pub async fn exchange_code(
         &self,
         approval: &DeviceApproval,
-        now: DateTime<Utc>,
+        now: Timestamp,
         proxy: Option<&ProxySpec>,
     ) -> Result<TokenSet, AuthError> {
         let form = form_body(&[
@@ -485,7 +484,7 @@ impl Client {
     pub async fn refresh(
         &self,
         refresh_token: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         proxy: Option<&ProxySpec>,
     ) -> Result<TokenSet, AuthError> {
         let form = form_body(&[

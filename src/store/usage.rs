@@ -1,5 +1,7 @@
 use crate::store::usage_source::{self, SourcePlan};
 use crate::store::user::OWNER_LOGIN;
+use jiff::{SignedDuration, Timestamp};
+use jiff_sqlx::ToSqlx;
 use sqlx::PgPool;
 
 // ---------- admin reads: usage / request log / cooldowns ----------
@@ -147,11 +149,8 @@ pub struct TrendRow {
 /// A window buckets hourly up to this span, else daily (a local calendar day
 /// is 23–25 hours under DST, so a day still reads as hours). Shared by
 /// [`usage_trend`]'s SQL and the GUI's bucket grid so the two always agree.
-pub fn hourly_buckets(
-    since: chrono::DateTime<chrono::Utc>,
-    until: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    until - since <= chrono::Duration::hours(25)
+pub fn hourly_buckets(since: Timestamp, until: Timestamp) -> bool {
+    until.duration_since(since) <= SignedDuration::from_hours(25)
 }
 
 /// Usage aggregated by bucket × category for the trend chart over the
@@ -162,10 +161,10 @@ pub fn hourly_buckets(
 /// clock); the GUI's bucket grid shifts by the same offset, so labels match.
 pub async fn usage_trend(
     pool: &PgPool,
-    since: chrono::DateTime<chrono::Utc>,
-    until: chrono::DateTime<chrono::Utc>,
+    since: Timestamp,
+    until: Timestamp,
     split: TrendSplit,
-    local_offset: chrono::Duration,
+    local_offset: SignedDuration,
     caller: Option<CallerFilter>,
 ) -> anyhow::Result<Vec<TrendRow>> {
     let bucket = if hourly_buckets(since, until) {
@@ -271,13 +270,20 @@ pub async fn usage_trend(
         );
         let binds = CallerBinds::from(caller);
         let mut query = sqlx::query_as::<_, TrendRow>(sqlx::AssertSqlSafe(sql))
-            .bind(since)
-            .bind(until)
-            .bind(local_offset)
+            .bind(since.to_sqlx())
+            .bind(until.to_sqlx())
+            .bind(sqlx::postgres::types::PgInterval {
+                months: 0,
+                days: 0,
+                microseconds: local_offset.as_secs() * 1_000_000
+                    + i64::from(local_offset.subsec_micros()),
+            })
             .bind(binds.kind)
             .bind(binds.id);
         if let SourcePlan::Split { .. } = plan {
-            query = query.bind(left_end).bind(right_start);
+            query = query
+                .bind(jiff_sqlx::Timestamp::from(left_end))
+                .bind(jiff_sqlx::Timestamp::from(right_start));
         }
         if let Some(owner_login) = owner_login {
             query = query.bind(owner_login);
@@ -310,9 +316,14 @@ pub async fn usage_trend(
     // bind parameters.
     let binds = CallerBinds::from(caller);
     let mut query = sqlx::query_as::<_, TrendRow>(sqlx::AssertSqlSafe(sql))
-        .bind(since)
-        .bind(until)
-        .bind(local_offset)
+        .bind(since.to_sqlx())
+        .bind(until.to_sqlx())
+        .bind(sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: local_offset.as_secs() * 1_000_000
+                + i64::from(local_offset.subsec_micros()),
+        })
         .bind(binds.kind)
         .bind(binds.id);
     // Only the client and user arms supply an extra bind, because only their
@@ -356,8 +367,8 @@ pub struct UsageWindow {
 /// Aggregate the whole window into one row for the KPI cards.
 pub async fn usage_window(
     pool: &PgPool,
-    since: chrono::DateTime<chrono::Utc>,
-    until: chrono::DateTime<chrono::Utc>,
+    since: Timestamp,
+    until: Timestamp,
     caller: Option<CallerFilter>,
 ) -> anyhow::Result<UsageWindow> {
     let binds = CallerBinds::from(caller);
@@ -387,12 +398,12 @@ pub async fn usage_window(
            FROM additive"
     );
     let mut query = sqlx::query_as::<_, UsageWindow>(sqlx::AssertSqlSafe(sql))
-        .bind(since)
-        .bind(until)
+        .bind(since.to_sqlx())
+        .bind(until.to_sqlx())
         .bind(binds.kind)
         .bind(binds.id);
     if let SourcePlan::Split { .. } = plan {
-        query = query.bind(left_end).bind(right_start);
+        query = query.bind(left_end.to_sqlx()).bind(right_start.to_sqlx());
     }
     let window = query.fetch_one(pool).await?;
     Ok(window)

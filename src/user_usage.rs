@@ -101,7 +101,7 @@ fn user_scope(
     token: &str,
     principal: &Principal,
     admin_key: &AdminKey,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> Result<UserScope, String> {
     if is_admin_key(token, admin_key) {
         return Err("admin key is not valid for user usage".to_owned());
@@ -200,7 +200,7 @@ async fn user_auth(
             return;
         }
     };
-    match user_scope(token, &principal, admin_key, chrono::Utc::now()) {
+    match user_scope(token, &principal, admin_key, jiff::Timestamp::now()) {
         Ok(scope) => {
             depot.insert_typed(scope);
         }
@@ -247,7 +247,7 @@ struct MeUser {
     display_name: String,
     enabled: bool,
     max_concurrent: i32,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
 }
 
 /// The group part of [`MeView`]; `rate_bp` is the group's own rate.
@@ -261,9 +261,9 @@ struct MeGroup {
 #[derive(Deserialize)]
 struct WindowQuery {
     #[serde(default)]
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    since: Option<jiff::Timestamp>,
     #[serde(default)]
-    until: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<jiff::Timestamp>,
     #[serde(default)]
     days: Option<i32>,
 }
@@ -271,9 +271,9 @@ struct WindowQuery {
 #[derive(Deserialize)]
 struct TrendQuery {
     #[serde(default)]
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    since: Option<jiff::Timestamp>,
     #[serde(default)]
-    until: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<jiff::Timestamp>,
     #[serde(default)]
     days: Option<i32>,
     #[serde(default)]
@@ -297,16 +297,16 @@ fn user_split(split: Option<store::TrendSplit>) -> Result<store::TrendSplit, &'s
 }
 
 fn resolve_window(
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    until: Option<chrono::DateTime<chrono::Utc>>,
+    since: Option<jiff::Timestamp>,
+    until: Option<jiff::Timestamp>,
     days: Option<i32>,
-) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
-    let until = until.unwrap_or_else(chrono::Utc::now);
+) -> (jiff::Timestamp, jiff::Timestamp) {
+    let until = until.unwrap_or_else(jiff::Timestamp::now);
     let since = since.unwrap_or_else(|| {
-        until - chrono::Duration::days(i64::from(days.unwrap_or(7).clamp(1, 365)))
+        until - jiff::SignedDuration::from_hours(24 * i64::from(days.unwrap_or(7).clamp(1, 365)))
     });
     (
-        since.clamp(until - chrono::Duration::days(370), until),
+        since.clamp(until - jiff::SignedDuration::from_hours(24 * 370), until),
         until,
     )
 }
@@ -404,7 +404,7 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
         since,
         until,
         split,
-        chrono::Duration::seconds(offset_seconds),
+        jiff::SignedDuration::from_secs(offset_seconds),
         Some(caller),
     )
     .await
@@ -442,8 +442,8 @@ async fn me(depot: &mut Depot, response: &mut Response) {
             return;
         }
     };
-    let until = chrono::Utc::now();
-    let since = until - chrono::Duration::days(ME_USAGE_DAYS);
+    let until = jiff::Timestamp::now();
+    let since = until - jiff::SignedDuration::from_hours(24 * ME_USAGE_DAYS);
     let (mut keys, usage) = match futures::try_join!(
         store::list_gateway_keys(pool, Some(scope.user_id())),
         store::usage_window(pool, since, until, Some(scope.caller_filter())),

@@ -126,7 +126,7 @@ pub fn prepare(
         call.next_attempt(),
         KIRO_MAX_ATTEMPTS,
         true,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     ));
     // Field-by-field straight from the translated tree — no intermediate
     // `Value`, no deep copy of the session.

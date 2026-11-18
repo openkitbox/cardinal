@@ -10,9 +10,8 @@
 pub mod auth;
 pub mod login;
 
-use chrono::DateTime;
-use chrono::Duration;
-use chrono::Utc;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 
 /// The JWT claim object that carries the ChatGPT workspace and plan.
 const AUTH_CLAIM: &str = "https://api.openai.com/auth";
@@ -34,7 +33,7 @@ pub struct OpenaiOAuth {
     /// Refresh token, rotated on refresh (secret).
     pub refresh_token: String,
     /// UTC instant at which `access_token` stops being accepted.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// The ChatGPT workspace id (`chatgpt-account-id` header value).
     pub account_id: String,
     /// Account email as the token named it (decoration only).
@@ -50,7 +49,7 @@ impl OpenaiOAuth {
     /// the refresh margin every caller shares. A bundle expiring inside the
     /// skew counts as stale, so a request never races the expiry.
     #[must_use]
-    pub fn fresh_for(&self, now: DateTime<Utc>, skew: Duration) -> bool {
+    pub fn fresh_for(&self, now: Timestamp, skew: SignedDuration) -> bool {
         self.expires_at - now > skew
     }
 

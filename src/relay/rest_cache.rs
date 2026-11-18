@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::store::{ActiveRestRow, RestRow};
 
@@ -18,7 +18,7 @@ pub struct RestCache {
 
 #[derive(Clone, Debug)]
 pub struct RestEntry {
-    pub rest_until: DateTime<Utc>,
+    pub rest_until: Timestamp,
     pub reason: String,
 }
 
@@ -54,7 +54,7 @@ impl RestCache {
 
     /// All currently-unexpired rest rows (replaces `active_rest_rows`).
     pub fn active_rows(&self) -> Vec<ActiveRestRow> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         self.inner
             .read()
             .map(|inner| {
@@ -77,7 +77,7 @@ impl RestCache {
         &self,
         key_id: i64,
         model: Option<&str>,
-        rest_until: DateTime<Utc>,
+        rest_until: Timestamp,
         reason: &str,
     ) -> anyhow::Result<()> {
         crate::store::insert_rest(&self.pool, key_id, model, rest_until, reason).await?;

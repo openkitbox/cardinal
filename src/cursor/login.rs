@@ -14,9 +14,8 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use chrono::DateTime;
-use chrono::Utc;
 use dashmap::DashMap;
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use super::auth::Challenge;
@@ -121,7 +120,7 @@ pub struct Session {
     /// residency: [`CursorLogins::prune`] turns a still-waiting session past
     /// this instant `Expired`; a finished session stays readable for the
     /// separate [`TERMINAL_RETENTION_SECS`] window.
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
     /// The existing account key this login replaces (a re-login); `None`
     /// means the login creates a new key once the tokens land.
     key_id: Option<i64>,
@@ -131,13 +130,13 @@ pub struct Session {
 
 struct Outcome {
     state: SessionState,
-    finished_at: Option<DateTime<Utc>>,
+    finished_at: Option<Timestamp>,
 }
 
 impl Session {
     /// Build a waiting session.
     #[must_use]
-    pub fn new(challenge: Challenge, expires_at: DateTime<Utc>, key_id: Option<i64>) -> Self {
+    pub fn new(challenge: Challenge, expires_at: Timestamp, key_id: Option<i64>) -> Self {
         Self {
             challenge,
             expires_at,
@@ -157,7 +156,7 @@ impl Session {
 
     /// When polling stops.
     #[must_use]
-    pub fn expires_at(&self) -> DateTime<Utc> {
+    pub fn expires_at(&self) -> Timestamp {
         self.expires_at
     }
 
@@ -182,7 +181,7 @@ impl Session {
     /// Move a waiting session to `next` and stamp the verdict time. False when
     /// the session was already terminal (or `next` is not terminal): only the
     /// first verdict stands.
-    pub fn finish(&self, next: SessionState, now: DateTime<Utc>) -> bool {
+    pub fn finish(&self, next: SessionState, now: Timestamp) -> bool {
         if !next.is_terminal() {
             tracing::warn!(
                 state = next.as_str(),
@@ -199,10 +198,10 @@ impl Session {
         true
     }
 
-    fn is_stale(&self, now: DateTime<Utc>) -> bool {
+    fn is_stale(&self, now: Timestamp) -> bool {
         let outcome = self.lock();
         outcome.finished_at.is_some_and(|finished_at| {
-            now.signed_duration_since(finished_at).num_seconds() > TERMINAL_RETENTION_SECS
+            now.duration_since(finished_at).as_secs() > TERMINAL_RETENTION_SECS
         })
     }
 
@@ -236,7 +235,7 @@ impl CursorLogins {
 
     /// Register a started login and return the id the GUI polls with,
     /// together with the shared session the poller will drive.
-    pub fn insert(&self, session: Session, now: DateTime<Utc>) -> (Uuid, Arc<Session>) {
+    pub fn insert(&self, session: Session, now: Timestamp) -> (Uuid, Arc<Session>) {
         self.prune(now);
         let id = Uuid::new_v4();
         let session = Arc::new(session);
@@ -246,14 +245,14 @@ impl CursorLogins {
 
     /// The session `id` names while it is still known (prunes first).
     #[must_use]
-    pub fn get(&self, id: &Uuid, now: DateTime<Utc>) -> Option<Arc<Session>> {
+    pub fn get(&self, id: &Uuid, now: Timestamp) -> Option<Arc<Session>> {
         self.prune(now);
         self.sessions.get(id).map(|entry| Arc::clone(entry.value()))
     }
 
     /// Cancel a waiting session; false when the id is unknown or the login
     /// had already reached a verdict.
-    pub fn cancel(&self, id: &Uuid, now: DateTime<Utc>) -> bool {
+    pub fn cancel(&self, id: &Uuid, now: Timestamp) -> bool {
         self.get(id, now)
             .is_some_and(|session| session.finish(SessionState::Cancelled, now))
     }
@@ -261,7 +260,7 @@ impl CursorLogins {
     /// Drop sessions whose verdict is older than the retention window, and
     /// expire a session still waiting past its poll deadline, so a poller
     /// that died cannot leave a `waiting` login nothing can finish.
-    pub fn prune(&self, now: DateTime<Utc>) {
+    pub fn prune(&self, now: Timestamp) {
         // Collect first: removing while iterating a DashMap can deadlock on a
         // shard this thread already holds.
         let mut expired: Vec<(Uuid, Arc<Session>)> = Vec::new();

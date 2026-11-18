@@ -20,10 +20,8 @@
 //! and fixed messages only. Neither credentials nor the vendor's answer text
 //! ever reach a log line.
 
-use chrono::DateTime;
-use chrono::NaiveDateTime;
-use chrono::TimeDelta;
-use chrono::Utc;
+use jiff::civil::DateTime as CivilDateTime;
+use jiff::{SignedDuration, Timestamp};
 use sqlx::PgPool;
 
 use super::KeyQuota;
@@ -141,7 +139,7 @@ pub async fn fetch_workbuddy_quota(
         .await;
     }
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let meter = MeterProbe {
         transport,
         dns,
@@ -169,7 +167,9 @@ pub async fn fetch_workbuddy_quota(
         if codes.is_empty() {
             return None;
         }
-        let day = (now + TimeDelta::hours(8)).format("%Y-%m-%d").to_string();
+        let day = (now + SignedDuration::from_hours(8))
+            .strftime("%Y-%m-%d")
+            .to_string();
         let paid = meter
             .post(
                 &format!("{base}/billing/meter/get-user-resource-paid-packages"),
@@ -400,18 +400,23 @@ fn display(value: Option<&serde_json::Value>) -> Option<String> {
 }
 
 /// The meter writes local wall-clock strings in UTC+8; convert to UTC.
-fn local_utc8(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
-    let naive = NaiveDateTime::parse_from_str(text(value)?, "%Y-%m-%d %H:%M:%S").ok()?;
-    Some(naive.and_utc() - TimeDelta::hours(8))
+fn local_utc8(value: Option<&serde_json::Value>) -> Option<Timestamp> {
+    let local = CivilDateTime::strptime("%Y-%m-%d %H:%M:%S", text(value)?).ok()?;
+    let utc = local.checked_sub(SignedDuration::from_hours(8)).ok()?;
+    Some(
+        utc.to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .ok()?
+            .timestamp(),
+    )
 }
 
-fn epoch_ms(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
+fn epoch_ms(value: Option<&serde_json::Value>) -> Option<Timestamp> {
     let millis: i64 = match value? {
         serde_json::Value::Number(number) => number.as_i64()?,
         serde_json::Value::String(text) => text.trim().parse().ok()?,
         _ => return None,
     };
-    DateTime::from_timestamp_millis(millis)
+    Timestamp::from_millisecond(millis).ok()
 }
 
 fn accounts(value: &serde_json::Value) -> &[serde_json::Value] {
@@ -423,7 +428,7 @@ fn accounts(value: &serde_json::Value) -> &[serde_json::Value] {
 fn single_window(
     used_pct: f64,
     total: String,
-    resets_at: DateTime<Utc>,
+    resets_at: Timestamp,
     period_minutes: i64,
 ) -> KeyQuota {
     KeyQuota {
@@ -450,7 +455,7 @@ struct Candidate<'a> {
     used: f64,
     total: f64,
     total_text: String,
-    end: DateTime<Utc>,
+    end: Timestamp,
     period_minutes: i64,
 }
 
@@ -466,7 +471,7 @@ fn parse_personal_quota(
     summary: &serde_json::Value,
     paid: &serde_json::Value,
     free: &serde_json::Value,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Option<KeyQuota> {
     let packages = field(summary, "Packages")?.as_array()?;
     let subscription = text(field(summary, "SubscriptionPackageCode"));
@@ -488,7 +493,7 @@ fn parse_personal_quota(
                 .or_else(|| epoch_ms(field(cycle, "DeductionEndTime")))
                 .or_else(|| local_utc8(field(cycle, "ExpiredTime")))?;
             let period_minutes = match local_utc8(field(cycle, "CycleStartTime")) {
-                Some(start) if start < end => (end - start).num_minutes().max(1),
+                Some(start) if start < end => ((end - start).as_secs() / 60).max(1),
                 _ => MONTH_MINUTES,
             };
             let used = amount(field(package, "CycleUsedCapacity")).unwrap_or(0.);
@@ -523,7 +528,7 @@ fn parse_personal_quota(
 }
 
 /// Map an enterprise account's meter answer to one quota window.
-fn parse_enterprise_quota(usage: &serde_json::Value, now: DateTime<Utc>) -> Option<KeyQuota> {
+fn parse_enterprise_quota(usage: &serde_json::Value, now: Timestamp) -> Option<KeyQuota> {
     let limit_field = field(usage, "limitNum");
     let limit = amount(limit_field)?;
     if limit <= 0. {
@@ -535,7 +540,7 @@ fn parse_enterprise_quota(usage: &serde_json::Value, now: DateTime<Utc>) -> Opti
         return None;
     }
     let period_minutes = match local_utc8(field(usage, "cycleStartTime")) {
-        Some(start) if start < reset => (reset - start).num_minutes().max(1),
+        Some(start) if start < reset => ((reset - start).as_secs() / 60).max(1),
         _ => MONTH_MINUTES,
     };
     Some(single_window(

@@ -1,3 +1,5 @@
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use sqlx::PgPool;
 
 use crate::quota::KeyQuota;
@@ -11,7 +13,7 @@ pub struct QuotaHistoryPoint {
     pub key_id: i64,
     pub window_name: String,
     pub used_pct: f64,
-    pub probed_at: chrono::DateTime<chrono::Utc>,
+    pub probed_at: Timestamp,
 }
 
 // ---------- quota snapshots (decorative GUI card cache, one row per key) ----------
@@ -25,7 +27,7 @@ pub async fn quota_snapshot_upsert(
     pool: &PgPool,
     key_id: i64,
     quota: &KeyQuota,
-    probed_at: chrono::DateTime<chrono::Utc>,
+    probed_at: Timestamp,
 ) -> anyhow::Result<()> {
     let payload = serde_json::to_value(quota)?;
     sqlx::query(
@@ -35,7 +37,7 @@ pub async fn quota_snapshot_upsert(
     )
     .bind(key_id)
     .bind(payload)
-    .bind(probed_at)
+    .bind(probed_at.to_sqlx())
   .execute(pool)
   .await?;
     Ok(())
@@ -47,8 +49,8 @@ pub async fn quota_snapshot_upsert(
 /// shows no reading.
 pub async fn list_quota_snapshots(
     pool: &PgPool,
-) -> anyhow::Result<Vec<(i64, KeyQuota, chrono::DateTime<chrono::Utc>)>> {
-    let rows = sqlx::query_as::<_, (i64, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
+) -> anyhow::Result<Vec<(i64, KeyQuota, Timestamp)>> {
+    let rows = sqlx::query_as::<_, (i64, serde_json::Value, jiff_sqlx::Timestamp)>(
         "SELECT key_id, payload, probed_at FROM gateway_key_quota_snapshots ORDER BY key_id",
     )
     .fetch_all(pool)
@@ -56,7 +58,7 @@ pub async fn list_quota_snapshots(
     let mut snapshots = Vec::with_capacity(rows.len());
     for (key_id, payload, probed_at) in rows {
         match serde_json::from_value(payload) {
-            Ok(quota) => snapshots.push((key_id, quota, probed_at)),
+            Ok(quota) => snapshots.push((key_id, quota, probed_at.to_jiff())),
             Err(error) => {
                 tracing::warn!(key_id, %error, "quota snapshot: undecodable payload skipped")
             }
@@ -117,10 +119,11 @@ pub async fn quota_history_insert(
         "INSERT INTO gateway_key_quota_history (key_id, window_name, used_pct, resets_at) ",
     );
     query.push_values(quota.windows.iter(), |mut row, window| {
+        let resets_at = window.resets_at;
         row.push_bind(key_id)
             .push_bind(&window.name)
             .push_bind(window.used_pct)
-            .push_bind(window.resets_at);
+            .push_bind(resets_at.map(ToSqlx::to_sqlx));
     });
     // `probed_at` keeps its column default (`now()`): one statement stamps
     // every window of a probe with the same instant.
@@ -161,7 +164,7 @@ pub async fn quota_history_prune(pool: &PgPool) -> anyhow::Result<u64> {
 /// filtered by the GUI against the current window's start — the gateway does
 /// not need to know each window's period to serve the series.
 pub async fn list_quota_history(pool: &PgPool) -> anyhow::Result<Vec<QuotaHistoryPoint>> {
-    let rows = sqlx::query_as::<_, (i64, String, f64, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<_, (i64, String, f64, jiff_sqlx::Timestamp)>(
         "WITH recent AS (
              SELECT DISTINCT ON (key_id, window_name, date_trunc('hour', probed_at))
                     key_id, window_name, used_pct, probed_at
@@ -192,7 +195,7 @@ pub async fn list_quota_history(pool: &PgPool) -> anyhow::Result<Vec<QuotaHistor
                 key_id,
                 window_name,
                 used_pct,
-                probed_at,
+                probed_at: probed_at.to_jiff(),
             },
         )
         .collect())

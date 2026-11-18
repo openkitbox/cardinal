@@ -16,9 +16,8 @@
 //! columns.
 
 use anyhow::anyhow;
-use chrono::DateTime;
-use chrono::Duration;
-use chrono::Utc;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 
 use crate::kiro::KiroOAuth;
 use crate::openai::OpenaiOAuth;
@@ -29,7 +28,7 @@ use crate::workbuddy::WorkbuddyOAuth;
 /// publishes no metadata, so a bundle's `expires_at` is decoded from the access
 /// token's JWT `exp` claim; a claim further out than this is a misread token,
 /// not a credential to keep, and would never be refreshed.
-const MAX_CURSOR_TOKEN_LIFETIME: Duration = Duration::days(730);
+const MAX_CURSOR_TOKEN_LIFETIME: SignedDuration = SignedDuration::from_hours(24 * 730);
 
 /// How a `gateway_provider_keys` row authenticates upstream, mirroring the
 /// `auth_kind` CHECK constraint.
@@ -101,7 +100,7 @@ pub struct CursorOAuth {
     pub refresh_token: String,
     /// UTC instant at which `access_token` stops being accepted, decoded from
     /// its JWT `exp`.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// Account email as the login answer reported it (decoration only).
     pub email: Option<String>,
     /// Selected team id, sent as `x-cursor-team-id` on dispatch (never a
@@ -124,7 +123,7 @@ impl CursorOAuth {
             "Cursor OAuth refresh_token must not be empty"
         );
         anyhow::ensure!(
-            self.expires_at <= Utc::now() + MAX_CURSOR_TOKEN_LIFETIME,
+            self.expires_at <= Timestamp::now() + MAX_CURSOR_TOKEN_LIFETIME,
             "Cursor OAuth expires_at {} is beyond the {MAX_CURSOR_TOKEN_LIFETIME} lifetime bound",
             self.expires_at
         );

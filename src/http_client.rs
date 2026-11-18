@@ -30,8 +30,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
+use jiff::{SignedDuration, Timestamp};
 
 use crate::activity::{ActivityEvent, ActivityReceiver};
 use crate::admin_ops::{ConcurrencyView, KeyQuotaRow, KeyQuotaSnapshotRow, KeyView};
@@ -253,7 +253,7 @@ pub struct GatewayKeyUpdate<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<Option<DateTime<Utc>>>,
+    pub expires_at: Option<Option<Timestamp>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_usd: Option<Option<&'a str>>,
     /// Three-state: absent = untouched, null = inherit the user, array = whitelist.
@@ -416,8 +416,8 @@ pub struct OpenaiResetCredit {
     pub id: String,
     pub status: String,
     pub reset_type: Option<String>,
-    pub granted_at: Option<DateTime<Utc>>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub granted_at: Option<Timestamp>,
+    pub expires_at: Option<Timestamp>,
     pub title: Option<String>,
     pub description: Option<String>,
 }
@@ -621,8 +621,8 @@ impl GatewayHttpClient {
     /// `scope` restricts the callers counted.
     pub async fn usage_window(
         &self,
-        since: DateTime<Utc>,
-        until: DateTime<Utc>,
+        since: Timestamp,
+        until: Timestamp,
         scope: UsageScope,
     ) -> Result<UsageWindow, ClientError> {
         #[derive(serde::Serialize)]
@@ -649,10 +649,10 @@ impl GatewayHttpClient {
     /// `scope` restricts the callers counted.
     pub async fn usage_trend(
         &self,
-        since: DateTime<Utc>,
-        until: DateTime<Utc>,
+        since: Timestamp,
+        until: Timestamp,
         split: TrendSplit,
-        local_offset: chrono::Duration,
+        local_offset: SignedDuration,
         scope: UsageScope,
     ) -> Result<Vec<TrendRow>, ClientError> {
         #[derive(serde::Serialize)]
@@ -670,7 +670,7 @@ impl GatewayHttpClient {
             since: rfc3339(since),
             until: rfc3339(until),
             split,
-            offset_seconds: local_offset.num_seconds(),
+            offset_seconds: local_offset.as_secs(),
             key_id: scope.key_id(),
             user_id: scope.user_id(),
         };
@@ -982,7 +982,7 @@ impl GatewayHttpClient {
         &self,
         user_id: Option<i64>,
         label: &str,
-        expires_at: Option<DateTime<Utc>>,
+        expires_at: Option<Timestamp>,
         quota_usd: Option<&str>,
         route_aliases: Option<&[String]>,
     ) -> Result<String, ClientError> {
@@ -992,7 +992,7 @@ impl GatewayHttpClient {
             #[serde(skip_serializing_if = "Option::is_none")]
             user_id: Option<i64>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            expires_at: Option<DateTime<Utc>>,
+            expires_at: Option<Timestamp>,
             #[serde(skip_serializing_if = "Option::is_none")]
             quota_usd: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -1804,8 +1804,8 @@ fn encode_path_segment(value: &str) -> String {
 /// RFC3339 with the `Z` spelling — human-diffable in logs; reqwest's query
 /// serializer percent-encodes whatever it gets, so the `+00:00` pitfall the
 /// handler tests document cannot bite here.
-fn rfc3339(ts: DateTime<Utc>) -> String {
-    ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+fn rfc3339(ts: Timestamp) -> String {
+    ts.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// Body of `POST /api/users/{id}/topup` and `/adjust`.

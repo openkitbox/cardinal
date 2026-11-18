@@ -1,5 +1,5 @@
-use chrono::DateTime;
-use chrono::Utc;
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use sqlx::PgPool;
 
 /// The [`GatewayKeyRow`] select list over `gateway_keys k JOIN users u`,
@@ -38,7 +38,7 @@ pub async fn seed_gateway_key(pool: &PgPool, gateway_key: &str) -> anyhow::Resul
 }
 
 /// Gateway key row for admin listing.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayKeyRow {
     pub id: i64,
     /// Original key (plaintext, for display and copy in admin UI).
@@ -48,18 +48,48 @@ pub struct GatewayKeyRow {
     /// Owning user and that user's login.
     pub user_id: i64,
     pub login: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub created_by: Option<String>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub disabled_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<Timestamp>,
+    pub disabled_at: Option<Timestamp>,
     /// After this instant the key no longer authenticates; `None` = never.
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// Cumulative spending cap, micro-USD; `None` = unlimited.
     pub quota_microus: Option<i64>,
     /// Micro-USD charged through this key so far (the sum of its charge
     /// entries, kept by settlement).
     pub spent_microus: i64,
     pub route_aliases: Option<Vec<String>>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for GatewayKeyRow {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(Self {
+            id: row.try_get("id")?,
+            key: row.try_get("key")?,
+            label: row.try_get("label")?,
+            enabled: row.try_get("enabled")?,
+            user_id: row.try_get("user_id")?,
+            login: row.try_get("login")?,
+            created_at: row
+                .try_get::<jiff_sqlx::Timestamp, _>("created_at")?
+                .to_jiff(),
+            created_by: row.try_get("created_by")?,
+            last_used_at: row
+                .try_get::<Option<jiff_sqlx::Timestamp>, _>("last_used_at")?
+                .map(jiff_sqlx::Timestamp::to_jiff),
+            disabled_at: row
+                .try_get::<Option<jiff_sqlx::Timestamp>, _>("disabled_at")?
+                .map(jiff_sqlx::Timestamp::to_jiff),
+            expires_at: row
+                .try_get::<Option<jiff_sqlx::Timestamp>, _>("expires_at")?
+                .map(jiff_sqlx::Timestamp::to_jiff),
+            quota_microus: row.try_get("quota_microus")?,
+            spent_microus: row.try_get("spent_microus")?,
+            route_aliases: row.try_get("route_aliases")?,
+        })
+    }
 }
 
 /// List gateway keys, newest first: every key, or only those `user_id` owns.
@@ -84,7 +114,7 @@ pub async fn list_gateway_keys(
 #[derive(Debug, Clone, Default)]
 pub struct KeyTerms {
     /// `None` = never expires.
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// Cumulative cap in micro-USD; `None` = unlimited.
     pub quota_microus: Option<i64>,
     /// Route visibility: `None` inherits, an array is a whitelist.
@@ -121,7 +151,7 @@ pub async fn create_gateway_key(
     .bind(label)
     .bind(created_by)
     .bind(user_id)
-    .bind(terms.expires_at)
+    .bind(terms.expires_at.map(ToSqlx::to_sqlx))
     .bind(terms.quota_microus)
     .bind(terms.route_aliases)
     .execute(pool)
@@ -178,7 +208,7 @@ pub async fn create_user_gateway_key(
     .bind(label)
     .bind(&login)
     .bind(user_id)
-    .bind(terms.expires_at)
+    .bind(terms.expires_at.map(ToSqlx::to_sqlx))
     .bind(terms.quota_microus)
     .fetch_one(&mut *tx)
     .await?;
@@ -193,7 +223,7 @@ pub async fn create_user_gateway_key(
 pub struct GatewayKeyPatch<'a> {
     pub label: Option<&'a str>,
     pub enabled: Option<bool>,
-    pub expires_at: Option<Option<DateTime<Utc>>>,
+    pub expires_at: Option<Option<Timestamp>>,
     pub quota_microus: Option<Option<i64>>,
     pub route_aliases: Option<Option<&'a [String]>>,
 }
@@ -226,7 +256,7 @@ pub async fn update_gateway_key(
     .bind(patch.label)
     .bind(patch.enabled)
     .bind(patch.expires_at.is_some())
-    .bind(patch.expires_at.flatten())
+    .bind(patch.expires_at.flatten().map(ToSqlx::to_sqlx))
     .bind(patch.quota_microus.is_some())
     .bind(patch.quota_microus.flatten())
     .bind(patch.route_aliases.is_some())

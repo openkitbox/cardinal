@@ -14,9 +14,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::DateTime;
-use chrono::TimeDelta;
-use chrono::Utc;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use reqwest::StatusCode;
 
 use super::is_opencode_console_url;
@@ -131,9 +130,9 @@ impl ReadyToken {
     /// saturating conversions only keep a hand-built token from wrapping into
     /// the past or panicking.
     #[must_use]
-    pub fn expires_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+    pub fn expires_at(&self, now: Timestamp) -> Timestamp {
         let seconds = i64::try_from(self.expires_in).unwrap_or(i64::MAX);
-        now + TimeDelta::try_seconds(seconds).unwrap_or(TimeDelta::MAX)
+        now + SignedDuration::from_secs(seconds)
     }
 }
 

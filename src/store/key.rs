@@ -1,3 +1,6 @@
+use jiff::Timestamp;
+use jiff::ZonedDateTime;
+use jiff::civil::Time;
 use sqlx::PgPool;
 
 use crate::credentials::{AuthKind, CursorOAuth, KeyCredential};
@@ -9,7 +12,7 @@ use crate::workbuddy::WorkbuddyOAuth;
 
 use super::key_group::AddKeyGroupsError;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProviderKeyRow {
     pub id: i64,
     pub provider_id: i64,
@@ -35,12 +38,10 @@ pub struct ProviderKeyRow {
     /// The key's cached model-list snapshot: what its provider's /models last
     /// answered (NULL until the first successful probe). Feeds the /v1/models
     /// route-object derivation.
-    #[sqlx(json(nullable))]
     pub models: Option<Vec<ProbeModel>>,
     /// Model whitelist: NULL/empty = unrestricted (every model servable);
     /// a non-empty list = the exact upstream model ids this key may serve
     /// (relay candidate filtering).
-    #[sqlx(json(nullable))]
     pub allowed_models: Option<Vec<String>>,
     /// How the row authenticates upstream: `static` (the plaintext api_key
     /// above), `kiro_oidc`, `opencode_oauth`, `cursor_oauth` or `openai_oauth`
@@ -56,12 +57,11 @@ pub struct ProviderKeyRow {
     /// never a guess. Never serialized: this row is an internal read shape and
     /// the tokens must not reach any JSON surface (the bootstrap/reveal views
     /// carry no credential).
-    #[sqlx(json(nullable))]
     #[serde(skip)]
     pub oauth: Option<serde_json::Value>,
     /// When the account was archived; None = not archived. Independent of
     /// `enabled` and of group membership (migrations/0011).
-    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub archived_at: Option<Timestamp>,
     /// The per-account egress proxy endpoint (https/socks5), stored verbatim
     /// with optional credentials (migrations/0028). It is a live secret: the
     /// type-level `serde(skip)` keeps it out of every JSON surface, the manual
@@ -69,6 +69,36 @@ pub struct ProviderKeyRow {
     /// [`ProviderKeyView::proxy_configured`].
     #[serde(skip)]
     pub proxy_url: Option<String>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ProviderKeyRow {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(Self {
+            id: row.try_get("id")?,
+            provider_id: row.try_get("provider_id")?,
+            label: row.try_get("label")?,
+            api_key: row.try_get("api_key")?,
+            enabled: row.try_get("enabled")?,
+            position: row.try_get("position")?,
+            max_concurrency: row.try_get("max_concurrency")?,
+            rest_on_429: row.try_get("rest_on_429")?,
+            models: row
+                .try_get::<Option<sqlx::types::Json<Vec<ProbeModel>>>, _>("models")?
+                .map(|json| json.0),
+            allowed_models: row
+                .try_get::<Option<sqlx::types::Json<Vec<String>>>, _>("allowed_models")?
+                .map(|json| json.0),
+            auth_kind: row.try_get("auth_kind")?,
+            oauth: row
+                .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("oauth")?
+                .map(|json| json.0),
+            archived_at: row
+                .try_get::<Option<jiff_sqlx::Timestamp>, _>("archived_at")?
+                .map(jiff_sqlx::Timestamp::to_jiff),
+            proxy_url: row.try_get("proxy_url")?,
+        })
+    }
 }
 
 /// The row as diagnostics see it: every field except the credentials.
@@ -231,7 +261,7 @@ pub struct ProviderKeyView {
     pub organization: Option<String>,
     /// When the account was archived (None = not archived).
     #[serde(default)]
-    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub archived_at: Option<Timestamp>,
     /// Whether this account has an egress proxy configured. The proxy URL is a
     /// secret and never appears here; this boolean is the only proxy state the
     /// list/bootstrap/reveal surfaces expose. `default` keeps older gateways'
@@ -1775,7 +1805,7 @@ impl RouteEntry {
     /// (every rule names a window it governs, so a moment no rule covers is the
     /// unrestricted default — a deny-only list cannot accidentally deny the
     /// whole day); no rules at all means always available.
-    pub fn is_available(&self, now: chrono::DateTime<chrono::Local>) -> bool {
+    pub fn is_available(&self, now: &ZonedDateTime) -> bool {
         let rules = self.rules();
         if rules.is_empty() {
             return true;
@@ -1821,8 +1851,8 @@ pub struct ActiveWindow {
 }
 
 impl ActiveWindow {
-    fn parse_hhmm(text: &str) -> Option<chrono::NaiveTime> {
-        chrono::NaiveTime::parse_from_str(text, "%H:%M").ok()
+    fn parse_hhmm(text: &str) -> Option<Time> {
+        Time::strptime("%H:%M", text).ok()
     }
 
     /// Persist-time validation: both ends must parse as HH:MM, and every
@@ -1858,12 +1888,10 @@ impl ActiveWindow {
     /// `start == end` covers the whole day (only storable with `days`). An
     /// unparseable stored window is treated as always-active (writes are
     /// validated; this is only defensive).
-    pub fn contains(&self, now: chrono::DateTime<chrono::Local>) -> bool {
+    pub fn contains(&self, now: &ZonedDateTime) -> bool {
         if let Some(days) = &self.days
             && !days.is_empty()
-            && !days.contains(
-                &u8::try_from(chrono::Datelike::weekday(&now).number_from_monday()).unwrap_or(0),
-            )
+            && !days.contains(&(now.weekday().to_monday_one_offset() as u8))
         {
             return false;
         }

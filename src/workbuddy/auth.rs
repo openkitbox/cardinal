@@ -1,8 +1,7 @@
 use std::time::Duration;
 
-use chrono::DateTime;
-use chrono::TimeDelta;
-use chrono::Utc;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 
 use crate::protocol::Prepared;
 use crate::upstream::Dns;
@@ -65,7 +64,7 @@ pub fn envelope(text: &str) -> Result<serde_json::Value, WorkbuddyError> {
 /// What one token poll returned.
 pub enum TokenPoll {
     Pending,
-    Ready(WorkbuddyOAuth),
+    Ready(Box<WorkbuddyOAuth>),
 }
 
 /// What one account poll returned.
@@ -160,7 +159,7 @@ impl Client {
             Err(WorkbuddyError::Envelope { code: 11217, .. }) => return Ok(TokenPoll::Pending),
             Err(error) => return Err(error),
         };
-        token_from(&data, build, Utc::now()).map(TokenPoll::Ready)
+        token_from(&data, build, Timestamp::now()).map(|bundle| TokenPoll::Ready(Box::new(bundle)))
     }
 
     /// Poll the account identity associated with an access token.
@@ -275,7 +274,7 @@ impl Client {
                 proxy,
             )
             .await?;
-        merge_refresh(&data, current, build, domain.as_deref(), Utc::now())
+        merge_refresh(&data, current, build, domain.as_deref(), Timestamp::now())
     }
 
     async fn call(
@@ -451,8 +450,8 @@ fn epoch_field(
     data: &serde_json::Value,
     absolute: &str,
     relative: &str,
-    now: DateTime<Utc>,
-) -> Result<Option<DateTime<Utc>>, ()> {
+    now: Timestamp,
+) -> Result<Option<Timestamp>, ()> {
     if let Some(value) = data.get(absolute).and_then(number_value)
         && value > 0
     {
@@ -461,13 +460,14 @@ fn epoch_field(
         } else {
             value.checked_mul(1000).ok_or(())?
         };
-        return DateTime::from_timestamp_millis(millis).ok_or(()).map(Some);
+        return Ok(Timestamp::from_millisecond(millis).ok());
     }
     let Some(seconds) = data.get(relative).and_then(number_value).filter(|v| *v > 0) else {
         return Ok(None);
     };
-    let delta = TimeDelta::try_seconds(seconds).ok_or(())?;
-    now.checked_add_signed(delta).ok_or(()).map(Some)
+    now.checked_add(SignedDuration::from_secs(seconds))
+        .map(Some)
+        .map_err(|_| ())
 }
 
 fn number_value(value: &serde_json::Value) -> Option<i64> {
@@ -479,7 +479,7 @@ fn number_value(value: &serde_json::Value) -> Option<i64> {
 fn token_from(
     data: &serde_json::Value,
     build: BuildInfo,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<WorkbuddyOAuth, WorkbuddyError> {
     let access_token = text_field(data, "accessToken", "auth/token")?;
     let refresh_token = text_field(data, "refreshToken", "auth/token")?;
@@ -519,7 +519,7 @@ fn merge_refresh(
     current: &WorkbuddyOAuth,
     build: Build,
     current_domain: Option<&str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<WorkbuddyOAuth, WorkbuddyError> {
     let access_token = text_field(data, "accessToken", "auth/token/refresh")?;
     let refresh_token =

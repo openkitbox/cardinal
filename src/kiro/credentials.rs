@@ -337,9 +337,9 @@ pub fn parse_import_credentials(
             i64::try_from(seconds).map_err(|_| anyhow::anyhow!("expiresAt is out of range"))?
         }
         Some(serde_json::Value::String(value)) => {
-            let timestamp = chrono::DateTime::parse_from_rfc3339(value)
+            let timestamp = jiff::Timestamp::strptime(value, "%Y-%m-%dT%H:%M:%S%.f%:z")
                 .map_err(|_| anyhow::anyhow!("expiresAt must be RFC3339 or Unix timestamp"))?
-                .timestamp();
+                .as_second();
             anyhow::ensure!(timestamp > 0, "expiresAt must be positive");
             timestamp
         }

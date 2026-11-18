@@ -33,9 +33,9 @@
 
 use std::sync::Arc;
 
-use chrono::Duration;
-use chrono::Utc;
 use dashmap::DashMap;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
@@ -239,7 +239,7 @@ impl OpenaiTokens {
     /// `Arc`, never of the tokens.
     fn fresh_cached(&self, key_id: i64) -> Option<Arc<OpenaiOAuth>> {
         let bundle = self.bundles.get(&key_id)?;
-        let fresh = bundle.fresh_for(Utc::now(), skew());
+        let fresh = bundle.fresh_for(Timestamp::now(), skew());
         fresh.then(|| Arc::clone(bundle.value()))
     }
 
@@ -289,13 +289,13 @@ impl OpenaiTokens {
                 return Err(OpenaiTokenError::Store);
             }
         };
-        let adoptable = adoptable(mode, &stored, Utc::now());
+        let adoptable = adoptable(mode, &stored, Timestamp::now());
         if adoptable {
             return Ok(self.adopt(key_id, stored));
         }
         let tokens = match self
             .client
-            .refresh(&stored.refresh_token, Utc::now(), proxy)
+            .refresh(&stored.refresh_token, Timestamp::now(), proxy)
             .await
         {
             Ok(tokens) => tokens,
@@ -413,7 +413,7 @@ impl OpenaiTokens {
 /// moved was rotated by whoever won the gate (or another process), so
 /// refreshing it again would rotate the account's only working refresh token
 /// away.
-fn adoptable(mode: Freshness<'_>, stored: &OpenaiOAuth, now: chrono::DateTime<Utc>) -> bool {
+fn adoptable(mode: Freshness<'_>, stored: &OpenaiOAuth, now: Timestamp) -> bool {
     match mode {
         Freshness::Check => stored.fresh_for(now, skew()),
         Freshness::Force { rejected } => stored.access_token != rejected,
@@ -421,8 +421,8 @@ fn adoptable(mode: Freshness<'_>, stored: &OpenaiOAuth, now: chrono::DateTime<Ut
 }
 
 /// The shared refresh margin as a duration.
-fn skew() -> Duration {
-    Duration::seconds(REFRESH_SKEW_SECS)
+fn skew() -> SignedDuration {
+    SignedDuration::from_secs(REFRESH_SKEW_SECS)
 }
 
 /// Reduce one issuer failure to the relay-facing verdict.

@@ -11,6 +11,7 @@ use super::ir::{
     IrToolChoice,
 };
 use crate::protocol::ProtocolError;
+use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 const DROPPED_FIELDS: &[&str] = &[
@@ -674,7 +675,7 @@ pub fn emit_response_json(
         ),
     };
     let mut body = serde_json::json!({
-      "id": format!("msg_{:024x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().unsigned_abs()),
+      "id": format!("msg_{:024x}", Timestamp::now().as_nanosecond().unsigned_abs()),
       "type": "message",
       "role": "assistant",
       "model": response.model,

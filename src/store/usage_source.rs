@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SourcePlan {
@@ -11,9 +11,9 @@ pub(crate) enum SourcePlan {
 }
 
 pub(crate) fn source_plan(
-    since: DateTime<Utc>,
-    until: DateTime<Utc>,
-) -> (SourcePlan, DateTime<Utc>, DateTime<Utc>) {
+    since: Timestamp,
+    until: Timestamp,
+) -> (SourcePlan, Timestamp, Timestamp) {
     let left_end = ceil_hour(since);
     let right_start = floor_hour(until);
     if since >= until || left_end >= right_start {
@@ -31,21 +31,21 @@ pub(crate) fn source_plan(
     )
 }
 
-pub(crate) fn can_use_cagg_trend(local_offset: Duration) -> bool {
-    local_offset.num_seconds().rem_euclid(3_600) == 0
+pub(crate) fn can_use_cagg_trend(local_offset: SignedDuration) -> bool {
+    local_offset.as_secs().rem_euclid(3_600) == 0
 }
 
-fn floor_hour(timestamp: DateTime<Utc>) -> DateTime<Utc> {
-    let seconds = timestamp.timestamp().div_euclid(3_600) * 3_600;
-    DateTime::from_timestamp(seconds, 0).expect("UTC timestamp remains representable")
+fn floor_hour(timestamp: Timestamp) -> Timestamp {
+    let seconds = timestamp.as_second().div_euclid(3_600) * 3_600;
+    Timestamp::new(seconds, 0).expect("UTC timestamp remains representable")
 }
 
-fn ceil_hour(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+fn ceil_hour(timestamp: Timestamp) -> Timestamp {
     let floor = floor_hour(timestamp);
     if timestamp == floor {
         floor
     } else {
-        floor + Duration::hours(1)
+        floor + SignedDuration::from_hours(1)
     }
 }
 

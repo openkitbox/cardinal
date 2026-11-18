@@ -34,8 +34,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use jiff::Timestamp;
 use serde::Deserialize;
 
 use crate::protocol::cursor::request as cursor_request;
@@ -110,7 +110,7 @@ impl CursorUsage {
         key_id: i64,
         bearer: &CursorBearer,
         conversation_id: &str,
-        since: DateTime<Utc>,
+        since: Timestamp,
         dns: crate::upstream::Dns,
     ) -> Resolved {
         if self.is_unreadable(key_id) {
@@ -163,11 +163,11 @@ impl CursorUsage {
         key_id: i64,
         bearer: &CursorBearer,
         conversation_id: &str,
-        since: DateTime<Utc>,
+        since: Timestamp,
         dns: crate::upstream::Dns,
     ) -> Ask {
-        let since_ms = since.timestamp_millis();
-        let now_ms = Utc::now().timestamp_millis();
+        let since_ms = since.as_millisecond();
+        let now_ms = Timestamp::now().as_millisecond();
         let mut body = serde_json::Map::new();
         if let Some(team_id) = bearer.team_id()
             && let Ok(team_id) = team_id.parse::<i64>()

@@ -1,4 +1,5 @@
 use crate::protocol::ProtocolId;
+use jiff::Timestamp;
 use sqlx::PgPool;
 
 /// The ledger time and dispatch request id of one request row — the anchor
@@ -9,13 +10,13 @@ use sqlx::PgPool;
 pub async fn request_row_anchor(
     pool: &PgPool,
     id: i64,
-) -> anyhow::Result<Option<(chrono::DateTime<chrono::Utc>, Option<String>)>> {
-    let row: Option<(chrono::DateTime<chrono::Utc>, Option<String>)> =
+) -> anyhow::Result<Option<(Timestamp, Option<String>)>> {
+    let row: Option<(jiff_sqlx::Timestamp, Option<String>)> =
         sqlx::query_as("SELECT ts, request_id FROM gateway_requests WHERE id = $1")
             .bind(id)
             .fetch_optional(pool)
             .await?;
-    Ok(row)
+    Ok(row.map(|(ts, request_id)| (ts.to_jiff(), request_id)))
 }
 
 /// In-memory record of one relay attempt — the write-side shape of a
@@ -248,7 +249,8 @@ fn column<'a, T>(attempts: &'a [AttemptLog], map: impl Fn(&'a AttemptLog) -> T) 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct RequestRow {
     pub id: i64,
-    pub ts: chrono::DateTime<chrono::Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub ts: Timestamp,
     pub protocol: String,
     /// The client-facing protocol (None: rows predating migration 0018).
     pub client_protocol: Option<String>,

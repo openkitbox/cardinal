@@ -12,6 +12,8 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use jiff::{SignedDuration, Timestamp};
+
 use regex::Regex;
 
 use super::optional;
@@ -156,8 +158,12 @@ impl AttemptError {
     /// retry pauses.
     pub fn retry_after_duration(&self) -> Option<std::time::Duration> {
         match self {
-            Self::Transport(error) => error.retry_after().and_then(|d| d.to_std().ok()),
-            Self::KiroTokenError(error) => error.retry_after().and_then(|d| d.to_std().ok()),
+            Self::Transport(error) => error
+                .retry_after()
+                .and_then(|d| std::time::Duration::try_from(d).ok()),
+            Self::KiroTokenError(error) => error
+                .retry_after()
+                .and_then(|d| std::time::Duration::try_from(d).ok()),
             _ => None,
         }
     }
@@ -172,13 +178,9 @@ pub enum Failure {
     /// refusal carries one (body timestamp, reset header, or Retry-After —
     /// precedence in that order), capped at [`MAX_QUOTA_REST`]; 15min when it
     /// says nothing of when.
-    Quota {
-        reset_until: Option<chrono::DateTime<chrono::Utc>>,
-    },
+    Quota { reset_until: Option<Timestamp> },
     /// Short rate limit: rest Retry-After (≤30min) else 1min.
-    Rate {
-        retry_after: Option<chrono::Duration>,
-    },
+    Rate { retry_after: Option<SignedDuration> },
     /// The plan/channel does not serve THIS model: fail over, rest the
     /// (key, model) pair for a fixed 15min (deliberately NOT parsed from any
     /// resets_at the body may carry — the pairing matters
@@ -199,10 +201,10 @@ pub enum Failure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestTarget {
     /// The whole key: every model on it rests.
-    Key(chrono::Duration),
+    Key(SignedDuration),
     /// Only the (key, model) pair of the failed candidate: sibling models on
     /// the same key stay usable.
-    KeyModel(chrono::Duration),
+    KeyModel(SignedDuration),
 }
 
 /// How one account answers a 429 short rate limit ([`Failure::Rate`]), from
@@ -248,28 +250,28 @@ impl Failure {
         &self,
         policy: RateLimitPolicy,
         consecutive_failures: u32,
-        now: chrono::DateTime<chrono::Utc>,
+        now: Timestamp,
     ) -> Option<RestTarget> {
         let key = |duration| Some(RestTarget::Key(duration));
         match self {
             Self::Rate { .. } if policy == RateLimitPolicy::RetryInPlace => None,
-            Self::Credit => key(chrono::Duration::minutes(30)),
+            Self::Credit => key(SignedDuration::from_mins(30)),
             Self::Quota { reset_until } => key(match *reset_until {
                 // A vendor-stated reset is trusted up to MAX_QUOTA_REST (a
                 // week's window plus a day over); past that the word
                 // is wrong and the 15min re-probe is the honest answer.
                 Some(t) if t > now => (t - now).min(MAX_QUOTA_REST),
-                _ => chrono::Duration::minutes(15),
+                _ => SignedDuration::from_mins(15),
             }),
             Self::Rate { retry_after } => key(match retry_after {
-                Some(d) => (*d).min(chrono::Duration::minutes(30)),
-                None => chrono::Duration::minutes(1),
+                Some(d) => (*d).min(SignedDuration::from_mins(30)),
+                None => SignedDuration::from_mins(1),
             }),
-            Self::Unserved => Some(RestTarget::KeyModel(chrono::Duration::minutes(15))),
+            Self::Unserved => Some(RestTarget::KeyModel(SignedDuration::from_mins(15))),
             Self::Blameless | Self::Request => None,
             Self::Other => {
                 let shift = consecutive_failures.saturating_sub(1).min(10);
-                key(chrono::Duration::minutes(1i64 << shift).min(chrono::Duration::minutes(10)))
+                key(SignedDuration::from_mins(1i64 << shift).min(SignedDuration::from_mins(10)))
             }
         }
     }
@@ -415,7 +417,7 @@ pub fn classify(error: &AttemptError) -> Failure {
         }
         AttemptError::Protocol(_) => return Failure::Request,
     };
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     let retry_after = retry_after_raw.and_then(crate::upstream::transport::parse_retry_after);
     let header_reset =
         reset_header_raw.and_then(|raw| crate::upstream::transport::parse_reset_header(raw, now));
@@ -462,12 +464,12 @@ pub fn classify(error: &AttemptError) -> Failure {
             Failure::Quota {
                 reset_until: body_reset(&text, now)
                     .or(header_reset)
-                    .or_else(|| retry_after.map(|d| now + d.min(chrono::Duration::hours(1)))),
+                    .or_else(|| retry_after.map(|d| now + d.min(SignedDuration::from_hours(1)))),
             }
         } else {
             Failure::Rate {
                 retry_after: retry_after
-                    .or_else(|| header_reset.map(|t| (t - now).min(chrono::Duration::minutes(30)))),
+                    .or_else(|| header_reset.map(|t| (t - now).min(SignedDuration::from_mins(30)))),
             }
         };
     }
@@ -476,7 +478,7 @@ pub fn classify(error: &AttemptError) -> Failure {
         return Failure::Quota {
             reset_until: body_reset(&text, now)
                 .or(header_reset)
-                .or_else(|| retry_after.map(|d| now + d.min(chrono::Duration::hours(1)))),
+                .or_else(|| retry_after.map(|d| now + d.min(SignedDuration::from_hours(1)))),
         };
     }
     // 8. Transferable statuses: auth-ish, request timeout, server errors, and
@@ -491,17 +493,14 @@ pub fn classify(error: &AttemptError) -> Failure {
 
 /// The most a vendor-stated quota reset is trusted (a week's window plus a
 /// day over). Enforced in `Failure::rest_target`.
-pub const MAX_QUOTA_REST: chrono::Duration = chrono::Duration::days(8);
+pub const MAX_QUOTA_REST: SignedDuration = SignedDuration::from_hours(24 * 8);
 
 /// A quota refusal's own word of when the allowance returns: Claude Code's
 /// "usage limit reached|<unix>" in the message text, the ChatGPT-style JSON
 /// `error.resets_at` / `error.resets_in_seconds`, or Google's
 /// `error.details[].retryDelay` ("26s"). Absolutize at `now`; past resets
 /// count as no word at all.
-fn body_reset(
-    text: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+fn body_reset(text: &str, now: Timestamp) -> Option<Timestamp> {
     static RESETS_WORDS: OnceLock<Option<Regex>> = OnceLock::new();
     if let Some(t) = RESETS_WORDS
         .get_or_init(|| Regex::new(r"(?i)limit reached\|(\d{9,13})\b").ok())
@@ -515,11 +514,11 @@ fn body_reset(
             (n, "s")
         };
         let t = if unit == "ms" {
-            chrono::DateTime::from_timestamp_millis(n)
+            Timestamp::from_millisecond(n).ok()
         } else {
-            chrono::DateTime::from_timestamp(n, 0)
+            Timestamp::from_second(n).ok()
         };
-        if let Some(t) = t.map(|t| t.with_timezone(&chrono::Utc))
+        if let Some(t) = t
             && t > now
         {
             return Some(t);
@@ -534,8 +533,7 @@ fn body_reset(
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let error = value.get("error")?;
     if let Some(at) = error.get("resets_at").and_then(serde_json::Value::as_i64)
-        && let Some(t) =
-            chrono::DateTime::from_timestamp(at, 0).map(|t| t.with_timezone(&chrono::Utc))
+        && let Some(t) = Timestamp::from_second(at).ok()
         && t > now
     {
         return Some(t);
@@ -545,7 +543,7 @@ fn body_reset(
         .and_then(serde_json::Value::as_i64)
         && secs > 0
     {
-        return Some(now + chrono::Duration::seconds(secs));
+        return Some(now + SignedDuration::from_secs(secs));
     }
     if let Some(delay) = error
         .get("details")

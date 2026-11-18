@@ -1,5 +1,5 @@
-use chrono::DateTime;
-use chrono::Utc;
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use sqlx::PgPool;
 
 use crate::quota;
@@ -15,7 +15,7 @@ pub struct BalanceHistoryPoint {
     pub amount: f64,
     pub opens_segment: bool,
     pub topup: Option<f64>,
-    pub probed_at: chrono::DateTime<chrono::Utc>,
+    pub probed_at: Timestamp,
 }
 
 /// Record one balance reading taken from the vendor at `probed_at` if it
@@ -40,7 +40,7 @@ pub async fn balance_history_record(
     pool: &PgPool,
     key_id: i64,
     balance: &Balance,
-    probed_at: DateTime<Utc>,
+    probed_at: Timestamp,
 ) -> anyhow::Result<()> {
     if !balance.amount.is_finite() {
         return Ok(());
@@ -52,7 +52,7 @@ pub async fn balance_history_record(
     .bind(key_id)
     .execute(&mut *tx)
     .await?;
-    let latest: Option<(f64, DateTime<Utc>)> = sqlx::query_as(
+    let latest: Option<(f64, jiff_sqlx::Timestamp)> = sqlx::query_as(
         "SELECT amount, probed_at FROM gateway_key_balance_history
          WHERE key_id = $1 ORDER BY probed_at DESC, id DESC LIMIT 1",
     )
@@ -60,7 +60,7 @@ pub async fn balance_history_record(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some((_, latest_at)) = latest
-        && probed_at <= latest_at
+        && probed_at <= latest_at.to_jiff()
     {
         return Ok(()); // stale reading; the transaction rolls back on drop
     }
@@ -78,7 +78,7 @@ pub async fn balance_history_record(
     .bind(balance.amount)
     .bind(opens_segment)
     .bind(topup)
-    .bind(probed_at)
+    .bind(probed_at.to_sqlx())
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -103,7 +103,7 @@ pub async fn balance_history_record(
 /// within a segment, so a bucket's last row carries its end value and
 /// downsampling loses no shape. Ordered by key, then probe time.
 pub async fn list_balance_history(pool: &PgPool) -> anyhow::Result<Vec<BalanceHistoryPoint>> {
-    let rows = sqlx::query_as::<_, (i64, f64, bool, Option<f64>, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<_, (i64, f64, bool, Option<f64>, jiff_sqlx::Timestamp)>(
         "WITH base AS (
              SELECT DISTINCT ON (key_id) id, key_id, probed_at
              FROM gateway_key_balance_history
@@ -145,7 +145,7 @@ pub async fn list_balance_history(pool: &PgPool) -> anyhow::Result<Vec<BalanceHi
                 amount,
                 opens_segment,
                 topup,
-                probed_at,
+                probed_at: probed_at.to_jiff(),
             },
         )
         .collect())

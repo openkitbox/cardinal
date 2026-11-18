@@ -1,3 +1,5 @@
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use sqlx::PgPool;
 
 // ---------- failure cooldown (rest), identity = (key, model); model NULL = the whole key ----------
@@ -8,7 +10,8 @@ pub struct ActiveRestRow {
     pub key_id: i64,
     /// NULL = the whole key rests; a model id cools only that (key, model) pair.
     pub model: Option<String>,
-    pub rest_until: chrono::DateTime<chrono::Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub rest_until: Timestamp,
     pub reason: Option<String>,
 }
 
@@ -19,7 +22,8 @@ pub struct RestRow {
     pub provider_id: i64,
     /// NULL = the whole key rests; a model id cools only that (key, model) pair.
     pub model: Option<String>,
-    pub rest_until: chrono::DateTime<chrono::Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub rest_until: Timestamp,
     pub reason: Option<String>,
     pub provider_name: String,
     pub key_label: String,
@@ -38,7 +42,7 @@ pub async fn insert_rest(
     pool: &PgPool,
     key_id: i64,
     model: Option<&str>,
-    rest_until: chrono::DateTime<chrono::Utc>,
+    rest_until: Timestamp,
     reason: &str,
 ) -> anyhow::Result<()> {
     sqlx::query(
@@ -47,7 +51,7 @@ pub async fn insert_rest(
   )
   .bind(key_id)
   .bind(model)
-  .bind(rest_until)
+  .bind(rest_until.to_sqlx())
   .bind(reason)
   .execute(pool)
   .await?;

@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use chrono::Duration;
-use chrono::Utc;
 use dashmap::DashMap;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
@@ -235,11 +235,11 @@ impl WorkbuddyTokens {
 }
 
 fn fresh(bundle: &WorkbuddyOAuth) -> bool {
-    bundle.expires_at - Utc::now() > Duration::seconds(REFRESH_SKEW_SECS)
+    bundle.expires_at - Timestamp::now() > SignedDuration::from_secs(REFRESH_SKEW_SECS)
 }
 
 fn unexpired(bundle: &WorkbuddyOAuth) -> bool {
-    bundle.expires_at > Utc::now()
+    bundle.expires_at > Timestamp::now()
 }
 
 fn refresh_was_rejected(error: &WorkbuddyError) -> bool {

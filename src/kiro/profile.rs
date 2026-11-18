@@ -29,7 +29,8 @@
 //!   capture in `fixtures/kiro-cli-profile.json` is the real client's wire and
 //!   is what a fresh kiro-cli presents.
 
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// `x-amz-target` of the conversational call (`GenerateAssistantResponse`).
@@ -81,12 +82,12 @@ pub fn retry_headers(
     attempt: u32,
     max: u32,
     kiro: bool,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<(&'static str, String)> {
     let ttl = if attempt > 1 {
         format!(
             "ttl={}; ",
-            (now + chrono::Duration::hours(1)).format("%Y%m%dT%H%M%SZ")
+            (now + SignedDuration::from_hours(1)).strftime("%Y%m%dT%H%M%SZ")
         )
     } else {
         String::new()

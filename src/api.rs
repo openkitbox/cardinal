@@ -689,7 +689,7 @@ fn refused_key(key: Option<&str>) -> String {
 /// user is disabled, or the key has expired at `now`. `None` = admitted.
 /// Messages name the key by its label, never by its value. Shared with the
 /// user usage surface (`user_usage`), which admits the same keys.
-pub(crate) fn refusal(principal: &Principal, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+pub(crate) fn refusal(principal: &Principal, now: jiff::Timestamp) -> Option<String> {
     if !principal.key_enabled {
         return Some(format!("the API key '{}' is disabled", principal.key_label));
     }
@@ -762,7 +762,7 @@ async fn gateway_auth(
         refuse(request, response, ctrl, reason);
         return;
     };
-    if let Some(reason) = refusal(&principal, chrono::Utc::now()) {
+    if let Some(reason) = refusal(&principal, jiff::Timestamp::now()) {
         refuse(request, response, ctrl, reason);
         return;
     }

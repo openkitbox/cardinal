@@ -10,6 +10,7 @@ use super::ir::{
     Effort, IrMessage, IrPart, IrRequest, IrResponse, IrRole, IrStop, IrTool, IrToolChoice,
 };
 use crate::protocol::ProtocolError;
+use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 /// Responses-only concepts no translated hop can carry. `store`/`background`
@@ -472,9 +473,9 @@ pub fn emit_response_json(
         IrStop::Stop | IrStop::ToolUse => ("completed", None),
     };
     let mut body = serde_json::json!({
-      "id": format!("resp_{:032x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().unsigned_abs()),
+      "id": format!("resp_{:032x}", Timestamp::now().as_nanosecond().unsigned_abs()),
       "object": "response",
-      "created_at": chrono::Utc::now().timestamp(),
+      "created_at": Timestamp::now().as_second(),
       "status": status,
       "model": response.model,
     });

@@ -10,8 +10,7 @@
 //! [`create`] and [`patch`] turn a create request or a [`PatchBody`] into
 //! the store values both APIs write; they stay free of I/O.
 
-use chrono::DateTime;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::Deserialize;
 
 use crate::store::GatewayKeyPatch;
@@ -47,9 +46,9 @@ pub fn quota(quota_usd: Option<&str>) -> Result<Option<i64>, &'static str> {
 /// The expiry (`None` = never expires), or why it is refused: a key cannot
 /// be given an expiry at or before `now`.
 pub fn expiry(
-    expires_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> Result<Option<DateTime<Utc>>, &'static str> {
+    expires_at: Option<Timestamp>,
+    now: Timestamp,
+) -> Result<Option<Timestamp>, &'static str> {
     match expires_at {
         Some(at) if at <= now => Err("expires_at must be in the future"),
         other => Ok(other),
@@ -60,10 +59,10 @@ pub fn expiry(
 /// they are refused.
 pub fn create<'a>(
     label_text: &'a str,
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<Timestamp>,
     quota_usd: Option<&str>,
     route_aliases: Option<&[String]>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(&'a str, KeyTerms), &'static str> {
     let label = label(label_text)?;
     let terms = KeyTerms {
@@ -84,7 +83,7 @@ pub struct PatchBody {
     pub enabled: Option<bool>,
     /// Three-state: absent = untouched, null = never expires, RFC 3339 = set.
     #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
-    pub expires_at: Option<Option<DateTime<Utc>>>,
+    pub expires_at: Option<Option<Timestamp>>,
     /// Three-state: absent = untouched, null = unlimited, decimal USD
     /// string = set the cap.
     #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
@@ -102,7 +101,7 @@ pub struct AdminPatchBody {
     pub enabled: Option<bool>,
     /// Three-state: absent = untouched, null = never expires, RFC 3339 = set.
     #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
-    pub expires_at: Option<Option<DateTime<Utc>>>,
+    pub expires_at: Option<Option<Timestamp>>,
     /// Three-state: absent = untouched, null = unlimited, decimal USD
     /// string = set the cap.
     #[serde(default, deserialize_with = "crate::tri_state::deserialize")]
@@ -113,7 +112,7 @@ pub struct AdminPatchBody {
 }
 
 /// Validate a key PATCH body into a store patch, or the 400 message.
-pub fn patch(body: &PatchBody, now: DateTime<Utc>) -> Result<GatewayKeyPatch<'_>, &'static str> {
+pub fn patch(body: &PatchBody, now: Timestamp) -> Result<GatewayKeyPatch<'_>, &'static str> {
     Ok(GatewayKeyPatch {
         label: body.label.as_deref().map(label).transpose()?,
         enabled: body.enabled,
@@ -133,7 +132,7 @@ pub fn patch(body: &PatchBody, now: DateTime<Utc>) -> Result<GatewayKeyPatch<'_>
 /// Validate an administrator key PATCH body into a store patch.
 pub fn admin_patch(
     body: &AdminPatchBody,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<GatewayKeyPatch<'_>, &'static str> {
     Ok(GatewayKeyPatch {
         label: body.label.as_deref().map(label).transpose()?,

@@ -1,33 +1,34 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff::civil::Date;
 
 use super::KeyQuota;
 
-/// The next monthly reset at UTC midnight of `day`, strictly after `now`.
-/// Days past the 28th are rejected — February has no 30th, and an anchor that
-/// cannot exist every month is a config error, not something to clamp.
-pub fn next_monthly_reset(day: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    use chrono::Datelike as _;
+pub fn next_monthly_reset(day: u32, now: Timestamp) -> Option<Timestamp> {
     if !(1..=28).contains(&day) {
         return None;
     }
-    let this_month = now.date_naive().with_day(day)?;
-    let this_month = this_month.and_hms_opt(0, 0, 0)?.and_utc();
-    Some(if this_month > now {
-        this_month
+    let utc = now.to_zoned_datetime(jiff::tz::TimeZone::UTC);
+    let make = |year, month| -> Option<Timestamp> {
+        Some(
+            Date::new(year, month, i8::try_from(day).ok()?)
+                .ok()?
+                .at(0, 0, 0, 0)
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                .ok()?
+                .timestamp(),
+        )
+    };
+    let current = make(utc.year(), utc.month())?;
+    if current > now {
+        Some(current)
+    } else if utc.month() == 12 {
+        make(utc.year() + 1, 1)
     } else {
-        this_month
-            .date_naive()
-            .checked_add_months(chrono::Months::new(1))?
-            .and_hms_opt(0, 0, 0)?
-            .and_utc()
-    })
+        make(utc.year(), utc.month() + 1)
+    }
 }
 
-/// Fill the vendor-hidden monthly reset from the key's configured anchor: a
-/// long window (period ≥ 28 days) whose probe carried no reset instant —
-/// CommandCode's credits month — gets the next anchor midnight. Windows the
-/// vendor did date itself are never touched.
-pub fn apply_monthly_anchor(quota: &mut KeyQuota, day: u32, now: DateTime<Utc>) {
+pub fn apply_monthly_anchor(quota: &mut KeyQuota, day: u32, now: Timestamp) {
     let Some(resets_at) = next_monthly_reset(day, now) else {
         return;
     };

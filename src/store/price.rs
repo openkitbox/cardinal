@@ -1,3 +1,4 @@
+use jiff::Timestamp;
 use sqlx::PgPool;
 
 /// One volume tier: a request whose prompt total is
@@ -226,7 +227,8 @@ pub async fn served_models_for_pricing(pool: &PgPool) -> anyhow::Result<Vec<Stri
 pub struct ModelSuccessRow {
     pub key_id: i64,
     pub served_model: String,
-    pub last_ok: chrono::DateTime<chrono::Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub last_ok: Timestamp,
 }
 
 /// Latest successful request time grouped by (key, served model) over the
