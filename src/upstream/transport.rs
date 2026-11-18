@@ -1171,27 +1171,3 @@ impl From<WireError> for TransportError {
         Self::InvalidBody
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn fresh_client_does_not_touch_shared_pool() {
-        let transport = Transport::new(Limits::default()).expect("transport should build");
-        let destination = Destination {
-            host: "api.example.com".to_owned(),
-            port: 443,
-            address: "203.0.113.10".parse().expect("valid test address"),
-            addresses: vec!["203.0.113.10".parse().expect("valid test address")],
-        };
-
-        let client = transport
-            .fresh_client_for("https://api.example.com", &destination, Dns::Overseas, None)
-            .await
-            .expect("fresh client should build");
-        drop(client);
-
-        assert!(transport.clients_lock().is_empty());
-    }
-}

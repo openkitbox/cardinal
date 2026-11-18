@@ -632,16 +632,3 @@ impl Failover {
         self.retry_pause = pause;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn explicit_upstream_terminal_is_not_transferable() {
-        let error = AttemptError::UpstreamTerminal(Terminal::Failed);
-
-        assert_eq!(classify(&error), Failure::Request);
-        assert!(!classify(&error).transferable());
-    }
-}

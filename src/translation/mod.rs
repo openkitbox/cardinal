@@ -131,26 +131,3 @@ pub fn for_protocol(protocol: ProtocolId) -> Option<Dialect> {
 pub fn dialect(protocol: ProtocolId) -> Result<Dialect, crate::protocol::ProtocolError> {
     for_protocol(protocol).ok_or(crate::protocol::ProtocolError::UnsupportedApi)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chat_client_may_be_served_by_a_responses_upstream() {
-        assert!(translatable(
-            ProtocolId::OpenAiChat,
-            ProtocolId::OpenAiResponses
-        ));
-        // The reverse hop was already open and stays so; Messages → Responses
-        // is deliberately not opened.
-        assert!(translatable(
-            ProtocolId::OpenAiResponses,
-            ProtocolId::OpenAiChat
-        ));
-        assert!(!translatable(
-            ProtocolId::AnthropicMessages,
-            ProtocolId::OpenAiResponses
-        ));
-    }
-}

@@ -57,6 +57,7 @@ pub struct AppState {
     pub opencode_tokens: Arc<crate::upstream::OpencodeTokens>,
     /// Per-key OpenAI Codex account bearer manager, same contract.
     pub openai_tokens: Arc<crate::upstream::OpenaiTokens>,
+    pub codex_version: crate::upstream::codex_version::CodexClientVersion,
     /// The stateless OpenAI issuer client shared by the token manager and the
     /// admin surface's device-login flow.
     pub openai_client: Arc<crate::openai::auth::Client>,
@@ -249,6 +250,7 @@ async fn relay_dispatch(
         prompt_cache: &state.prompt_cache,
         opencode_tokens: state.opencode_tokens.as_ref(),
         openai_tokens: state.openai_tokens.as_ref(),
+        codex_version: &state.codex_version,
         cursor_tokens: state.cursor_tokens.as_ref(),
         workbuddy_tokens: state.workbuddy_tokens.as_ref(),
         cursor_usage: &state.cursor_usage,

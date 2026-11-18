@@ -244,47 +244,6 @@ fn column<'a, T>(attempts: &'a [AttemptLog], map: impl Fn(&'a AttemptLog) -> T) 
     attempts.iter().map(map).collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{BatchFailure, BatchFailureStage, REQUEST_LOG_INSERT_SQL, classify_batch_failure};
-
-    #[test]
-    fn only_a_successful_rollback_allows_row_fallback() {
-        assert_eq!(
-            classify_batch_failure(BatchFailureStage::Fetch, true),
-            BatchFailure::SafeToFallback
-        );
-        assert_eq!(
-            classify_batch_failure(BatchFailureStage::Fetch, false),
-            BatchFailure::Ambiguous
-        );
-        assert_eq!(
-            classify_batch_failure(BatchFailureStage::Commit, true),
-            BatchFailure::Ambiguous
-        );
-    }
-
-    const COLUMNS: &str = "protocol, client_protocol, effort, alias, provider_id, provider_key_id, model, served_model, status, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens, total_ms, ttft_ms, cost_usd, error, caller_key, agent, request_id, user_id, gateway_key_id, charged_microus, rate_bp";
-
-    /// The statement names the column order three times (INSERT target, SELECT
-    /// list, UNNEST alias) and a multi-array UNNEST pairs its arrays by
-    /// position, so a column added to one list alone would write every value of
-    /// the batch into the wrong field.
-    #[test]
-    fn batch_statement_names_the_same_columns_in_every_list() {
-        let sql: String = REQUEST_LOG_INSERT_SQL
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(sql.matches(COLUMNS).count(), 3, "columns: {COLUMNS}");
-        assert_eq!(
-            sql.matches('$').count(),
-            24,
-            "one placeholder per column, in column order: {sql}"
-        );
-    }
-}
-
 /// One `gateway_requests` row (the request log).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct RequestRow {

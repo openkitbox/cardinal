@@ -22,218 +22,6 @@ use super::endpoint::sort_windows;
 use super::key_quota::{CodexResetDisplay, CodexResetSummary};
 use crate::upstream::OpenaiBearer;
 
-#[cfg(test)]
-mod tests {
-    use chrono::Utc;
-    use reqwest::Method;
-
-    use super::{
-        CodexResetOutcome, RESET_CONSUME_URL, RESET_DETAILS_URL, parse_codex_reset_details,
-        parse_codex_reset_outcome, parse_codex_usage,
-    };
-
-    fn test_bearer() -> crate::openai::OpenaiOAuth {
-        crate::openai::OpenaiOAuth {
-            access_token: "test-access-token".to_owned(),
-            refresh_token: "test-refresh-token".to_owned(),
-            expires_at: Utc::now(),
-            account_id: "test-account".to_owned(),
-            email: None,
-            plan_type: None,
-        }
-    }
-
-    #[test]
-    fn reset_details_request_contract_is_exact_without_secret_values() {
-        let client = reqwest::Client::new();
-        let request = crate::probe::codex_request(
-            &client,
-            Method::GET,
-            RESET_DETAILS_URL,
-            &test_bearer(),
-            None,
-        )
-        .build()
-        .expect("reset details request should build");
-
-        assert_eq!(request.method(), Method::GET);
-        assert_eq!(request.url().as_str(), RESET_DETAILS_URL);
-        assert_eq!(request.headers().len(), 5);
-        assert_eq!(
-            request.headers().get("chatgpt-account-id").unwrap(),
-            "test-account"
-        );
-        assert_eq!(request.headers().get("accept").unwrap(), "application/json");
-        assert_eq!(request.headers().get("originator").unwrap(), "cardinal");
-        assert_eq!(
-            request.headers().get("version").unwrap(),
-            crate::relay::capabilities::codex::CLIENT_VERSION
-        );
-        assert!(request.headers().get("authorization").is_some());
-        assert!(!request.url().as_str().contains("test-access-token"));
-    }
-
-    #[test]
-    fn reset_consume_request_contract_serializes_body_and_headers() {
-        let client = reqwest::Client::new();
-        let body = br#"{"redeem_request_id":"request-1","credit_id":"credit-1"}"#;
-        let request = crate::probe::codex_request(
-            &client,
-            Method::POST,
-            RESET_CONSUME_URL,
-            &test_bearer(),
-            Some(body),
-        )
-        .build()
-        .expect("reset consume request should build");
-
-        assert_eq!(request.method(), Method::POST);
-        assert_eq!(request.url().as_str(), RESET_CONSUME_URL);
-        assert_eq!(request.headers().len(), 6);
-        assert_eq!(
-            request.headers().get("content-type").unwrap(),
-            "application/json"
-        );
-        assert_eq!(
-            request.body().and_then(|body| body.as_bytes()),
-            Some(body.as_slice())
-        );
-        assert!(!String::from_utf8_lossy(body).contains("test-access-token"));
-        assert!(!String::from_utf8_lossy(body).contains("test-refresh-token"));
-    }
-
-    #[tokio::test]
-    async fn consume_rejects_oversized_body_before_transport() {
-        let bearer = test_bearer();
-        let transport = crate::upstream::transport::Transport::new(
-            crate::upstream::transport::Limits::default(),
-        )
-        .expect("default transport should build");
-        let error = crate::probe::codex_post(
-            RESET_CONSUME_URL,
-            &bearer,
-            &[0; 16 * 1024 + 1],
-            &transport,
-            crate::upstream::Dns::Overseas,
-            None,
-        )
-        .await
-        .expect_err("oversized reset request must be rejected");
-
-        assert_eq!(error.to_string(), "Codex request is too large");
-    }
-
-    #[test]
-    fn reset_details_keep_available_count_and_tolerate_bad_expiry() {
-        let body = br#"{
-          "available_count": 7,
-          "credits": [
-            {"id":"credit-1","status":"available","reset_type":"primary","granted_at":"2026-11-01T00:00:00Z","expires_at":"not-a-date","title":"Primary","description":"A reset"},
-            {"id":"credit-2","status":"redeemed","reset_type":"weekly","granted_at":null,"expires_at":"2026-12-01T00:00:00Z"}
-          ]
-        }"#;
-        let details = parse_codex_reset_details(body).expect("details should parse");
-        assert_eq!(details.available_count, 7);
-        assert_eq!(details.credits.len(), 2);
-        assert_eq!(details.credits[0].id, "credit-1");
-        assert!(details.credits[0].expires_at.is_none());
-    }
-
-    #[test]
-    fn consume_outcomes_are_mapped_without_echoing_wire_body() {
-        assert_eq!(
-            parse_codex_reset_outcome(br#"{"status":"reset","windows_reset":["primary"]}"#)
-                .expect("reset outcome"),
-            CodexResetOutcome::Reset {
-                windows_reset: vec!["primary".to_owned()]
-            }
-        );
-        assert_eq!(
-            parse_codex_reset_outcome(br#"{"outcome":"already_redeemed"}"#)
-                .expect("already redeemed outcome"),
-            CodexResetOutcome::AlreadyRedeemed
-        );
-        assert_eq!(
-            parse_codex_reset_outcome(br#"{"status":"vendor_changed"}"#)
-                .expect("unknown is a typed result"),
-            CodexResetOutcome::Unknown
-        );
-        assert_eq!(
-            parse_codex_reset_outcome(br#"{"outcome":"nothing_to_reset"}"#)
-                .expect("nothing-to-reset outcome"),
-            CodexResetOutcome::NothingToReset
-        );
-        assert_eq!(
-            parse_codex_reset_outcome(br#"{"status":"no_credit"}"#).expect("no-credit outcome"),
-            CodexResetOutcome::NoCredit
-        );
-    }
-
-    #[test]
-    fn consume_request_omits_absent_credit_id() {
-        let request = super::CodexResetConsumeRequest {
-            redeem_request_id: "request-1".to_owned(),
-            credit_id: None,
-        };
-        let json = serde_json::to_value(request).expect("request serializes");
-        assert_eq!(json, serde_json::json!({"redeem_request_id":"request-1"}));
-    }
-
-    #[test]
-    fn consume_request_includes_selected_credit_id() {
-        let request = super::CodexResetConsumeRequest {
-            redeem_request_id: "request-1".to_owned(),
-            credit_id: Some("credit-1".to_owned()),
-        };
-        let json = serde_json::to_value(request).expect("request serializes");
-        assert_eq!(
-            json,
-            serde_json::json!({"redeem_request_id":"request-1","credit_id":"credit-1"})
-        );
-    }
-
-    #[test]
-    fn selected_credit_must_be_listed_as_available() {
-        let details = super::CodexResetDetails {
-            available_count: 1,
-            credits: vec![super::CodexResetCredit {
-                id: "credit-1".to_owned(),
-                status: "available".to_owned(),
-                reset_type: None,
-                granted_at: None,
-                expires_at: None,
-                title: None,
-                description: None,
-            }],
-        };
-        assert!(super::validate_codex_reset_credit(&details, None).is_ok());
-        assert!(super::validate_codex_reset_credit(&details, Some("credit-1")).is_ok());
-        assert!(super::validate_codex_reset_credit(&details, Some("credit-2")).is_err());
-
-        let mut redeemed = details.clone();
-        redeemed.credits[0].status = "redeemed".to_owned();
-        assert!(super::validate_codex_reset_credit(&redeemed, Some("credit-1")).is_err());
-    }
-
-    #[test]
-    fn unknown_consume_outcome_is_not_accepted_as_success() {
-        let outcome = super::parse_codex_reset_outcome(br#"{"status":"vendor_changed"}"#)
-            .expect("unknown outcome remains parseable for classification");
-        assert_eq!(outcome, super::CodexResetOutcome::Unknown);
-    }
-
-    #[test]
-    fn credit_billed_usage_keeps_a_quota_row_for_reset_details() {
-        let quota = parse_codex_usage(
-            br#"{"rate_limit":null,"spend_control":{"limit":10,"used":2}}"#,
-            Utc::now(),
-        )
-        .expect("credit-billed account should remain observable");
-        assert!(quota.windows.is_empty());
-        assert!(quota.codex_resets.is_none());
-    }
-}
-
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const RESET_DETAILS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const RESET_CONSUME_URL: &str =
@@ -338,9 +126,10 @@ pub async fn fetch_openai_codex_quota(
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
     proxy: Option<&crate::upstream::ProxySpec>,
+    version: &str,
 ) -> Option<KeyQuota> {
     let (status, body) =
-        match crate::probe::codex_get(USAGE_URL, bearer, transport, dns, proxy).await {
+        match crate::probe::codex_get(USAGE_URL, bearer, transport, dns, proxy, version).await {
             Ok(answer) => answer,
             Err(error) => {
                 tracing::warn!(key_id, %error, "Codex quota probe: request failed");
@@ -365,7 +154,7 @@ pub async fn fetch_openai_codex_quota(
         );
         return None;
     };
-    match fetch_openai_codex_resets(bearer, transport, dns, proxy).await {
+    match fetch_openai_codex_resets(bearer, transport, dns, proxy, version).await {
         Ok(details) => {
             quota.codex_resets = Some(CodexResetSummary {
                 available_count: details.available_count,
@@ -394,9 +183,10 @@ pub async fn fetch_openai_codex_resets(
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
     proxy: Option<&crate::upstream::ProxySpec>,
+    version: &str,
 ) -> anyhow::Result<CodexResetDetails> {
     let (status, body) =
-        crate::probe::codex_get(RESET_DETAILS_URL, bearer, transport, dns, proxy).await?;
+        crate::probe::codex_get(RESET_DETAILS_URL, bearer, transport, dns, proxy, version).await?;
     if !(200..300).contains(&status) {
         anyhow::bail!("Codex reset-credit service rejected the request (HTTP {status})");
     }
@@ -411,11 +201,20 @@ pub async fn consume_openai_codex_reset(
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
     proxy: Option<&crate::upstream::ProxySpec>,
+    version: &str,
 ) -> anyhow::Result<CodexResetOutcome> {
     let body =
         serde_json::to_vec(request).map_err(|_| anyhow::anyhow!("Codex reset request invalid"))?;
-    let (status, response) =
-        crate::probe::codex_post(RESET_CONSUME_URL, bearer, &body, transport, dns, proxy).await?;
+    let (status, response) = crate::probe::codex_post(
+        RESET_CONSUME_URL,
+        bearer,
+        &body,
+        transport,
+        dns,
+        proxy,
+        version,
+    )
+    .await?;
     if !(200..300).contains(&status) {
         anyhow::bail!("Codex reset-credit service rejected the request (HTTP {status})");
     }

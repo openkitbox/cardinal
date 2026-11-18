@@ -466,6 +466,7 @@ struct AttemptContext<'a> {
     /// per dispatch; `None` when no OpenCode or Codex upstream is in play.
     /// OpenCode derives `x-opencode-session` from it, Codex its session headers.
     session_seed: Option<&'a str>,
+    codex_version: &'a crate::upstream::codex_version::CodexClientVersion,
     /// This candidate's Chat-body adaptations (none for the common request).
     fixups: ChatFixups,
     /// This candidate model's supported effort levels (ascending, named only);
@@ -567,6 +568,7 @@ async fn send_attempt(
         proxy,
         vendor_skip,
         session_seed,
+        codex_version,
         fixups,
         supported_efforts,
         default_effort,
@@ -582,7 +584,7 @@ async fn send_attempt(
         workbuddy_key,
         cursor,
     } = *ctx;
-    // The selected capability IS the upstream protocol: passthrough when it
+    let codex_version = openai.map(|_| codex_version.current());
     // matches the client protocol, translation target otherwise.
     let protocol = capability.protocol;
     // A Cursor Run authenticates with a bearer the manager produced from the
@@ -860,7 +862,13 @@ async fn send_attempt(
         }
     } else {
         match (&kiro_call, &opencode_bundle, &openai_bundle) {
-            (_, _, Some(bundle)) => capabilities::codex::headers(bundle, session_seed),
+            (_, _, Some(bundle)) => {
+                let version = codex_version.as_ref().map_or(
+                    crate::upstream::codex_version::FALLBACK_VERSION,
+                    AsRef::as_ref,
+                );
+                capabilities::codex::headers(bundle, session_seed, version)
+            }
             (_, Some(bundle), None) => opencode_auth_headers(bundle),
             (Some(call), None, None) => {
                 vec![("authorization", format!("Bearer {}", call.bearer()))]
@@ -1022,7 +1030,11 @@ async fn send_attempt(
                 .resolve_forced(deps.pool, deps.key_id, &presented.access_token, proxy)
                 .await
                 .map_err(failover::AttemptError::OpenaiTokenError)?;
-            headers = capabilities::codex::headers(&bundle, session_seed);
+            let version = codex_version.as_ref().map_or(
+                crate::upstream::codex_version::FALLBACK_VERSION,
+                AsRef::as_ref,
+            );
+            headers = capabilities::codex::headers(&bundle, session_seed, version);
             openai_bundle = Some(bundle);
             tracing::warn!(
                 key_id = deps.key_id,
@@ -2412,6 +2424,7 @@ pub struct DispatchDeps<'a> {
     /// Per-key OpenAI Codex account bearer manager (lazy refresh, single-flight,
     /// CAS write-back).
     pub openai_tokens: &'a OpenaiTokens,
+    pub codex_version: &'a crate::upstream::codex_version::CodexClientVersion,
     /// Per-key Cursor bearer manager (login-bundle refresh or API-key exchange,
     /// single-flight, write-back). The same instance backs model probing.
     pub cursor_tokens: &'a CursorTokens,
@@ -2594,6 +2607,7 @@ pub async fn dispatch_at(
         prompt_cache,
         opencode_tokens,
         openai_tokens,
+        codex_version,
         cursor_tokens,
         cursor_usage,
         workbuddy_tokens,
@@ -3298,6 +3312,7 @@ pub async fn dispatch_at(
                         proxy: proxy.as_ref(),
                         vendor_skip,
                         session_seed: session_seed.as_deref(),
+                        codex_version,
                         fixups,
                         supported_efforts: candidate.supported_efforts.as_deref(),
                         default_effort: candidate.default_effort,

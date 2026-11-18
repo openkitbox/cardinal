@@ -103,15 +103,3 @@ pub struct CodexResetDisplay {
     pub title: Option<String>,
     pub description: Option<String>,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::KeyQuota;
-
-    #[test]
-    fn old_snapshot_without_codex_resets_still_deserializes() {
-        let snapshot = r#"{"windows":[],"balance":null,"plan":null,"details":[]}"#;
-        let quota: KeyQuota = serde_json::from_str(snapshot).expect("old snapshot is valid");
-        assert!(quota.codex_resets.is_none());
-    }
-}

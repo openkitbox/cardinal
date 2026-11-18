@@ -12,6 +12,7 @@
 //! list) from a plan the kernel prepared — still without reading the model's
 //! words.
 
+pub mod codex_version;
 pub mod cursor_run;
 pub mod cursor_tokens;
 pub mod cursor_usage;

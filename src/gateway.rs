@@ -104,6 +104,7 @@ struct Core {
     /// And for OpenAI Codex account rows: one bearer cache shared by dispatch
     /// (the refresh client is stateless, so the manager owns its own).
     openai_tokens: Arc<crate::upstream::OpenaiTokens>,
+    codex_version: crate::upstream::codex_version::CodexClientVersion,
     /// The OpenAI issuer client (stateless): the token manager refreshes
     /// through it and the device-login flow starts and polls through it.
     openai_client: Arc<crate::openai::auth::Client>,
@@ -253,6 +254,7 @@ impl Core {
             kiro_tokens,
             opencode_tokens,
             openai_tokens,
+            codex_version: crate::upstream::codex_version::CodexClientVersion::new(),
             openai_client,
             openai_logins: crate::openai::login::OpenaiLogins::new(),
             cursor_tokens,
@@ -295,6 +297,7 @@ struct QuotaTokens {
     cursor: Arc<crate::upstream::CursorTokens>,
     openai: Arc<crate::upstream::OpenaiTokens>,
     workbuddy: Arc<crate::upstream::WorkbuddyTokens>,
+    codex_version: crate::upstream::codex_version::CodexClientVersion,
 }
 
 /// Background vendor-quota prober: every [`QUOTA_PROBE_INTERVAL`], run the
@@ -343,6 +346,7 @@ async fn quota_prober(
                     cursor: Some(Arc::clone(&tokens.cursor)),
                     openai: Some(Arc::clone(&tokens.openai)),
                     workbuddy: Some(Arc::clone(&tokens.workbuddy)),
+                    codex_version: Some(tokens.codex_version.clone()),
                 },
             )
             .await;
@@ -470,6 +474,7 @@ impl Gateway {
                     cursor: Arc::clone(&core.cursor_tokens),
                     openai: Arc::clone(&core.openai_tokens),
                     workbuddy: Arc::clone(&core.workbuddy_tokens),
+                    codex_version: core.codex_version.clone(),
                 },
                 core.transport.clone(),
                 core.activity.clone(),
@@ -508,6 +513,7 @@ impl Gateway {
             prompt_cache: core.prompt_cache.clone(),
             opencode_tokens: core.opencode_tokens.clone(),
             openai_tokens: Arc::clone(&core.openai_tokens),
+            codex_version: core.codex_version.clone(),
             openai_client: Arc::clone(&core.openai_client),
             openai_logins: core.openai_logins.clone(),
             cursor_tokens: Arc::clone(&core.cursor_tokens),

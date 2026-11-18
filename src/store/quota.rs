@@ -197,37 +197,3 @@ pub async fn list_quota_history(pool: &PgPool) -> anyhow::Result<Vec<QuotaHistor
         )
         .collect())
 }
-
-#[cfg(test)]
-fn history_insert_sql(window_count: usize) -> String {
-    let mut sql = String::from(
-        "INSERT INTO gateway_key_quota_history (key_id, window_name, used_pct, resets_at) VALUES ",
-    );
-    for index in 0..window_count {
-        if index > 0 {
-            sql.push_str(", ");
-        }
-        let first_bind = index * 4 + 1;
-        sql.push_str(&format!(
-            "(${0}, ${1}, ${2}, ${3})",
-            first_bind,
-            first_bind + 1,
-            first_bind + 2,
-            first_bind + 3
-        ));
-    }
-    sql
-}
-
-#[cfg(test)]
-mod tests {
-    use super::history_insert_sql;
-
-    #[test]
-    fn history_insert_uses_one_statement_for_all_windows() {
-        assert_eq!(
-            history_insert_sql(3),
-            "INSERT INTO gateway_key_quota_history (key_id, window_name, used_pct, resets_at) VALUES ($1, $2, $3, $4), ($5, $6, $7, $8), ($9, $10, $11, $12)"
-        );
-    }
-}

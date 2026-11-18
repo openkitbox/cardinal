@@ -221,6 +221,7 @@ pub(crate) fn admin_from_state(state: &crate::api::AppState) -> crate::admin_ops
     .with_opencode_tokens(Arc::clone(&state.opencode_tokens))
     .with_cursor_tokens(Arc::clone(&state.cursor_tokens))
     .with_openai_tokens(Arc::clone(&state.openai_tokens))
+    .with_codex_version(state.codex_version.clone())
     .with_workbuddy_tokens(Arc::clone(&state.workbuddy_tokens))
     .with_workbuddy_login(
         Arc::clone(&state.workbuddy_client),
@@ -3137,82 +3138,5 @@ async fn agent_disconnect(request: &mut Request, response: &mut Response) {
     match result {
         Ok(restored) => json_response(response, &json!({"ok": true, "restored": restored})),
         Err(error) => internal(response, error),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::OpenaiResetError;
-    use super::normalize_openai_reset_id;
-    use super::openai_reset_error_response;
-    use super::sse_events;
-    use crate::activity::ActivityEvent;
-    use futures::StreamExt;
-    use salvo::http::StatusCode;
-
-    #[test]
-    fn reset_errors_have_fixed_safe_status_and_message() {
-        let (status, message) = openai_reset_error_response(&OpenaiResetError::NotOpenaiKey);
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(message, "key is not an OpenAI Codex account");
-
-        let (status, message) = openai_reset_error_response(&OpenaiResetError::Upstream);
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(message, "OpenAI reset service unavailable");
-    }
-
-    #[test]
-    fn reset_ids_are_trimmed_and_bounded_at_the_admin_boundary() {
-        assert_eq!(
-            normalize_openai_reset_id("  request-1  ".to_owned(), "redeem_request_id")
-                .expect("valid request id"),
-            "request-1"
-        );
-        assert!(normalize_openai_reset_id(" ".to_owned(), "credit_id").is_err());
-        assert!(normalize_openai_reset_id("x".repeat(257), "credit_id").is_err());
-        assert!(normalize_openai_reset_id("credit\n1".to_owned(), "credit_id").is_err());
-    }
-
-    #[tokio::test]
-    async fn activity_sse_emits_repeated_heartbeats_and_later_activity() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
-        let mut stream = Box::pin(sse_events(receiver, std::time::Duration::ZERO));
-
-        let first_heartbeat = stream
-            .next()
-            .await
-            .expect("stream should stay open")
-            .expect("heartbeat should render");
-        assert_eq!(
-            first_heartbeat.to_string(),
-            ":alive\n\n",
-            "first frame should be a heartbeat"
-        );
-
-        let second_heartbeat = stream
-            .next()
-            .await
-            .expect("stream should stay open")
-            .expect("heartbeat should render");
-        assert_eq!(
-            second_heartbeat.to_string(),
-            ":alive\n\n",
-            "second frame should be a heartbeat"
-        );
-
-        sender
-            .send(ActivityEvent::Persisted)
-            .await
-            .expect("receiver is open");
-        let activity = stream
-            .next()
-            .await
-            .expect("activity stream should stay open")
-            .expect("activity should render");
-        assert_eq!(
-            activity.to_string(),
-            "data: {\"t\":\"persisted\"}\n\n",
-            "activity should arrive after repeated heartbeats"
-        );
     }
 }

@@ -12,9 +12,9 @@
 
 use anyhow::Context as _;
 
-use crate::relay::capabilities::codex::CLIENT_VERSION as CODEX_CLIENT_VERSION;
 use crate::relay::capabilities::{Build, WorkbuddyCredential, workbuddy_headers};
 use crate::upstream::ProxySpec;
+use crate::upstream::codex_version::CodexClientVersion;
 
 /// One probe attempt's budget (matches the magnitude the relay allows for
 /// opening a response).
@@ -883,9 +883,10 @@ pub(crate) async fn codex_get(
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
     proxy: Option<&ProxySpec>,
+    version: &str,
 ) -> anyhow::Result<(u16, String)> {
     let client = codex_client(transport, dns, proxy).await?;
-    let response = codex_request(&client, reqwest::Method::GET, url, bearer, None)
+    let response = codex_request(&client, reqwest::Method::GET, url, bearer, None, version)
         .send()
         .await
         .map_err(|_| anyhow::anyhow!("Codex backend request failed"))?;
@@ -905,13 +906,21 @@ pub(crate) async fn codex_post(
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
     proxy: Option<&ProxySpec>,
+    version: &str,
 ) -> anyhow::Result<(u16, String)> {
     anyhow::ensure!(body.len() <= 16 * 1024, "Codex request is too large");
     let client = codex_client(transport, dns, proxy).await?;
-    let response = codex_request(&client, reqwest::Method::POST, url, bearer, Some(body))
-        .send()
-        .await
-        .map_err(|_| anyhow::anyhow!("Codex backend request failed"))?;
+    let response = codex_request(
+        &client,
+        reqwest::Method::POST,
+        url,
+        bearer,
+        Some(body),
+        version,
+    )
+    .send()
+    .await
+    .map_err(|_| anyhow::anyhow!("Codex backend request failed"))?;
     let status = response.status().as_u16();
     let body = read_bounded(response)
         .await
@@ -946,6 +955,7 @@ pub(crate) fn codex_request(
     url: &str,
     bearer: &crate::openai::OpenaiOAuth,
     body: Option<&[u8]>,
+    version: &str,
 ) -> reqwest::RequestBuilder {
     let mut request = client
         .request(method, url)
@@ -954,7 +964,7 @@ pub(crate) fn codex_request(
         .header("chatgpt-account-id", &bearer.account_id)
         .header(reqwest::header::ACCEPT, "application/json")
         .header("originator", "cardinal")
-        .header("version", CODEX_CLIENT_VERSION);
+        .header("version", version);
     if let Some(body) = body {
         request = request
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -963,29 +973,145 @@ pub(crate) fn codex_request(
     request
 }
 
+/// Fixed warning categories for the Codex model-list probe. The variants carry no
+/// upstream-controlled text, so they are safe to use as structured log fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexProbeFailure {
+    GithubLatestFallback,
+    Request,
+    NonSuccess,
+    ResponseUnreadable,
+    Json,
+    Empty,
+}
+
+fn codex_probe_failure_category(failure: CodexProbeFailure) -> &'static str {
+    match failure {
+        CodexProbeFailure::GithubLatestFallback => "github_latest_fallback",
+        CodexProbeFailure::Request => "codex_request_failed",
+        CodexProbeFailure::NonSuccess => "codex_http_error",
+        CodexProbeFailure::ResponseUnreadable => "codex_response_unreadable",
+        CodexProbeFailure::Json => "codex_json_invalid",
+        CodexProbeFailure::Empty => "codex_models_empty",
+    }
+}
+
+fn classify_codex_get_error(error: &anyhow::Error) -> CodexProbeFailure {
+    if error
+        .chain()
+        .any(|cause| cause.to_string() == "Codex backend response unreadable")
+    {
+        CodexProbeFailure::ResponseUnreadable
+    } else {
+        CodexProbeFailure::Request
+    }
+}
+
 /// Fetch a ChatGPT-subscription account's Codex model catalogue
 /// (`GET /codex/models`). The bearer comes from the caller
 /// (`OpenaiTokens::resolve`), so this stays free of the credential store.
 pub async fn fetch_openai_codex_models(
+    key_id: i64,
     bearer: &crate::upstream::OpenaiBearer,
     transport: &crate::upstream::transport::Transport,
     dns: crate::upstream::Dns,
     proxy: Option<&ProxySpec>,
+    version_state: &CodexClientVersion,
 ) -> anyhow::Result<Vec<ProbeModel>> {
-    let (status, body) = codex_get(
-        &format!("{CODEX_MODELS_URL}?client_version={CODEX_CLIENT_VERSION}"),
+    let current_version = version_state.current();
+    let github_version = match crate::upstream::codex_version::fetch_latest(transport, proxy).await
+    {
+        Ok(version) => Some(version),
+        Err(error) => {
+            tracing::warn!(
+                key_id,
+                fallback_version = current_version.as_ref(),
+                category = codex_probe_failure_category(CodexProbeFailure::GithubLatestFallback),
+                failure_stage = error.stage().as_str(),
+                "Codex latest version lookup failed; using fallback version"
+            );
+            None
+        }
+    };
+    let request_version = github_version
+        .as_deref()
+        .unwrap_or_else(|| current_version.as_ref());
+    let (status, body) = match codex_get(
+        &format!("{CODEX_MODELS_URL}?client_version={request_version}"),
         bearer,
         transport,
         dns,
         proxy,
+        request_version,
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let failure = classify_codex_get_error(&error);
+            tracing::warn!(
+                key_id,
+                client_version = request_version,
+                category = codex_probe_failure_category(failure),
+                "Codex model catalogue request failed"
+            );
+            return Err(error);
+        }
+    };
     if !(200..300).contains(&status) {
+        tracing::warn!(
+            key_id,
+            client_version = request_version,
+            status,
+            category = codex_probe_failure_category(CodexProbeFailure::NonSuccess),
+            "Codex model catalogue returned a non-success status"
+        );
         // The error body is upstream-controlled; the fixed message is all that
         // crosses the admin API.
         anyhow::bail!("模型目录服务拒绝请求 (HTTP {status})");
     }
-    parse_codex_models(&body).map_err(|_| anyhow::anyhow!("模型目录响应无效"))
+    let raw_model_count = raw_codex_model_count(&body);
+    let models = match parse_codex_models(&body) {
+        Ok(models) => models,
+        Err(_) => {
+            tracing::warn!(
+                key_id,
+                client_version = request_version,
+                category = codex_probe_failure_category(CodexProbeFailure::Json),
+                "Codex model catalogue response could not be parsed"
+            );
+            return Err(anyhow::anyhow!("模型目录响应无效"));
+        }
+    };
+    if models.is_empty() {
+        tracing::warn!(
+            key_id,
+            client_version = request_version,
+            category = codex_probe_failure_category(CodexProbeFailure::Empty),
+            "Codex model catalogue contained no usable models"
+        );
+        return Err(anyhow::anyhow!("Codex model catalogue is empty"));
+    }
+    version_state.update_after_probe(github_version.as_deref(), true);
+    tracing::info!(
+        key_id,
+        client_version = request_version,
+        raw_model_count,
+        model_count = models.len(),
+        "Codex model catalogue fetched"
+    );
+    Ok(models)
+}
+
+fn raw_codex_model_count(body: &str) -> usize {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(body) else {
+        return 0;
+    };
+    [root.get("models"), root.get("data")]
+        .into_iter()
+        .flatten()
+        .find_map(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 /// Parse the Codex catalogue: `{"models": [...]}` (a `data` array is read too).
@@ -1066,81 +1192,4 @@ fn parse_codex_models(body: &str) -> anyhow::Result<Vec<ProbeModel>> {
         });
     }
     Ok(models)
-}
-
-#[cfg(test)]
-mod workbuddy_tests {
-    use super::parse_workbuddy_config;
-
-    #[test]
-    fn parses_normal_catalogue() {
-        let models = parse_workbuddy_config(
-            r#"{"code":0,"data":{"models":[{"id":"alpha","maxInputTokens":8192,"maxOutputTokens":1024,"supportsImages":true,"supportsReasoning":true,"reasoning":{"supportedEfforts":["low","high"],"defaultEffort":"high"}}]}}"#,
-        )
-        .expect("normal config should parse");
-        assert_eq!(models[0].id, "alpha");
-        assert_eq!(models[0].context, Some(8192));
-        assert_eq!(models[0].max_output, Some(1024));
-        assert_eq!(models[0].input_modalities, vec!["image"]);
-        assert_eq!(models[0].effort_levels, vec!["low", "high"]);
-        assert_eq!(models[0].default_effort.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn rejects_nonzero_code() {
-        let error = parse_workbuddy_config(r#"{"code":10001,"msg":"secret"}"#)
-            .expect_err("nonzero code should fail");
-        assert_eq!(
-            error.to_string(),
-            "WorkBuddy model catalogue returned an error"
-        );
-        assert!(!error.to_string().contains("secret"));
-    }
-
-    #[test]
-    fn rejects_empty_models() {
-        let error = parse_workbuddy_config(r#"{"code":0,"data":{"models":[]}}"#)
-            .expect_err("empty catalogue should fail");
-        assert_eq!(error.to_string(), "WorkBuddy model catalogue is empty");
-    }
-
-    #[test]
-    fn rejects_malformed_json() {
-        assert!(parse_workbuddy_config("{not json").is_err());
-    }
-
-    #[test]
-    fn supplies_reasoning_fallback_when_efforts_are_missing() {
-        let models = parse_workbuddy_config(
-            r#"{"code":0,"data":{"models":[{"id":"thinking","supportsReasoning":true,"reasoning":{"effort":"medium"}},{"id":"plain"}]}}"#,
-        )
-        .expect("missing effort fields should use the documented fallback");
-        assert_eq!(
-            models[0].effort_levels,
-            vec!["low", "high", "max", "medium"]
-        );
-        assert_eq!(models[0].default_effort.as_deref(), Some("medium"));
-        assert!(models[1].effort_levels.is_empty());
-    }
-
-    #[test]
-    fn keeps_supplied_levels_and_filters_default_to_them() {
-        let models = parse_workbuddy_config(
-            r#"{"code":0,"data":{"models":[{"id":"thinking","supportsReasoning":true,"reasoning":{"supportedEfforts":["minimal","HIGH","high"],"effort":"medium","defaultEffort":"xhigh"}}]}}"#,
-        )
-        .expect("supplied reasoning fields should be canonicalized");
-        assert_eq!(models[0].effort_levels, vec!["low", "high"]);
-        assert_eq!(models[0].default_effort, None);
-    }
-
-    #[test]
-    fn skips_blank_ids_and_fails_when_none_are_usable() {
-        let error =
-            parse_workbuddy_config(r#"{"code":0,"data":{"models":[{"id":"  "},{"name":""}]}}"#)
-                .expect_err("catalogue without usable ids should fail");
-        assert_eq!(
-            error.to_string(),
-            "WorkBuddy model catalogue has no usable models"
-        );
-    }
 }

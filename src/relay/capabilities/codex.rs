@@ -80,7 +80,6 @@ pub(crate) const REQUIRED_FIELDS: &[(&str, &str)] = &[("instructions", "\"\"")];
 /// the CLI release oh-my-pi claims. The shared transport sets no User-Agent of
 /// its own, so [`headers`] carries one.
 const ORIGINATOR: &str = "cardinal";
-pub(crate) const CLIENT_VERSION: &str = "0.159.0";
 
 /// Namespace of the session ids derived from a conversation seed.
 const SESSION_NAMESPACE: uuid::Uuid =
@@ -98,12 +97,13 @@ const SESSION_NAMESPACE: uuid::Uuid =
 pub(crate) fn headers(
     bundle: &OpenaiOAuth,
     session_seed: Option<&str>,
+    version: &str,
 ) -> Vec<(&'static str, String)> {
     let mut headers = vec![
         ("authorization", format!("Bearer {}", bundle.access_token)),
         ("chatgpt-account-id", bundle.account_id.clone()),
         ("originator", ORIGINATOR.to_owned()),
-        ("version", CLIENT_VERSION.to_owned()),
+        ("version", version.to_owned()),
         (
             "user-agent",
             format!("cardinal/{}", env!("CARGO_PKG_VERSION")),

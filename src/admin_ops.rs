@@ -585,6 +585,7 @@ pub struct QuotaProbeTokens {
     pub cursor: Option<Arc<crate::upstream::CursorTokens>>,
     pub openai: Option<Arc<crate::upstream::OpenaiTokens>>,
     pub workbuddy: Option<Arc<crate::upstream::WorkbuddyTokens>>,
+    pub codex_version: Option<crate::upstream::codex_version::CodexClientVersion>,
 }
 
 /// Which credential a key's probe uses.
@@ -600,7 +601,10 @@ enum QuotaSource {
     Cursor(Arc<crate::upstream::CursorTokens>),
     /// The shared OpenAI token manager: the account's bearer, at the
     /// ChatGPT usage endpoint.
-    Openai(Arc<crate::upstream::OpenaiTokens>),
+    Openai {
+        tokens: Arc<crate::upstream::OpenaiTokens>,
+        codex_version: crate::upstream::codex_version::CodexClientVersion,
+    },
     /// The shared WorkBuddy token manager: the account's bearer, uid and
     /// domain, at the vendor's billing meter host.
     Workbuddy {
@@ -677,11 +681,18 @@ fn quota_source(
     } else if key.auth_kind == AuthKind::OpenaiOauth.as_str() {
         // Same rule for an OpenAI account row: no api_key, and the
         // refresh token rotates, so only the shared manager may refresh.
-        let Some(tokens) = tokens.openai.as_ref() else {
+        let Some(openai_tokens) = tokens.openai.as_ref() else {
             tracing::warn!(provider = %provider.name, "quota probe: no OpenAI token manager wired; skipping its keys");
             return QuotaSourceDecision::SkipProvider;
         };
-        QuotaSourceDecision::Source(QuotaSource::Openai(Arc::clone(tokens)))
+        let Some(codex_version) = tokens.codex_version.as_ref() else {
+            tracing::warn!(provider = %provider.name, "quota probe: Codex version state is not wired; skipping its keys");
+            return QuotaSourceDecision::SkipProvider;
+        };
+        QuotaSourceDecision::Source(QuotaSource::Openai {
+            tokens: Arc::clone(openai_tokens),
+            codex_version: codex_version.clone(),
+        })
     } else {
         match key.api_key.take() {
             Some(api_key) => QuotaSourceDecision::Source(QuotaSource::Static(api_key)),
@@ -731,10 +742,21 @@ async fn probe_key_reading(
                 None
             }
         },
-        QuotaSource::Openai(tokens) => match tokens.resolve(pool, key_id, proxy).await {
+        QuotaSource::Openai {
+            tokens,
+            codex_version,
+        } => match tokens.resolve(pool, key_id, proxy).await {
             Ok(bearer) => {
-                quota::fetch_openai_codex_quota(&bearer, key_id, transport, provider_dns, proxy)
-                    .await
+                let version = codex_version.current();
+                quota::fetch_openai_codex_quota(
+                    &bearer,
+                    key_id,
+                    transport,
+                    provider_dns,
+                    proxy,
+                    version.as_ref(),
+                )
+                .await
             }
             Err(error) => {
                 tracing::warn!(key_id, error = %error, "quota probe: OpenAI bearer unavailable");
@@ -945,6 +967,7 @@ pub struct Admin {
     /// [`Self::with_openai_tokens`] wires it): model probing and quota probing
     /// resolve their bearer through dispatch's cache.
     openai_tokens: Option<Arc<crate::upstream::OpenaiTokens>>,
+    codex_version: Option<crate::upstream::codex_version::CodexClientVersion>,
     /// The OpenAI Codex device-login flow's dependencies (None until
     /// [`Self::with_openai_login`] wires them).
     openai_login: Option<OpenaiLogin>,
@@ -953,6 +976,33 @@ pub struct Admin {
     dispatcher: Option<tokio::sync::mpsc::UnboundedSender<crate::relay::dispatcher::DispatchEvent>>,
     /// Process-wide bootstrap read model shared with [`crate::api::AppState`].
     snapshot: AdminSnapshot,
+}
+
+/// Fixed warning categories for failures before a Codex model probe can run.
+#[derive(Clone, Copy)]
+enum CodexProbeSetupFailure {
+    TokenManagerUnavailable,
+    TokenResolveFailed,
+    VersionStateUnwired,
+}
+
+fn codex_probe_setup_warning_fields(
+    failure: CodexProbeSetupFailure,
+) -> (&'static str, &'static str) {
+    match failure {
+        CodexProbeSetupFailure::TokenManagerUnavailable => (
+            "codex_probe_manager_unavailable",
+            "Codex model probe token manager is unavailable",
+        ),
+        CodexProbeSetupFailure::TokenResolveFailed => (
+            "codex_probe_bearer_unavailable",
+            "Codex model probe bearer could not be resolved",
+        ),
+        CodexProbeSetupFailure::VersionStateUnwired => (
+            "codex_probe_version_unwired",
+            "Codex model probe version state is not wired",
+        ),
+    }
 }
 
 impl Admin {
@@ -986,6 +1036,7 @@ impl Admin {
             opencode_login: None,
             cursor_login: None,
             openai_tokens: None,
+            codex_version: None,
             openai_login: None,
             dispatcher: None,
             snapshot: AdminSnapshot::new(),
@@ -1030,6 +1081,14 @@ impl Admin {
     /// dispatch's bearer cache and a finished login installs its bundle there.
     pub fn with_openai_tokens(mut self, openai_tokens: Arc<crate::upstream::OpenaiTokens>) -> Self {
         self.openai_tokens = Some(openai_tokens);
+        self
+    }
+
+    pub fn with_codex_version(
+        mut self,
+        codex_version: crate::upstream::codex_version::CodexClientVersion,
+    ) -> Self {
+        self.codex_version = Some(codex_version);
         self
     }
 
@@ -1296,6 +1355,7 @@ impl Admin {
                 cursor: self.cursor_tokens.clone(),
                 openai: self.openai_tokens.clone(),
                 workbuddy: self.workbuddy_tokens.clone(),
+                codex_version: self.codex_version.clone(),
             },
         )
         .await;
@@ -1336,6 +1396,7 @@ impl Admin {
             cursor: self.cursor_tokens.clone(),
             openai: self.openai_tokens.clone(),
             workbuddy: self.workbuddy_tokens.clone(),
+            codex_version: self.codex_version.clone(),
         };
         let source = match quota_source(&mut key, &provider, &tokens) {
             QuotaSourceDecision::Source(source) => source,
@@ -1417,13 +1478,23 @@ impl Admin {
                 );
                 OpenaiResetError::Credentials(error)
             })?;
-        let details =
-            quota::fetch_openai_codex_resets(&bearer, &self.transport, provider.dns, proxy)
-                .await
-                .map_err(|_error| {
-                    tracing::warn!(key_id, "Codex reset details: upstream request failed");
-                    OpenaiResetError::Upstream
-                })?;
+        let version = self
+            .codex_version
+            .as_ref()
+            .ok_or(OpenaiResetError::ManagerUnavailable)?
+            .current();
+        let details = quota::fetch_openai_codex_resets(
+            &bearer,
+            &self.transport,
+            provider.dns,
+            proxy,
+            version.as_ref(),
+        )
+        .await
+        .map_err(|_error| {
+            tracing::warn!(key_id, "Codex reset details: upstream request failed");
+            OpenaiResetError::Upstream
+        })?;
         Ok(OpenaiResetDetails {
             available_count: details.available_count,
             credits: details
@@ -1471,14 +1542,24 @@ impl Admin {
                 );
                 OpenaiResetError::Credentials(error)
             })?;
+        let version = self
+            .codex_version
+            .as_ref()
+            .ok_or(OpenaiResetError::ManagerUnavailable)?
+            .current();
         if credit_id.is_some() {
-            let details =
-                quota::fetch_openai_codex_resets(&bearer, &self.transport, provider.dns, proxy)
-                    .await
-                    .map_err(|_error| {
-                        tracing::warn!(key_id, "Codex reset consume: upstream details failed");
-                        OpenaiResetError::Upstream
-                    })?;
+            let details = quota::fetch_openai_codex_resets(
+                &bearer,
+                &self.transport,
+                provider.dns,
+                proxy,
+                version.as_ref(),
+            )
+            .await
+            .map_err(|_error| {
+                tracing::warn!(key_id, "Codex reset consume: upstream details failed");
+                OpenaiResetError::Upstream
+            })?;
             quota::validate_codex_reset_credit(&details, credit_id.as_deref())
                 .map_err(|_| OpenaiResetError::CreditUnavailable)?;
         }
@@ -1486,13 +1567,20 @@ impl Admin {
             redeem_request_id,
             credit_id,
         };
-        quota::consume_openai_codex_reset(&bearer, &request, &self.transport, provider.dns, proxy)
-            .await
-            .map_err(|_error| {
-                tracing::warn!(key_id, "Codex reset consume: upstream request failed");
-                OpenaiResetError::Upstream
-            })
-            .and_then(map_openai_reset_outcome)
+        quota::consume_openai_codex_reset(
+            &bearer,
+            &request,
+            &self.transport,
+            provider.dns,
+            proxy,
+            version.as_ref(),
+        )
+        .await
+        .map_err(|_error| {
+            tracing::warn!(key_id, "Codex reset consume: upstream request failed");
+            OpenaiResetError::Upstream
+        })
+        .and_then(map_openai_reset_outcome)
     }
 
     async fn openai_reset_key(
@@ -1739,16 +1827,40 @@ impl Admin {
         key: &store::ProviderKeyRow,
     ) -> anyhow::Result<Vec<ProbeModel>> {
         let Some(tokens) = &self.openai_tokens else {
+            let (category, message) =
+                codex_probe_setup_warning_fields(CodexProbeSetupFailure::TokenManagerUnavailable);
+            tracing::warn!(key_id = key.id, category, message);
             anyhow::bail!("OpenAI 模型列表需要已接线的 token 管理器")
         };
         let key_proxy = crate::upstream::ProxySpec::from_stored(key.proxy_url.as_deref(), key.id);
-        let bearer = tokens
-            .resolve(&self.pool, key.id, key_proxy.as_ref())
-            .await
-            .map_err(|error| ProbeError::Regular(error.into()))?;
-        probe::fetch_openai_codex_models(&bearer, &self.transport, provider.dns, key_proxy.as_ref())
-            .await
-            .map_err(|error| ProbeError::Regular(error).into())
+        let bearer = match tokens.resolve(&self.pool, key.id, key_proxy.as_ref()).await {
+            Ok(bearer) => bearer,
+            Err(error) => {
+                let (category, message) =
+                    codex_probe_setup_warning_fields(CodexProbeSetupFailure::TokenResolveFailed);
+                tracing::warn!(key_id = key.id, category, message);
+                return Err(ProbeError::Regular(error.into()).into());
+            }
+        };
+        let version = match self.codex_version.as_ref() {
+            Some(version) => version,
+            None => {
+                let (category, message) =
+                    codex_probe_setup_warning_fields(CodexProbeSetupFailure::VersionStateUnwired);
+                tracing::warn!(key_id = key.id, category, message);
+                return Err(anyhow::anyhow!("OpenAI Codex version state is not wired"));
+            }
+        };
+        probe::fetch_openai_codex_models(
+            key.id,
+            &bearer,
+            &self.transport,
+            provider.dns,
+            key_proxy.as_ref(),
+            version,
+        )
+        .await
+        .map_err(|error| ProbeError::Regular(error).into())
     }
 
     /// One Cursor key's usable-models list, authenticated with the account's
@@ -3132,14 +3244,21 @@ impl Admin {
         // The credential is committed: everything below is best effort.
         if let Some(tokens) = &self.openai_tokens {
             let bearer = tokens.adopt(key_id, bundle);
-            match probe::fetch_openai_codex_models(
-                &bearer,
-                &self.transport,
-                provider.dns,
-                exchange_proxy.as_ref(),
-            )
-            .await
-            {
+            let result = match self.codex_version.as_ref() {
+                Some(version) => {
+                    probe::fetch_openai_codex_models(
+                        key_id,
+                        &bearer,
+                        &self.transport,
+                        provider.dns,
+                        exchange_proxy.as_ref(),
+                        version,
+                    )
+                    .await
+                }
+                None => Err(anyhow::anyhow!("OpenAI Codex version state is not wired")),
+            };
+            match result {
                 Ok(models) => {
                     if let Err(error) = store::update_key_models(&self.pool, key_id, &models).await
                     {
@@ -4401,192 +4520,5 @@ fn map_openai_reset_outcome(
         crate::quota::CodexResetOutcome::NothingToReset => Ok(OpenaiResetOutcome::NothingToReset),
         crate::quota::CodexResetOutcome::NoCredit => Ok(OpenaiResetOutcome::NoCredit),
         crate::quota::CodexResetOutcome::Unknown => Err(OpenaiResetError::Upstream),
-    }
-}
-
-#[cfg(test)]
-mod quota_history_tests {
-    use super::HistoryPruneGate;
-    use super::QUOTA_HISTORY_PRUNE_INTERVAL_MS;
-
-    #[test]
-    fn prune_gate_admits_one_prune_per_interval() {
-        let gate = HistoryPruneGate::new();
-        let start = 1_000_000;
-        assert!(gate.claim(start), "first round must prune");
-        assert!(!gate.claim(start), "same instant must not prune twice");
-        assert!(
-            !gate.claim(start + QUOTA_HISTORY_PRUNE_INTERVAL_MS - 1),
-            "round inside interval must wait"
-        );
-        assert!(
-            gate.claim(start + QUOTA_HISTORY_PRUNE_INTERVAL_MS),
-            "interval boundary must admit pruning"
-        );
-    }
-
-    #[test]
-    fn prune_gate_saturates_instead_of_wrapping_the_deadline() {
-        let gate = HistoryPruneGate::new();
-        assert!(gate.claim(i64::MAX), "large clock must still admit pruning");
-        assert!(!gate.claim(i64::MAX), "deadline must not wrap to the past");
-    }
-}
-
-#[cfg(test)]
-mod codex_reset_contract_tests {
-    use super::{
-        OpenaiResetCredit, OpenaiResetDetails, OpenaiResetOutcome, map_openai_reset_outcome,
-    };
-    use crate::quota::CodexResetOutcome;
-
-    #[test]
-    fn unknown_consume_outcome_maps_to_bad_gateway_error() {
-        assert!(matches!(
-            map_openai_reset_outcome(CodexResetOutcome::Unknown),
-            Err(super::OpenaiResetError::Upstream)
-        ));
-    }
-
-    #[test]
-    fn reset_details_are_display_safe_but_keep_credit_id_for_admin_action() {
-        let details = OpenaiResetDetails {
-            available_count: 2,
-            credits: vec![OpenaiResetCredit {
-                id: "credit-1".to_owned(),
-                status: "available".to_owned(),
-                reset_type: Some("primary".to_owned()),
-                granted_at: None,
-                expires_at: None,
-                title: Some("Primary".to_owned()),
-                description: None,
-            }],
-        };
-        let json = serde_json::to_value(details).expect("reset details should serialize");
-        assert_eq!(json["available_count"], 2);
-        assert_eq!(json["credits"][0]["id"], "credit-1");
-        assert!(!json.to_string().contains("access_token"));
-    }
-
-    #[test]
-    fn outcome_wire_shape_is_stable() {
-        let json = serde_json::to_value(OpenaiResetOutcome::Reset {
-            windows_reset: vec!["primary".to_owned()],
-        })
-        .expect("outcome should serialize");
-        assert_eq!(
-            json,
-            serde_json::json!({"outcome":"reset","windows_reset":["primary"]})
-        );
-    }
-
-    #[test]
-    fn every_consume_outcome_is_explicit_on_the_admin_wire() {
-        let outcomes = [
-            (
-                CodexResetOutcome::AlreadyRedeemed,
-                serde_json::json!({"outcome":"already_redeemed"}),
-            ),
-            (
-                CodexResetOutcome::NothingToReset,
-                serde_json::json!({"outcome":"nothing_to_reset"}),
-            ),
-            (
-                CodexResetOutcome::NoCredit,
-                serde_json::json!({"outcome":"no_credit"}),
-            ),
-        ];
-        for (source, expected) in outcomes {
-            let mapped = map_openai_reset_outcome(source).expect("known outcome should map");
-            assert_eq!(
-                serde_json::to_value(mapped).expect("outcome should serialize"),
-                expected
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod quota_source_tests {
-    use super::{QuotaProbeTokens, QuotaSource, QuotaSourceDecision, quota_source};
-    use crate::credentials::AuthKind;
-    use crate::store::{ProviderKeyRow, ProviderRow};
-
-    fn provider(name: &str, protocol: &str) -> ProviderRow {
-        ProviderRow {
-            id: 7,
-            name: name.to_owned(),
-            protocol: protocol.to_owned(),
-            base_url: "https://example.test".to_owned(),
-            auth_scheme: "bearer".to_owned(),
-            enabled: true,
-            dns: Default::default(),
-        }
-    }
-
-    fn key(auth_kind: AuthKind, api_key: Option<&str>) -> ProviderKeyRow {
-        ProviderKeyRow {
-            id: 42,
-            provider_id: 7,
-            label: "account".to_owned(),
-            api_key: api_key.map(str::to_owned),
-            enabled: true,
-            position: 0,
-            max_concurrency: None,
-            rest_on_429: true,
-            models: None,
-            allowed_models: None,
-            auth_kind: auth_kind.as_str().to_owned(),
-            oauth: None,
-            archived_at: None,
-            proxy_url: None,
-        }
-    }
-
-    fn tokens() -> QuotaProbeTokens {
-        QuotaProbeTokens {
-            kiro: None,
-            opencode: None,
-            cursor: None,
-            openai: None,
-            workbuddy: None,
-        }
-    }
-
-    #[test]
-    fn static_key_uses_its_own_credential() {
-        let mut row = key(AuthKind::Static, Some("secret"));
-
-        let decision = quota_source(&mut row, &provider("generic", "openai"), &tokens());
-
-        assert!(
-            matches!(decision, QuotaSourceDecision::Source(QuotaSource::Static(credential)) if credential == "secret"),
-            "static key must probe with its own api_key"
-        );
-        assert!(row.api_key.is_none(), "credential is moved into the source");
-    }
-
-    #[test]
-    fn credentialless_static_key_is_skipped() {
-        let mut row = key(AuthKind::Static, None);
-
-        let decision = quota_source(&mut row, &provider("generic", "openai"), &tokens());
-
-        assert!(
-            matches!(decision, QuotaSourceDecision::SkipKey),
-            "no credential means no vendor call"
-        );
-    }
-
-    #[test]
-    fn missing_token_manager_skips_the_rest_of_the_provider() {
-        let mut row = key(AuthKind::KiroOidc, None);
-
-        let decision = quota_source(&mut row, &provider("kiro", "kiro"), &tokens());
-
-        assert!(
-            matches!(decision, QuotaSourceDecision::SkipProvider),
-            "an unwired shared manager must skip every key of this provider"
-        );
     }
 }

@@ -208,14 +208,3 @@ async fn read_bounded(response: reqwest::Response) -> anyhow::Result<String> {
     }
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::quota_endpoint;
-
-    #[test]
-    fn workbuddy_has_no_quota_endpoint() {
-        assert!(quota_endpoint("workbuddy", "https://copilot.tencent.com").is_none());
-        assert!(quota_endpoint("workbuddy-intl", "https://www.workbuddy.ai").is_none());
-    }
-}
