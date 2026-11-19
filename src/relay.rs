@@ -3112,7 +3112,18 @@ pub async fn dispatch_at(
             &provider.base_url,
             &provider.auth_scheme,
         );
-        let Some(capability) = capabilities::select(&caps, protocol, target_model) else {
+        // The public OpenAI API serves this gateway exclusively through
+        // Responses; Chat clients take the existing Chat→Responses translation.
+        // Only the capability selection changes — the client's protocol and
+        // body stay untouched.
+        let client_protocol = if protocol == ProtocolId::OpenAiChat
+            && capabilities::openai::is_public_api(&provider.name, &provider.base_url)
+        {
+            ProtocolId::OpenAiResponses
+        } else {
+            protocol
+        };
+        let Some(capability) = capabilities::select(&caps, client_protocol, target_model) else {
             if caps.is_empty() {
                 tracing::warn!(
                     "provider {} has an invalid protocol or credential scheme; skipping candidate",
@@ -3124,7 +3135,7 @@ pub async fn dispatch_at(
                     provider = provider.name.as_str(),
                     key = candidate.key.label.as_str(),
                     "no capability serves the {} protocol; skipping candidate",
-                    protocol.as_str()
+                    client_protocol.as_str()
                 );
             }
             drop(slot.take()); // Release the slot before failing over.

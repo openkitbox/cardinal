@@ -1,7 +1,43 @@
 //! Compatibility decisions for the public OpenAI Chat endpoint.
 
+use crate::protocol::ProtocolId;
 use crate::protocol::openai_chat::ChatDialect;
 use serde_json::Value;
+
+use super::{Capability, single_protocol};
+
+/// Whether this row is the public OpenAI Platform API. Only that endpoint is
+/// known to serve `/v1/responses` alongside Chat; a compatible server under a
+/// different host is never assumed to have it.
+pub(crate) fn is_public_api(provider_name: &str, base_url: &str) -> bool {
+    provider_name == "openai"
+        && reqwest::Url::parse(base_url.trim())
+            .is_ok_and(|url| url.scheme() == "https" && url.host_str() == Some("api.openai.com"))
+}
+
+/// A Chat row on the public API also advertises Responses, so a request that
+/// needs the latter can select it without a second provider row.
+pub(super) fn capabilities(
+    row_protocol: &str,
+    row_auth_scheme: &str,
+    base: &str,
+) -> Vec<Capability> {
+    let mut caps = single_protocol(row_protocol, row_auth_scheme, base);
+    if caps
+        .first()
+        .is_some_and(|cap| cap.protocol == ProtocolId::OpenAiChat)
+    {
+        let auth_scheme = caps[0].auth_scheme;
+        caps.push(Capability {
+            protocol: ProtocolId::OpenAiResponses,
+            endpoint: format!("{base}/responses"),
+            stream_endpoint: None,
+            auth_scheme,
+            claude_only: false,
+        });
+    }
+    caps
+}
 
 /// Choose the wire dialect for one OpenAI Chat candidate.
 ///

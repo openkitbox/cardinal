@@ -238,6 +238,9 @@ pub fn capabilities(
         ("deepseek", _) => deepseek::capabilities(base),
         // `openai-codex` only: plain `openai` keeps the generic row.
         ("openai", _) if codex::is_codex(provider_name) => codex::capabilities(base),
+        ("openai", _) if openai::is_public_api(provider_name, row_base_url) => {
+            openai::capabilities(row_protocol, row_auth_scheme, base)
+        }
         _ => single_protocol(row_protocol, row_auth_scheme, base),
     }
 }
