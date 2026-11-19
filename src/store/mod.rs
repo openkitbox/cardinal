@@ -61,7 +61,8 @@ pub use quota::{
     quota_history_insert, quota_history_prune, quota_snapshot_upsert,
 };
 pub use request::{
-    AttemptLog, RequestRow, insert_request_logs, list_recent_requests, request_row_anchor,
+    AttemptLog, RequestFilter, RequestRow, RequestStatus, insert_request_logs,
+    list_recent_requests, request_row_anchor,
 };
 pub use rest::{
     ActiveRestRow, RestRow, active_rest_rows, clear_provider_rests, clear_rest,

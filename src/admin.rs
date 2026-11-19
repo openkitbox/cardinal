@@ -51,7 +51,10 @@
 //! - `GET /api/usage/trend?since&until&split&offset_seconds` (bucket × category aggregates for the trend chart; `split` =
 //!   `route`|`model`|`provider`|`client`|`user` (`user` = the owning user's login); `caller`/`key_id`/`user_id` as above)
 //! - `GET /api/usage/window?since&until` (whole-window aggregate behind the KPI cards; `caller`/`key_id`/`user_id` as above)
-//! - `GET /api/requests?limit=N` (recent requests, with `user_id`, `login`, `gateway_key_id`, `charged_microus`, `rate_bp`)
+//! - `GET /api/requests?limit&before_id&since&until&user_id&key_id&status` (recent requests, newest first;
+//!   `since`/`until` are RFC3339 with `until` exclusive, `status` = `all`|`ok` (2xx)|`error` (non-2xx);
+//!   a malformed query is 400, never a silently unfiltered listing; each row includes `user_id`, `login`,
+//!   `gateway_key_id`, `charged_microus`, `rate_bp`)
 //! - `GET /api/requests/:id/bodies` (captured request/response bodies from the hourly payload files)
 //! - `GET /api/chat-models` (the chat picker's model list: route aliases + probed direct entries)
 //! - `GET /api/concurrency` (per-key live occupancy for concurrency-capped keys)
@@ -784,6 +787,16 @@ struct RequestsQuery {
     /// Cursor: only rows with a smaller id (older than this row) are returned.
     #[serde(default)]
     before_id: Option<i64>,
+    #[serde(default)]
+    since: Option<jiff::Timestamp>,
+    #[serde(default)]
+    until: Option<jiff::Timestamp>,
+    #[serde(default)]
+    user_id: Option<i64>,
+    #[serde(default)]
+    key_id: Option<i64>,
+    #[serde(default)]
+    status: store::RequestStatus,
 }
 
 fn default_limit() -> i64 {
@@ -792,15 +805,28 @@ fn default_limit() -> i64 {
 
 #[handler]
 async fn recent_requests(request: &mut Request, depot: &mut Depot, response: &mut Response) {
-    let pool = state_pool(depot);
-    let query = request
-        .parse_queries::<RequestsQuery>()
-        .unwrap_or(RequestsQuery {
-            limit: default_limit(),
-            before_id: None,
-        });
+    // Parse before touching the pool: a bad status or timestamp must never
+    // fall back to an unfiltered listing (nor spend a database round trip).
+    let query = match request.parse_queries::<RequestsQuery>() {
+        Ok(query) => query,
+        Err(_) => {
+            json_error(
+                response,
+                StatusCode::BAD_REQUEST,
+                "invalid requests query (limit, before_id, since/until as RFC3339, user_id, key_id, status = all|ok|error)",
+            );
+            return;
+        }
+    };
+    let filter = store::RequestFilter {
+        since: query.since,
+        until: query.until,
+        user_id: query.user_id,
+        key_id: query.key_id,
+        status: query.status,
+    };
     let limit = query.limit.clamp(1, 500);
-    match store::list_recent_requests(pool, limit, query.before_id).await {
+    match store::list_recent_requests(state_pool(depot), limit, query.before_id, filter).await {
         // The Row serializes with exactly these fields (key_label included — the
         // LEFT JOIN selects it into the row); keep the wire the Row itself.
         Ok(rows) => json_response(response, &json!({ "items": rows })),

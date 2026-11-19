@@ -297,13 +297,50 @@ pub struct RequestRow {
     pub rate_bp: Option<i64>,
 }
 
+/// Which request statuses a listing admits. `Ok` is exactly 2xx; `Error` is
+/// its complement (including nonstandard statuses outside 100..599). `All`
+/// imposes no status restriction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RequestStatus {
+    #[default]
+    All,
+    Ok,
+    Error,
+}
+
+impl RequestStatus {
+    /// The status arm the listing SQL matches (never caller-supplied text).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Optional predicates for [`list_recent_requests`]. Every `None` field and
+/// [`RequestStatus::All`] means "no restriction"; the zero value is the
+/// unfiltered listing. `since` is inclusive, `until` exclusive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestFilter {
+    pub since: Option<Timestamp>,
+    pub until: Option<Timestamp>,
+    pub user_id: Option<i64>,
+    pub key_id: Option<i64>,
+    pub status: RequestStatus,
+}
+
 /// The most recent requests, newest first. `before_id` paginates: only rows
 /// with `id < before_id` are returned (id order == time order), None = first
-/// page. A page smaller than `limit` means there is no older data.
+/// page. A page smaller than `limit` means there is no older data. `filter`
+/// narrows the listing on top of the cursor; it never changes the id ordering.
 pub async fn list_recent_requests(
     pool: &PgPool,
     limit: i64,
     before_id: Option<i64>,
+    filter: RequestFilter,
 ) -> anyhow::Result<Vec<RequestRow>> {
     let rows = sqlx::query_as::<_, RequestRow>(
     "SELECT r.id, r.ts, r.protocol, r.client_protocol, r.effort, r.alias, r.provider_id, r.provider_key_id, r.model, r.served_model, r.status,
@@ -312,11 +349,23 @@ pub async fn list_recent_requests(
          FROM gateway_requests r
          LEFT JOIN gateway_provider_keys k ON k.id = r.provider_key_id
          LEFT JOIN users u ON u.id = r.user_id
-         WHERE ($1::bigint IS NULL OR r.id < $1)
-         ORDER BY r.id DESC LIMIT $2",
+          WHERE ($1::bigint IS NULL OR r.id < $1)
+          AND ($3::timestamptz IS NULL OR r.ts >= $3)
+          AND ($4::timestamptz IS NULL OR r.ts < $4)
+          AND ($5::bigint IS NULL OR r.user_id = $5)
+          AND ($6::bigint IS NULL OR r.gateway_key_id = $6)
+          AND ($7::text = 'all'
+               OR ($7::text = 'ok' AND r.status >= 200 AND r.status < 300)
+               OR ($7::text = 'error' AND (r.status < 200 OR r.status >= 300)))
+          ORDER BY r.id DESC LIMIT $2",
   )
   .bind(before_id)
   .bind(limit)
+  .bind(filter.since.map(jiff_sqlx::Timestamp::from))
+  .bind(filter.until.map(jiff_sqlx::Timestamp::from))
+  .bind(filter.user_id)
+  .bind(filter.key_id)
+  .bind(filter.status.as_str())
   .fetch_all(pool)
   .await?;
     Ok(rows)

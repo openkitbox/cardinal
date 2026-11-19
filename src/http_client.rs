@@ -40,8 +40,9 @@ use crate::kiro::KiroOAuth;
 use crate::probe::ProbeModel;
 use crate::relay::DispatchTrace;
 use crate::store::{
-    EntryRow, GatewayKeyRow, GroupRow, ModelSuccessRow, ProviderInput, ProviderRow, RequestRow,
-    RestRow, RouteEntry, RouteRow, RouteStrategy, TrendRow, TrendSplit, UsageWindow, UserRow,
+    EntryRow, GatewayKeyRow, GroupRow, ModelSuccessRow, ProviderInput, ProviderRow, RequestFilter,
+    RequestRow, RequestStatus, RestRow, RouteEntry, RouteRow, RouteStrategy, TrendRow, TrendSplit,
+    UsageWindow, UserRow,
 };
 
 /// What the GUI shows when the gateway is not running (spec §8 decision 1).
@@ -690,22 +691,38 @@ impl GatewayHttpClient {
     }
 
     /// The most recent requests (clamped to 1..=500 server-side), newest
-    /// first. `before_id` paginates.
+    /// first. `before_id` paginates; `filter` narrows the listing on top of
+    /// the cursor (all/absent fields = unfiltered).
     pub async fn recent_requests(
         &self,
         limit: i64,
         before_id: Option<i64>,
+        filter: RequestFilter,
     ) -> Result<Vec<RequestRow>, ClientError> {
         #[derive(serde::Serialize)]
         struct RequestsParams {
             limit: i64,
             #[serde(skip_serializing_if = "Option::is_none")]
             before_id: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            since: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            until: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            user_id: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            key_id: Option<i64>,
+            status: RequestStatus,
         }
-        items(
-            self.get("/api/requests")
-                .query(&RequestsParams { limit, before_id }),
-        )
+        items(self.get("/api/requests").query(&RequestsParams {
+            limit,
+            before_id,
+            since: filter.since.map(rfc3339),
+            until: filter.until.map(rfc3339),
+            user_id: filter.user_id,
+            key_id: filter.key_id,
+            status: filter.status,
+        }))
         .await
     }
 
@@ -1556,7 +1573,7 @@ impl GatewayHttpClient {
                         // ledger state at stream start (events missed during the outage
                         // surface as one Persisted).
                         let newest = client
-                            .recent_requests(1, None)
+                            .recent_requests(1, None, RequestFilter::default())
                             .await
                             .ok()
                             .and_then(|rows| rows.first().map(|row| row.id));
