@@ -1,10 +1,10 @@
 //! Self-service gateway keys for ordinary users (`/user/keys`).
 //!
 //! Mounted by [`crate::user_usage::router`] inside its auth hoop, so every
-//! handler acts for the one authenticated user and only on keys that user
-//! owns; a key id the caller does not own answers 404, the same as an
-//! unknown id. A one-key scope (a built-in owner key) sees and edits only
-//! that key and cannot create keys (403). Terms are validated by
+//! handler acts only within the authenticated scope; a key id the caller does
+//! not own answers 404, the same as an unknown id. A key scope sees and edits
+//! only that key and cannot create keys (403), while an account scope can
+//! manage all keys it owns. Terms are validated by
 //! [`crate::key_terms`], the same rules as the admin API.
 //!
 //! Endpoints:

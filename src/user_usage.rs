@@ -1,13 +1,10 @@
 //! Self-service API for ordinary gateway-key users (`/user/*`).
 //!
-//! This surface is separate from the admin router. It authenticates one
-//! gateway key that is enabled, unexpired and owned by an enabled user, and
-//! scopes every read to that user — every key the user owns, by `user_id`.
-//! A key of the built-in owner is the exception: the owner is no real user
-//! identity, so such a key sees only itself (its usage, its ledger entries,
-//! itself in the key list) and cannot create keys. Callers cannot select
-//! another scope through query parameters, and the admin key is never
-//! accepted here.
+//! This surface is separate from the admin router. It accepts an enabled,
+//! unexpired gateway key, or a currently valid portal session. Raw gateway
+//! keys and key sessions are scoped to that one key; account sessions are
+//! scoped to every key owned by that account. Callers cannot select another
+//! scope through query parameters, and the admin key is never accepted here.
 //!
 //! Endpoints:
 //! - `GET /user/me` — profile, group, effective rate, balance, the user's
@@ -29,27 +26,22 @@ use crate::admin::AdminKey;
 use crate::api::AppState;
 use crate::store::{self, CallerFilter, Principal};
 
-/// What the authenticated key may see, injected by [`user_auth`] for the
-/// handlers.
+/// What the authenticated credential may see, injected by [`user_auth`] for
+/// the handlers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UserScope {
-    /// Every key of one real user.
+    /// Every key of one real user, as granted by an account session.
     User(i64),
-    /// One key of the built-in owner, and nothing else.
+    /// One gateway key, as granted by a raw key or key session.
     Key { user_id: i64, key_id: i64 },
 }
 
 impl UserScope {
-    /// The scope a principal gets: one key for the built-in owner, else the
-    /// whole user.
-    fn of(principal: &Principal) -> Self {
-        if principal.login == store::OWNER_LOGIN {
-            UserScope::Key {
-                user_id: principal.user_id,
-                key_id: principal.key_id,
-            }
-        } else {
-            UserScope::User(principal.user_id)
+    /// The scope granted to a raw gateway key.
+    fn key(principal: &Principal) -> Self {
+        UserScope::Key {
+            user_id: principal.user_id,
+            key_id: principal.key_id,
         }
     }
 
@@ -65,6 +57,19 @@ impl UserScope {
         match self {
             UserScope::User(_) => None,
             UserScope::Key { key_id, .. } => Some(key_id),
+        }
+    }
+
+    fn auth(self) -> AuthView {
+        match self {
+            Self::User(_) => AuthView {
+                kind: "account",
+                key_id: None,
+            },
+            Self::Key { key_id, .. } => AuthView {
+                kind: "key",
+                key_id: Some(key_id),
+            },
         }
     }
 
@@ -94,8 +99,8 @@ fn bearer_token(value: &str) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
-/// Resolve the usage scope of an authenticated key without accepting client
-/// input: the admin key is refused, as is a key the relay hoop would refuse
+/// Resolve the usage scope of a raw authenticated key without accepting client
+/// input. The admin key is refused, as is a key the relay hoop would refuse
 /// (disabled key or user, expired key — [`crate::api::refusal`]).
 fn user_scope(
     token: &str,
@@ -108,7 +113,7 @@ fn user_scope(
     }
     match crate::api::refusal(principal, now) {
         Some(reason) => Err(reason),
-        None => Ok(UserScope::of(principal)),
+        None => Ok(UserScope::key(principal)),
     }
 }
 
@@ -184,31 +189,59 @@ async fn user_auth(
         ctrl.skip_rest();
         return;
     };
-    let principal = match store::authenticate_principal(&pool, token).await {
-        Ok(Some(principal)) => principal,
-        Ok(None) => {
-            response.status_code(StatusCode::UNAUTHORIZED);
-            let _ = response.body("invalid gateway key");
-            ctrl.skip_rest();
-            return;
+    let scope = if crate::account_auth::is_portal_session_token(token) {
+        let session = match crate::account_auth::lookup_portal_session(&pool, token).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                response.status_code(StatusCode::UNAUTHORIZED);
+                let _ = response.body("invalid portal session");
+                ctrl.skip_rest();
+                return;
+            }
+            Err(error) => {
+                tracing::warn!("portal session lookup failed: {error:#}");
+                response.status_code(StatusCode::SERVICE_UNAVAILABLE);
+                let _ = response.body("portal session lookup failed");
+                ctrl.skip_rest();
+                return;
+            }
+        };
+        match session.key_id {
+            Some(key_id) => UserScope::Key {
+                user_id: session.user_id,
+                key_id,
+            },
+            None => UserScope::User(session.user_id),
         }
-        Err(error) => {
-            tracing::warn!("user usage gateway key lookup failed: {error:#}");
-            response.status_code(StatusCode::SERVICE_UNAVAILABLE);
-            let _ = response.body("gateway key lookup failed");
-            ctrl.skip_rest();
-            return;
+    } else {
+        let principal = match store::authenticate_principal(&pool, token).await {
+            Ok(Some(principal)) => principal,
+            Ok(None) => {
+                response.status_code(StatusCode::UNAUTHORIZED);
+                let _ = response.body("invalid gateway key");
+                ctrl.skip_rest();
+                return;
+            }
+            Err(error) => {
+                tracing::warn!("user usage gateway key lookup failed: {error:#}");
+                response.status_code(StatusCode::SERVICE_UNAVAILABLE);
+                let _ = response.body("gateway key lookup failed");
+                ctrl.skip_rest();
+                return;
+            }
+        };
+        match user_scope(token, &principal, admin_key, jiff::Timestamp::now()) {
+            Ok(scope) => scope,
+            Err(reason) => {
+                response.status_code(StatusCode::UNAUTHORIZED);
+                let _ = response.body(reason);
+                ctrl.skip_rest();
+                return;
+            }
         }
     };
-    match user_scope(token, &principal, admin_key, jiff::Timestamp::now()) {
-        Ok(scope) => {
-            depot.insert_typed(scope);
-        }
-        Err(reason) => {
-            response.status_code(StatusCode::UNAUTHORIZED);
-            let _ = response.body(reason);
-            ctrl.skip_rest();
-        }
+    {
+        depot.insert_typed(scope);
     }
 }
 
@@ -226,6 +259,7 @@ const ME_USAGE_DAYS: i64 = 30;
 /// The `GET /user/me` body: the caller's own account.
 #[derive(serde::Serialize)]
 struct MeView {
+    auth: AuthView,
     user: MeUser,
     group: MeGroup,
     /// The effective rate: the user override, else the group rate.
@@ -235,8 +269,113 @@ struct MeView {
     balance_usd: String,
     /// Every key the user owns, full plaintext included.
     keys: Vec<store::GatewayKeyRow>,
-    /// Usage over the last [`ME_USAGE_DAYS`] days, all of the user's keys.
-    usage_30d: store::UsageWindow,
+    /// Usage over the last [`ME_USAGE_DAYS`] days in the authenticated scope.
+    usage_30d: UserUsageWindow,
+}
+
+/// User-facing usage omits the internal catalog price while retaining charged
+/// usage and the fields needed by the portal charts.
+#[derive(serde::Serialize)]
+struct UserUsageWindow {
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_input_tokens: i64,
+    requests: i64,
+    failed: i64,
+    charged_microus: i64,
+    unpriced: i64,
+    timed_output: i64,
+    timed_ms: i64,
+    decode_ms: i64,
+}
+
+impl From<store::UsageWindow> for UserUsageWindow {
+    fn from(window: store::UsageWindow) -> Self {
+        Self {
+            input_tokens: window.input_tokens,
+            output_tokens: window.output_tokens,
+            cached_input_tokens: window.cached_input_tokens,
+            requests: window.requests,
+            failed: window.failed,
+            charged_microus: window.charged_microus,
+            unpriced: window.unpriced,
+            timed_output: window.timed_output,
+            timed_ms: window.timed_ms,
+            decode_ms: window.decode_ms,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct UserTrendRow {
+    bucket: String,
+    category: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_input_tokens: i64,
+    requests: i64,
+    failed: i64,
+    charged_microus: i64,
+    timed_output: i64,
+    timed_ms: i64,
+    decode_ms: i64,
+}
+
+impl From<store::TrendRow> for UserTrendRow {
+    fn from(row: store::TrendRow) -> Self {
+        Self {
+            bucket: row.bucket,
+            category: row.category,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cached_input_tokens: row.cached_input_tokens,
+            requests: row.requests,
+            failed: row.failed,
+            charged_microus: row.charged_microus,
+            timed_output: row.timed_output,
+            timed_ms: row.timed_ms,
+            decode_ms: row.decode_ms,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct UserEntryRow {
+    id: i64,
+    user_id: i64,
+    kind: String,
+    amount_microus: i64,
+    balance_after_microus: i64,
+    request_id: Option<String>,
+    rate_bp: Option<i64>,
+    gateway_key_id: Option<i64>,
+    note: String,
+    operator: Option<String>,
+    created_at: jiff::Timestamp,
+}
+
+impl From<store::EntryRow> for UserEntryRow {
+    fn from(row: store::EntryRow) -> Self {
+        Self {
+            id: row.id,
+            user_id: row.user_id,
+            kind: row.kind,
+            amount_microus: row.amount_microus,
+            balance_after_microus: row.balance_after_microus,
+            request_id: row.request_id,
+            rate_bp: row.rate_bp,
+            gateway_key_id: row.gateway_key_id,
+            note: row.note,
+            operator: row.operator,
+            created_at: row.created_at,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct AuthView {
+    kind: &'static str,
+    key_id: Option<i64>,
 }
 
 /// The profile part of [`MeView`].
@@ -350,7 +489,7 @@ async fn usage_window(request: &mut Request, depot: &mut Depot, response: &mut R
         }
     };
     match store::usage_window(pool, since, until, Some(caller)).await {
-        Ok(window) => json_response(response, &window),
+        Ok(window) => json_response(response, &UserUsageWindow::from(window)),
         Err(error) => internal(response, error),
     }
 }
@@ -409,7 +548,10 @@ async fn usage_trend(request: &mut Request, depot: &mut Depot, response: &mut Re
     )
     .await
     {
-        Ok(rows) => json_response(response, &json!({ "items": rows })),
+        Ok(rows) => {
+            let rows: Vec<UserTrendRow> = rows.into_iter().map(UserTrendRow::from).collect();
+            json_response(response, &json!({ "items": rows }));
+        }
         Err(error) => internal(response, error),
     }
 }
@@ -457,6 +599,7 @@ async fn me(depot: &mut Depot, response: &mut Response) {
     keys.retain(|key| scope.covers_key(key.id));
     let rate_bp = crate::billing::effective_rate_bp(user.rate_bp, user.group_rate_bp);
     let view = MeView {
+        auth: scope.auth(),
         user: MeUser {
             id: user.id,
             login: user.login,
@@ -474,7 +617,7 @@ async fn me(depot: &mut Depot, response: &mut Response) {
         balance_microus: user.balance_microus,
         balance_usd: crate::billing::format_usd(user.balance_microus),
         keys,
-        usage_30d: usage,
+        usage_30d: usage.into(),
     };
     json_response(response, &view);
 }
@@ -503,7 +646,10 @@ async fn me_entries(request: &mut Request, depot: &mut Depot, response: &mut Res
     )
     .await
     {
-        Ok(rows) => json_response(response, &json!({ "items": rows })),
+        Ok(rows) => {
+            let rows: Vec<UserEntryRow> = rows.into_iter().map(UserEntryRow::from).collect();
+            json_response(response, &json!({ "items": rows }));
+        }
         Err(error) => internal(response, error.into()),
     }
 }
@@ -526,4 +672,5 @@ pub fn router(admin_key: Arc<AdminKey>) -> Router {
                 .push(Router::with_path("trend").get(usage_trend)),
         )
         .push(crate::user_keys::router())
+        .push(crate::user_topup::router())
 }

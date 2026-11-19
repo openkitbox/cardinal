@@ -43,6 +43,24 @@ pub struct Config {
     /// with a tight client deadline wants this larger; see also the
     /// transport's `opening` for the upstream-first-byte patience.
     pub queue_timeout_secs: Option<u64>,
+    pub portal: PortalConfig,
+}
+
+/// Explicit opt-in settings for customer portal authentication.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PortalConfig {
+    pub default_customer_group: Option<String>,
+    pub mail: Option<PortalMailConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PortalMailConfig {
+    pub url: String,
+    pub token: String,
+    pub from: String,
+    pub origin: String,
 }
 
 impl Default for Config {
@@ -61,6 +79,7 @@ impl Default for Config {
             providers: Vec::new(),
             prices: Vec::new(),
             queue_timeout_secs: None,
+            portal: PortalConfig::default(),
         }
     }
 }

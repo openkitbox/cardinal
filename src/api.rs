@@ -740,6 +740,18 @@ async fn gateway_auth(
     let state = depot.get_typed::<Arc<AppState>>().expect("state");
     let pool = state.pool.clone();
     let candidates = caller_keys(request);
+    if candidates
+        .iter()
+        .any(|candidate| crate::account_auth::is_portal_session_token(candidate))
+    {
+        refuse(
+            request,
+            response,
+            ctrl,
+            "a portal session is not a gateway API key".to_owned(),
+        );
+        return;
+    }
     let mut principal: Option<Principal> = None;
     for candidate in &candidates {
         match crate::store::authenticate_principal(&pool, candidate).await {
@@ -769,10 +781,11 @@ async fn gateway_auth(
     depot.insert_typed(principal);
 }
 
-pub fn router(
+pub(crate) fn router(
     state: Arc<AppState>,
     admin_key: Arc<crate::admin::AdminKey>,
     admin_remote: Arc<crate::admin::AdminRemote>,
+    auth_state: crate::account_auth::AuthState,
 ) -> Router {
     Router::new()
         .hoop(crate::access_log::AccessLog)
@@ -793,6 +806,7 @@ pub fn router(
                 .push(Router::with_path("models/{**call}").post(gemini_generate)),
         )
         .push(crate::admin::router(Arc::clone(&admin_key), admin_remote))
+        .push(crate::account_auth::router(auth_state))
         .push(crate::user_usage::router(admin_key))
         .hoop(affix_state::inject(state))
 }

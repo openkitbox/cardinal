@@ -390,6 +390,9 @@ pub(crate) fn is_global_unicast(ip: IpAddr) -> bool {
         || segments[0] == 0x2002
         // 2001:db8::/32 documentation
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        // 2001:2::/48 benchmarking and 3fff::/20 documentation
+        || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
+        || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
         || (segments[0] == 0x2001 && segments[1] == 0))
         }
     }

@@ -493,6 +493,12 @@ impl Gateway {
         ));
         let admin_key = Arc::new(admin::AdminKey(config.gateway_key.clone()));
         let admin_remote = Arc::new(admin::AdminRemote(config.admin_remote));
+        let auth_state = crate::account_auth::AuthState::new(
+            core.pool.clone(),
+            config.portal,
+            &config.gateway_key,
+        )
+        .await;
         let state = Arc::new(api::AppState {
             pool: core.pool.clone(),
             transport: core.transport.clone(),
@@ -539,7 +545,8 @@ impl Gateway {
 
         let server = Server::new(acceptor);
         let handle = server.handle();
-        let join = tokio::spawn(server.serve(api::router(state, admin_key, admin_remote)));
+        let join =
+            tokio::spawn(server.serve(api::router(state, admin_key, admin_remote, auth_state)));
         tracing::info!("listening on {addr}");
         Ok(Self {
             core,

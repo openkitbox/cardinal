@@ -5,6 +5,7 @@
 //! cooldown identity is (key, model) with NULL meaning the whole key, and routes are named key
 //! subsets exposed as client model ids.
 
+mod account_auth;
 mod balance_history;
 mod billing;
 mod gateway_key;
@@ -20,6 +21,12 @@ mod usage;
 mod usage_source;
 mod user;
 
+pub use account_auth::{
+    AccountCredential, PortalSession, complete_password_reset, complete_registration,
+    configured_group, create_account_session, create_key_session, issue_password_reset_challenge,
+    issue_registration_challenge, lookup_account_credential, lookup_session, normalize_email,
+    revoke_session,
+};
 pub use balance_history::{BalanceHistoryPoint, balance_history_record, list_balance_history};
 pub use billing::{
     Charge, CreditError, CreditKind, EntryRow, KeyReconciliation, Overflowed, ReconcileReport,

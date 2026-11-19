@@ -20,7 +20,9 @@ test-support = []
 
 [dependencies]
 anyhow = "1"
+argon2 = "0.6"
 async-stream = "0.3"
+base64 = "0.23"
 bytes = "1"
 jiff = { version = "1", features = ["serde"] }
 jiff-sqlx = { version = "1.0.0", features = ["postgres", "serde"] }
@@ -29,6 +31,7 @@ crc32fast = "1"
 dashmap = "6"
 dirs = "7"
 futures = "0.3"
+getrandom = "0.4"
 hex = "0.4"
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "https-ring", "tls-ring", "webpki-roots"] }
 nanoid = "0.5"

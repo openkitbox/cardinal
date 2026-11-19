@@ -16,11 +16,14 @@
 //! crate call `gateway::gateway::Gateway::start` directly.
 
 pub mod access_log;
+pub(crate) mod account_auth;
+mod account_mail;
 pub mod activity;
 pub mod admin;
 pub mod admin_ops;
 pub mod agent;
 pub mod api;
+mod auth_limits;
 pub mod billing;
 pub mod body_log;
 pub mod client;
@@ -49,6 +52,7 @@ pub mod translation;
 pub mod tri_state;
 pub mod upstream;
 pub mod user_keys;
+pub mod user_topup;
 pub mod user_usage;
 pub mod workbuddy;
 

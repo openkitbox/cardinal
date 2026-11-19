@@ -35,6 +35,17 @@ listen = "127.0.0.1:8787"
 # 某个 key 满载时，调度在队列里等多久（秒）再故障转移到下一个候选。默认 30。
 # queue_timeout_secs = 30
 
+# Customer portal registration is disabled unless both an explicit customer
+# group and a mail transport are configured. The group must not be `owner` or
+# `internal`.
+# [gateway.portal]
+# default_customer_group = "customer"
+# [gateway.portal.mail]
+# url = "https://mail.example.test/send"
+# token = "replace-me"
+# from = "Cardinal <auth@example.com>"
+# origin = "https://portal.example.com"
+
 # ── Provider 种子 ─────────────────────────────────────────────
 # 启动时幂等写入 DB（name 为主键，config 是 source of truth）。
 # 凭证（keys）和路由不在这里配——运行时通过管理 API / GUI 管理。

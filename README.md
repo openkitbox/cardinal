@@ -43,14 +43,56 @@ key = "your-admin-key"
 # key_path = "/path/to/key.pem"
 ```
 
-### Run
+### Customer portal local integration
+
+The customer portal is deliberately opt-in. Registration is enabled only when both
+an explicit non-internal customer group and a valid HTTP mail transport are
+configured. Do not point a local run at the production database or mail service.
+
+The reproducible Web integration command is run from the companion Web worktree:
 
 ```bash
-cargo build --release
-./target/release/cardinal
+export CARDINAL_TEST_DATABASE_URL='postgres://cardinal:password@127.0.0.1:5432/cardinal_test'
+cd ../cardinal-web/.ox/worktrees/customer-portal
+bun run test:e2e
 ```
 
-### Verify
+`bun run test:e2e` creates an isolated PostgreSQL 18/TimescaleDB Docker container
+when `CARDINAL_TEST_DATABASE_URL` is not set, starts a mock mail HTTP endpoint,
+configures the Gateway with a temporary customer group and mail origin, and
+starts the real Gateway and Web servers. The test also uses a local
+OpenAI-compatible upstream fixture. It polls readiness and mail/usage conditions
+with bounded timeouts; it does not read a home-directory config, production
+DSN, or live credentials. Set `CARDINAL_GATEWAY_ROOT` when the Gateway worktree
+is not at the default adjacent path.
+
+A manual local configuration has the same required portal fields:
+
+```toml
+[gateway.portal]
+default_customer_group = "customer"
+
+[gateway.portal.mail]
+url = "http://127.0.0.1:18080/send"
+token = "local-mail-secret"
+from = "Cardinal <auth@example.test>"
+origin = "http://127.0.0.1:5173"
+```
+
+Use PostgreSQL 18 with TimescaleDB >= 2.31 for integration tests. The local
+fixture image `timescale/timescaledb:latest-pg18` currently provides a compatible
+TimescaleDB version and initializes the extension in `template1`; a fresh test
+database should execute `CREATE EXTENSION IF NOT EXISTS timescaledb` before
+migrations when the fixture owns database creation.
+
+The portal E2E covers open registration and fragment mail verification, account
+and Key login, two customer keys, a real mocked upstream request, aggregate vs
+single-Key usage, billing, unavailable top-up, forgot/reset, logout, and
+second-user isolation. Payment providers, orders, webhooks, real mail
+reachability, production routing, and production admin-surface isolation are
+not covered by the local test.
+
+
 
 ```bash
 curl -H "Authorization: Bearer your-admin-key" http://127.0.0.1:8787/api/info
@@ -139,7 +181,10 @@ updates the `latest` tag.
 | `GET /user/usage/window`, `GET /user/usage/trend` | Self-service usage; trend `split` = `route` (default), `model` or `client` (`provider`/`user` → 400) |
 
 Admin endpoints under `/api` require `Authorization: Bearer <admin key>`;
-`/v1` and `/user` endpoints require a gateway key.
+`/v1` endpoints require a gateway key; `/user/*` accepts account portal
+sessions, key portal sessions, and raw gateway keys. Existing billing users are
+not automatically provisioned account credentials, and registration does not
+backfill credentials onto them.
 
 ## Architecture
 
