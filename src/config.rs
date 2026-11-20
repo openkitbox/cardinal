@@ -46,14 +46,20 @@ pub struct Config {
     pub portal: PortalConfig,
 }
 
-/// Explicit opt-in settings for customer portal authentication.
+/// Deployment-level portal settings retained in the config file. Runtime
+/// secrets and mail transport live in the database; only the BFF shared secret
+/// and the default registration group remain here as deployment policy.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PortalConfig {
     pub default_customer_group: Option<String>,
-    pub mail: Option<PortalMailConfig>,
+    /// Shared secret presented by the browser-facing frontend. Stored as a
+    /// digest in the runtime snapshot; never returned by an API.
+    pub bff_secret: Option<String>,
 }
 
+/// Mail transport shape still used by the HTTP mailer. Its values are read
+/// from `portal_settings` at startup and on reload, not from the config file.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PortalMailConfig {

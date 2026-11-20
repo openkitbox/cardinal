@@ -75,6 +75,10 @@
 //!   a key whose spend reached its quota is refused with 402
 //! - `GET /api/traces`, `GET /api/traces/:request_id` — recent routing traces from the dispatch trace ring
 //!   (newest first, capped at the ring's capacity; transient — nothing is persisted)
+//! - `GET/PUT /api/portal/settings` — masked view / full replacement of DB-backed mail settings
+//!   (`"********"` on a secret means keep it, `""` clears it)
+//! - `GET /api/portal/providers`, `PUT/DELETE /api/portal/providers/{provider}` — masked login-provider
+//!   configuration; every successful write reloads the portal runtime before answering
 
 use std::sync::Arc;
 
@@ -85,6 +89,7 @@ use salvo::sse::SseEvent;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::account_auth::AuthState;
 use crate::admin_ops::CursorLoginError;
 use crate::admin_ops::OpenaiLoginError;
 use crate::admin_ops::OpenaiLoginRequest;
@@ -95,7 +100,9 @@ use crate::agent;
 use crate::credentials::{AuthKind, KeyCredential, resolve_key_credential};
 use crate::key_terms;
 use crate::kiro::KiroOAuth;
-use crate::store::{self, ProviderInput, RouteEntry, RouteStrategy};
+use crate::store::{
+    self, AuthProviderInput, PortalSettingsInput, ProviderInput, RouteEntry, RouteStrategy,
+};
 use crate::upstream::Dns;
 
 /// Admin key SHA-256 (shared in-process, injected by main from config).
@@ -190,6 +197,31 @@ fn state(depot: &Depot) -> &Arc<crate::api::AppState> {
 
 fn state_pool(depot: &Depot) -> &sqlx::PgPool {
     &state(depot).pool
+}
+
+fn portal_auth_state(depot: &Depot) -> &AuthState {
+    depot
+        .get_typed::<AuthState>()
+        .expect("portal auth state injected")
+}
+
+/// A write must not answer 2xx until the runtime has picked it up. The DB row
+/// is already committed at this point: if reload fails we report an error (and
+/// leave the old snapshot live) rather than claiming a partially applied
+/// configuration.
+async fn reload_portal(depot: &Depot, response: &mut Response) -> bool {
+    match portal_auth_state(depot).reload().await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "portal settings saved but runtime reload failed; previous snapshot retained");
+            json_error(
+                response,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "portal settings saved but runtime reload failed; previous snapshot retained",
+            );
+            false
+        }
+    }
 }
 
 /// Assemble the facade from the shared AppState: the registries are the live
@@ -1938,13 +1970,236 @@ async fn consume_openai_reset(request: &mut Request, depot: &mut Depot, response
     }
 }
 
+// ---------- customer portal configuration ----------
+
+/// Provider path segment allowlist. Endpoints are code constants (T3), so an
+/// operator cannot turn this API into an SSRF proxy; the name only selects one
+/// of the known provider implementations.
+fn valid_portal_provider(provider: &str) -> bool {
+    let bytes = provider.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortalSettingsBody {
+    mail_transport: String,
+    mail_url: String,
+    mail_token: String,
+    mail_from: String,
+    mail_origin: String,
+    smtp_host: String,
+    smtp_port: i32,
+    smtp_username: String,
+    smtp_password: String,
+    smtp_tls: String,
+    smtp_from: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortalProviderBody {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    enabled: bool,
+    #[serde(default)]
+    extra: Option<serde_json::Value>,
+}
+
+#[handler]
+async fn portal_get_settings(depot: &mut Depot, response: &mut Response) {
+    match store::get_portal_settings_masked(state_pool(depot)).await {
+        Ok(view) => json_response(response, &view),
+        Err(error) => {
+            tracing::warn!(error = %error, "portal settings read failed");
+            json_error(
+                response,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "portal settings read failed",
+            );
+        }
+    }
+}
+
+#[handler]
+async fn portal_put_settings(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Ok(body) = request.parse_json::<PortalSettingsBody>().await else {
+        json_error(
+            response,
+            StatusCode::BAD_REQUEST,
+            "invalid portal settings body",
+        );
+        return;
+    };
+    if !["http", "smtp"].contains(&body.mail_transport.as_str()) {
+        json_error(response, StatusCode::BAD_REQUEST, "unknown mail_transport");
+        return;
+    }
+    if !["none", "starttls", "tls"].contains(&body.smtp_tls.as_str()) {
+        json_error(response, StatusCode::BAD_REQUEST, "unknown smtp_tls");
+        return;
+    }
+    if !(1..=65535).contains(&body.smtp_port) {
+        json_error(response, StatusCode::BAD_REQUEST, "smtp_port out of range");
+        return;
+    }
+    let input = PortalSettingsInput {
+        mail_transport: &body.mail_transport,
+        mail_url: &body.mail_url,
+        mail_token: &body.mail_token,
+        mail_from: &body.mail_from,
+        mail_origin: &body.mail_origin,
+        smtp_host: &body.smtp_host,
+        smtp_port: body.smtp_port,
+        smtp_username: &body.smtp_username,
+        smtp_password: &body.smtp_password,
+        smtp_tls: &body.smtp_tls,
+        smtp_from: &body.smtp_from,
+    };
+    let row = match store::put_portal_settings(state_pool(depot), &input).await {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(error = %error, "portal settings write failed");
+            json_error(
+                response,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "portal settings write failed",
+            );
+            return;
+        }
+    };
+    if !reload_portal(depot, response).await {
+        return;
+    }
+    json_response(response, &row.masked());
+}
+
+#[handler]
+async fn portal_list_providers(depot: &mut Depot, response: &mut Response) {
+    match store::list_auth_providers(state_pool(depot)).await {
+        Ok(rows) => {
+            let views: Vec<_> = rows.iter().map(|row| row.masked()).collect();
+            json_response(response, &views);
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "auth provider list failed");
+            json_error(
+                response,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "auth provider list failed",
+            );
+        }
+    }
+}
+
+#[handler]
+async fn portal_put_provider(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let provider = request.param::<String>("provider").unwrap_or_default();
+    if !valid_portal_provider(&provider) {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid provider name");
+        return;
+    }
+    let Ok(body) = request.parse_json::<PortalProviderBody>().await else {
+        json_error(
+            response,
+            StatusCode::BAD_REQUEST,
+            "invalid auth provider body",
+        );
+        return;
+    };
+    let extra = body.extra.unwrap_or_else(|| json!({}));
+    if !extra.is_object() {
+        json_error(
+            response,
+            StatusCode::BAD_REQUEST,
+            "extra must be a JSON object",
+        );
+        return;
+    }
+    let input = AuthProviderInput {
+        provider: &provider,
+        client_id: &body.client_id,
+        client_secret: &body.client_secret,
+        redirect_uri: &body.redirect_uri,
+        enabled: body.enabled,
+        extra: &extra,
+    };
+    let row = match store::upsert_auth_provider(state_pool(depot), &input).await {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(error = %error, "auth provider write failed");
+            json_error(
+                response,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "auth provider write failed",
+            );
+            return;
+        }
+    };
+    if !reload_portal(depot, response).await {
+        return;
+    }
+    json_response(response, &row.masked());
+}
+
+#[handler]
+async fn portal_delete_provider(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let provider = request.param::<String>("provider").unwrap_or_default();
+    if !valid_portal_provider(&provider) {
+        json_error(response, StatusCode::BAD_REQUEST, "invalid provider name");
+        return;
+    }
+    match store::delete_auth_provider(state_pool(depot), &provider).await {
+        Ok(true) => {}
+        Ok(false) => {
+            not_found(response, "auth provider");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "auth provider delete failed");
+            json_error(
+                response,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "auth provider delete failed",
+            );
+            return;
+        }
+    }
+    if !reload_portal(depot, response).await {
+        return;
+    }
+    response.status_code(StatusCode::NO_CONTENT);
+}
+
 /// `/api/*` sub-router (loopback-only + admin auth). Mounted on the main router.
-pub fn router(admin_key: Arc<AdminKey>, admin_remote: Arc<AdminRemote>) -> Router {
+pub(crate) fn router(
+    admin_key: Arc<AdminKey>,
+    admin_remote: Arc<AdminRemote>,
+    auth_state: AuthState,
+) -> Router {
     Router::with_path("api")
         .hoop(affix_state::inject(admin_key))
         .hoop(affix_state::inject(admin_remote))
+        .hoop(affix_state::inject(auth_state))
         .hoop(admin_local_only)
         .hoop(admin_auth)
+        .push(
+            Router::with_path("portal/settings")
+                .get(portal_get_settings)
+                .put(portal_put_settings),
+        )
+        .push(Router::with_path("portal/providers").get(portal_list_providers))
+        .push(
+            Router::with_path("portal/providers/{provider}")
+                .put(portal_put_provider)
+                .delete(portal_delete_provider),
+        )
         .push(
             Router::with_path("providers")
                 .get(list_providers)
@@ -3183,5 +3438,28 @@ async fn agent_disconnect(request: &mut Request, response: &mut Response) {
     match result {
         Ok(restored) => json_response(response, &json!({"ok": true, "restored": restored})),
         Err(error) => internal(response, error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portal_provider_names_reject_path_surprises() {
+        for name in ["google", "github-enterprise", "a1-b2"] {
+            assert!(valid_portal_provider(name), "{name}");
+        }
+        for name in [
+            "",
+            "1password",
+            "Google",
+            "github_enterprise",
+            "../admin",
+            "with space",
+            &"a".repeat(65),
+        ] {
+            assert!(!valid_portal_provider(name), "{name}");
+        }
     }
 }

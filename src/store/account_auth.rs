@@ -1,6 +1,7 @@
 //! Portal persistence. The caller verifies passwords and supplies password hashes
 //! and 32-byte token digests; plaintext passwords and tokens never enter SQL.
 
+use anyhow::Context as _;
 use jiff::Timestamp;
 use jiff_sqlx::ToSqlx;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -34,6 +35,44 @@ pub async fn lookup_account_credential(
           WHERE c.email = $1 AND u.enabled AND u.login <> $2",
     )
     .bind(normalize_email(email))
+    .bind(OWNER_LOGIN)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Resolve the credential by user id. OAuth subject reuse keeps the original
+/// credential email, so the provider's current email cannot identify it.
+pub async fn lookup_account_credential_by_user_id(
+    pool: &PgPool,
+    user_id: i64,
+) -> sqlx::Result<Option<AccountCredential>> {
+    sqlx::query_as(
+        "SELECT c.user_id, c.password_hash, c.password_version
+           FROM account_credentials c JOIN users u ON u.id = c.user_id
+          WHERE c.user_id = $1 AND u.enabled AND u.login <> $2",
+    )
+    .bind(user_id)
+    .bind(OWNER_LOGIN)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The valid user already bound to an OAuth subject, if any. Used to avoid
+/// generating a password hash that the identity transaction would discard.
+pub async fn lookup_oauth_identity_user_id(
+    pool: &PgPool,
+    provider: &str,
+    subject: &str,
+) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT i.user_id
+           FROM public.account_oauth_identities i
+           JOIN public.users u ON u.id = i.user_id
+          WHERE i.provider = $1 AND i.subject = $2
+            AND u.enabled AND u.login <> $3",
+    )
+    .bind(provider)
+    .bind(subject)
     .bind(OWNER_LOGIN)
     .fetch_optional(pool)
     .await
@@ -296,4 +335,197 @@ pub async fn revoke_session(pool: &PgPool, token_digest: &[u8; 32]) -> sqlx::Res
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// How an OAuth subject was resolved. Callers use this to distinguish a reuse
+/// from an email link or a freshly provisioned account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthIdentityOutcome {
+    Existing { user_id: i64 },
+    Linked { user_id: i64 },
+    Created { user_id: i64 },
+}
+
+impl OAuthIdentityOutcome {
+    /// The account whose session may be issued.
+    #[must_use]
+    pub fn user_id(self) -> i64 {
+        match self {
+            Self::Existing { user_id } | Self::Linked { user_id } | Self::Created { user_id } => {
+                user_id
+            }
+        }
+    }
+}
+
+/// User behind a credential or an identity, with the validity checks needed
+/// before signing an account session.
+#[derive(sqlx::FromRow)]
+struct IdentityUser {
+    id: i64,
+    enabled: bool,
+    is_owner: bool,
+}
+
+impl IdentityUser {
+    fn valid(&self) -> bool {
+        self.enabled && !self.is_owner
+    }
+}
+
+async fn oauth_identity_user(
+    tx: &mut Transaction<'_, Postgres>,
+    provider: &str,
+    subject: &str,
+) -> sqlx::Result<Option<IdentityUser>> {
+    sqlx::query_as(
+        "SELECT u.id, u.enabled, u.login = $3 AS is_owner
+           FROM public.account_oauth_identities i
+           JOIN public.users u ON u.id = i.user_id
+          WHERE i.provider = $1 AND i.subject = $2",
+    )
+    .bind(provider)
+    .bind(subject)
+    .bind(OWNER_LOGIN)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+async fn credential_user(
+    tx: &mut Transaction<'_, Postgres>,
+    email: &str,
+) -> sqlx::Result<Option<IdentityUser>> {
+    sqlx::query_as(
+        "SELECT u.id, u.enabled, u.login = $2 AS is_owner
+           FROM public.account_credentials c
+           JOIN public.users u ON u.id = c.user_id
+          WHERE c.email = $1
+          FOR UPDATE OF c",
+    )
+    .bind(email)
+    .bind(OWNER_LOGIN)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// Resolve an OAuth identity or create the account behind it, atomically.
+///
+/// Ordering: an existing `(provider, subject)` wins; otherwise a verified email
+/// matching `account_credentials.email` links to that account; otherwise a new
+/// zero-balance customer is created in `group_name` with the supplied password
+/// hash (which must be unusable to anyone but the OAuth flow). `None` means the
+/// login must be rejected: unverified email, no email, or an owner/disabled
+/// account. A missing or reserved group is an error, never a fallback group.
+pub async fn find_or_create_oauth_identity(
+    pool: &PgPool,
+    provider: &str,
+    subject: &str,
+    email: &str,
+    email_verified: bool,
+    group_name: &str,
+    password_hash: &str,
+) -> anyhow::Result<Option<OAuthIdentityOutcome>> {
+    if provider.is_empty() || subject.is_empty() {
+        return Ok(None);
+    }
+    let mut tx = pool.begin().await?;
+    if let Some(user) = oauth_identity_user(&mut tx, provider, subject).await? {
+        return if user.valid() {
+            Ok(Some(OAuthIdentityOutcome::Existing { user_id: user.id }))
+        } else {
+            Ok(None)
+        };
+    }
+    if !email_verified {
+        return Ok(None);
+    }
+    let email = normalize_email(email);
+    if email.is_empty() {
+        return Ok(None);
+    }
+    let existing_credential = credential_user(&mut tx, &email).await?;
+    if existing_credential
+        .as_ref()
+        .is_some_and(|user| !user.valid())
+    {
+        return Ok(None);
+    }
+    let mut created_user = None;
+    let user_id = match existing_credential {
+        Some(user) => user.id,
+        None => {
+            let id = insert_customer(&mut tx, group_name)
+                .await
+                .context("no usable customer group for OAuth signup")?;
+            created_user = Some(id);
+            let inserted = sqlx::query(
+                "INSERT INTO public.account_credentials (user_id, email, password_hash)
+                 VALUES ($1, $2, $3) ON CONFLICT (email) DO NOTHING",
+            )
+            .bind(id)
+            .bind(&email)
+            .bind(password_hash)
+            .execute(&mut *tx)
+            .await?;
+            if inserted.rows_affected() == 0 {
+                // A concurrent signup took the address; link to its account
+                // rather than leaving behind a user with no credential.
+                let Some(winner) = credential_user(&mut tx, &email).await? else {
+                    return Ok(None);
+                };
+                if !winner.valid() {
+                    return Ok(None);
+                }
+                sqlx::query("DELETE FROM public.users WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                created_user = None;
+                winner.id
+            } else {
+                id
+            }
+        }
+    };
+    let inserted = sqlx::query(
+        "INSERT INTO public.account_oauth_identities (provider, subject, user_id, email)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (provider, subject) DO NOTHING",
+    )
+    .bind(provider)
+    .bind(subject)
+    .bind(user_id)
+    .bind(&email)
+    .execute(&mut *tx)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        // A concurrent transaction bound the same subject first. Discard only
+        // the user this transaction created; the winner may be that same user
+        // when both transactions linked the same email.
+        let Some(winner) = oauth_identity_user(&mut tx, provider, subject).await? else {
+            return Ok(None);
+        };
+        if !winner.valid() {
+            return Ok(None);
+        }
+        if let Some(created) = created_user.filter(|id| *id != winner.id) {
+            sqlx::query("DELETE FROM public.users WHERE id = $1")
+                .bind(created)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let outcome = if created_user == Some(winner.id) {
+            OAuthIdentityOutcome::Created { user_id: winner.id }
+        } else {
+            OAuthIdentityOutcome::Existing { user_id: winner.id }
+        };
+        tx.commit().await?;
+        return Ok(Some(outcome));
+    }
+    tx.commit().await?;
+    let outcome = if created_user.is_some() {
+        OAuthIdentityOutcome::Created { user_id }
+    } else {
+        OAuthIdentityOutcome::Linked { user_id }
+    };
+    Ok(Some(outcome))
 }

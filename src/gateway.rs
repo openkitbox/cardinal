@@ -497,8 +497,9 @@ impl Gateway {
             core.pool.clone(),
             config.portal,
             &config.gateway_key,
+            config.allow_insecure_upstream,
         )
-        .await;
+        .await?;
         let state = Arc::new(api::AppState {
             pool: core.pool.clone(),
             transport: core.transport.clone(),

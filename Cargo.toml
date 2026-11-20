@@ -34,9 +34,13 @@ futures = "0.3"
 getrandom = "0.4"
 hex = "0.4"
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "https-ring", "tls-ring", "webpki-roots"] }
+# JWKS-backed RS256 ID-token verification (v10.4: `jwk` module, rust_crypto backend).
+jsonwebtoken = { version = "10.4", default-features = false, features = ["rust_crypto", "use_pem"] }
+# Async SMTP transport for portal challenge mail; TLS via rustls/webpki roots.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls", "rustls-tls", "builder"] }
 nanoid = "0.5"
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "query", "http2", "socks"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "stream", "query", "http2", "socks"] }
 # mimalloc as the global allocator: frees pages back to the OS ~1s after a
 # burst (glibc retains them for the process lifetime). `no_thp` makes it
 # prctl(PR_SET_THP_DISABLE) itself — under a THP=[always] kernel (Debian 13)

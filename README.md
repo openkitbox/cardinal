@@ -45,39 +45,70 @@ key = "your-admin-key"
 
 ### Customer portal local integration
 
-The customer portal is deliberately opt-in. Registration is enabled only when both
-an explicit non-internal customer group and a valid HTTP mail transport are
-configured. Do not point a local run at the production database or mail service.
+The customer portal is deliberately opt-in: registration is enabled only with
+an explicit non-internal customer group. Only deployment policy stays in TOML:
 
-The reproducible Web integration command is run from the companion Web worktree:
+```toml
+[gateway.portal]
+default_customer_group = "customer"   # must not be `owner` or `internal`
+bff_secret = "local-bff-secret"       # shared with the Cloudflare Web BFF
+```
+
+`bff_secret` must match the Web BFF's `GATEWAY_BFF_SECRET`; no configured secret
+means `POST /auth/oauth/exchange` rejects every request. The Web side also needs
+`CARDINAL_URL` (Gateway base URL) and `OAUTH_STATE_SECRET` (signs the one-time
+OAuth state cookie). Provider client secrets stay in Gateway — never in Web
+environment variables or frontend code.
+
+Mail transport (HTTP or SMTP) and Google/GitHub OAuth providers live in
+PostgreSQL, are managed through the Gateway admin API or the GUI settings page,
+and take effect immediately. There is no `[gateway.portal.mail]` TOML section;
+configure mail after Gateway health with `PUT /api/portal/settings`:
+
+```bash
+curl -H "Authorization: Bearer your-admin-key" \
+  -H 'Content-Type: application/json' \
+  -X PUT http://127.0.0.1:8787/api/portal/settings \
+  -d '{"mail_transport":"http",
+       "mail_url":"http://127.0.0.1:18080/send",
+       "mail_token":"local-mail-secret",
+       "mail_from":"Cardinal <auth@example.test>",
+       "mail_origin":"http://127.0.0.1:5173",
+       "smtp_host":"","smtp_port":25,"smtp_username":"",
+       "smtp_password":"","smtp_tls":"starttls","smtp_from":""}'
+```
+
+Login providers use `GET /api/portal/providers` and
+`PUT/DELETE /api/portal/providers/{provider}` (`google` or `github`). The public
+`GET /auth/oauth/providers` lists only enabled providers and never exposes
+secrets. `client_id`, `client_secret`, `redirect_uri` and `enabled` are stored in
+the DB; dev-only loopback endpoint overrides under `extra.endpoints` in the
+provider record require `[gateway] allow_insecure_upstream = true`. Never enable
+that flag in production.
+
+An account created only through OAuth has a random, unusable password hash; if
+its owner explicitly completes the email forgot/reset-password flow, it becomes
+a dual-mode account that can log in both with email+password and through the
+linked OAuth provider (unverified emails are never auto-linked).
+
+The reproducible Web integration command is run from the companion Web checkout:
 
 ```bash
 export CARDINAL_TEST_DATABASE_URL='postgres://cardinal:password@127.0.0.1:5432/cardinal_test'
-cd ../cardinal-web/.ox/worktrees/customer-portal
+cd ../cardinal-web
 bun run test:e2e
 ```
 
 `bun run test:e2e` creates an isolated PostgreSQL 18/TimescaleDB Docker container
-when `CARDINAL_TEST_DATABASE_URL` is not set, starts a mock mail HTTP endpoint,
-configures the Gateway with a temporary customer group and mail origin, and
-starts the real Gateway and Web servers. The test also uses a local
-OpenAI-compatible upstream fixture. It polls readiness and mail/usage conditions
-with bounded timeouts; it does not read a home-directory config, production
-DSN, or live credentials. Set `CARDINAL_GATEWAY_ROOT` when the Gateway worktree
-is not at the default adjacent path.
-
-A manual local configuration has the same required portal fields:
-
-```toml
-[gateway.portal]
-default_customer_group = "customer"
-
-[gateway.portal.mail]
-url = "http://127.0.0.1:18080/send"
-token = "local-mail-secret"
-from = "Cardinal <auth@example.test>"
-origin = "http://127.0.0.1:5173"
-```
+when `CARDINAL_TEST_DATABASE_URL` is not set, starts mock mail and OAuth provider
+HTTP endpoints, configures the Gateway with a temporary customer group, a BFF
+secret, mail settings via `PUT /api/portal/settings` after `/health` is ready,
+and a GitHub login provider, then starts the real Gateway and Web servers with
+the environment variables above. It also uses a local OpenAI-compatible upstream
+fixture. It polls readiness and mail/usage conditions with bounded timeouts; it
+does not read a home-directory config, production DSN, or live credentials. Set
+`CARDINAL_GATEWAY_ROOT` when the Gateway worktree is not at the default adjacent
+path.
 
 Use PostgreSQL 18 with TimescaleDB >= 2.31 for integration tests. The local
 fixture image `timescale/timescaledb:latest-pg18` currently provides a compatible
@@ -86,13 +117,14 @@ database should execute `CREATE EXTENSION IF NOT EXISTS timescaledb` before
 migrations when the fixture owns database creation.
 
 The portal E2E covers open registration and fragment mail verification, account
-and Key login, two customer keys, a real mocked upstream request, aggregate vs
-single-Key usage, billing, unavailable top-up, forgot/reset, logout, and
-second-user isolation. Payment providers, orders, webhooks, real mail
-reachability, production routing, and production admin-surface isolation are
-not covered by the local test.
+and Key login, OAuth login through loopback-provider mocks, two customer keys, a
+real mocked upstream request, aggregate vs single-Key usage, billing,
+unavailable top-up, forgot/reset, logout, and second-user isolation. Payment
+providers, orders, webhooks, real mail reachability, real Google/GitHub
+endpoints, production routing, and production admin-surface isolation are not
+covered by the local test.
 
-
+Check the gateway is up with:
 
 ```bash
 curl -H "Authorization: Bearer your-admin-key" http://127.0.0.1:8787/api/info

@@ -11,6 +11,7 @@ mod billing;
 mod gateway_key;
 mod key;
 mod key_group;
+mod portal_settings;
 mod price;
 mod provider;
 mod quota;
@@ -22,10 +23,11 @@ mod usage_source;
 mod user;
 
 pub use account_auth::{
-    AccountCredential, PortalSession, complete_password_reset, complete_registration,
-    configured_group, create_account_session, create_key_session, issue_password_reset_challenge,
-    issue_registration_challenge, lookup_account_credential, lookup_session, normalize_email,
-    revoke_session,
+    AccountCredential, OAuthIdentityOutcome, PortalSession, complete_password_reset,
+    complete_registration, configured_group, create_account_session, create_key_session,
+    find_or_create_oauth_identity, issue_password_reset_challenge, issue_registration_challenge,
+    lookup_account_credential, lookup_account_credential_by_user_id, lookup_oauth_identity_user_id,
+    lookup_session, normalize_email, revoke_session,
 };
 pub use balance_history::{BalanceHistoryPoint, balance_history_record, list_balance_history};
 pub use billing::{
@@ -52,6 +54,12 @@ pub use key::{
 pub use key_group::{
     KeyGroupError, KeyGroupView, create_key_group, delete_key_group, key_groups_exist,
     list_key_groups, rename_key_group,
+};
+pub use portal_settings::{
+    AuthProviderInput, AuthProviderRow, AuthProviderView, PortalSettingsInput, PortalSettingsRow,
+    PortalSettingsView, PublicAuthProvider, SECRET_MASK, delete_auth_provider, get_auth_provider,
+    get_portal_settings, get_portal_settings_masked, list_auth_providers,
+    list_enabled_auth_providers, mask_secret, put_portal_settings, upsert_auth_provider,
 };
 pub use price::{
     ModelPrice, ModelSuccessRow, PriceTier, get_price, last_model_success,

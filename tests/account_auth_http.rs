@@ -1,15 +1,19 @@
 //! Gateway HTTP tests. Set CARDINAL_TEST_DATABASE_URL to an isolated PostgreSQL
 //! 18 cluster with TimescaleDB preloaded and a role allowed to create databases.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use cardinal::config::Config;
 use cardinal::db::parse_pg_options;
 use cardinal::gateway::Gateway;
-use cardinal::store;
+use cardinal::store::{self, PortalSettingsInput};
+use jiff::{SignedDuration, Timestamp};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::{Client, Response, StatusCode, Url};
 use salvo::affix_state;
 use salvo::conn::{Acceptor as _, Listener as _};
+use salvo::prelude::Json;
 use salvo::{Depot, Request, Router, Server, handler};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -61,6 +65,11 @@ impl Fixture {
             .execute(&pool)
             .await
             .unwrap();
+        // Portal settings are DB-backed: seed the row before the gateway
+        // builds its first runtime snapshot.
+        let mut migrator = cardinal::migrator();
+        migrator.dangerous_set_table_name("_sqlx_migrations_gateway".to_owned());
+        migrator.run(&pool).await.unwrap();
         let acceptor = salvo::conn::TcpListener::new("127.0.0.1:0")
             .try_bind()
             .await
@@ -73,7 +82,25 @@ impl Fixture {
             .hoop(affix_state::inject(sender))
             .post(receive_mail);
         let mock = tokio::spawn(Server::new(acceptor).serve(mail_router));
-        let config = fixture_config(&dsn, group, mail.then_some(mail_url.as_str()));
+        let config = fixture_config(&dsn, group);
+        let settings = PortalSettingsInput {
+            mail_transport: "http",
+            mail_url: if mail { &mail_url } else { "" },
+            mail_token: if mail { "mock-secret" } else { "" },
+            mail_from: if mail {
+                "Cardinal <auth@example.com>"
+            } else {
+                ""
+            },
+            mail_origin: if mail { ORIGIN } else { "" },
+            smtp_host: "",
+            smtp_port: 587,
+            smtp_username: "",
+            smtp_password: "",
+            smtp_tls: "starttls",
+            smtp_from: "",
+        };
+        store::put_portal_settings(&pool, &settings).await.unwrap();
         let gateway = Gateway::start(config).await.unwrap();
         let group_id = store::create_group(&pool, "customer", 10000, None)
             .await
@@ -219,15 +246,12 @@ impl Fixture {
     }
 }
 
-fn fixture_config(dsn: &str, group: Option<&str>, mail: Option<&str>) -> Config {
+fn fixture_config(dsn: &str, group: Option<&str>) -> Config {
     let mut config = format!(
         "listen = '127.0.0.1:0'\nsql_dsn = '{dsn}'\ngateway_key = '{ADMIN_KEY}'\n[portal]\n"
     );
     if let Some(group) = group {
         config.push_str(&format!("default_customer_group = '{group}'\n"));
-    }
-    if let Some(url) = mail {
-        config.push_str(&format!("[portal.mail]\nurl = '{url}'\ntoken = 'mock-secret'\nfrom = 'Cardinal <auth@example.com>'\norigin = '{ORIGIN}'\n"));
     }
     toml::from_str(&config).unwrap()
 }
@@ -546,6 +570,594 @@ async fn account_auth_store_failure_returns_no_credentials() {
     let body = response.text().await.unwrap();
     assert!(
         !body.contains("ps_") && !body.contains(PASSWORD) && !body.contains("deny_test_session")
+    );
+    app.close().await;
+}
+
+// --- OAuth exchange tests (dev-only loopback provider overrides) -------------
+
+const BFF_SECRET: &str = "bff-shared-secret";
+const OAUTH_REDIRECT: &str = "https://portal.example.com/oauth/callback";
+const CODE_VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._";
+const TEST_RSA_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAppTyf1y6n4C3QaDbarWw5x0gHxaX32+XAgyBE/V1TqikoCgo
+KMdd5oT1K+8OEUhcoa6OYqBgwCARuxBvFGwHk41mb4oHmX+R2ot01qv2UroB/bYA
+ohvRWs2GBLtWAV/k4hSy/mRCwwewEsknIxCI2Bqai/xTUBBoSvaaa3+Vflj8r10T
+r/6QY1nA7xzl8P6Zc4YsIvYwVREg87kL7FNcYSdhgr022Xkaa28lR8cXN7NqVYzw
+3uJUgJ3+M+7O+c35wp9eC5Vwc7ZOF8kmzsWyJCAAKsIzMvctoV/7F5jNZTo7QrV4
+4fvrP5pamtioy1AR+1SBxExvjYqbomTcFK0T/wIDAQABAoIBAAt/qOo8EJEgYEX8
+9bhneKHIw7tcTWPPKZ7VayGMENVlqbt5GiXlISkKO3xAC6S2GILRRaMu4Tl8h+Ig
+RR1P7wlIj5jFGozbc/TLKeeu8MQOx+1nSfg8BaxdbHyuIRvbg9/2lXvJmEbVzy8f
+cylQo7Q7HeOU1Ca+LdzNf0+f+8XqqkR+cCQ0c0Av43CfXmvM4vOmRolxLyxB1tf2
+tHXtXm7Xk6RDTOM++WFERqFTFqEttBYV7C79FpGhg+Af7xCn7XM5D3IQzQIYG24d
+zAwteh9ZAfTdq+gySn3c1yB0o498eyrdvzmKrvvrJVT3xviuVz/q1jk3lel0nQEw
+UW2fjVECgYEA5MdIksxsJPcIF4AlsIWGHHcjFMnmopRig1QW93r1cs14pWTuhl98
+DXyX/gTMsC+pW40UT1gh7Z5C3PevqeujFHSFpJEL4UjerLFgV3ikBSx7m16lZAeq
++IHzW/i/v17xB2Jo0S44adnCE2b+02TAUROvovrPA/Ynh8ohvMuWS/ECgYEAumce
+3tjhfv7F+UVO2A6Uuxco5cXcG48b+l/8hef1iDtHwLzOsLWt0/ZbpNY19xU5ficx
+CjPXrPeI0Net+5bZhh99QV7VGgPMdlBHlTFH+p4cWHfQ0qW8bDG2TR/5W1sjmZDt
+s+ZSZq6VNxizZ08KXgnUE5dVnKbfRi6/+seFDu8CgYBiy0AmzIpC6D6hT2B3OyHv
+9u66Unn7aVKlXdHRK1MFMX/RBKYQdvluJYjJVC9EQkDDXUgQ/4EfSMGdBITiPvSc
+p7jymQRlU/982dg9zcYeydfS/2syqDEHwa5i4CeFr60sQC39bxVDeJrboBWZGiAG
+oxasrdxp3ImzlPE+wzfzMQKBgC7Percn6+kCfiENQLGNZ9hcBo89UvswwyvrMvVF
+vSlLCcfjIlzKIy8ZrQYGLWMxV1DQ8sXHIyBywU8A+tY1mcbO3Zuu/wEbdxs3KeLT
+j2nmjuPAoxZjPKBHE6rmnq5MgvIrrSYCbysOKLa/Yz5MYSQgf7uzw3IljeiIEPof
+ZNDNAoGBAIOMdW3mzSA5rOg0Iz89MwuuJQCU/fjkT+93pXfcxHGfp3JzDK6god2O
+xxu3NUpaBatH9Yd3FM/YGFcT7T/pbYvYtPoiNYlKtrkqLSWX6JGCFEVfEDRn5/kc
+MuwqJe08pDk0+oLcX6W5IDtJ8Tgs3dZvza33xkxra7pxzksOHOBi
+-----END RSA PRIVATE KEY-----";
+const TEST_RSA_N: &str = "ppTyf1y6n4C3QaDbarWw5x0gHxaX32-XAgyBE_V1TqikoCgoKMdd5oT1K-8OEUhcoa6OYqBgwCARuxBvFGwHk41mb4oHmX-R2ot01qv2UroB_bYAohvRWs2GBLtWAV_k4hSy_mRCwwewEsknIxCI2Bqai_xTUBBoSvaaa3-Vflj8r10Tr_6QY1nA7xzl8P6Zc4YsIvYwVREg87kL7FNcYSdhgr022Xkaa28lR8cXN7NqVYzw3uJUgJ3-M-7O-c35wp9eC5Vwc7ZOF8kmzsWyJCAAKsIzMvctoV_7F5jNZTo7QrV44fvrP5pamtioy1AR-1SBxExvjYqbomTcFK0T_w";
+
+async fn form_params(request: &mut Request) -> HashMap<String, String> {
+    let bytes = request.payload_with_max_size(8192).await.unwrap();
+    String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .split('&')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            Some((key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn mock_bearer(request: &Request) -> String {
+    request.headers()["authorization"]
+        .to_str()
+        .unwrap()
+        .strip_prefix("Bearer ")
+        .unwrap()
+        .to_owned()
+}
+
+#[handler]
+async fn mock_google_token(request: &mut Request) -> Json<Value> {
+    let params = form_params(request).await;
+    assert_eq!(
+        params.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
+    assert_eq!(
+        params.get("client_secret").map(String::as_str),
+        Some("google-secret-do-not-leak")
+    );
+    assert_eq!(
+        params.get("code_verifier").map(String::as_str),
+        Some(CODE_VERIFIER)
+    );
+    let (subject, email, verified, nonce) = match params["code"].as_str() {
+        "google-ok" => ("google-subject-ok", "google.oauth@example.com", true, None),
+        "google-changed-email" => ("google-subject-ok", "changed.oauth@example.com", true, None),
+        "google-unverified" => (
+            "google-subject-unverified",
+            "google.unverified@example.com",
+            false,
+            None,
+        ),
+        "google-nonce" => (
+            "google-subject-nonce",
+            "google.nonce@example.com",
+            true,
+            Some("expected-nonce"),
+        ),
+        _ => return Json(json!({"error": "invalid_grant"})),
+    };
+    let now = Timestamp::now().as_second();
+    let mut claims = json!({
+        "iss": "https://accounts.google.com",
+        "aud": "google-client",
+        "sub": subject,
+        "email": email,
+        "email_verified": verified,
+        "iat": now,
+        "exp": now + 600,
+    });
+    if let Some(nonce) = nonce {
+        claims["nonce"] = json!(nonce);
+    }
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("test-key".to_owned());
+    let key = EncodingKey::from_rsa_pem(TEST_RSA_KEY.as_bytes()).expect("test RSA key");
+    let id_token = encode(&header, &claims, &key).expect("sign test ID token");
+    Json(json!({"id_token": id_token, "token_type": "Bearer"}))
+}
+
+#[handler]
+async fn mock_google_jwks() -> Json<Value> {
+    Json(json!({
+        "keys": [{
+            "kty": "RSA",
+            "kid": "test-key",
+            "use": "sig",
+            "alg": "RS256",
+            "n": TEST_RSA_N,
+            "e": "AQAB",
+        }],
+    }))
+}
+
+#[handler]
+async fn mock_github_token(request: &mut Request) -> Json<Value> {
+    let params = form_params(request).await;
+    assert_eq!(
+        params.get("client_secret").map(String::as_str),
+        Some("github-secret-do-not-leak")
+    );
+    assert_eq!(
+        params.get("code_verifier").map(String::as_str),
+        Some(CODE_VERIFIER)
+    );
+    let token = match params["code"].as_str() {
+        "github-alice" => "gho_alice",
+        "github-linked" => "gho_linked",
+        "github-created" => "gho_created",
+        "github-fail" => return Json(json!({"error": "bad_verification_code"})),
+        "github-unverified" => {
+            return Json(json!({"error": "unverified_user_email"}));
+        }
+        _ => return Json(json!({"error": "bad_verification_code"})),
+    };
+    Json(json!({
+        "access_token": token,
+        "scope": "read:user,user:email",
+        "token_type": "bearer",
+    }))
+}
+
+#[handler]
+async fn mock_github_user(request: &Request) -> Json<Value> {
+    let id = match mock_bearer(request).as_str() {
+        "gho_alice" => 101,
+        "gho_linked" => 303,
+        "gho_created" => 404,
+        _ => 0,
+    };
+    Json(json!({"id": id, "login": "oauth-user"}))
+}
+
+#[handler]
+async fn mock_github_emails(request: &Request) -> Json<Value> {
+    let email = match mock_bearer(request).as_str() {
+        "gho_alice" => "alice.oauth@example.com",
+        "gho_linked" => "linked@example.com",
+        "gho_created" => "created@example.com",
+        _ => "unknown@example.com",
+    };
+    Json(json!([{
+        "email": email,
+        "primary": true,
+        "verified": true,
+    }]))
+}
+
+struct OauthFixture {
+    gateway: Gateway,
+    pool: PgPool,
+    dsn: String,
+    client: Client,
+    mock: tokio::task::JoinHandle<()>,
+    group_id: i64,
+}
+
+impl OauthFixture {
+    async fn start() -> Self {
+        let base_dsn = std::env::var("CARDINAL_TEST_DATABASE_URL")
+            .expect("set CARDINAL_TEST_DATABASE_URL to an isolated test cluster");
+        let (options, _) = parse_pg_options(&base_dsn).unwrap();
+        let name = format!("cardinal_oauth_http_{}", uuid::Uuid::new_v4().simple());
+        let options = options.database(&name);
+        let dsn = options.to_url_lossy().to_string();
+        Postgres::create_database(&dsn).await.unwrap();
+        let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS timescaledb")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut migrator = cardinal::migrator();
+        migrator.dangerous_set_table_name("_sqlx_migrations_gateway".to_owned());
+        migrator.run(&pool).await.unwrap();
+        let group_id = store::create_group(&pool, "customer", 10000, None)
+            .await
+            .unwrap();
+        let settings = PortalSettingsInput {
+            mail_transport: "http",
+            mail_url: "",
+            mail_token: "",
+            mail_from: "",
+            mail_origin: "",
+            smtp_host: "",
+            smtp_port: 587,
+            smtp_username: "",
+            smtp_password: "",
+            smtp_tls: "starttls",
+            smtp_from: "",
+        };
+        store::put_portal_settings(&pool, &settings).await.unwrap();
+
+        let acceptor = salvo::conn::TcpListener::new("127.0.0.1:0")
+            .try_bind()
+            .await
+            .unwrap();
+        let local_addr = acceptor.holdings()[0].local_addr.to_string();
+        let mock_port = local_addr.rsplit(':').next().expect("mock provider port");
+        let mock_base = format!("http://127.0.0.1:{mock_port}");
+        let mock_router = Router::new()
+            .push(Router::with_path("google/token").post(mock_google_token))
+            .push(Router::with_path("google/jwks").get(mock_google_jwks))
+            .push(Router::with_path("github/token").post(mock_github_token))
+            .push(Router::with_path("github/user").get(mock_github_user))
+            .push(Router::with_path("github/emails").get(mock_github_emails));
+        let mock = tokio::spawn(Server::new(acceptor).serve(mock_router));
+
+        let google_extra = json!({"endpoints": {
+            "authorize": format!("{mock_base}/google/authorize"),
+            "token": format!("{mock_base}/google/token"),
+            "jwks": format!("{mock_base}/google/jwks"),
+            "issuer": "https://accounts.google.com",
+        }});
+        store::upsert_auth_provider(
+            &pool,
+            &store::AuthProviderInput {
+                provider: "google",
+                client_id: "google-client",
+                client_secret: "google-secret-do-not-leak",
+                redirect_uri: OAUTH_REDIRECT,
+                enabled: true,
+                extra: &google_extra,
+            },
+        )
+        .await
+        .unwrap();
+        let github_extra = json!({"endpoints": {
+            "authorize": format!("{mock_base}/github/authorize"),
+            "token": format!("{mock_base}/github/token"),
+            "userinfo": format!("{mock_base}/github/user"),
+            "emails": format!("{mock_base}/github/emails"),
+        }});
+        store::upsert_auth_provider(
+            &pool,
+            &store::AuthProviderInput {
+                provider: "github",
+                client_id: "github-client",
+                client_secret: "github-secret-do-not-leak",
+                redirect_uri: OAUTH_REDIRECT,
+                enabled: true,
+                extra: &github_extra,
+            },
+        )
+        .await
+        .unwrap();
+        let disabled_extra = json!({});
+        store::upsert_auth_provider(
+            &pool,
+            &store::AuthProviderInput {
+                provider: "blocked",
+                client_id: "blocked-client",
+                client_secret: "blocked-secret-do-not-leak",
+                redirect_uri: OAUTH_REDIRECT,
+                enabled: false,
+                extra: &disabled_extra,
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = toml::from_str(&format!(
+            "listen = '127.0.0.1:0'\nsql_dsn = '{dsn}'\ngateway_key = 'admin-key'\n\
+             allow_insecure_upstream = true\n[portal]\nbff_secret = '{BFF_SECRET}'\n\
+             default_customer_group = 'customer'\n"
+        ))
+        .unwrap();
+        let gateway = Gateway::start(config).await.unwrap();
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        Self {
+            gateway,
+            pool,
+            dsn,
+            client,
+            mock,
+            group_id,
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.gateway.local_addr())
+    }
+
+    async fn exchange(&self, body: Value, secret: &str) -> Response {
+        let response = self
+            .client
+            .post(self.url("/auth/oauth/exchange"))
+            .bearer_auth(secret)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        response
+    }
+
+    async fn session(&self, response: Response, expected_user: Option<i64>) -> String {
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = response.json().await.unwrap();
+        let token = value["token"].as_str().unwrap();
+        assert!(token.starts_with("ps_"));
+        assert_eq!(token.len(), 46);
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let session = store::lookup_session(&self.pool, &digest)
+            .await
+            .unwrap()
+            .expect("issued session must be live");
+        // Account-scoped session: no gateway key is attached.
+        assert!(session.key_id.is_none());
+        if let Some(user_id) = expected_user {
+            assert_eq!(session.user_id, user_id);
+        }
+        token.to_owned()
+    }
+
+    async fn close(self) {
+        self.gateway.shutdown().await.unwrap();
+        self.mock.abort();
+        self.pool.close().await;
+        Postgres::drop_database(&self.dsn).await.unwrap();
+    }
+}
+
+fn oauth_body(provider: &str, code: &str) -> Value {
+    json!({"provider": provider, "code": code, "code_verifier": CODE_VERIFIER})
+}
+
+#[tokio::test]
+async fn account_auth_http_oauth_public_providers_hide_secrets_and_use_code_endpoints() {
+    let app = OauthFixture::start().await;
+    let response = app
+        .client
+        .get(app.url("/auth/oauth/providers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(!body.contains("do-not-leak"));
+    assert!(!body.contains("endpoints"));
+    let providers: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(providers.as_array().unwrap().len(), 2);
+    assert_eq!(providers[0]["provider"], "github");
+    let github_authorize = providers[0]["authorize_url"].as_str().unwrap();
+    assert!(github_authorize.starts_with("http://127.0.0.1:"));
+    assert!(github_authorize.ends_with("/github/authorize"));
+    assert_eq!(providers[0]["scope"], "read:user user:email");
+    assert_eq!(providers[0]["redirect_uri"], OAUTH_REDIRECT);
+    assert_eq!(providers[1]["provider"], "google");
+    let google_authorize = providers[1]["authorize_url"].as_str().unwrap();
+    assert!(google_authorize.starts_with("http://127.0.0.1:"));
+    assert!(google_authorize.ends_with("/google/authorize"));
+    assert_eq!(providers[1]["scope"], "openid email");
+    app.close().await;
+}
+
+#[tokio::test]
+async fn account_auth_http_oauth_google_exchange_verifies_the_id_token() {
+    let app = OauthFixture::start().await;
+    let response = app
+        .exchange(oauth_body("google", "google-ok"), BFF_SECRET)
+        .await;
+    app.session(response, None).await;
+    let verified: i64 = sqlx::query_scalar(
+        "SELECT user_id FROM account_oauth_identities WHERE provider = 'google'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    let user = store::get_user(&app.pool, verified).await.unwrap().unwrap();
+    assert_eq!(user.group_id, app.group_id);
+    assert_eq!(
+        store::lookup_oauth_identity_user_id(&app.pool, "google", "google-subject-ok")
+            .await
+            .unwrap(),
+        Some(verified)
+    );
+    assert_eq!(
+        store::lookup_oauth_identity_user_id(&app.pool, "google", "unknown-subject")
+            .await
+            .unwrap(),
+        None
+    );
+    let credential = store::lookup_account_credential_by_user_id(&app.pool, verified)
+        .await
+        .unwrap()
+        .expect("OAuth signup must leave a credential");
+    assert_eq!(credential.user_id, verified);
+    assert!(!credential.password_hash.is_empty());
+    assert!(
+        store::lookup_account_credential_by_user_id(&app.pool, verified + 1000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Subject reuse must not depend on the provider's current email: T1 keeps
+    // the credential created for the first email.
+    let changed = app
+        .exchange(oauth_body("google", "google-changed-email"), BFF_SECRET)
+        .await;
+    app.session(changed, Some(verified)).await;
+    let stored_email: String =
+        sqlx::query_scalar("SELECT email FROM account_credentials WHERE user_id = $1")
+            .bind(verified)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_email, "google.oauth@example.com");
+
+    let unverified = app
+        .exchange(oauth_body("google", "google-unverified"), BFF_SECRET)
+        .await;
+    assert_eq!(unverified.status(), StatusCode::UNAUTHORIZED);
+    let mut body = oauth_body("google", "google-nonce");
+    body["nonce"] = json!("wrong-nonce");
+    assert_eq!(
+        app.exchange(body, BFF_SECRET).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut body = oauth_body("google", "google-nonce");
+    body["nonce"] = json!("expected-nonce");
+    app.session(app.exchange(body, BFF_SECRET).await, None)
+        .await;
+    app.close().await;
+}
+
+#[tokio::test]
+async fn account_auth_http_oauth_github_exchange_covers_all_identity_branches() {
+    let app = OauthFixture::start().await;
+    let created = app
+        .exchange(oauth_body("github", "github-created"), BFF_SECRET)
+        .await;
+    let created_user = {
+        let value: Value = created.json().await.unwrap();
+        let digest: [u8; 32] = Sha256::digest(value["token"].as_str().unwrap().as_bytes()).into();
+        store::lookup_session(&app.pool, &digest)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_id
+    };
+    let created_again = app
+        .exchange(oauth_body("github", "github-created"), BFF_SECRET)
+        .await;
+    let response = app
+        .exchange(oauth_body("github", "github-alice"), BFF_SECRET)
+        .await;
+    app.session(response, None).await;
+
+    // Pre-existing account with the same verified email links instead of creating.
+    let challenge: [u8; 32] = Sha256::digest("oauth-link-challenge").into();
+    store::issue_registration_challenge(
+        &app.pool,
+        "linked@example.com",
+        &challenge,
+        Timestamp::now() + SignedDuration::from_mins(5),
+    )
+    .await
+    .unwrap();
+    let linked_user = store::complete_registration(
+        &app.pool,
+        &challenge,
+        "$argon2id$v=19$m=19456,t=2,p=1$MjAxOTAxMDEwMDAwMDAwMA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "customer",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let linked = app
+        .exchange(oauth_body("github", "github-linked"), BFF_SECRET)
+        .await;
+    let session = app.session(linked, Some(linked_user)).await;
+    assert_ne!(session, "");
+    let existing = app
+        .exchange(oauth_body("github", "github-created"), BFF_SECRET)
+        .await;
+    let value: Value = existing.json().await.unwrap();
+    let digest: [u8; 32] = Sha256::digest(value["token"].as_str().unwrap().as_bytes()).into();
+    assert_eq!(
+        store::lookup_session(&app.pool, &digest)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_id,
+        created_user
+    );
+    // The second exchange for the same subject must not create another account.
+    let subjects: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM account_oauth_identities WHERE provider = 'github' AND subject = '404'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(subjects, 1);
+    assert!(created_again.status().is_success());
+    app.close().await;
+}
+
+#[tokio::test]
+async fn account_auth_http_oauth_exchange_rejects_bad_requests() {
+    let app = OauthFixture::start().await;
+    assert_eq!(
+        app.exchange(oauth_body("github", "github-created"), "wrong-secret")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.exchange(oauth_body("blocked", "github-created"), BFF_SECRET)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.exchange(oauth_body("unknown", "github-created"), BFF_SECRET)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.exchange(oauth_body("github", "github-fail"), BFF_SECRET)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.exchange(oauth_body("github", "github-unverified"), BFF_SECRET)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.exchange(
+            json!({"provider":"github","code":"github-created","code_verifier":CODE_VERIFIER,"extra":1}),
+            BFF_SECRET,
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.exchange(
+            json!({"provider":"github","code":"github-created","code_verifier":"short"}),
+            BFF_SECRET,
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    // No token exchange may happen without the BFF secret, even for a valid code.
+    assert_eq!(
+        app.exchange(oauth_body("github", "github-created"), "")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
     );
     app.close().await;
 }
