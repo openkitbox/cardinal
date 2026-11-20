@@ -2809,11 +2809,16 @@ pub async fn dispatch_at(
     // Free callers and in-process calls keep every candidate. An empty
     // resolution falls through to the window/no-key answers below.
     if billing::needs_price(principal) && !expanded.is_empty() {
+        let mut unpriced_providers: Vec<String> = Vec::new();
         expanded.retain(|candidate| {
             let priced = price_cache.contains(candidate.provider.id, &candidate.upstream_model);
             if !priced {
                 // May be new to models.dev: nudge the catalog keeper (6h-throttled).
                 crate::prices::missing(&candidate.upstream_model);
+                let name = &candidate.provider.name;
+                if !unpriced_providers.iter().any(|existing| existing == name) {
+                    unpriced_providers.push(name.clone());
+                }
             }
             priced
         });
@@ -2823,6 +2828,7 @@ pub async fn dispatch_at(
             }
             tracing::warn!(
                 model = model.as_str(),
+                providers = ?unpriced_providers,
                 user_id = principal.map(|principal| principal.user_id),
                 "no priced candidate for a billed caller; refusing"
             );

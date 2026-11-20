@@ -14,7 +14,9 @@
 //! The catalog is a process-wide singleton: only the standalone binary
 //! starts it, so test processes (which build routers directly) never fetch.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -31,6 +33,10 @@ const STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
 const MISSING_AFTER: Duration = Duration::from_secs(6 * 3600);
 /// How often the keeper loop looks at the cache's age.
 const RECHECK_EVERY: Duration = Duration::from_secs(3600);
+/// A failed fetch is retried after this delay, doubling on each further
+/// failure up to `RETRY_MAX`.
+const RETRY_BASE: Duration = Duration::from_secs(120);
+const RETRY_MAX: Duration = Duration::from_secs(3600);
 /// The download is capped.
 const MAX_BYTES: u64 = 64 << 20;
 /// One fetch may not hang the keeper forever.
@@ -58,6 +64,8 @@ struct CatalogState {
     /// Models already reported missing, with when — one trigger per model per
     /// MISSING_AFTER window.
     missing: HashMap<String, Instant>,
+    /// Consecutive failed syncs, reset by any success.
+    failures: u32,
 }
 
 /// Start the catalog keeper for this process (the standalone binary only).
@@ -113,14 +121,17 @@ pub fn missing(model: &str) {
     }
 }
 
-/// The keeper loop: sync when stale, look again in an
-/// hour, forever. Never returns; the process exit ends it.
+/// The keeper loop: sync when stale, retry a failed sync with a bounded
+/// backoff, otherwise look again in an hour, forever. Never returns; the
+/// process exit ends it.
 async fn keep_fresh(catalog: &'static Catalog) {
     loop {
-        if cache_age(&catalog.cache_path).is_none_or(|age| age > STALE_AFTER) {
-            sync(catalog).await;
-        }
-        tokio::time::sleep(RECHECK_EVERY).await;
+        let retry = if cache_age(&catalog.cache_path).is_none_or(|age| age > STALE_AFTER) {
+            sync(catalog).await
+        } else {
+            None
+        };
+        tokio::time::sleep(retry.unwrap_or(RECHECK_EVERY)).await;
     }
 }
 
@@ -130,11 +141,31 @@ fn cache_age(path: &PathBuf) -> Option<Duration> {
     SystemTime::now().duration_since(mtime).ok()
 }
 
+/// Retry delay after `failures` consecutive sync failures: 2min, 4min, 8min,
+/// …, capped at an hour; zero after a success.
+fn next_retry(failures: u32) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    // Cap the shift so neither the shift nor the multiplication overflows;
+    // the first failure is one base delay.
+    let shift = failures.saturating_sub(1).min(5);
+    RETRY_BASE.saturating_mul(1u32 << shift).min(RETRY_MAX)
+}
+
+/// The cached catalog file is the freshness record: only advance its mtime
+/// once every DB write in the sync succeeded.
+fn should_persist_cache(db_ok: bool) -> bool {
+    db_ok
+}
+
 /// One fetch + upsert pass, single-flight: a keeper sync
 /// and a miss-triggered one cannot interleave writes.
-async fn sync(catalog: &'static Catalog) {
+///
+/// Returns the next retry delay on failure, `None` on success.
+async fn sync(catalog: &'static Catalog) -> Option<Duration> {
     if catalog.fetching.swap(true, Ordering::SeqCst) {
-        return;
+        return None;
     }
     catalog
         .state
@@ -143,40 +174,76 @@ async fn sync(catalog: &'static Catalog) {
         .last_attempt = Some(Instant::now());
     let result = sync_inner(catalog).await;
     catalog.fetching.store(false, Ordering::SeqCst);
+    let retry = {
+        let mut state = catalog.state.lock().unwrap_or_else(|e| e.into_inner());
+        if result.is_ok() {
+            state.failures = 0;
+            None
+        } else {
+            state.failures = state.failures.saturating_add(1);
+            Some(next_retry(state.failures))
+        }
+    };
     if let Err(error) = result {
         tracing::warn!(%error, "models.dev catalog sync failed");
     }
+    retry
+}
+
+/// Served models plus the names that missed pricing, deduped and sorted so a
+/// miss-triggered sync can actually upsert the model that triggered it.
+fn upsert_candidates(served: Vec<String>, missing: &HashMap<String, Instant>) -> Vec<String> {
+    let mut names: BTreeSet<&str> = served.iter().map(String::as_str).collect();
+    names.extend(missing.keys().map(String::as_str));
+    names.into_iter().map(str::to_owned).collect()
 }
 
 async fn sync_inner(catalog: &Catalog) -> anyhow::Result<()> {
     let bytes = fetch().await?;
     let parsed = parse_catalog(&bytes)?;
-    // Cache write first: the file's mtime is the freshness record, so it must
-    // only move once the payload parsed.
-    if let Some(dir) = catalog.cache_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&catalog.cache_path, &bytes)?;
-    let models = crate::store::served_models_for_pricing(&catalog.pool).await?;
+    // One lookup index for this sync, built from the parsed payload and never
+    // cached process-wide, so it cannot drift from what we fetched.
+    let index = PriceIndex::new(&parsed);
+    let served = crate::store::served_models_for_pricing(&catalog.pool).await?;
+    // Copy the missing names and drop the guard before any await.
+    let models = {
+        let state = catalog.state.lock().unwrap_or_else(|e| e.into_inner());
+        upsert_candidates(served, &state.missing)
+    };
+    let mut db_error = None;
     for model in &models {
-        if let Some(cost) = find_cost(&parsed, model) {
-            catalog
-                .price_cache
-                .upsert(
-                    &catalog.pool,
-                    0,
-                    model,
-                    crate::relay::PriceInput {
-                        input: cost.input,
-                        output: cost.output,
-                        cache_read: Some(cost.cache_read),
-                        cache_write: Some(cost.cache_write),
-                    },
-                )
-                .await?;
+        let Some(cost) = index.find(model) else {
+            continue;
+        };
+        if let Err(error) = catalog
+            .price_cache
+            .upsert(
+                &catalog.pool,
+                0,
+                model,
+                crate::relay::PriceInput {
+                    input: cost.input,
+                    output: cost.output,
+                    cache_read: Some(cost.cache_read),
+                    cache_write: Some(cost.cache_write),
+                },
+            )
+            .await
+        {
+            db_error = Some(error);
+            break;
         }
     }
-    Ok(())
+    if should_persist_cache(db_error.is_none()) {
+        if let Some(dir) = catalog.cache_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&catalog.cache_path, &bytes)?;
+    }
+    match db_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 async fn fetch() -> anyhow::Result<Vec<u8>> {
@@ -275,37 +342,170 @@ pub(crate) fn bare(key: &str) -> &str {
     key.rsplit('/').next().unwrap_or(key)
 }
 
-/// The catalog cost of a served model id, conservatively:
-/// 1. a MAKER provider's entry whose bare key is the id (zhipuai's
-///    `glm-5.3-flash`), else
-/// 2. a MAKER entry whose `canonical_model_id` names the id (deepseek's
-///    `deepseek-flash` → `deepseek/deepseek-v4.1-flash`), else
-/// 3. None — reseller prices are never imported.
-fn find_cost(catalog: &CatalogJson, model: &str) -> Option<CostEntry> {
-    let target = model.to_lowercase();
-    for maker in MAKERS {
-        let Some(provider) = catalog.get(*maker) else {
-            continue;
-        };
-        for (model_id, entry) in &provider.models {
-            let Some(cost) = entry.cost else { continue };
-            if is_priced(&cost) && bare(&model_id.to_lowercase()) == target {
-                return Some(cost);
-            }
-        }
-    }
-    for maker in MAKERS {
-        let Some(provider) = catalog.get(*maker) else {
-            continue;
-        };
-        for entry in provider.models.values() {
-            let (Some(cost), Some(canonical)) = (entry.cost, &entry.canonical_model_id) else {
+/// A one-shot lookup index built from a parsed catalog once per sync, never
+/// cached process-wide, so it cannot drift from the payload we fetched.
+///
+/// Only MAKER entries contribute prices; any provider may still declare an
+/// alias (`canonical_model_id`) pointing at one of those maker prices.
+struct PriceIndex {
+    /// Priced maker entry by bare lowercase id. First maker wins, unchanged
+    /// from the previous exact-match behaviour.
+    ids: HashMap<String, CostEntry>,
+    /// The same entries with dots replaced by dashes: relays spell Anthropic
+    /// `claude-opus-5.5`, the maker lists `claude-opus-5-5`.
+    dashed_ids: HashMap<String, CostEntry>,
+    /// A served id (from any provider) → the maker price its canonical names.
+    /// `None` means alias sources disagree, so the alias stays unpriced.
+    aliases: HashMap<String, Option<CostEntry>>,
+}
+
+impl PriceIndex {
+    fn new(catalog: &CatalogJson) -> Self {
+        let mut ids = HashMap::new();
+        let mut dashed_ids = HashMap::new();
+        // Canonical id → price agreed across the maker entries that declare
+        // it. A reseller's listing under someone else's canonical is not that
+        // maker's price (moonshotai-cn relists moonshotai/kimi-k3 at a
+        // different rate), so it may only act as an alias source below.
+        let mut shared: HashMap<String, Option<CostEntry>> = HashMap::new();
+        // Of those entries, the one whose own id IS the canonical names the
+        // base model; a differently priced sibling variant sharing the same
+        // canonical (kimi-k3.1-pro-highspeed) must not decide its price.
+        let mut owners: HashMap<String, Option<CostEntry>> = HashMap::new();
+        let mut aliases: HashMap<String, Option<CostEntry>> = HashMap::new();
+        for maker in MAKERS {
+            let Some(provider) = catalog.get(*maker) else {
                 continue;
             };
-            if is_priced(&cost) && bare(&canonical.to_lowercase()) == target {
-                return Some(cost);
+            for (id, entry) in &provider.models {
+                let Some(cost) = entry.cost else { continue };
+                if !is_priced(&cost) {
+                    continue;
+                }
+                let id_bare = bare(&id.to_lowercase()).to_owned();
+                ids.entry(id_bare.clone()).or_insert(cost);
+                dashed_ids.entry(dashed(&id_bare)).or_insert(cost);
+                let Some(spec) = entry.canonical_model_id.as_deref() else {
+                    continue;
+                };
+                let Some((head, tail)) = spec.split_once('/') else {
+                    continue;
+                };
+                if !head.eq_ignore_ascii_case(maker) {
+                    continue;
+                }
+                let key = canonical_key(tail);
+                agree(&mut shared, key.clone(), cost);
+                if canonical_key(id) == key {
+                    agree(&mut owners, key, cost);
+                }
+            }
+        }
+        let mut canonical = shared;
+        for (key, cost) in owners {
+            canonical.insert(key, cost);
+        }
+        // The maker's own canonical is also a name relays serve the model
+        // under, so keep the old direct canonical lookup. Only resolved
+        // prices seed aliases: an unresolved canonical must never clobber a
+        // healthy alias contributed by another provider.
+        for maker in MAKERS {
+            let Some(provider) = catalog.get(*maker) else {
+                continue;
+            };
+            for entry in provider.models.values() {
+                let Some(spec) = entry.canonical_model_id.as_deref() else {
+                    continue;
+                };
+                let Some((head, tail)) = spec.split_once('/') else {
+                    continue;
+                };
+                if !head.eq_ignore_ascii_case(maker) {
+                    continue;
+                }
+                let Some(Some(cost)) = canonical.get(&canonical_key(tail)) else {
+                    continue;
+                };
+                agree(&mut aliases, bare(&spec.to_lowercase()).to_owned(), *cost);
+            }
+        }
+        for provider in catalog.values() {
+            for (id, entry) in &provider.models {
+                let Some((_, tail)) = entry
+                    .canonical_model_id
+                    .as_deref()
+                    .and_then(|spec| spec.split_once('/'))
+                else {
+                    continue;
+                };
+                let Some(Some(cost)) = canonical.get(&canonical_key(tail)) else {
+                    continue;
+                };
+                agree(&mut aliases, bare(&id.to_lowercase()).to_owned(), *cost);
+            }
+        }
+        Self {
+            ids,
+            dashed_ids,
+            aliases,
+        }
+    }
+
+    /// The catalog cost of a served model id: exact maker id, then the same
+    /// with dots as dashes, then a canonical alias resolved to a maker price.
+    /// Reseller prices are never used and a disagreement stays unpriced.
+    fn find(&self, model: &str) -> Option<CostEntry> {
+        let target = model.to_lowercase();
+        let target = bare(&target);
+        if let Some(cost) = self.ids.get(target) {
+            return Some(*cost);
+        }
+        let dashed = dashed(target);
+        if let Some(cost) = self.dashed_ids.get(&dashed) {
+            return Some(*cost);
+        }
+        self.aliases.get(target).copied().flatten()
+    }
+}
+
+/// Dots and dashes are interchangeable across relays and makers.
+fn dashed(id: &str) -> String {
+    id.replace('.', "-")
+}
+
+/// Strip one path head, lowercase and normalize a canonical id, dropping a
+/// date-like snapshot suffix (`deepseek-v4.1-flash-1017` is the maker's
+/// `deepseek-v4.1-flash`). Short numeric tails are part of the model's name —
+/// `claude-opus-5-5` must not become `claude-opus-5`.
+fn canonical_key(id: &str) -> String {
+    let lower = id.to_lowercase();
+    let bare = bare(&lower);
+    let dashed = dashed(bare);
+    strip_snapshot(&dashed).to_owned()
+}
+
+fn strip_snapshot(id: &str) -> &str {
+    let Some((head, tail)) = id.rsplit_once('-') else {
+        return id;
+    };
+    if tail.len() >= 4 && tail.bytes().all(|byte| byte.is_ascii_digit()) {
+        head
+    } else {
+        id
+    }
+}
+
+/// Keep a price only while every maker entry for the key agrees; a conflict
+/// poisons the key so lookup fails closed instead of guessing a rate.
+fn agree(by: &mut HashMap<String, Option<CostEntry>>, key: String, cost: CostEntry) {
+    match by.entry(key) {
+        Entry::Vacant(slot) => {
+            slot.insert(Some(cost));
+        }
+        Entry::Occupied(mut slot) => {
+            if slot.get().is_some_and(|was| was != cost) {
+                slot.insert(None);
             }
         }
     }
-    None
 }

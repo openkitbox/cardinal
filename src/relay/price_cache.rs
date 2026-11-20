@@ -91,18 +91,17 @@ impl PriceCache {
             tiers,
         ) in rows
         {
-            let tiers = match tiers {
-                Some(json) => serde_json::from_str::<Vec<crate::store::PriceTier>>(&json)?,
-                None => Vec::new(),
-            };
-            let price = ModelPrice {
-                input_usd,
-                output_usd,
-                cache_read_usd,
-                cache_write_usd,
-                cache_write_1h_usd,
-                tiers,
-            };
+            let price = ModelPrice::parse_price_row(
+                &model,
+                (
+                    input_usd,
+                    output_usd,
+                    cache_read_usd,
+                    cache_write_usd,
+                    cache_write_1h_usd,
+                    tiers,
+                ),
+            )?;
             map.insert(provider_id, model, price);
         }
         *self

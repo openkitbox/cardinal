@@ -47,6 +47,28 @@ pub struct ModelPrice {
 }
 
 impl ModelPrice {
+    /// Build one price from a `(input, output, cache_read, cache_write,
+    /// cache_write_1h, tiers)` DB row, applying the Claude one-hour default.
+    /// Shared by the hot-path DB lookup and the startup cache load so the two
+    /// cannot disagree about a price.
+    pub(crate) fn parse_price_row(model: &str, row: PriceRow) -> anyhow::Result<Self> {
+        let (input_usd, output_usd, cache_read_usd, cache_write_usd, cache_write_1h_usd, tiers) =
+            row;
+        let tiers = match tiers {
+            Some(json) => serde_json::from_str::<Vec<PriceTier>>(&json)?,
+            None => Vec::new(),
+        };
+        Ok(Self {
+            input_usd,
+            output_usd,
+            cache_read_usd,
+            cache_write_usd,
+            cache_write_1h_usd: cache_write_1h_usd
+                .or_else(|| claude_one_hour_default(model, input_usd, cache_write_usd)),
+            tiers,
+        })
+    }
+
     /// The request bills whole at the unit prices of the
     /// highest tier its prompt total passes (OpenAI counts a request's input
     /// with its cached tokens in it, and the tier is chosen on that total),
@@ -138,23 +160,6 @@ async fn load_price_row(
   )
 }
 
-fn parse_price_row(model: &str, row: PriceRow) -> anyhow::Result<ModelPrice> {
-    let (input_usd, output_usd, cache_read_usd, cache_write_usd, cache_write_1h_usd, tiers) = row;
-    let tiers = match tiers {
-        Some(json) => serde_json::from_str::<Vec<PriceTier>>(&json)?,
-        None => Vec::new(),
-    };
-    Ok(ModelPrice {
-        input_usd,
-        output_usd,
-        cache_read_usd,
-        cache_write_usd,
-        cache_write_1h_usd: cache_write_1h_usd
-            .or_else(|| claude_one_hour_default(model, input_usd, cache_write_usd)),
-        tiers,
-    })
-}
-
 /// The effective price for a call to `model` through provider `provider_id`:
 /// the provider-scoped row when one exists, else the global row (a relay
 /// marking a model up gets its own row, everyone else shares the flat one).
@@ -164,10 +169,10 @@ pub async fn get_price(
     model: &str,
 ) -> anyhow::Result<Option<ModelPrice>> {
     if let Some(row) = load_price_row(pool, provider_id, model).await? {
-        return parse_price_row(model, row).map(Some);
+        return ModelPrice::parse_price_row(model, row).map(Some);
     }
     match load_price_row(pool, 0, model).await? {
-        Some(row) => parse_price_row(model, row).map(Some),
+        Some(row) => ModelPrice::parse_price_row(model, row).map(Some),
         None => Ok(None),
     }
 }
