@@ -11,6 +11,7 @@ mod billing;
 mod gateway_key;
 mod key;
 mod key_group;
+mod payment;
 mod portal_settings;
 mod price;
 mod provider;
@@ -32,7 +33,8 @@ pub use account_auth::{
 pub use balance_history::{BalanceHistoryPoint, balance_history_record, list_balance_history};
 pub use billing::{
     Charge, CreditError, CreditKind, EntryRow, KeyReconciliation, Overflowed, ReconcileReport,
-    Reconciliation, SettleReport, credit, list_entries, reconcile_user, settle_charges,
+    Reconciliation, SettleReport, credit, credit_in_tx, list_entries, reconcile_user,
+    settle_charges,
 };
 pub use gateway_key::{
     GatewayKeyPatch, GatewayKeyRow, KeyTerms, create_gateway_key, create_user_gateway_key,
@@ -54,6 +56,13 @@ pub use key::{
 pub use key_group::{
     KeyGroupError, KeyGroupView, create_key_group, delete_key_group, key_groups_exist,
     list_key_groups, rename_key_group,
+};
+pub use payment::{
+    NewPaymentEvent, NewPaymentOrder, NewPaymentRefund, PaymentError, PaymentEventRow,
+    PaymentOrderRow, PaymentPlacement, PaymentRefundRow, SettleOutcome, SettlePaymentInput,
+    create_order, create_refund_in_tx, get_event, get_order, get_order_by_out_trade_no, get_refund,
+    list_events, list_orders, list_refunds, record_event_in_tx, record_placement_in_tx,
+    set_order_status_in_tx, set_refund_status_in_tx, settle_succeeded_payment_in_tx,
 };
 pub use portal_settings::{
     AuthProviderInput, AuthProviderRow, AuthProviderView, PortalSettingsInput, PortalSettingsRow,

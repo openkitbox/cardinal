@@ -40,6 +40,7 @@ pub mod metering;
 pub mod models;
 pub mod openai;
 pub mod opencode;
+pub mod payments;
 pub mod prices;
 pub mod probe;
 pub mod protocol;
@@ -55,6 +56,7 @@ pub mod user_keys;
 pub mod user_topup;
 pub mod user_usage;
 pub mod workbuddy;
+pub mod xiaodou_pay;
 
 /// This crate's schema migrator (`migrations/`). Composition roots run it
 /// once at startup via `crate::db::Db::migrate("gateway", gateway::migrator())`.

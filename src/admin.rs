@@ -2297,6 +2297,9 @@ pub(crate) fn router(
         .push(Router::with_path("users/{id}/adjust").post(adjust_user))
         .push(Router::with_path("users/{id}/entries").get(list_user_entries))
         .push(Router::with_path("users/{id}/reconcile").get(reconcile_user))
+        .push(Router::with_path("payment/orders").get(payment_orders))
+        .push(Router::with_path("payment/orders/{id}/refund").post(payment_refund))
+        .push(Router::with_path("payment/reconciliation").get(payment_reconciliation))
         .push(
             Router::with_path("user-groups")
                 .get(list_user_groups)
@@ -2327,6 +2330,80 @@ pub(crate) fn router(
 }
 
 // ---------- provider keys and failure cooldowns ----------
+
+// ---------- online payments (decisions in `crate::payments`) ----------
+
+#[derive(Deserialize)]
+struct PaymentReconciliationQuery {
+    from: String,
+    to: String,
+}
+
+fn payment_error(response: &mut Response, error: crate::payments::PaymentError) {
+    use crate::payments::PaymentError;
+
+    let status = match error {
+        PaymentError::InvalidAmount | PaymentError::MissingPayerIp => StatusCode::BAD_REQUEST,
+        PaymentError::NotFound => StatusCode::NOT_FOUND,
+        PaymentError::Terminal | PaymentError::Conflict => StatusCode::CONFLICT,
+        PaymentError::AmountMismatch => StatusCode::UNPROCESSABLE_ENTITY,
+        PaymentError::Disabled => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    response.status_code(status);
+    json_response(response, &json!({ "error": error.to_string() }));
+}
+
+#[handler]
+async fn payment_orders(depot: &mut Depot, response: &mut Response) {
+    match crate::payments::list_all_orders(&state(depot).pool).await {
+        Ok(orders) => json_response(response, &json!({ "orders": orders })),
+        Err(error) => payment_error(response, error),
+    }
+}
+
+#[handler]
+async fn payment_refund(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Some(id) = request.param::<i64>("id") else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("invalid order id");
+        return;
+    };
+    let actor = request
+        .headers()
+        .get("x-operator")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("admin")
+        .to_owned();
+    match crate::payments::refund_order(&state(depot).pool, id, &actor).await {
+        Ok(view) => {
+            response.status_code(StatusCode::CREATED);
+            json_response(response, &view);
+        }
+        Err(error) => payment_error(response, error),
+    }
+}
+
+#[handler]
+async fn payment_reconciliation(request: &mut Request, depot: &mut Depot, response: &mut Response) {
+    let Ok(query) = request.parse_queries::<PaymentReconciliationQuery>() else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("from/to must be RFC3339 timestamps");
+        return;
+    };
+    let (Ok(from), Ok(to)) = (
+        query.from.parse::<jiff::Timestamp>(),
+        query.to.parse::<jiff::Timestamp>(),
+    ) else {
+        response.status_code(StatusCode::BAD_REQUEST);
+        let _ = response.body("from/to must be RFC3339 timestamps");
+        return;
+    };
+    match crate::payments::reconcile(&state(depot).pool, from, to).await {
+        Ok(report) => json_response(response, &report),
+        Err(error) => payment_error(response, error),
+    }
+}
 
 #[derive(Deserialize)]
 struct KeyBody {

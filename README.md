@@ -18,6 +18,7 @@ The companion native macOS management dashboard is available in the [Cardinal GU
 - **SSE activity stream** — Real-time event feed of all gateway activity
 - **TLS** — Optional TLS via rustls (configured in config file)
 - **Vendor dialects** — Automatic handling of provider-specific quirks (GLM thinking mode, DeepSeek tool-call pairing, image stripping)
+- **Online top-up (Xiaodou)** — Optional `ALIPAY_H5` payments: signed orders/webhooks, idempotent USD-micro crediting, refunds and reconciliation; private key stays on the Gateway host
 
 ## Quick Start
 
@@ -118,17 +119,79 @@ migrations when the fixture owns database creation.
 
 The portal E2E covers open registration and fragment mail verification, account
 and Key login, OAuth login through loopback-provider mocks, two customer keys, a
-real mocked upstream request, aggregate vs single-Key usage, billing,
-unavailable top-up, forgot/reset, logout, and second-user isolation. Payment
-providers, orders, webhooks, real mail reachability, real Google/GitHub
-endpoints, production routing, and production admin-surface isolation are not
-covered by the local test.
+real mocked upstream request, aggregate vs single-Key usage, billing, Xiaodou
+CNY top-up with a signed loopback mock and webhooks, forgot/reset, logout, and
+second-user isolation. Real mail reachability, real Google/GitHub endpoints,
+real Xiaodou endpoints, production routing, and production admin-surface
+isolation are not covered by the local test.
 
 Check the gateway is up with:
 
 ```bash
 curl -H "Authorization: Bearer your-admin-key" http://127.0.0.1:8787/api/info
 ```
+
+## Online payments (Xiaodou / ALIPAY_H5)
+
+Gateway owns orders, signature verification, the USD-micro ledger and the
+private key; Web and GUI never see key material. `[gateway.payments.xiaodou]`
+is optional (omit it to keep top-up disabled) and its full shape is in
+`config.example.toml`.
+
+### Merchant portal setup (before enabling)
+
+1. Generate an RSA2 key pair on the Gateway host. Keep the private key there,
+   upload the public key in the Xiaodou merchant portal, and record the
+   resulting `merchant_kid` plus the published platform key `kid`/PEM/fingerprint
+   (verify the fingerprint locally; never take a platform key from a response).
+2. Add **every production/DR egress IP** the Gateway calls from to the portal IP
+   allowlist; keep source-IP verification enabled.
+3. Submit `https://c1.iios.net/payments/webhook/xiaodou` as the **application-level**
+   `notifyUrl` (it takes effect immediately and needs SMS confirmation). It is
+   not a per-order field. The route is public, outside `gateway_auth`: it
+   verifies the raw request body with `XD-Webhook-v1`, deduplicates `eventId` in
+   the same DB transaction as the ledger write, and replies with the exact bytes
+   `success`.
+4. Confirm `ALIPAY_H5` × the configured `trade_scope` (for example
+   `CARD_VIRTUAL`) is approved for the app; unapproved combinations return 422.
+5. Apply for a **sandbox app**. Local mocks cannot replace production checks of
+   permissions, fees and channel enablement; run the whole flow in sandbox first.
+6. Enable **NTP** on the Gateway host. Clock skew causes intermittent 401s.
+
+Copy the config section from `config.example.toml` and inject the private key
+through the process environment — never inline PEM into TOML, DB, logs, Web or
+GUI config:
+
+```bash
+export CARDINAL_XIAODOU_PRIVATE_KEY="$(cat /path/to/xiaodou-private.pem)"
+cardinal-gateway --config /path/to/config.toml
+```
+
+Missing or invalid config/key fails closed: capabilities report
+`online_payment_available: false` and order endpoints refuse to operate.
+`base_url` comes only from config. CNY amounts are converted with the fixed
+`usd_micros_per_cny_fen` snapshot and credited to the USD-micro ledger; there
+is no live FX and no second ledger currency.
+
+Operational endpoints: public `POST /payments/webhook/xiaodou`; account-session
+`GET /user/topup/capabilities`, `POST /user/topup/orders`,
+`GET /user/topup/orders`, `GET /user/topup/orders/{id}`,
+`POST /user/topup/orders/{id}/attempts`; admin bearer-key
+`GET /api/payment/orders`, `POST /api/payment/orders/{id}/refund`,
+`GET /api/payment/reconciliation?from=&to=` (platform-success/local-not,
+local-success/platform-not, and amount mismatch). Only a verified success event
+or authoritative query result credits an order; `payUrl`/`returnUrl` are not
+proof of payment.
+
+### First live payment accompaniment
+
+- [ ] Small real first payment; name who watches order status, webhook arrival and the settlement view.
+- [ ] Re-deliver one `eventId`: exactly one credit and a `success` reply; a success event after `CLOSED/FAILED` may still promote the order.
+- [ ] Check desktop / WeChat-outside / WeChat-inside flows; render `qrCode` only from a fresh response with the official prefix, never from a query response, and never log the materials.
+- [ ] Delay or drop one event and confirm query compensation converges the order; `UNKNOWN` is retried, never re-ordered.
+- [ ] Refund the test order and check the negative ledger entry uses that order's rate snapshot; run the reconciliation query for the period.
+- [ ] Grep logs for private key, full bodies, signatures, `payUrl`/`qrCode`; keep only request/event/order ids and amounts.
+- [ ] Archive golden-vector and webhook-verification results, and know where the top-up entry is disabled for rollback — do not hot-edit config or code during an incident.
 
 ## Deployment
 
@@ -211,6 +274,10 @@ updates the `latest` tag.
 | `GET /user/me`, `GET /user/me/entries` | Self-service balance, keys and ledger (gateway key auth) |
 | `GET/POST /user/keys`, `PATCH /user/keys/{id}` | Self-service keys: list (full key), create `{label, expires_at?, quota_usd?}`, edit `{label?, enabled?, expires_at?, quota_usd?}` (null clears expiry/quota); at most 20 keys per user, disabled included (409); another user's key is 404; no delete |
 | `GET /user/usage/window`, `GET /user/usage/trend` | Self-service usage; trend `split` = `route` (default), `model` or `client` (`provider`/`user` → 400) |
+| `GET /user/topup/capabilities`, `POST /user/topup/orders` | Online-payment availability and order creation (account session only) |
+| `GET /user/topup/orders`, `GET /user/topup/orders/{id}`, `POST /user/topup/orders/{id}/attempts` | Own payment orders and re-launch (new QR code) |
+| `POST /payments/webhook/xiaodou` | Public Xiaodou event webhook; raw-body signature check, exact `success` response |
+| `GET /api/payment/orders`, `POST /api/payment/orders/{id}/refund`, `GET /api/payment/reconciliation?from=&to=` | Admin payment orders, full refund, reconciliation differences |
 
 Admin endpoints under `/api` require `Authorization: Bearer <admin key>`;
 `/v1` endpoints require a gateway key; `/user/*` accepts account portal

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 use jiff_sqlx::ToSqlx;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 /// The [`EntryRow`] column list, shared by every query that returns entries
 /// (a `macro_rules!` so `concat!` keeps each query a `&'static str`).
@@ -379,10 +379,37 @@ pub async fn credit(
     operator: &str,
 ) -> Result<Option<EntryRow>, CreditError> {
     let mut tx = pool.begin().await?;
+    let entry = credit_in_tx(
+        &mut tx,
+        user_id,
+        kind.as_str(),
+        amount_microus,
+        note,
+        operator,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(entry)
+}
+
+/// The same ledger write in a caller-owned transaction. It does not commit:
+/// the caller decides whether the whole unit of work lands. `request_id`, when
+/// present, is a stable payment key (`outTradeNo` / `outRefundNo`) whose
+/// uniqueness prevents a second money movement for the same payment.
+pub async fn credit_in_tx(
+    conn: &mut PgConnection,
+    user_id: i64,
+    kind: &str,
+    amount_microus: i64,
+    note: &str,
+    operator: &str,
+    request_id: Option<&str>,
+) -> Result<Option<EntryRow>, CreditError> {
     let balance: Option<i64> =
         sqlx::query_scalar("SELECT balance_microus FROM users WHERE id = $1 FOR UPDATE")
             .bind(user_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
     let Some(balance) = balance else {
         return Ok(None);
@@ -392,25 +419,25 @@ pub async fn credit(
         .ok_or(CreditError::Overflow)?;
     let entry = sqlx::query_as::<_, EntryRow>(concat!(
         "INSERT INTO billing_entries
-             (user_id, kind, amount_microus, balance_after_microus, note, operator)
-         VALUES ($1, $2, $3, $4, $5, $6)
+             (user_id, kind, amount_microus, balance_after_microus, request_id, note, operator)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING ",
         entry_columns!()
     ))
     .bind(user_id)
-    .bind(kind.as_str())
+    .bind(kind)
     .bind(amount_microus)
     .bind(after)
+    .bind(request_id)
     .bind(note)
     .bind(operator)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
     sqlx::query("UPDATE users SET balance_microus = $2 WHERE id = $1")
         .bind(user_id)
         .bind(after)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
     Ok(Some(entry))
 }
 

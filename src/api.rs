@@ -790,6 +790,8 @@ pub(crate) fn router(
     Router::new()
         .hoop(crate::access_log::AccessLog)
         .push(Router::with_path("health").get(health))
+        // Public webhook: signature is the credential; no gateway_auth hoop.
+        .push(Router::with_path("payments/webhook/xiaodou").post(crate::user_topup::webhook))
         .push(
             Router::with_path("v1")
                 .hoop(gateway_auth)
